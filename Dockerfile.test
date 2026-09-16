@@ -1,0 +1,10 @@
+FROM alpine:edge
+
+RUN apk add --no-cache build-base linux-headers
+
+WORKDIR /src
+COPY . .
+
+RUN make clean \
+ && make CC=gcc CFLAGS='-O3 -flto -fno-plt' LDFLAGS='-flto' \
+ && make test

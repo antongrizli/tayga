@@ -1,0 +1,34 @@
+FROM alpine:edge
+
+RUN apk add --no-cache \
+    build-base \
+    linux-headers \
+    iproute2 \
+    iperf3 \
+    nftables \
+    procps \
+    python3 \
+    unbound
+
+WORKDIR /src
+ARG TAYGA_SOURCE=tayga-clat-perf
+COPY ${TAYGA_SOURCE}/ /src/
+
+RUN make CC=gcc CFLAGS='-O3 -flto -fno-plt' LDFLAGS='-flto' \
+ && install -Dm0755 tayga /usr/sbin/tayga
+
+COPY telekom-nat64-minimal/start.sh /usr/local/sbin/start.sh
+COPY telekom-nat64-minimal/clat-start.sh /usr/local/sbin/clat-start.sh
+COPY telekom-nat64-minimal/tayga.conf /etc/tayga.conf
+COPY telekom-nat64-minimal/unbound.conf /etc/unbound/unbound.conf
+COPY telekom-nat64-minimal/benchmark/compare-nat64.sh /usr/local/sbin/compare-nat64.sh
+COPY tayga-clat-perf/benchmark-clat.sh /tmp/benchmark-clat.sh
+COPY telekom-nat64-minimal/test-464xlat-lab.sh /tmp/test-464xlat-lab.sh
+
+RUN mkdir -p /usr/local/sbin \
+ && cp /tmp/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh \
+ && cp /tmp/test-464xlat-lab.sh /usr/local/sbin/test-464xlat-lab.sh \
+ && chmod 0755 /usr/local/sbin/start.sh /usr/local/sbin/clat-start.sh /usr/local/sbin/compare-nat64.sh /usr/local/sbin/benchmark-clat.sh /usr/local/sbin/test-464xlat-lab.sh \
+ && unbound-checkconf /etc/unbound/unbound.conf
+
+ENTRYPOINT ["/usr/local/sbin/compare-nat64.sh"]

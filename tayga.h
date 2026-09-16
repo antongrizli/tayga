@@ -194,6 +194,8 @@ static_assert(sizeof(struct icmp) == 8,"Struct ICMP must be 8 bytes long");
 
 /// Packet structure
 struct pkt {
+	/* Keep replies on the same TUN queue that delivered this packet. */
+	int tun_fd;
 	struct ip4 *ip4;
 	struct ip6 *ip6;
 	struct ip6_frag *ip6_frag;
@@ -343,6 +345,8 @@ struct config {
 	struct in6_addr local_addr6;
 	struct list_head map4_list;
 	struct list_head map6_list;
+	/* Set after validation when no code path can modify static maps. */
+	int maps_immutable;
 
 	//Dynamic map parameters
 	char data_dir[512];

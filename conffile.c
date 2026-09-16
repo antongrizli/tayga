@@ -873,8 +873,14 @@ int config_validate(void)
 	m4 = list_entry(gcfg.map4_list.next, struct map4, list);
 	m6 = list_entry(gcfg.map6_list.next, struct map6, list);
 
-	if (m4->type == MAP_TYPE_RFC6052 && m6->type == MAP_TYPE_RFC6052) {
-		slog(LOG_DEBUG,"Disabling cache, not required\n");
+	/*
+	 * A configuration without a dynamic pool or a reloadable map file has a
+	 * small, immutable static map set.  The cache adds a global mutex, hash
+	 * lookup and per-packet timestamp write but cannot make those maps change.
+	 */
+	gcfg.maps_immutable = !gcfg.dynamic_pool && !gcfg.map_file[0];
+	if (gcfg.maps_immutable) {
+		slog(LOG_DEBUG,"Disabling cache for immutable static maps\n");
 		gcfg.cache_size = 0;
 	}
 

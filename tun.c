@@ -583,6 +583,7 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 		return;
 	}
 	memset(p, 0, sizeof(struct pkt));
+	p->tun_fd = tun_fd;
 	p->data = recv_buf + sizeof(struct tun_pi);
 	p->data_len = ret - sizeof(struct tun_pi);
 	switch (TUN_GET_PROTO(pi)) {
