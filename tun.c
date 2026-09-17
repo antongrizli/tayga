@@ -559,10 +559,66 @@ int tun_setup(int do_mktun, int do_rmtun)
 #endif
 
 
+/* tun_write: Write a single contiguous packet buffer to the TUN device.
+ * TUN devices are packet-based (datagram) interfaces. Each write must send exactly
+ * one complete IP packet. Partial writes cannot be resumed with subsequent writes,
+ * as each write syscall represents a separate network packet to the kernel.
+ * Handles EINTR interrupts safely and detects truncated writes.
+ */
+ssize_t tun_write(int tun_fd, const void *buf, size_t len)
+{
+	ssize_t ret;
+	int retries = 0;
+
+	for (;;) {
+		ret = write(tun_fd, buf, len);
+		if (likely(ret == (ssize_t)len))
+			return ret;
+		if (ret < 0) {
+			if (errno == EINTR && retries++ < 5)
+				continue;
+			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
+				strerror(errno));
+			return -1;
+		}
+		/* Short write: packet was truncated by kernel/device.
+		 * Do not attempt to append remainder; drop and log warning. */
+		slog(LOG_WARNING, "short write to tun device: wrote %zd of %zu bytes\n",
+			ret, len);
+		return -1;
+	}
+}
+
+/* tun_writev: Write vectored buffers to the TUN device.
+ * Retries on EINTR and verifies total length matches written bytes.
+ */
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 {
-	return writev(tun_fd, iov, iovcnt);
+	size_t total_len = 0;
+	ssize_t ret;
+	int retries = 0;
+
+	for (int i = 0; i < iovcnt; i++)
+		total_len += iov[i].iov_len;
+
+	for (;;) {
+		ret = writev(tun_fd, iov, iovcnt);
+		if (likely(ret == (ssize_t)total_len))
+			return ret;
+		if (ret < 0) {
+			if (errno == EINTR && retries++ < 5)
+				continue;
+			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
+				strerror(errno));
+			return -1;
+		}
+		/* Short write: packet was truncated */
+		slog(LOG_WARNING, "short writev to tun device: wrote %zd of %zu bytes\n",
+			ret, total_len);
+		return -1;
+	}
 }
+
 
 void tun_read(uint8_t * recv_buf,int tun_fd)
 {

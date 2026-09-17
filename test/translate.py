@@ -1274,6 +1274,14 @@ def sec_5_1():
     expect_ref = IPv6(dst=str(test.public_ipv4_xlate),src=str(test.public_ipv6),nh=16,plen=1420) / Raw(randbytes(1420))
     test.send_and_check(expect_ref,ip_val, "Basic Translation Larger Packet")
 
+    # RFC 7915 §5.1 DF threshold boundary tests (1259, 1260, 1261 bytes total IPv4 length)
+    expect_ref = IPv6(dst=str(test.public_ipv4_xlate),src=str(test.public_ipv6),nh=16,plen=1239) / Raw(randbytes(1239))
+    test.send_and_check(expect_ref,ip_val, "RFC 7915 DF Threshold 1259 bytes (DF=0)")
+    expect_ref = IPv6(dst=str(test.public_ipv4_xlate),src=str(test.public_ipv6),nh=16,plen=1240) / Raw(randbytes(1240))
+    test.send_and_check(expect_ref,ip_val, "RFC 7915 DF Threshold 1260 bytes (DF=0)")
+    expect_ref = IPv6(dst=str(test.public_ipv4_xlate),src=str(test.public_ipv6),nh=16,plen=1241) / Raw(randbytes(1241))
+    test.send_and_check(expect_ref,ip_val, "RFC 7915 DF Threshold 1261 bytes (DF=1)")
+
     # TOS value tests
     expect_ref = IPv6(dst=str(test.public_ipv4_xlate),src=str(test.public_ipv6),nh=16,tc=24,plen=1420) / Raw(randbytes(1420))
     test.send_and_check(expect_ref,ip_val, "Type Of Service 1")
@@ -1946,5 +1954,5 @@ time.sleep(1)
 
 test.cleanup()
 #Print test report (expected pass/fail count)
-test.report(246,1)
+test.report(249,1)
 

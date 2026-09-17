@@ -93,8 +93,10 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile
+test: unit_conffile unit_checksum unit_ip4_id
 	./unit_conffile
+	./unit_checksum
+	./unit_ip4_id
 
 # these are only valid for GCC
 TEST_CFLAGS := $(CFLAGS) -Werror -coverage -DCOVERAGE_TESTING
@@ -104,6 +106,12 @@ endif
 TEST_FILES := test/unit.c
 unit_conffile: $(TEST_FILES) test/unit_conffile.c conffile.c addrmap.c tayga.h list.h
 	$(CC) $(TEST_CFLAGS) -I. -o unit_conffile $(TEST_FILES) test/unit_conffile.c conffile.c addrmap.c $(LDFLAGS)
+
+unit_checksum: test/unit_checksum.c tayga.h
+	$(CC) $(CFLAGS) -I. -o unit_checksum test/unit_checksum.c $(LDFLAGS)
+
+unit_ip4_id: test/unit_ip4_id.c nat64.c tayga.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c $(LDFLAGS) -lpthread
 
 .PHONY: integration
 integration: tayga
@@ -132,7 +140,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar
-	$(RM) unit_conffile *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_ip4_id *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

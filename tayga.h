@@ -374,9 +374,6 @@ struct config {
 	struct list_head map6_list;
 	/* Set after validation when no code path can modify static maps. */
 	int maps_immutable;
-	struct map_static *clat_static_map;
-	struct map6 *clat_rfc6052_map6;
-	struct map4 *clat_rfc6052_map4;
 
 	//Dynamic map parameters
 	char data_dir[512];
@@ -501,6 +498,9 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown);
 /* nat64.c */
 void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
+uint16_t next_ip4_ident(void);
+void set_ip4_ident_counter(uint32_t val);
+void reset_ip4_ident_local(void);
 
 /* log.c */
 #define STRINGIFY_IMPL(x) #x
@@ -518,6 +518,7 @@ int journal_printv_with_location(
 int tun_setup(int do_mktun, int do_rmtun);
 int set_nonblock(int fd);
 void tun_read(uint8_t * recv_buf,int tun_fd);
+ssize_t tun_write(int tun_fd, const void *buf, size_t len);
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);
 
 
