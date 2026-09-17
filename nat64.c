@@ -232,16 +232,21 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 	header.ip4.cksum = 0;
 	header.ip4.src = *src;
 	header.ip4.dest = *dest;
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
+	header.ip4.cksum = ip4_header_checksum(&header.ip4);
 	header.icmp = *icmp;
 	header.icmp.cksum = 0;
 	header.icmp.cksum = ones_add(ip_checksum(data, data_len),
 			ip_checksum(&header.icmp, sizeof(header.icmp)));
+#ifdef __linux__
+	iov[0].iov_base = &header.ip4;
+	iov[0].iov_len = sizeof(header.ip4) + sizeof(header.icmp);
+#else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
+#endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
-	if (writev(tun_fd, iov, data_len ? 2 : 1) < 0)
+	if (tun_writev(tun_fd, iov, data_len ? 2 : 1) < 0)
 		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 			strerror(errno));
 }
@@ -430,14 +435,22 @@ static void xlate_4to6_data(struct pkt *p)
 	TUN_SET_PROTO(&header.pi,  ETH_P_IPV6);
 
 	if (no_frag_hdr) {
+#ifdef __linux__
+		uint8_t *out = p->data - sizeof(struct ip6);
+		memcpy(out, &header.ip6, sizeof(struct ip6));
+		if (unlikely(write(p->tun_fd, out, sizeof(struct ip6) + p->data_len) < 0))
+			slog(LOG_WARNING, "error writing packet to tun "
+					"device: %s\n", strerror(errno));
+#else
 		iov[0].iov_base = &header;
 		iov[0].iov_len = sizeof(struct tun_pi) + sizeof(struct ip6);
 		iov[1].iov_base = p->data;
 		iov[1].iov_len = p->data_len;
 
-		if (writev(p->tun_fd, iov, 2) < 0)
+		if (tun_writev(p->tun_fd, iov, 2) < 0)
 			slog(LOG_WARNING, "error writing packet to tun "
 					"device: %s\n", strerror(errno));
+#endif
 	} else {
 		header.ip6_frag.next_header = header.ip6.next_header;
 		header.ip6_frag.reserved = 0;
@@ -445,8 +458,13 @@ static void xlate_4to6_data(struct pkt *p)
 
 		header.ip6.next_header = 44;
 
+#ifdef __linux__
+		iov[0].iov_base = &header.ip6;
+		iov[0].iov_len = sizeof(struct ip6) + sizeof(struct ip6_frag);
+#else
 		iov[0].iov_base = &header;
 		iov[0].iov_len = sizeof(header);
+#endif
 
 		off = (off & IP4_F_MASK) * 8;
 		frag_size = (frag_size - sizeof(header.ip6_frag)) & ~7;
@@ -470,7 +488,7 @@ static void xlate_4to6_data(struct pkt *p)
 							htons(IP4_F_MF)))
 				header.ip6_frag.offset_flags |= htons(IP6_F_MF);
 
-			if (writev(p->tun_fd, iov, 2) < 0) {
+			if (tun_writev(p->tun_fd, iov, 2) < 0) {
 				slog(LOG_WARNING, "error writing packet to "
 						"tun device: %s\n",
 						strerror(errno));
@@ -727,48 +745,52 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 
 	TUN_SET_PROTO(&header.pi,  ETH_P_IPV6);
 
+#ifdef __linux__
+	iov[0].iov_base = &header.ip6;
+	iov[0].iov_len = sizeof(header.ip6) + sizeof(header.icmp) + sizeof(header.ip6_em);
+#else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
+#endif
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
 
-	if (writev(p->tun_fd, iov, 2) < 0)
+	if (tun_writev(p->tun_fd, iov, 2) < 0)
 		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 			strerror(errno));
 }
 
 void handle_ip4(struct pkt *p)
 {
-	if (parse_ip4(p) < 0) return; //error already logged
-	if (p->ip4->ttl == 0 ||
+	if (unlikely(parse_ip4(p) < 0)) return; //error already logged
+	if (unlikely(p->ip4->ttl == 0 ||
 			ip_checksum(p->ip4, p->header_len) ||
-			p->header_len + p->data_len != ntohs(p->ip4->length)) {
+			p->header_len + p->data_len != ntohs(p->ip4->length))) {
 		log_pkt4(LOG_OPT_DROP,p,"IP Header Invalid");
 		return;
 	}
 
-	if (p->icmp && ip_checksum(p->data, p->data_len)) {
-		log_pkt4(LOG_OPT_DROP,p,"ICMP Checksum is invalid");
+	if (unlikely(p->icmp && ip_checksum(p->data, p->data_len))) {
+		log_pkt4(LOG_OPT_DROP,p,"ICMP Invalid Checksum");
 		return;
 	}
 
-	/* Packet for ourselves*/
-	if (p->ip4->dest.s_addr == gcfg.local_addr4.s_addr) {
+	if (unlikely(p->ip4->dest.s_addr == gcfg.local_addr4.s_addr)) {
 		if (p->data_proto == 1)
 			host_handle_icmp4(p);
 		else {
-			log_pkt4(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Self-Assigned Packet w/ Invalid Proto");
-			host_send_icmp4_error(3, 2, 0, p);
+			log_pkt4(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Unknown protocol to self");
+			host_send_icmp4_error(3, 2, 4, p);
 		}
 	} else {
-		/* Time Exceeded*/
-		if (p->ip4->ttl == 1) {
+		if (unlikely(p->ip4->ttl == 1)) {
 			log_pkt4(LOG_OPT_ICMP,p,"Time Exceeded");
 			host_send_icmp4_error(11, 0, 0, p);
 			return;
 		}
-		if (p->data_proto != 1 || p->icmp->type == 8 ||
-				p->icmp->type == 0)
+
+		if (likely(p->data_proto != 1 || p->icmp->type == 8 ||
+				p->icmp->type == 0))
 			xlate_4to6_data(p);
 		else
 			xlate_4to6_icmp_error(p);
@@ -796,11 +818,16 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 	header.icmp.cksum = ones_add(header.icmp.cksum,
 			ip6_checksum(&header.ip6,
 					data_len + sizeof(header.icmp), 58));
+#ifdef __linux__
+	iov[0].iov_base = &header.ip6;
+	iov[0].iov_len = sizeof(header.ip6) + sizeof(header.icmp);
+#else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
+#endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
-	if (writev(tun_fd, iov, data_len ? 2 : 1) < 0)
+	if (tun_writev(tun_fd, iov, data_len ? 2 : 1) < 0)
 		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 			strerror(errno));
 }
@@ -847,6 +874,29 @@ static void host_handle_icmp6(struct pkt *p)
 	}
 }
 
+#include <stdatomic.h>
+
+/* Coordinated lock-free IPv4 identification generator across worker threads.
+ * To satisfy RFC 6864 and RFC 7739 and avoid collisions between threads processing
+ * packets of the same flow, each thread leases a block of 64 IDs at a time
+ * from a global atomic counter using relaxed atomic increments.
+ * This guarantees zero sequence overlap between threads and zero cross-core
+ * cache bouncing on the fast path (atomic fetch_add occurs once every 64 packets).
+ */
+static _Atomic uint32_t global_ip4_ident = 0xb00b;
+
+static inline uint16_t next_ip4_ident(void)
+{
+	static __thread uint32_t local_cur = 0;
+	static __thread uint32_t local_end = 0;
+
+	if (unlikely(local_cur >= local_end)) {
+		local_cur = atomic_fetch_add_explicit(&global_ip4_ident, 64, memory_order_relaxed);
+		local_end = local_cur + 64;
+	}
+	return (uint16_t)(local_cur++);
+}
+
 static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,
 		int payload_length)
 {
@@ -864,15 +914,7 @@ static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,
 		ip4->flags_offset &= ~htons(IP4_F_DF);
 	/* Smol packets can be fragmented downstream */
 	} else if (p->header_len + payload_length <= MTU_MIN) {
-		/* Need to generate a psuedo-random ident value
-		 * A simple counter is not secure enough
-		 * However, it doesn't actually seem to be that random in practice
-		 * ref. https://datatracker.ietf.org/doc/html/rfc7739#appendix-B
-		 * */
-		static uint32_t ident = 0xb00b;
-		if(ident & 0x1) ident ^= 0x6464beef;
-		ident >>= 1;
-		ip4->ident = (ident& 0xffff);
+		ip4->ident = htons(next_ip4_ident());
 		ip4->flags_offset = 0;
 	/* Packets > 1280 must kick back a Packet Too Big */
 	} else {
@@ -954,7 +996,9 @@ static void xlate_6to4_data(struct pkt *p)
 {
 	struct ip4_data header;
 	int ret;
+#ifndef __linux__
 	struct iovec iov[2];
+#endif
 
 	ret = map_ip6_to_ip4(&header.ip4.dest, &p->ip6->dest, 0);
 	if (ret == ERROR_REJECT) {
@@ -992,18 +1036,24 @@ static void xlate_6to4_data(struct pkt *p)
 	if (xlate_payload_6to4(p, &header.ip4,0) < 0)
 		return;
 
-	TUN_SET_PROTO(&header.pi, ETH_P_IP);
+	header.ip4.cksum = ip4_header_checksum(&header.ip4);
 
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
-
+#ifdef __linux__
+	uint8_t *out = p->data - sizeof(struct ip4);
+	memcpy(out, &header.ip4, sizeof(struct ip4));
+	if (unlikely(write(p->tun_fd, out, sizeof(struct ip4) + p->data_len) < 0))
+		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
+			strerror(errno));
+#else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
 	iov[1].iov_base = p->data;
 	iov[1].iov_len = p->data_len;
 
-	if (writev(p->tun_fd, iov, 2) < 0)
+	if (tun_writev(p->tun_fd, iov, 2) < 0)
 		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 			strerror(errno));
+#endif
 }
 
 static int parse_ip6(struct pkt *p,int em)
@@ -1258,7 +1308,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 				sizeof(header.ip4_em) + p_em.data_len);
 	--header.ip4.ttl;
 
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
+	header.ip4.cksum = ip4_header_checksum(&header.ip4);
 
 	header.icmp.cksum = 0;
 	header.icmp.cksum = ones_add(ip_checksum(&header.icmp,
@@ -1268,33 +1318,38 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 
 	TUN_SET_PROTO(&header.pi, ETH_P_IP);
 
+#ifdef __linux__
+	iov[0].iov_base = &header.ip4;
+	iov[0].iov_len = sizeof(header.ip4) + sizeof(header.icmp) + sizeof(header.ip4_em);
+#else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
+#endif
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
 
-	if (writev(p->tun_fd, iov, 2) < 0)
+	if (tun_writev(p->tun_fd, iov, 2) < 0)
 		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 			strerror(errno));
 }
 
 void handle_ip6(struct pkt *p)
 {
-	if (parse_ip6(p,0)) return;
-	if (p->ip6->hop_limit == 0 ||
+	if (unlikely(parse_ip6(p,0))) return;
+	if (unlikely(p->ip6->hop_limit == 0 ||
 			p->header_len + p->data_len !=
-				ntohs(p->ip6->payload_length)) {
+				ntohs(p->ip6->payload_length))) {
 		log_pkt6(LOG_OPT_DROP,p,"Insufficient Length");
 		return;
 	}
 
-	if (p->icmp && ones_add(ip_checksum(p->data, p->data_len),
-				ip6_checksum(p->ip6, p->data_len, 58))) {
+	if (unlikely(p->icmp && ones_add(ip_checksum(p->data, p->data_len),
+				ip6_checksum(p->ip6, p->data_len, 58)))) {
 		log_pkt6(LOG_OPT_DROP,p,"ICMP Invalid Checksum");
 		return;
 	}
 
-	if (IN6_ARE_ADDR_EQUAL(&p->ip6->dest, &gcfg.local_addr6)) {
+	if (unlikely(IN6_ARE_ADDR_EQUAL(&p->ip6->dest, &gcfg.local_addr6))) {
 		if (p->data_proto == 58)
 			host_handle_icmp6(p);
 		else {
@@ -1302,14 +1357,14 @@ void handle_ip6(struct pkt *p)
 			host_send_icmp6_error(4, 1, 6, p);
 		}
 	} else {
-		if (p->ip6->hop_limit == 1) {
+		if (unlikely(p->ip6->hop_limit == 1)) {
 			log_pkt6(LOG_OPT_ICMP,p,"Time Exceeded");
 			host_send_icmp6_error(3, 0, 0, p);
 			return;
 		}
 
-		if (p->data_proto != 58 || p->icmp->type == 128 ||
-				p->icmp->type == 129)
+		if (likely(p->data_proto != 58 || p->icmp->type == 128 ||
+				p->icmp->type == 129))
 			xlate_6to4_data(p);
 		else
 			xlate_6to4_icmp_error(p);

@@ -50,6 +50,7 @@ echo "Bringing up the interface"
 ip link set dev clat up
 echo "Setting MTU to ${TAYGA_MTU}"
 ip link set clat mtu ${TAYGA_MTU}
+ip link set clat txqueuelen "${TAYGA_TXQLEN:-1000}"
 echo "Adding default route"
 ip -4 route add default dev clat
 echo "Adding IPv6 map route"

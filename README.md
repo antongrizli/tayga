@@ -60,3 +60,58 @@ If you are having difficulty configuring `tayga`, use the `-d` option to run the
 ```sh
 tayga -d
 ```
+
+## CLAT performance harness
+
+`benchmark-clat.sh` creates a LAN → NAT44 → CLAT → IPv6-server laboratory.
+It starts distinct IPv4 source addresses and iperf3 ports for every simulated
+client, saves the exact TAYGA PID and retains the JSON/log/counter artefacts.
+
+Build the profiling image from the parent workspace, then run it with Linux
+network namespace and TUN privileges:
+
+```sh
+docker build -t tayga-clat:bench -f tayga-clat-perf/Dockerfile.benchmark \
+  --build-arg TAYGA_SOURCE=tayga-clat-perf .
+docker run --privileged --device /dev/net/tun --rm \
+  --entrypoint /usr/local/sbin/benchmark-clat.sh \
+  -e CLIENTS=20 -e FLOWS=1 -e WORKERS=3 -e RATE=15M \
+  -e DURATION=60 -e WARMUP=10 -e DIRECTIONS='upload download' \
+  tayga-clat:bench
+```
+
+The example aims for approximately 300 Mbit/s because `RATE` is applied to
+each of 20 one-flow clients. `WARMUP` is a separate unmeasured run; the actual
+run has no iperf `-O`, so its traffic, CPU and counter windows coincide.
+Always use measured `received_mbps`, not the requested rate. `DIRECTIONS` also
+accepts `bidir`; `PROTOCOL=udp` and `DATAGRAM_SIZE=1200` select UDP, while
+`BLOCK_SIZE` supplies iperf3 `-l` for a packet-size experiment.
+
+Every run saves a monotonic window, per-thread state, TUN/router link counter
+deltas, softirq/softnet snapshots, JSON/stderr and process CPU. TCP reports
+retransmits; UDP reports loss, jitter, packet count and out-of-order packets.
+By default `MAX_TUN_DROPS=0` and `MAX_UDP_LOSS_PERCENT=0`: a run crossing either
+limit is retained as an artifact but exits non-zero and is not valid for A/B.
+Results are written under `ARTIFACT_DIR` (default `/tmp/tayga-clat-results`).
+
+Для сравнения worker и размера UDP-пакета используйте matrix runner:
+
+```sh
+docker run --privileged --device /dev/net/tun --rm \
+  --entrypoint /usr/local/sbin/benchmark-matrix.sh \
+  -e CLIENTS=10 -e RATE=10M -e DURATION=10 -e WARMUP=2 \
+  -e PAYLOADS='64 256 512 1200' -e WORKERS_LIST='0 1 2 3' \
+  -e MATRIX_DIR=/tmp/tayga-clat-matrix \
+  tayga-clat:bench
+```
+
+`summary.tsv` содержит статус каждого сочетания и его числовые результаты.
+При drops или UDP loss runner возвращает ненулевой код, но сохраняет JSON,
+stderr и счётчики для анализа.
+
+Set `PERF_MODE=stat` or `PERF_MODE=record` only in a Linux environment where
+the `perf` command and PMU/tracepoint permissions are available. The harness
+records process-relative perf data after the warm-up window; warm-up artifacts
+are kept below `warmup-<direction>/` and measured artifacts below
+`<direction>/`. Docker Desktop on
+macOS may not expose perf; it writes a `perf-unavailable.txt` artifact instead.

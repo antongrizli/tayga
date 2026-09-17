@@ -19,3 +19,4 @@ callgrind*
 unit_conffile
 unit_conffile.conf
 tayga.map
+perf-sessions

@@ -294,7 +294,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN | IFF_MULTI_QUEUE;
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
 	strcpy(ifr.ifr_name, gcfg.tundev);
 	if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 		slog(LOG_CRIT, "Unable to attach tun device %s, aborting: "
@@ -423,7 +423,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 
 	/* Setup multiqueue additional queues */
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN | IFF_MULTI_QUEUE;
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
 	strcpy(ifr.ifr_name, gcfg.tundev);
 	for(int i = 0; i < gcfg.workers; i++) {
 		gcfg.tun_fd_addl[i] = open("/dev/net/tun", O_RDWR);
@@ -559,43 +559,78 @@ int tun_setup(int do_mktun, int do_rmtun)
 #endif
 
 
+ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
+{
+	return writev(tun_fd, iov, iovcnt);
+}
+
 void tun_read(uint8_t * recv_buf,int tun_fd)
 {
 	int ret;
-	struct tun_pi *pi = (struct tun_pi *)recv_buf;
 	struct pkt pbuf, *p = &pbuf;
 
-	ret = read(tun_fd, recv_buf, RECV_BUF_SIZE);
-	if (ret < 0) {
+	ret = read(tun_fd, recv_buf + HEADROOM, RECV_BUF_SIZE - HEADROOM);
+	if (unlikely(ret < 0)) {
 		if (errno == EAGAIN)
 			return;
 		slog(LOG_ERR, "received error when reading from tun "
 				"device: %s\n", strerror(errno));
 		return;
 	}
-	if ((size_t)ret < sizeof(struct tun_pi)) {
+	if (unlikely(ret < 1)) {
 		slog(LOG_WARNING, "short read from tun device "
 				"(%d bytes)\n", ret);
 		return;
 	}
-	if ((uint32_t)ret == RECV_BUF_SIZE) {
+	if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
 		slog(LOG_WARNING, "dropping oversized packet\n");
 		return;
 	}
-	memset(p, 0, sizeof(struct pkt));
-	p->tun_fd = tun_fd;
-	p->data = recv_buf + sizeof(struct tun_pi);
-	p->data_len = ret - sizeof(struct tun_pi);
-	switch (TUN_GET_PROTO(pi)) {
-	case ETH_P_IP:
+	*p = (struct pkt){
+		.tun_fd = tun_fd,
+		.ip4 = NULL,
+		.ip6 = NULL,
+		.ip6_frag = NULL,
+		.icmp = NULL,
+		.data_proto = 0,
+		.data = recv_buf + HEADROOM,
+		.data_len = (uint32_t)ret,
+		.header_len = 0,
+	};
+#ifdef __linux__
+	switch (p->data[0] >> 4) {
+	case 4:
 		handle_ip4(p);
 		break;
-	case ETH_P_IPV6:
+	case 6:
 		handle_ip6(p);
 		break;
 	default:
-		slog(LOG_WARNING, "Dropping unknown proto %04x from "
-				"tun device\n", ntohs(pi->proto));
+		slog(LOG_WARNING, "Dropping unknown IP version %u from "
+				"tun device\n", p->data[0] >> 4);
 		break;
 	}
+#else
+	{
+		struct tun_pi *pi = (struct tun_pi *)(recv_buf + HEADROOM);
+		if ((size_t)ret < sizeof(struct tun_pi)) {
+			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
+			return;
+		}
+		p->data = recv_buf + HEADROOM + sizeof(struct tun_pi);
+		p->data_len = ret - sizeof(struct tun_pi);
+		switch (TUN_GET_PROTO(pi)) {
+		case ETH_P_IP:
+			handle_ip4(p);
+			break;
+		case ETH_P_IPV6:
+			handle_ip6(p);
+			break;
+		default:
+			slog(LOG_WARNING, "Dropping unknown proto %04x from tun device\n",
+					ntohs(pi->proto));
+			break;
+		}
+	}
+#endif
 }

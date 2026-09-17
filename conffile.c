@@ -957,6 +957,31 @@ int config_validate(void)
 		return ERROR_REJECT;
 	}
 
+	if (gcfg.maps_immutable) {
+		struct list_head *entry;
+		struct map6 *m6_entry;
+		struct map_static *st;
+		int static_count = 0;
+
+		list_for_each(entry, &gcfg.map6_list) {
+			m6_entry = list_entry(entry, struct map6, list);
+			if (m6_entry->type == MAP_TYPE_STATIC) {
+				st = container_of(m6_entry, struct map_static, map6);
+				if (st->origin == MAP_ORIGIN_CONFFILE && m6_entry->prefix_len == 128) {
+					gcfg.clat_static_map = st;
+					static_count++;
+				}
+			} else if (m6_entry->type == MAP_TYPE_RFC6052) {
+				gcfg.clat_rfc6052_map6 = m6_entry;
+				st = container_of(m6_entry, struct map_static, map6);
+				if (st->map4.type == MAP_TYPE_RFC6052)
+					gcfg.clat_rfc6052_map4 = &st->map4;
+			}
+		}
+		if (static_count != 1)
+			gcfg.clat_static_map = NULL;
+	}
+
 	/* Guess there are no errors? */
 	return ERROR_NONE;
 }

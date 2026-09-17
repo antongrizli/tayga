@@ -66,10 +66,24 @@ inline static void dummy()
 #define dummy()
 #endif
 
+#ifndef likely
+#define likely(x)   __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 
 #ifdef __linux__
-#define	TUN_SET_PROTO(_pi, _af)			{ (_pi)->flags = 0; (_pi)->proto = htons(_af); }
-#define	TUN_GET_PROTO(_pi)			ntohs((_pi)->proto)
+/*
+ * Linux TUN can prepend a four-byte packet-information header (tun_pi) to
+ * every packet.  TAYGA only attaches to L3 TUN devices, so the IP version
+ * already identifies the protocol.  IFF_NO_PI removes this per-packet
+ * metadata from both directions.  The output packet structs keep tun_pi as
+ * their first member so the BSD layout remains unchanged; tun_writev() skips
+ * it on Linux.
+ */
+#define	TUN_SET_PROTO(_pi, _af)			do { (void)(_pi); (void)(_af); } while (0)
 #endif
 
 #ifdef __FreeBSD__
@@ -114,9 +128,11 @@ struct tun_pi {
 #define MAX_WORKERS 0
 #endif
 
+/* Headroom reserved before packet payload for in-place header translation */
+#define HEADROOM 64
+
 /* Size of receive buffer(s) */
-//'save' some bytes in the beginning of the buffer for headers later
-#define RECV_BUF_SIZE (65536+sizeof(struct tun_pi))
+#define RECV_BUF_SIZE (HEADROOM + 65536)
 /* Protocol structures */
 
 struct ip4 {
@@ -134,6 +150,17 @@ struct ip4 {
 
 static_assert(alignof(struct ip4) <= 4,"Struct IP4 must be 4-byte aligned");
 static_assert(sizeof(struct ip4) == 20,"Struct IP4 must be 20 bytes long");
+
+static inline uint16_t ip4_header_checksum(const struct ip4 *ip4)
+{
+	uint32_t w[5];
+	memcpy(w, ip4, sizeof(w));
+	uint64_t sum = (uint64_t)w[0] + w[1] + w[2] + w[3] + w[4];
+	sum = (sum & 0xffffffff) + (sum >> 32);
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return (uint16_t)~sum;
+}
 
 #define IP4_F_DF	0x4000
 #define IP4_F_MF	0x2000
@@ -347,6 +374,9 @@ struct config {
 	struct list_head map6_list;
 	/* Set after validation when no code path can modify static maps. */
 	int maps_immutable;
+	struct map_static *clat_static_map;
+	struct map6 *clat_rfc6052_map6;
+	struct map4 *clat_rfc6052_map4;
 
 	//Dynamic map parameters
 	char data_dir[512];
@@ -488,6 +518,7 @@ int journal_printv_with_location(
 int tun_setup(int do_mktun, int do_rmtun);
 int set_nonblock(int fd);
 void tun_read(uint8_t * recv_buf,int tun_fd);
+ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);
 
 
 #endif /* #ifndef __TAYGA_H__ */

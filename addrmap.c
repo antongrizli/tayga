@@ -309,6 +309,14 @@ struct map4 *find_map4(const struct in_addr *addr4)
 	struct list_head *entry;
 	struct map4 *m;
 
+	if (gcfg.clat_static_map) {
+		if (addr4->s_addr == gcfg.clat_static_map->map4.addr.s_addr)
+			return &gcfg.clat_static_map->map4;
+		if (gcfg.clat_rfc6052_map4 &&
+		    (gcfg.clat_rfc6052_map4->addr.s_addr == (gcfg.clat_rfc6052_map4->mask.s_addr & addr4->s_addr)))
+			return gcfg.clat_rfc6052_map4;
+	}
+
 	list_for_each(entry, &gcfg.map4_list) {
 		m = list_entry(entry, struct map4, list);
 		if (m->addr.s_addr == (m->mask.s_addr & addr4->s_addr))
@@ -326,6 +334,14 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 {
 	struct list_head *entry;
 	struct map6 *m;
+
+	if (gcfg.clat_static_map) {
+		if (IN6_ARE_ADDR_EQUAL(addr6, &gcfg.clat_static_map->map6.addr))
+			return &gcfg.clat_static_map->map6;
+		if (gcfg.clat_rfc6052_map6 &&
+		    IN6_IS_IN_NET(addr6, &gcfg.clat_rfc6052_map6->addr, &gcfg.clat_rfc6052_map6->mask))
+			return gcfg.clat_rfc6052_map6;
+	}
 
 	list_for_each(entry, &gcfg.map6_list) {
 		m = list_entry(entry, struct map6, list);
