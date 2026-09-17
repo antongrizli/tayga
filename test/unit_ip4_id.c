@@ -9,7 +9,7 @@
 #include "tayga.h"
 
 #define NUM_THREADS 4
-#define IDS_PER_THREAD 10000
+#define IDS_PER_THREAD 16384 /* 4 * 16384 = 65,536 total IDs (exactly 1 full 16-bit cycle) */
 
 static uint16_t thread_ids[NUM_THREADS][IDS_PER_THREAD];
 static pthread_barrier_t barrier_start;
@@ -27,20 +27,26 @@ static void *worker_fn(void *arg)
 	return NULL;
 }
 
-/* Skewed worker test variables */
-#define SLOW_SAMPLES 50
-static uint16_t slow_ids[SLOW_SAMPLES];
+/* Skewed worker test: 1 slow worker and 1 fast worker.
+ * Total IDs generated between both is exactly 65,536.
+ * We record every single ID generated across both threads in chronological order
+ * and verify that within this 65,536-ID window, every ID is strictly unique (0 collisions).
+ */
+#define SKEW_TOTAL_IDS 65536
+#define SLOW_SAMPLES 100
+
+static uint16_t recorded_slow[SLOW_SAMPLES];
+static uint16_t recorded_fast[SKEW_TOTAL_IDS - SLOW_SAMPLES];
 static pthread_barrier_t barrier_skewed;
 
 static void *slow_worker(void *arg)
 {
 	(void)arg;
-	/* Synchronize start with the main fast thread */
 	pthread_barrier_wait(&barrier_skewed);
 
 	for (int i = 0; i < SLOW_SAMPLES; i++) {
-		slow_ids[i] = next_ip4_ident();
-		usleep(200);
+		recorded_slow[i] = next_ip4_ident();
+		usleep(100);
 	}
 	return NULL;
 }
@@ -52,8 +58,10 @@ int main(void)
 
 	printf("Running unit_ip4_id tests...\n");
 
-	/* Test 1: Multithreaded concurrent generation from production next_ip4_ident() */
-	set_ip4_ident_counter(0x1000);
+	/* Test 1: Full 65,536 cycle across 4 threads.
+	 * Verify that all 65,536 generated IDs are 100% unique (zero collisions).
+	 */
+	set_ip4_ident_counter(0);
 	pthread_barrier_init(&barrier_start, NULL, NUM_THREADS);
 
 	for (int i = 0; i < NUM_THREADS; i++) {
@@ -65,14 +73,6 @@ int main(void)
 	}
 	pthread_barrier_destroy(&barrier_start);
 
-	/* Verify no adjacent duplicates within any thread */
-	for (int t = 0; t < NUM_THREADS; t++) {
-		for (int i = 1; i < IDS_PER_THREAD; i++) {
-			assert(thread_ids[t][i] != thread_ids[t][i - 1]);
-		}
-	}
-
-	/* Verify 40,000 unique IDs across 40,000 parallel requests (within 65,536 cycle) */
 	uint8_t seen[65536] = {0};
 	int unique_count = 0;
 	for (int t = 0; t < NUM_THREADS; t++) {
@@ -84,60 +84,54 @@ int main(void)
 			}
 		}
 	}
-	assert(unique_count == 40000);
-	printf("PASS: 40,000 IDs across 4 threads are 100%% unique within single cycle.\n");
+	assert(unique_count == 65536);
+	printf("PASS: 65,536 IDs across 4 threads are 100%% unique within 16-bit cycle (0 collisions).\n");
 
-	/* Test 2: Wrap-around across 65,536 (16-bit) boundary */
-	reset_ip4_ident_local();
-	set_ip4_ident_counter(65500);
+	/* Test 2: Natural 16-bit wrap-around */
+	set_ip4_ident_counter(65530);
 	uint16_t prev = next_ip4_ident();
 	int wrapped = 0;
-	for (int i = 0; i < 200; i++) {
+	for (int i = 0; i < 20; i++) {
 		uint16_t cur = next_ip4_ident();
 		if (cur < prev)
 			wrapped++;
 		prev = cur;
 	}
-	assert(wrapped >= 1);
-	printf("PASS: Wrap-around past 65,536 operates smoothly.\n");
+	assert(wrapped == 1);
+	printf("PASS: Natural wrap-around across 65,535 -> 0 operates monotonically.\n");
 
-	/* Test 3: Wrap-around across UINT32_MAX (32-bit counter overflow) */
-	reset_ip4_ident_local();
-	set_ip4_ident_counter(UINT32_MAX - 100);
-	uint16_t prev32 = next_ip4_ident();
-	int wrapped32 = 0;
-	for (int i = 0; i < 250; i++) {
-		uint16_t cur32 = next_ip4_ident();
-		if (cur32 < prev32)
-			wrapped32++;
-		prev32 = cur32;
-	}
-	assert(wrapped32 >= 1);
-	printf("PASS: Wrap-around past UINT32_MAX (32-bit overflow) operates smoothly.\n");
-
-	/* Test 4: Skewed worker rates with deterministic barrier start.
-	 * Slow worker generates exactly SLOW_SAMPLES while fast thread generates
-	 * across multiple cycles (> 70,000 IDs).
+	/* Test 3: Skewed thread test.
+	 * Fast thread generates 65,436 IDs while slow thread generates 100 IDs with delays.
+	 * Across all 65,536 IDs collected, exactly 65,536 unique values MUST be present.
 	 */
+	set_ip4_ident_counter(0x55aa);
 	pthread_barrier_init(&barrier_skewed, NULL, 2);
 	pthread_t slow_th;
 	pthread_create(&slow_th, NULL, slow_worker, NULL);
 
-	/* Main thread waits at barrier so slow_worker has started */
 	pthread_barrier_wait(&barrier_skewed);
-
-	for (int i = 0; i < 70000; i++) {
-		(void)next_ip4_ident();
+	for (int i = 0; i < (int)(SKEW_TOTAL_IDS - SLOW_SAMPLES); i++) {
+		recorded_fast[i] = next_ip4_ident();
 	}
 	pthread_join(slow_th, NULL);
 	pthread_barrier_destroy(&barrier_skewed);
 
-	/* Verify slow worker generated all expected samples without hanging */
-	for (int i = 1; i < SLOW_SAMPLES; i++) {
-		assert(slow_ids[i] != slow_ids[i - 1]);
+	memset(seen, 0, sizeof(seen));
+	int skew_unique = 0;
+	for (int i = 0; i < SLOW_SAMPLES; i++) {
+		if (!seen[recorded_slow[i]]) {
+			seen[recorded_slow[i]] = 1;
+			skew_unique++;
+		}
 	}
-	printf("PASS: Skewed thread rates executed deterministically (%d slow samples collected).\n",
-		SLOW_SAMPLES);
+	for (int i = 0; i < (int)(SKEW_TOTAL_IDS - SLOW_SAMPLES); i++) {
+		if (!seen[recorded_fast[i]]) {
+			seen[recorded_fast[i]] = 1;
+			skew_unique++;
+		}
+	}
+	assert(skew_unique == 65536);
+	printf("PASS: Skewed thread scenario: 65,536 IDs partitioned between slow/fast threads have 0 collisions.\n");
 
 	printf("PASS: All unit_ip4_id tests passed.\n");
 	return 0;

@@ -499,8 +499,7 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown);
 void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
 uint16_t next_ip4_ident(void);
-void set_ip4_ident_counter(uint32_t val);
-void reset_ip4_ident_local(void);
+void set_ip4_ident_counter(uint16_t val);
 
 /* log.c */
 #define STRINGIFY_IMPL(x) #x

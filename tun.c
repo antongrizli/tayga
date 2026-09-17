@@ -568,55 +568,69 @@ int tun_setup(int do_mktun, int do_rmtun)
 ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 {
 	ssize_t ret;
-	int retries = 0;
 
-	for (;;) {
+	for (int attempt = 0; attempt < 5; attempt++) {
 		ret = write(tun_fd, buf, len);
 		if (likely(ret == (ssize_t)len))
 			return ret;
 		if (ret < 0) {
-			if (errno == EINTR && retries++ < 5)
+			if (errno == EINTR)
 				continue;
+			int saved_errno = errno;
 			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-				strerror(errno));
+				strerror(saved_errno));
+			errno = saved_errno;
 			return -1;
 		}
 		/* Short write: packet was truncated by kernel/device.
-		 * Do not attempt to append remainder; drop and log warning. */
+		 * Do not attempt to append remainder; drop, set errno = EIO, and log warning. */
 		slog(LOG_WARNING, "short write to tun device: wrote %zd of %zu bytes\n",
 			ret, len);
+		errno = EIO;
 		return -1;
 	}
+	int saved_errno = errno;
+	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
+		strerror(saved_errno));
+	errno = saved_errno;
+	return -1;
 }
 
 /* tun_writev: Write vectored buffers to the TUN device.
- * Retries on EINTR and verifies total length matches written bytes.
+ * Retries on EINTR (up to 5 attempts) and verifies total length matches written bytes.
  */
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 {
 	size_t total_len = 0;
 	ssize_t ret;
-	int retries = 0;
 
 	for (int i = 0; i < iovcnt; i++)
 		total_len += iov[i].iov_len;
 
-	for (;;) {
+	for (int attempt = 0; attempt < 5; attempt++) {
 		ret = writev(tun_fd, iov, iovcnt);
 		if (likely(ret == (ssize_t)total_len))
 			return ret;
 		if (ret < 0) {
-			if (errno == EINTR && retries++ < 5)
+			if (errno == EINTR)
 				continue;
+			int saved_errno = errno;
 			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-				strerror(errno));
+				strerror(saved_errno));
+			errno = saved_errno;
 			return -1;
 		}
 		/* Short write: packet was truncated */
 		slog(LOG_WARNING, "short writev to tun device: wrote %zd of %zu bytes\n",
 			ret, total_len);
+		errno = EIO;
 		return -1;
 	}
+	int saved_errno = errno;
+	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
+		strerror(saved_errno));
+	errno = saved_errno;
+	return -1;
 }
 
 

@@ -246,9 +246,7 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 #endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
-	if (tun_writev(tun_fd, iov, data_len ? 2 : 1) < 0)
-		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-			strerror(errno));
+	tun_writev(tun_fd, iov, data_len ? 2 : 1);
 }
 
 static void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word,
@@ -484,12 +482,8 @@ static void xlate_4to6_data(struct pkt *p)
 							htons(IP4_F_MF)))
 				header.ip6_frag.offset_flags |= htons(IP6_F_MF);
 
-			if (tun_writev(p->tun_fd, iov, 2) < 0) {
-				slog(LOG_WARNING, "error writing packet to "
-						"tun device: %s\n",
-						strerror(errno));
+			if (tun_writev(p->tun_fd, iov, 2) < 0)
 				return;
-			}
 		}
 	}
 }
@@ -751,9 +745,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
 
-	if (tun_writev(p->tun_fd, iov, 2) < 0)
-		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-			strerror(errno));
+	tun_writev(p->tun_fd, iov, 2);
 }
 
 void handle_ip4(struct pkt *p)
@@ -823,9 +815,7 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 #endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
-	if (tun_writev(tun_fd, iov, data_len ? 2 : 1) < 0)
-		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-			strerror(errno));
+	tun_writev(tun_fd, iov, data_len ? 2 : 1);
 }
 
 static void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,
@@ -873,42 +863,33 @@ static void host_handle_icmp6(struct pkt *p)
 #include <stdatomic.h>
 
 /* Lock-free IPv4 identification generator across worker threads.
- * For non-fragmented IPv6 packets whose outgoing IPv4 total length is <= 1260
- * bytes, RFC 7915 §5.1 requires clearing DF (DF=0) and generating an IPv4 ID.
  *
- * To minimize cross-core cache-line contention and eliminate atomic operations
- * on every packet, each thread leases a block of 64 IDs at a time from a global
- * atomic counter. Within a cycle of 65,536 IDs:
- * - Thread-local blocks are disjoint, preventing concurrent duplicate IDs.
- * - However, because IPv4 ID is a 16-bit field, the space wraps after 65,536 IDs.
- *   In a stateless translator without per-flow state tables, if one thread holds
- *   an unconsumed block while others generate > 65,536 IDs, sequence overlap
- *   across cycles is theoretically possible. RFC 6864 deprecates reliance on
- *   IPv4 ID uniqueness for non-fragmented datagrams, but uniqueness is preserved
- *   as long as datagram rates per flow stay within 65,536 datagrams per cycle.
+ * RFC 7915 §5.1: For non-fragmented IPv6 packets whose outgoing IPv4 total length
+ * is <= 1260 bytes, DF is cleared (DF=0) and an IPv4 ID is generated.
+ *
+ * RFC 6864 §4.3: Datagrams with DF=0 (or fragmented) are NON-ATOMIC datagrams.
+ * For non-atomic datagrams, the IPv4 Identification field MUST be unique for a
+ * given (source, destination, protocol) tuple within the Maximum Datagram
+ * Lifetime (MDL).
+ *
+ * In a stateless translator without per-flow state tables, uniqueness across all
+ * concurrent flows is maintained by advancing a global monotonic 16-bit sequence.
+ * We use an atomic fetch-and-add of 1 (`atomic_fetch_add_explicit(&..., 1, ...)`).
+ * This eliminates thread-local block leases, preventing slow threads from holding
+ * stale ID blocks that could collide when fast threads cycle through 65,536 values.
+ * Every generated ID within any rolling window of 65,536 allocations is strictly
+ * distinct across all worker threads.
  */
-static _Atomic uint32_t global_ip4_ident = 0xb00b;
-static __thread uint32_t local_cur = 0;
-static __thread uint32_t local_end = 0;
+static _Atomic uint16_t global_ip4_ident = 0xb00b;
 
-void set_ip4_ident_counter(uint32_t val)
+void set_ip4_ident_counter(uint16_t val)
 {
 	atomic_store_explicit(&global_ip4_ident, val, memory_order_relaxed);
 }
 
-void reset_ip4_ident_local(void)
-{
-	local_cur = 0;
-	local_end = 0;
-}
-
 uint16_t next_ip4_ident(void)
 {
-	if (unlikely(local_cur >= local_end)) {
-		local_cur = atomic_fetch_add_explicit(&global_ip4_ident, 64, memory_order_relaxed);
-		local_end = local_cur + 64;
-	}
-	return (uint16_t)(local_cur++);
+	return atomic_fetch_add_explicit(&global_ip4_ident, 1, memory_order_relaxed);
 }
 
 static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,
@@ -1339,9 +1320,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
 
-	if (tun_writev(p->tun_fd, iov, 2) < 0)
-		slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-			strerror(errno));
+	tun_writev(p->tun_fd, iov, 2);
 }
 
 void handle_ip6(struct pkt *p)
