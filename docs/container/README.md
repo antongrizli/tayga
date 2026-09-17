@@ -5,7 +5,7 @@ TAYGA provides a `Containerfile` which may be used in containerized environments
 
 Three container images are provided: `tayga-nat64`, `tayga-clat`, and `tayga`. These differ only in their default launch script and `tayga.conf` configuration file. `tayga-nat64` and `tayga-clat` are pre-configured using environment variables for these common use cases, and `tayga` requires the user to supply a custom launch script which configures the system using `iproute2`.
 
-To run TAYGA containers on Mikrotik RouterOS, see the [Mikrotik Tutorial](mikrotik.md)
+To run TAYGA containers on MikroTik RouterOS 7, see the [MikroTik Setup Guide & Scripts](../../scripts/mikrotik/README.md) or [MikroTik Tutorial](mikrotik.md).
 
 ## NAT64 Container
 

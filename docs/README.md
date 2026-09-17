@@ -169,3 +169,4 @@ Many example configurations are provided, each with an example `tayga.conf` as w
 * [Stateless 464XLAT CLAT](clat/README.md)
 * [Statelsss IP/ICMP Translation (SIIT-DC)](siit/README.md)
 * [Container Docs](container/README.md) for using prebuilt TAYGA containers
+* [MikroTik RouterOS 7 Guide & Scripts](../scripts/mikrotik/README.md) for running TAYGA on MikroTik RouterOS
