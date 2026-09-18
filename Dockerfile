@@ -1,6 +1,10 @@
 # Stage 1: Build environment
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build-env
 
+ARG TAYGA_VERSION=""
+ARG TAYGA_COMMIT=""
+ARG TAYGA_BRANCH=""
+
 # Install build tools
 RUN apk add --no-cache gcc make musl-dev linux-headers git binutils
 
@@ -11,10 +15,19 @@ WORKDIR /app
 COPY ./ ./
 
 # Build tayga and helper statically and strip
-RUN make clean && make static pref64-discover && strip tayga pref64-discover
+RUN make clean && make static pref64-discover VERSION="${TAYGA_VERSION}" COMMIT="${TAYGA_COMMIT}" BRANCH="${TAYGA_BRANCH}" && strip tayga pref64-discover
 
 # Stage 2: Unified Minimal Production Base Image
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS production
+
+ARG TAYGA_VERSION="unknown"
+ARG TAYGA_COMMIT="unknown"
+
+LABEL org.opencontainers.image.title="TAYGA Unified 464XLAT & NAT64" \
+      org.opencontainers.image.description="High-performance stateless NAT64 / CLAT (RFC 6877 / RFC 6146) for MikroTik RouterOS 7 and Linux" \
+      org.opencontainers.image.version="${TAYGA_VERSION}" \
+      org.opencontainers.image.revision="${TAYGA_COMMIT}" \
+      org.opencontainers.image.licenses="GPL-2.0-or-later"
 
 # Install minimal runtime dependencies
 RUN apk add --no-cache \

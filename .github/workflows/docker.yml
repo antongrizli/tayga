@@ -6,6 +6,7 @@ on:
       - main
     tags:
       - 'v*'
+      - 'version*'
   workflow_dispatch:
 
 permissions:
@@ -19,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc make libpthread-stubs0-dev
@@ -33,9 +36,28 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version Info
+        id: meta
+        run: |
+          RAW_VER="${GITHUB_REF_NAME}"
+          CLEAN_VER="${RAW_VER#v}"
+          CLEAN_VER="${CLEAN_VER#version-}"
+          CLEAN_VER="${CLEAN_VER#version}"
+          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+          echo "raw_ver=${RAW_VER}" >> $GITHUB_OUTPUT
+          echo "clean_ver=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
       - name: Build local container image
-        run: docker build -t tayga-smoke:test --target production .
+        run: |
+          docker build \
+            --build-arg TAYGA_VERSION="${{ steps.meta.outputs.clean_ver }}" \
+            --build-arg TAYGA_COMMIT="${{ steps.meta.outputs.sha }}" \
+            --build-arg TAYGA_BRANCH="${{ steps.meta.outputs.raw_ver }}" \
+            -t tayga-smoke:test --target production .
 
       - name: Test RFC 7050 Helper in container
         run: |
@@ -90,6 +112,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up QEMU (Multi-Arch Support)
         uses: docker/setup-qemu-action@v3
@@ -109,10 +133,14 @@ jobs:
         run: |
           REPO_LC="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
           SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
-          BRANCH="${GITHUB_REF_NAME}"
+          RAW_VER="${GITHUB_REF_NAME}"
+          CLEAN_VER="${RAW_VER#v}"
+          CLEAN_VER="${CLEAN_VER#version-}"
+          CLEAN_VER="${CLEAN_VER#version}"
           echo "repo=${REPO_LC}" >> $GITHUB_OUTPUT
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
-          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "raw_ver=${RAW_VER}" >> $GITHUB_OUTPUT
+          echo "clean_ver=${CLEAN_VER}" >> $GITHUB_OUTPUT
 
       - name: Build & Push Unified Base Image (ghcr.io/${{ steps.meta.outputs.repo }})
         uses: docker/build-push-action@v6
@@ -122,9 +150,14 @@ jobs:
           target: production
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
+          build-args: |
+            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
+            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
+            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.repo }}:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.branch }}
+            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.raw_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.clean_ver }}
             ghcr.io/${{ steps.meta.outputs.repo }}:sha-${{ steps.meta.outputs.sha }}
 
       - name: Build & Push Explicit CLAT Image (ghcr.io/${{ steps.meta.outputs.repo }}-clat)
@@ -135,9 +168,14 @@ jobs:
           target: clat
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
+          build-args: |
+            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
+            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
+            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.branch }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.raw_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.clean_ver }}
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:sha-${{ steps.meta.outputs.sha }}
 
       - name: Build & Push Explicit NAT64 Image (ghcr.io/${{ steps.meta.outputs.repo }}-nat64)
@@ -148,7 +186,12 @@ jobs:
           target: nat64
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
+          build-args: |
+            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
+            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
+            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.repo }}-nat64:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.branch }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.raw_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.clean_ver }}
             ghcr.io/${{ steps.meta.outputs.repo }}-nat64:sha-${{ steps.meta.outputs.sha }}

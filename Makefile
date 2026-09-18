@@ -55,29 +55,30 @@ help:
 	@echo 'WITH_SYSTEMD    - Install systemd scripts'
 	@echo 'WITH_OPENRC     - Install OpenRC scripts and example config'
 
-# Synthesize the version.h header from Git
+# Version determination (can be overridden via make VERSION=1.0.0 COMMIT=... BRANCH=...)
+VERSION ?= $(shell $(GIT) describe --tags --always --dirty 2>/dev/null)
+BRANCH  ?= $(shell $(GIT) rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+COMMIT  ?= $(shell $(GIT) rev-parse HEAD 2>/dev/null || echo "unknown")
+
+# Synthesize the version.h header
 define VERSION_HEADER
 #ifndef __TAYGA_VERSION_H__
 #define __TAYGA_VERSION_H__
 
-#define TAYGA_VERSION "$(shell $(GIT) describe --tags --dirty)"
-#define TAYGA_BRANCH  "$(shell $(GIT) describe --all --dirty)"
-#define TAYGA_COMMIT  "$(shell $(GIT) rev-parse HEAD)"
+#define TAYGA_VERSION "$(VERSION)"
+#define TAYGA_BRANCH  "$(BRANCH)"
+#define TAYGA_COMMIT  "$(COMMIT)"
 
 #endif /* #ifndef __TAYGA_VERSION_H__ */
 endef
 
-# Regenerate version.h if detected to be in the tayga git repo
-define make-version-header
-  ifeq ($$(TOPDIR),$$(shell $$(GIT) rev-parse --show-toplevel 2>/dev/null))
-    $$(file > version.h,$$(VERSION_HEADER))
-  endif
-  $$(if $$(wildcard version.h),,$$(error missing version.h))
-endef
+.PHONY: version.h FORCE
+version.h: FORCE
+	@printf '#ifndef __TAYGA_VERSION_H__\n#define __TAYGA_VERSION_H__\n\n#define TAYGA_VERSION "%s"\n#define TAYGA_BRANCH  "%s"\n#define TAYGA_COMMIT  "%s"\n\n#endif /* #ifndef __TAYGA_VERSION_H__ */\n' \
+		"$(VERSION)" "$(BRANCH)" "$(COMMIT)" > version.h
 
 # Compile Tayga
-tayga: $(SOURCES)
-	$(eval $(make-version-header))
+tayga: $(SOURCES) version.h
 	$(CC) $(CFLAGS) -o tayga $(SOURCES) $(LDFLAGS) $(LDLIBS)
 
 # Compile Tayga (statically link)
