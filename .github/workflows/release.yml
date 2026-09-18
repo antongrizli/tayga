@@ -5,6 +5,7 @@ on:
     tags:
       - 'v*'
       - 'version*'
+      - '[0-9]*'
   workflow_dispatch:
     inputs:
       ver:
