@@ -1,7 +1,7 @@
 /*
  *  unit_conffile.c - Unit test for conffile.c
  *
- *  part of TAYGA <https://github.com/antongrizli/tayga>
+ *  part of TAYGA <https://github.com/apalrd/tayga>
  *  Copyright (C) 2025  Andrew Palardy <andrew@apalrd.net>
  *
  *  This program is free software; you can redistribute it and/or modify

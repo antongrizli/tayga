@@ -210,4 +210,4 @@ tayga.conf.
 
 **tayga**(8)
 
-<https://github.com/antongrizli/tayga/>
+<https://github.com/apalrd/tayga/>

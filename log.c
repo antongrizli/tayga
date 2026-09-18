@@ -1,7 +1,7 @@
 /*
  *  log.c - logging related functions
  *
- *  part of TAYGA <https://github.com/antongrizli/tayga>
+ *  part of TAYGA <https://github.com/apalrd/tayga>
  *  Copyright (C) 2010  Nathan Lutchansky <lutchann@litech.org>
  *  Copyright (C) 2025  Andrew Palardy <andrew@apalrd.net>
  *

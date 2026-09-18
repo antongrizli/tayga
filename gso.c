@@ -1,7 +1,7 @@
 /*
  *  gso.c -- TCP Generic Segmentation Offload engine for TAYGA
  *
- *  part of TAYGA <https://github.com/antongrizli/tayga>
+ *  part of TAYGA <https://github.com/apalrd/tayga>
  */
 
 #include "tayga.h"

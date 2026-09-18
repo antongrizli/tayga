@@ -1,5 +1,5 @@
 #
-#   part of TAYGA <https://github.com/antongrizli/tayga> test suite
+#   part of TAYGA <https://github.com/apalrd/tayga> test suite
 #   Copyright (C) 2025  Andrew Palardy <andrew@apalrd.net>
 # 
 #   test/mapping.py - Mapping methods of v4/v6 addresses
