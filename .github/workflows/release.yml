@@ -17,9 +17,6 @@ permissions:
   contents: write
   packages: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
-
 jobs:
   # 1. Synchronize version.h in Repository if not already updated
   sync-version-file:
@@ -27,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -61,7 +58,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -91,7 +88,7 @@ jobs:
             desc: "x86_64 (MikroTik CHR, PC)"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -108,7 +105,7 @@ jobs:
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Compile and extract static binaries
         run: |
@@ -122,7 +119,7 @@ jobs:
              cp pref64-discover dist-bin/pref64-discover-linux-${{ matrix.arch }}"
 
       - name: Upload static binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binaries-${{ matrix.arch }}
           path: dist-bin/*
@@ -148,7 +145,7 @@ jobs:
             tar_name: tayga-amd64.tar
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -165,10 +162,10 @@ jobs:
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and Export Container Image TAR
         run: |
@@ -185,7 +182,7 @@ jobs:
           ls -lh dist-tar/${{ matrix.tar_name }}
 
       - name: Upload Container TAR artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: container-tar-${{ matrix.arch }}
           path: dist-tar/*
@@ -198,18 +195,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -230,7 +227,7 @@ jobs:
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
       - name: Build & Push Unified Base Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -247,7 +244,7 @@ jobs:
             ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.clean_ver }}
 
       - name: Build & Push Explicit CLAT Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -264,7 +261,7 @@ jobs:
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.clean_ver }}
 
       - name: Build & Push Explicit NAT64 Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -287,19 +284,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download static binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: binaries-*
           path: release-assets
           merge-multiple: true
 
       - name: Download container TAR archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: container-tar-*
           path: release-assets
@@ -439,7 +436,7 @@ jobs:
           sed -i "s|TAG_PLACEHOLDER|${RAW_VER}|g" release_body.md
 
       - name: Create or Update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.ver || github.ref_name }}
           name: TAYGA ${{ inputs.ver || github.ref_name }}
