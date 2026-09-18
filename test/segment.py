@@ -1,5 +1,5 @@
 #
-#   part of TAYGA <https://github.com/apalrd/tayga> test suite
+#   part of TAYGA <https://github.com/antongrizli/tayga> test suite
 #   Copyright (C) 2025  Andrew Palardy <andrew@apalrd.net>
 # 
 #   test/segment.py - Test of segmentation / queue related behaviors

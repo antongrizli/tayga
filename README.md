@@ -8,14 +8,14 @@ If you are interested in the mechanics of NAT64 and Stateless IP / ICMP Translat
 
 ## Installation & Basic Configuration
 
-Pre-built statically linked binaries are available from [Releases](https://github.com/apalrd/tayga/releases) for `amd64` and `arm64` architectures. Container images are also available.
+Pre-built statically linked binaries are available from [Releases](https://github.com/antongrizli/tayga/releases) for `amd64` and `arm64` architectures. Container images are also available.
 
 ## Compiling
 
 `tayga` requires GNU `make` to build. If you would like to run the test suite, see [Test Documentation](test/index.md) for additional dependencies.
 
 ```sh
-git clone git@github.com:apalrd/tayga.git
+git clone https://github.com/antongrizli/tayga.git
 cd tayga
 make
 ```

@@ -1,7 +1,7 @@
 /*
  *  gso.h -- TCP Generic Segmentation Offload routines for TAYGA
  *
- *  part of TAYGA <https://github.com/apalrd/tayga>
+ *  part of TAYGA <https://github.com/antongrizli/tayga>
  */
 
 #ifndef TAYGA_GSO_H

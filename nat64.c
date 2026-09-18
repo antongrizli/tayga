@@ -1,7 +1,7 @@
 /*
  *  nat64.c -- IPv4/IPv6 header rewriting routines
  *
- *  part of TAYGA <https://github.com/apalrd/tayga>
+ *  part of TAYGA <https://github.com/antongrizli/tayga>
  *  Copyright (C) 2010  Nathan Lutchansky <lutchann@litech.org>
  *  Copyright (C) 2025  Andrew Palardy <andrew@apalrd.net>
  *

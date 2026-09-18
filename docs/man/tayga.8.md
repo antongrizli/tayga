@@ -97,4 +97,4 @@ There is NO WARRANTY, to the extent permitted by law.
 
 **tayga.conf**(5)
 
-<https://github.com/apalrd/tayga/>
+<https://github.com/antongrizli/tayga/>

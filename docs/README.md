@@ -89,7 +89,7 @@ service log, if your network requires this information
 `tayga` requires GNU `make` to build.
 
 ```sh
-git clone git@github.com:apalrd/tayga.git
+git clone https://github.com/antongrizli/tayga.git
 cd tayga
 make
 ```
