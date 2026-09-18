@@ -112,14 +112,14 @@ unit_conffile: $(TEST_FILES) test/unit_conffile.c conffile.c addrmap.c tayga.h l
 unit_checksum: test/unit_checksum.c tayga.h
 	$(CC) $(CFLAGS) -I. -o unit_checksum test/unit_checksum.c $(LDFLAGS)
 
-unit_ip4_id: test/unit_ip4_id.c nat64.c tayga.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c $(LDFLAGS) -lpthread
+unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c tayga.h gso.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c $(LDFLAGS) -lpthread
 
 unit_tun: test/unit_tun.c tun.c log.c tayga.h
-	$(CC) $(CFLAGS) -I. -o unit_tun test/unit_tun.c tun.c log.c -Wl,--wrap=write -Wl,--wrap=writev
+	$(CC) $(CFLAGS) -I. -o unit_tun test/unit_tun.c tun.c log.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS)
 
-unit_gso: test/unit_gso.c gso.c addrmap.c nat64.c tun.c log.c tayga.h gso.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c nat64.c tun.c log.c $(LDFLAGS) -lpthread
+unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c tayga.h gso.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c $(LDFLAGS) -lpthread
 
 tools/probe-tun-offload: tools/probe-tun-offload.c
 	$(CC) $(CFLAGS) -o tools/probe-tun-offload tools/probe-tun-offload.c

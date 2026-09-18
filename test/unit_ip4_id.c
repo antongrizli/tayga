@@ -8,6 +8,9 @@
 
 #include "tayga.h"
 
+struct config gcfg;
+time_t now;
+
 #define NUM_THREADS 4
 #define IDS_PER_THREAD 16384 /* 4 * 16384 = 65,536 total IDs (exactly 1 full 16-bit cycle) */
 
