@@ -43,6 +43,22 @@
 :global USE_REGISTRY
 :global REMOTE_IMAGE
 :global REGISTRY_URL
+:global POLICY
+:global PREFER_DIRECT_IPV4
+:global ALLOW_LOCAL_NAT64
+:global IPV6_ONLY_LAN_INTERFACES
+
+:local policy "auto"
+:if ([:len $POLICY] > 0) do={ :set policy $POLICY }
+
+:local preferDirectIpv4 "yes"
+:if ([:len $PREFER_DIRECT_IPV4] > 0) do={ :set preferDirectIpv4 $PREFER_DIRECT_IPV4 }
+
+:local allowLocalNat64 "yes"
+:if ([:len $ALLOW_LOCAL_NAT64] > 0) do={ :set allowLocalNat64 $ALLOW_LOCAL_NAT64 }
+
+:local ipv6OnlyLanIfaces ""
+:if ([:len $IPV6_ONLY_LAN_INTERFACES] > 0) do={ :set ipv6OnlyLanIfaces $IPV6_ONLY_LAN_INTERFACES }
 
 :local useRegistry false
 :if ($USE_REGISTRY = true) do={ :set useRegistry true }
@@ -179,10 +195,35 @@
     }
 }
 
+# --- 8b. Configure Shared Policy Environment (tayga-policy-envs) ---
+:put "--> Configuring shared policy environment list tayga-policy-envs..."
+:local policyEntries {
+    {"POLICY"; $policy};
+    {"PREFER_DIRECT_IPV4"; $preferDirectIpv4};
+    {"ALLOW_LOCAL_NAT64"; $allowLocalNat64};
+    {"IPV6_ONLY_LAN_INTERFACES"; $ipv6OnlyLanIfaces}
+}
+:foreach item in=$policyEntries do={
+    :local k ($item->0)
+    :local v ($item->1)
+    :local envId [/container/envs/find where list="tayga-policy-envs" and key=$k]
+    :if ([:len $envId] = 0) do={
+        /container/envs/add list=tayga-policy-envs key=$k value=$v
+    } else={
+        /container/envs/set ($envId->0) value=$v
+    }
+}
+
 # --- 9. Configure Routes for NAT64 Prefix and IPv4 Pool ---
-:if ([:len [/ipv6/route/find where comment="[tayga-unified:nat64] NAT64 prefix route"]] = 0) do={
+:local nat64PrefixRoutes [/ipv6/route/find where comment~"^\\[tayga-unified:nat64(:prefix)?\\]"]
+:local disPrefixRoute "no"
+:if ($policy = "auto") do={ :set disPrefixRoute "yes" }
+
+:if ([:len $nat64PrefixRoutes] > 0) do={
+    /ipv6/route/set ($nat64PrefixRoutes->0) dst-address=64:ff9b::/96 gateway=fc68::2 disabled=$disPrefixRoute comment="[tayga-unified:nat64:prefix] NAT64 prefix route"
+} else={
     :put "--> Routing 64:ff9b::/96 via container (fc68::2)..."
-    /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 comment="[tayga-unified:nat64] NAT64 prefix route"
+    /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 disabled=$disPrefixRoute comment="[tayga-unified:nat64:prefix] NAT64 prefix route"
 }
 
 :if ([:len [/ip/route/find where comment="[tayga-unified:nat64] NAT64 dynamic pool route"]] = 0) do={
@@ -208,7 +249,8 @@
 } else={
     :local tComm [/routing/table/get ($wanTable->0) comment]
     :if (!($tComm ~ "^\\[tayga-unified")) do={
-        :put "--> [WARN] Existing table 'wan-direct' is not owned by this project."
+        :put " [FAIL] Routing table 'wan-direct' already exists and is not owned by this project."
+        :error "Aborted: routing table wan-direct already exists and is unowned"
     }
 }
 :if ([:len [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified"]] = 0) do={
@@ -286,26 +328,49 @@
 }
 
 :local contId [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
-:if ([:len $contId] > 0) do={
-    :local isRun [/container/get $contId running]
-    :if ($isRun != true) do={
-        :put "--> Starting container..."
-        /container/start $contId
+:if ($policy = "auto") do={
+    :put "--> POLICY=auto: Container created in standby; Network State Controller will manage lifecycle."
+} else={
+    :if ([:len $contId] > 0) do={
+        :local isRun [/container/get $contId running]
+        :if ($isRun != true) do={
+            :put "--> Starting container (POLICY=manual)..."
+            /container/start $contId
+        }
+    }
+
+    # Poll for running state (up to 30s)
+    :put "--> Waiting for NAT64 + DNS64 initialization..."
+    :local contRunning false
+    :for i from=1 to=30 do={
+        :if ($contRunning = false) do={
+            :local r [/container/get $contId running]
+            :if ($r = true) do={
+                :set contRunning true
+            } else={
+                :delay 1s
+            }
+        }
     }
 }
 
-# Poll for running state (up to 30s)
-:put "--> Waiting for NAT64 + DNS64 initialization..."
-:local contRunning false
-:for i from=1 to=30 do={
-    :if ($contRunning = false) do={
-        :local r [/container/get $contId running]
-        :if ($r = true) do={
-            :set contRunning true
-        } else={
-            :delay 1s
-        }
-    }
+# --- 12. Register Network State Controller in Scheduler ---
+:local controllerScript ($basePath . "/scripts/routeros-controller.rsc")
+:local schedId [/system/scheduler/find where name="tayga-controller"]
+:if ([:len $schedId] = 0) do={
+    :put "--> Registering Network State Controller in /system/scheduler (interval: 15s)..."
+    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerScript) comment="[tayga-unified:controller] Network State Controller"
+} else={
+    :put "--> Updating /system/scheduler tayga-controller..."
+    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerScript)
+}
+
+# --- 13. Initial Network State Controller Evaluation ---
+:put "--> Running initial Network State Controller cycle..."
+:do {
+    /import file-name=$controllerScript
+} on-error={
+    :put " [WARN] Controller initial execution encountered a non-fatal error; scheduler will retry."
 }
 
 :put "============================================================"

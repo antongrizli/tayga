@@ -9,6 +9,7 @@
 # ==============================================================================
 
 :global TAYGA_LOCK_OWNER
+:global TAYGA_LOCK_TOKEN
 :global TAYGA_LOCK_TIME
 :global TAYGA_STATE
 :global TAYGA_PARKED_ROUTE_IDS
@@ -18,18 +19,38 @@
 :put "============================================================"
 
 # 0. Acquire Unified Lock with 20s wait
+:local myToken ("remove-" . [:tostr [/system/clock/get time]] . "-" . [:rndnum from=1000 to=9999])
 :local waitCount 0
-:while ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "remove" and $waitCount < 20) do={
-    :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCount . "/20s)...")
-    :delay 1s
-    :set waitCount ($waitCount + 1)
+:local acquired false
+
+:while ($acquired = false and $waitCount < 20) do={
+    :local curUp [/system/resource/get uptime]
+    :local busy false
+    :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+        :local age 0s
+        :do { :set age ($curUp - $TAYGA_LOCK_TIME) } on-error={ :set age 999s }
+        :if ($age < 120s) do={
+            :set busy true
+        } else={
+            :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . "...")
+        }
+    }
+    :if ($busy = false) do={
+        :set TAYGA_LOCK_OWNER "remove"
+        :set TAYGA_LOCK_TOKEN $myToken
+        :set TAYGA_LOCK_TIME $curUp
+        :set acquired true
+    } else={
+        :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCount . "/20s)...")
+        :delay 1s
+        :set waitCount ($waitCount + 1)
+    }
 }
-:if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "remove") do={
+
+:if ($acquired = false) do={
     :put " [FAIL] Lock could not be acquired within 20s timeout. Aborting remove."
     :error "Aborted: lock busy"
 }
-:set TAYGA_LOCK_OWNER "remove"
-:set TAYGA_LOCK_TIME [/system/resource/get uptime]
 
 :do {
     # 1. Restore specifically parked direct WAN default routes if any
@@ -123,6 +144,7 @@
     /container/envs/remove [find where comment~"^\\[tayga-unified"]
     /container/envs/remove [find where list="tayga-clat-envs"]
     /container/envs/remove [find where list="tayga-nat64-envs"]
+    /container/envs/remove [find where list="tayga-policy-envs"]
 
     # 6. Remove Bridge Ports and VETH Interfaces owned by this project
     :put "--> Removing bridge ports and VETH interfaces..."
@@ -150,7 +172,8 @@
     :put " [ERROR] An unexpected error occurred during removal."
 }
 
-# Release Unified Lock strictly by owner
-:if ($TAYGA_LOCK_OWNER = "remove") do={
+# Release Unified Lock strictly by token match
+:if ($TAYGA_LOCK_TOKEN = $myToken) do={
     :set TAYGA_LOCK_OWNER "none"
+    :set TAYGA_LOCK_TOKEN ""
 }

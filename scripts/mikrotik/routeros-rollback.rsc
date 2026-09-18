@@ -15,20 +15,41 @@
 
 # --- 0. Acquire Unified Lock (owner=rollback) ---
 :global TAYGA_LOCK_OWNER
+:global TAYGA_LOCK_TOKEN
 :global TAYGA_LOCK_TIME
 
+:local myToken ("rollback-" . [:tostr [/system/clock/get time]] . "-" . [:rndnum from=1000 to=9999])
 :local waitCtrl 0
-:while ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "rollback" and $waitCtrl < 20) do={
-    :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCtrl . "/20s)...")
-    :delay 1s
-    :set waitCtrl ($waitCtrl + 1)
+:local acquired false
+
+:while ($acquired = false and $waitCtrl < 20) do={
+    :local curUp [/system/resource/get uptime]
+    :local busy false
+    :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+        :local age 0s
+        :do { :set age ($curUp - $TAYGA_LOCK_TIME) } on-error={ :set age 999s }
+        :if ($age < 120s) do={
+            :set busy true
+        } else={
+            :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . "...")
+        }
+    }
+    :if ($busy = false) do={
+        :set TAYGA_LOCK_OWNER "rollback"
+        :set TAYGA_LOCK_TOKEN $myToken
+        :set TAYGA_LOCK_TIME $curUp
+        :set acquired true
+    } else={
+        :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCtrl . "/20s)...")
+        :delay 1s
+        :set waitCtrl ($waitCtrl + 1)
+    }
 }
-:if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "rollback") do={
+
+:if ($acquired = false) do={
     :put " [FAIL] Lock could not be acquired within 20s timeout. Aborting rollback."
     :error "Aborted: lock busy"
 }
-:set TAYGA_LOCK_OWNER "rollback"
-:set TAYGA_LOCK_TIME [/system/resource/get uptime]
 
 :do {
     :put "============================================================"
@@ -199,7 +220,8 @@
     :put " [ERROR] Unhandled error during rollback."
 }
 
-# Release Unified Lock strictly by owner
-:if ($TAYGA_LOCK_OWNER = "rollback") do={
+# Release Unified Lock strictly by token match
+:if ($TAYGA_LOCK_TOKEN = $myToken) do={
     :set TAYGA_LOCK_OWNER "none"
+    :set TAYGA_LOCK_TOKEN ""
 }

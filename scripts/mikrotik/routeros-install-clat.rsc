@@ -227,7 +227,8 @@
 } else={
     :local tComm [/routing/table/get ($wanTable->0) comment]
     :if (!($tComm ~ "^\\[tayga-unified")) do={
-        :put "--> [WARN] Existing table 'wan-direct' is not owned by this project."
+        :put " [FAIL] Routing table 'wan-direct' already exists and is not owned by this project."
+        :error "Aborted: routing table wan-direct already exists and is unowned"
     }
 }
 
@@ -238,7 +239,8 @@
 } else={
     :local cComm [/routing/table/get ($clatTable->0) comment]
     :if (!($cComm ~ "^\\[tayga-unified")) do={
-        :put "--> [WARN] Existing table 'tayga-probe-clat' is not owned by this project."
+        :put " [FAIL] Routing table 'tayga-probe-clat' already exists and is not owned by this project."
+        :error "Aborted: routing table tayga-probe-clat already exists and is unowned"
     }
 }
 
