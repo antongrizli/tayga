@@ -1,17 +1,17 @@
-# This make sure the code builds successfully on amd64/arm64 with gcc and clang
 name: Basic Test
 
-# Controls when the action will run. Workflow runs when manually triggered using the UI
-# or API.
+# Controls when the action will run. Workflow runs when triggered by push to main, PR, or manual dispatch
 on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize]
   workflow_dispatch:
     inputs:
       ver:
         description: 'Any valid git ref'
         required: false
         type: string
-  pull_request:
-    types: [opened, synchronize]
 
 # permissions are set per job
 permissions: { }
@@ -82,3 +82,31 @@ jobs:
             gmake clean && gmake CFLAGS="-Werror -Wall -O2"
             gmake test
             gmake clean && gmake CFLAGS="-Werror -Wextra -O2"
+
+  test-static-multiarch:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+            desc: "MikroTik Chateau ARM64"
+          - arch: armv7
+            platform: linux/arm/v7
+            desc: "MikroTik ARMv7"
+          - arch: amd64
+            platform: linux/amd64
+            desc: "x86_64"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ver || github.ref }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Build static binary inside Alpine (${{ matrix.desc }})
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} -v "$PWD":/src -w /src alpine:3.20 sh -c \
+            "apk add --no-cache gcc make musl-dev linux-headers binutils && make clean && make static && strip tayga && make test"

@@ -109,7 +109,7 @@ NAT64 translates IPv6-only client requests to IPv4 destinations.
 /ip/firewall/nat add chain=srcnat action=masquerade src-address=192.168.240.0/20 comment="NAT64 dynamic pool masquerade"
 
 # 7. Add TAYGA NAT64 container
-/container/add remote-image="ghcr.io/apalrd/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes
+/container/add remote-image="ghcr.io/antongrizli/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes
 ```
 
 ---
@@ -141,7 +141,7 @@ CLAT translates local IPv4-only application traffic into IPv6 packets destined f
 /ip/route add dst-address=0.0.0.0/0 gateway=192.168.238.2 distance=10 comment="IPv4 default route via CLAT"
 
 # 5. Add TAYGA CLAT container
-/container/add remote-image="ghcr.io/apalrd/tayga-clat:latest" interface=veth-clat name=tayga-clat workdir=/app logging=yes
+/container/add remote-image="ghcr.io/antongrizli/tayga-clat:latest" interface=veth-clat name=tayga-clat workdir=/app logging=yes
 ```
 
 ---
@@ -162,7 +162,7 @@ To define custom environment variables:
 Then attach the env list when adding the container:
 
 ```routeros
-/container/add remote-image="ghcr.io/apalrd/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 envlist=tayga-env workdir=/app logging=yes
+/container/add remote-image="ghcr.io/antongrizli/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 envlist=tayga-env workdir=/app logging=yes
 ```
 
 ### Supported Environment Variables:

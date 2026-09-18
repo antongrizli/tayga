@@ -30,4 +30,4 @@
 /ip firewall nat add chain=srcnat action=masquerade src-address=192.168.240.0/20 comment="NAT64 outbound IPv4 masquerade"
 
 # 8. Add TAYGA NAT64 container (fetches image from GitHub Container Registry)
-/container add remote-image="ghcr.io/apalrd/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes comment="TAYGA NAT64 Container"
+/container add remote-image="ghcr.io/antongrizli/tayga-nat64:latest" interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes comment="TAYGA NAT64 Container"

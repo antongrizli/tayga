@@ -38,7 +38,7 @@ Assumptions used in this guide:
 # Add our dynamic pool to interface list
 /interface/list/member add interface=nat64 list=LAN
 # Create tayga container
-/container/add remote-image=ghcr.io/apalrd/tayga-nat64 interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes
+/container/add remote-image=ghcr.io/antongrizli/tayga-nat64 interface=veth-nat64 name=tayga-nat64 workdir=/app logging=yes
 # Start the container
 /container/start [find name=tayga-nat64]
 ```

@@ -202,7 +202,7 @@ tayga.tar: scripts/launch.sh
 	podman manifest create tayga
 	podman build $(PODMAN_FLAGS) . --manifest tayga
 ifdef CONT_PUSH
-	podman manifest push --all tayga ghcr.io/apalrd/tayga:latest
+	podman manifest push --all tayga ghcr.io/antongrizli/tayga:latest
 endif
 	podman save -o $@ tayga
 
@@ -212,7 +212,7 @@ tayga-clat.tar: scripts/launch-clat.sh
 	podman manifest create tayga-clat
 	podman build $(PODMAN_FLAGS) . --manifest tayga-clat --target final-clat
 ifdef CONT_PUSH
-	podman manifest push --all tayga-clat ghcr.io/apalrd/tayga-clat:latest
+	podman manifest push --all tayga-clat ghcr.io/antongrizli/tayga-clat:latest
 endif
 	podman save -o $@ tayga-clat
 	podman manifest rm tayga-clat
@@ -222,7 +222,7 @@ tayga-nat64.tar: scripts/launch-nat64.sh
 	podman manifest create tayga-nat64
 	podman build $(PODMAN_FLAGS) . --manifest tayga-nat64 --target final-nat64
 ifdef CONT_PUSH
-	podman manifest push --all tayga-nat64 ghcr.io/apalrd/tayga-nat64:latest
+	podman manifest push --all tayga-nat64 ghcr.io/antongrizli/tayga-nat64:latest
 endif
 	podman save -o $@ tayga-nat64
 	podman manifest rm tayga-nat64
