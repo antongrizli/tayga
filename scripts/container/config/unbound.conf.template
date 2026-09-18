@@ -1,0 +1,23 @@
+# Template for Unbound DNS64 in TAYGA NAT64 mode
+server:
+    verbosity: 1
+    interface: 0.0.0.0
+    interface: ::0
+    port: 53
+    do-ip4: yes
+    do-ip6: yes
+    do-udp: yes
+    do-tcp: yes
+    access-control: 0.0.0.0/0 allow
+    access-control: ::0/0 allow
+    module-config: "dns64 validator iterator"
+    dns64-prefix: 64:ff9b::/96
+    dns64-synthall: no
+    hide-identity: yes
+    hide-version: yes
+    use-syslog: no
+
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1
+    forward-addr: 8.8.8.8

@@ -1,4 +1,4 @@
-name: Build & Publish Container Images to GHCR
+name: Build & Publish Unified Container Image to GHCR
 
 on:
   push:
@@ -13,7 +13,77 @@ permissions:
   packages: write
 
 jobs:
+  test-and-verify:
+    name: Run Unit Tests & C Code Verification
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc make libpthread-stubs0-dev
+
+      - name: Run Test Suite
+        run: make test CC=gcc LDFLAGS=""
+
+  container-smoke-test:
+    name: Container Image Runtime Functional Tests
+    needs: test-and-verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build local container image
+        run: docker build -t tayga-smoke:test --target production .
+
+      - name: Test RFC 7050 Helper in container
+        run: |
+          RES=$(docker run --rm --entrypoint /usr/local/sbin/pref64-discover tayga-smoke:test --check 64:ff9b::192.0.0.170)
+          echo "Discovered prefix: $RES"
+          test "$RES" = "64:ff9b::/96"
+
+      - name: Test MODE=diagnose in container
+        run: docker run --rm -e MODE=diagnose tayga-smoke:test
+
+      - name: Functional Test: CLAT Mode Launch & TUN Creation
+        run: |
+          docker run -d --name test-clat --cap-add=NET_ADMIN --device /dev/net/tun -e PREF64=64:ff9b::/96 -e ROUTER4=172.17.0.1 tayga-smoke:test
+          sleep 3
+          docker ps --filter "name=test-clat" --filter "status=running" | grep test-clat
+          docker logs test-clat | grep "TAYGA Unified CLAT"
+          docker stop test-clat
+          docker rm test-clat
+
+      - name: Functional Test: NAT64 Mode Launch (TAYGA + Unbound DNS64 Supervisor)
+        run: |
+          docker run -d --name test-nat64 --cap-add=NET_ADMIN --device /dev/net/tun -e MODE=nat64 tayga-smoke:test
+          sleep 3
+          docker ps --filter "name=test-nat64" --filter "status=running" | grep test-nat64
+          docker logs test-nat64 | grep "TAYGA Unified NAT64"
+          docker logs test-nat64 | grep "start of service (unbound"
+          docker stop test-nat64
+          docker rm test-nat64
+
+      - name: Test invalid MODE rejection (expected exit 1)
+        run: |
+          set +e
+          docker run --rm -e MODE=invalid_mode tayga-smoke:test
+          STATUS=$?
+          set -e
+          test $STATUS -eq 1
+
+      - name: Test invalid workers rejection (expected exit 64)
+        run: |
+          set +e
+          docker run --rm -e MODE=clat -e TAYGA_WORKERS=999 tayga-smoke:test
+          STATUS=$?
+          set -e
+          test $STATUS -eq 64
+
   build-and-push-ghcr:
+    name: Build Multi-Arch Unified Image & Publish
+    needs: container-smoke-test
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -42,12 +112,12 @@ jobs:
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
           echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
 
-      - name: Build & Push Base Image (ghcr.io/${{ steps.meta.outputs.repo }})
+      - name: Build & Push Unified Base Image (ghcr.io/${{ steps.meta.outputs.repo }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          target: final
+          target: production
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: |
@@ -55,12 +125,12 @@ jobs:
             ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.branch }}
             ghcr.io/${{ steps.meta.outputs.repo }}:sha-${{ steps.meta.outputs.sha }}
 
-      - name: Build & Push CLAT Image (ghcr.io/${{ steps.meta.outputs.repo }}-clat)
+      - name: Build & Push Explicit CLAT Image (ghcr.io/${{ steps.meta.outputs.repo }}-clat)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          target: final-clat
+          target: clat
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: |
@@ -68,12 +138,12 @@ jobs:
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.branch }}
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:sha-${{ steps.meta.outputs.sha }}
 
-      - name: Build & Push NAT64 Image (ghcr.io/${{ steps.meta.outputs.repo }}-nat64)
+      - name: Build & Push Explicit NAT64 Image (ghcr.io/${{ steps.meta.outputs.repo }}-nat64)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          target: final-nat64
+          target: nat64
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: |

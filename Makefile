@@ -93,12 +93,13 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso
+test: unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64
 	./unit_conffile
 	./unit_checksum
 	./unit_ip4_id
 	./unit_tun
 	./unit_gso
+	./unit_pref64
 
 # these are only valid for GCC
 TEST_CFLAGS := $(CFLAGS) -Werror -coverage -DCOVERAGE_TESTING
@@ -120,6 +121,12 @@ unit_tun: test/unit_tun.c tun.c log.c tayga.h
 
 unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c tayga.h gso.h
 	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c $(LDFLAGS) -lpthread
+
+unit_pref64: test/unit_pref64.c src-helper/pref64-discover.c
+	$(CC) $(CFLAGS) -DPREF64_NO_MAIN -I. -o unit_pref64 test/unit_pref64.c src-helper/pref64-discover.c $(LDFLAGS)
+
+pref64-discover: src-helper/pref64-discover.c
+	$(CC) $(CFLAGS) -I. -o pref64-discover src-helper/pref64-discover.c $(LDFLAGS)
 
 tools/probe-tun-offload: tools/probe-tun-offload.c
 	$(CC) $(CFLAGS) -o tools/probe-tun-offload tools/probe-tun-offload.c
@@ -150,8 +157,8 @@ man:
 
 .PHONY: clean
 clean:
-	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar
-	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso tools/probe-tun-offload *.gcda *.gcno
+	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
+	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64 tools/probe-tun-offload *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

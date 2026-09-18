@@ -18,5 +18,12 @@ latex/*
 callgrind*
 unit_conffile
 unit_conffile.conf
+unit_checksum
+unit_ip4_id
+unit_tun
+unit_gso
+unit_pref64
+pref64-discover
 tayga.map
 perf-sessions
+dist/

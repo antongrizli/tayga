@@ -1,5 +1,5 @@
 # Stage 1: Build environment
-FROM alpine:3.20 AS build-env
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build-env
 
 # Install build tools
 RUN apk add --no-cache gcc make musl-dev linux-headers git binutils
@@ -10,36 +10,50 @@ WORKDIR /app
 # Copy source code into the container
 COPY ./ ./
 
-# Build the code statically and strip
-RUN make clean && make static && strip tayga
+# Build tayga and helper statically and strip
+RUN make clean && make static pref64-discover && strip tayga pref64-discover
 
-# Stage 2a: Final image (nat64)
-FROM alpine:3.20 AS final-nat64
+# Stage 2: Unified Minimal Production Base Image
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS production
 
-WORKDIR /app
-COPY --from=build-env /app/tayga /app/tayga
-COPY scripts/launch-nat64.sh /app/launch-nat64.sh
-RUN chmod +x /app/launch-nat64.sh
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    iproute2 \
+    ethtool \
+    tini \
+    unbound \
+    ca-certificates \
+    && rm -rf /var/cache/apk/*
 
-ENTRYPOINT ["/bin/sh","/app/launch-nat64.sh"]
+# Install binaries
+COPY --from=build-env /app/tayga /usr/sbin/tayga
+COPY --from=build-env /app/pref64-discover /usr/local/sbin/pref64-discover
 
-# Stage 2b: Final Image (clat)
-FROM alpine:3.20 AS final-clat
-RUN apk add --no-cache iproute2
-WORKDIR /app
-COPY --from=build-env /app/tayga /app/tayga
-COPY scripts/launch-clat.sh /app/launch-clat.sh
-COPY scripts/clat-start.sh /app/clat-start.sh
-RUN chmod +x /app/launch-clat.sh /app/clat-start.sh
+# Install container scripts and templates
+COPY scripts/container/entrypoint.sh /usr/local/sbin/entrypoint.sh
+COPY scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
+COPY scripts/container/nat64-start.sh /usr/local/sbin/nat64-start.sh
+COPY scripts/container/diagnose.sh /usr/local/sbin/diagnose.sh
+COPY scripts/container/config/unbound.conf.template /etc/unbound/unbound.conf.template
 
-ENTRYPOINT ["/bin/sh","/app/launch-clat.sh"]
+# Ensure executable permissions and create backward-compatibility links
+RUN chmod +x /usr/sbin/tayga /usr/local/sbin/pref64-discover /usr/local/sbin/*.sh \
+    && mkdir -p /app /run /var/lib/tayga \
+    && ln -s /usr/sbin/tayga /app/tayga \
+    && ln -s /usr/local/sbin/entrypoint.sh /app/launch.sh \
+    && ln -s /usr/local/sbin/clat-start.sh /app/launch-clat.sh \
+    && ln -s /usr/local/sbin/nat64-start.sh /app/launch-nat64.sh
 
-# Stage 2c: Final Image (No Config / Bring Your Own)
-FROM alpine:3.20 AS final
-RUN apk add --no-cache iproute2
-WORKDIR /app
-COPY --from=build-env /app/tayga /app/tayga
-COPY scripts/launch.sh /app/launch.sh
-RUN chmod +x /app/launch.sh
+ENV MODE=clat
 
-ENTRYPOINT ["/bin/sh","/app/launch.sh"]
+WORKDIR /
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/sbin/entrypoint.sh"]
+
+# Target clat: Explicit CLAT profile
+FROM production AS clat
+ENV MODE=clat
+
+# Target nat64: Explicit NAT64 profile with Unbound DNS64
+FROM production AS nat64
+ENV MODE=nat64

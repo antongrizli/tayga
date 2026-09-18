@@ -1,0 +1,235 @@
+# ==============================================================================
+# RouterOS 7 Installation Script: TAYGA NAT64 (Server-Side Translator RFC 6146/6147)
+# ==============================================================================
+# Deploys TAYGA unified container in NAT64 mode with Unbound DNS64.
+# Uses tagged configuration [tayga-unified:nat64] for safe idempotency & rollback.
+#
+# Usage:
+#   /import file-name=usb1/telekom-xlat/scripts/routeros-install-nat64.rsc
+# ==============================================================================
+
+:put "============================================================"
+:put " Deploying TAYGA Unified NAT64 + DNS64 Container..."
+:put "============================================================"
+
+# --- 1. Detect External Storage Slot & Paths ---
+:local extSlot "usb1"
+:local diskId [/disk/find where slot="usb1" or name="usb1"]
+:if ([:len $diskId] = 0) do={
+    :set diskId [/disk/find where slot="pcie1" or name="pcie1"]
+    :if ([:len $diskId] > 0) do={ :set extSlot "pcie1" } else={
+        :foreach d in=[/disk/find where fs="ext4"] do={
+            :if ($extSlot = "usb1") do={
+                :do { :set extSlot [/disk/get $d slot] } on-error={
+                    :do { :set extSlot [/disk/get $d name] } on-error={}
+                }
+                :set diskId $d
+            }
+        }
+    }
+}
+:local basePath ($extSlot . "/telekom-xlat")
+:local preflightScript ($basePath . "/scripts/routeros-preflight.rsc")
+:local imagePath ($basePath . "/images/tayga-arm64.tar")
+:local rootfsPath ($basePath . "/rootfs/nat64")
+
+# --- 2. Run Preflight Audit First (NAT64 Mode) ---
+:global AUDITMODE "nat64"
+:do {
+    /import file-name=$preflightScript
+} on-error={
+    :error "Installation aborted: preflight audit failed."
+}
+
+# --- 3. Detect WAN Interface and Gateway ---
+:local wanIf "lte1"
+:if ([:len [/interface/find where name="lte1"]] = 0) do={
+    :local defRoute [/ip/route/find where dst-address="0.0.0.0/0" and active=yes]
+    :if ([:len $defRoute] > 0) do={
+        :set wanIf [/ip/route/get ($defRoute->0) gateway]
+    } else={
+        :set wanIf "ether1"
+    }
+}
+:if ([:len [/interface/find where name=$wanIf]] = 0) do={
+    :set wanIf "ether1"
+}
+:local wanGw "192.168.65.1"
+:local gwRoute [/ip/route/find where dst-address="0.0.0.0/0" and active=yes]
+:if ([:len $gwRoute] > 0) do={
+    :do { :set wanGw [/ip/route/get ($gwRoute->0) gateway] } on-error={}
+}
+:put ("--> WAN interface detected: " . $wanIf . " (Gateway: " . $wanGw . ")")
+
+# --- 4. Check Required Image Archive on Storage ---
+:local imageFound [:len [/file/find where name=$imagePath]]
+:if ($imageFound = 0) do={
+    :put (" [FAIL] Required image archive '" . $imagePath . "' not found on storage drive.")
+    :put (" Upload the image first: scp dist/tayga-arm64.tar admin@<router-ip>:" . $imagePath)
+    :error "Aborted: missing container image archive"
+}
+
+# --- 3. Collision Check: Ensure Interface Names are not Claimed by Other Projects ---
+:local existingBridge [/interface/bridge/find where name="bridge-nat64"]
+:if ([:len $existingBridge] > 0) do={
+    :local bComm [/interface/bridge/get $existingBridge comment]
+    :if (!($bComm ~ "^\\[tayga-unified:nat64\\]")) do={
+        :put " [FAIL] Conflict: 'bridge-nat64' already exists and is NOT owned by this project. Aborting."
+        :error "Aborted: bridge-nat64 collision"
+    }
+}
+
+:local existingVeth [/interface/veth/find where name="veth-nat64"]
+:if ([:len $existingVeth] > 0) do={
+    :local vComm [/interface/veth/get $existingVeth comment]
+    :if (!($vComm ~ "^\\[tayga-unified:nat64\\]")) do={
+        :put " [FAIL] Conflict: 'veth-nat64' already exists and is NOT owned by this project. Aborting."
+        :error "Aborted: veth-nat64 collision"
+    }
+}
+
+# --- 4. Create Dedicated Bridge for Container Transport ---
+:if ([:len [/interface/bridge/find where name="bridge-nat64"]] = 0) do={
+    :put "--> Creating bridge-nat64..."
+    /interface/bridge/add name=bridge-nat64 comment="[tayga-unified:nat64] Transport Bridge"
+} else={
+    :put "--> bridge-nat64 already exists with project ownership (reusing)"
+}
+
+# --- 5. Configure RouterOS Gateway IP Addresses on Bridge ---
+:if ([:len [/ip/address/find where comment="[tayga-unified:nat64] RouterOS IPv4 gateway"]] = 0) do={
+    :put "--> Assigning IPv4 gateway 192.168.238.1/30 to bridge-nat64..."
+    /ip/address/add address=192.168.238.1/30 interface=bridge-nat64 comment="[tayga-unified:nat64] RouterOS IPv4 gateway"
+}
+
+:if ([:len [/ipv6/address/find where comment="[tayga-unified:nat64] RouterOS IPv6 gateway"]] = 0) do={
+    :put "--> Assigning IPv6 gateway fc68::1/126 to bridge-nat64..."
+    /ipv6/address/add address=fc68::1/126 interface=bridge-nat64 advertise=no comment="[tayga-unified:nat64] RouterOS IPv6 gateway"
+}
+
+# --- 6. Create VETH Interface for Container ---
+:if ([:len [/interface/veth/find where name="veth-nat64"]] = 0) do={
+    :put "--> Creating veth-nat64 interface..."
+    /interface/veth/add name=veth-nat64 \
+        address=192.168.238.2/30,fc68::2/126 \
+        gateway=192.168.238.1 \
+        gateway6=fc68::1 \
+        dhcp=no \
+        comment="[tayga-unified:nat64] Container VETH"
+}
+
+# --- 7. Attach VETH to Bridge ---
+:if ([:len [/interface/bridge/port/find where interface="veth-nat64"]] = 0) do={
+    :put "--> Attaching veth-nat64 to bridge-nat64..."
+    /interface/bridge/port/add bridge=bridge-nat64 interface=veth-nat64 comment="[tayga-unified:nat64] VETH bridge port"
+}
+
+# --- 8. Configure Container Environment Variables (key-by-key with list= / key= / value=) ---
+:put "--> Configuring container environment list tayga-nat64-envs..."
+:local envEntries {
+    {"MODE"; "nat64"};
+    {"TAYGA_PREF64"; "64:ff9b::/96"};
+    {"TAYGA_POOL4"; "192.168.240.0/20"};
+    {"TAYGA_ADDR4"; "192.168.240.1"};
+    {"TAYGA_ADDR6"; "fc68::2"};
+    {"TAYGA_WORKERS"; "3"};
+    {"TAYGA_OFFLOAD"; "off"};
+    {"DNS64_UPSTREAM"; "1.1.1.1,8.8.8.8"}
+}
+:foreach item in=$envEntries do={
+    :local k ($item->0)
+    :local v ($item->1)
+    :local envId [/container/envs/find where list="tayga-nat64-envs" and key=$k]
+    :if ([:len $envId] = 0) do={
+        /container/envs/add list=tayga-nat64-envs key=$k value=$v
+    }
+}
+
+# --- 9. Configure Routes for NAT64 Prefix and IPv4 Pool ---
+:if ([:len [/ipv6/route/find where comment="[tayga-unified:nat64] NAT64 prefix route"]] = 0) do={
+    :put "--> Routing 64:ff9b::/96 via container (fc68::2)..."
+    /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 comment="[tayga-unified:nat64] NAT64 prefix route"
+}
+
+:if ([:len [/ip/route/find where comment="[tayga-unified:nat64] NAT64 dynamic pool route"]] = 0) do={
+    :put "--> Routing dynamic pool 192.168.240.0/20 via container (192.168.238.2)..."
+    /ip/route/add dst-address=192.168.240.0/20 gateway=192.168.238.2 comment="[tayga-unified:nat64] NAT64 dynamic pool route"
+}
+
+# --- 10. Configure NAT44 Masquerade for Dynamic Pool and Container DNS64 Transport ---
+:if ([:len [/ip/firewall/nat/find where comment="[tayga-unified:nat64] NAT64 pool masquerade"]] = 0) do={
+    :put ("--> Adding NAT44 srcnat masquerade for 192.168.240.0/20 on WAN (" . $wanIf . ")...")
+    /ip/firewall/nat/add chain=srcnat src-address=192.168.240.0/20 out-interface=$wanIf action=masquerade comment="[tayga-unified:nat64] NAT64 pool masquerade"
+}
+
+:if ([:len [/ip/firewall/nat/find where comment="[tayga-unified:nat64] Container DNS64 WAN masquerade"]] = 0) do={
+    :put ("--> Adding NAT44 srcnat masquerade for container transport 192.168.238.0/30 on WAN (" . $wanIf . ")...")
+    /ip/firewall/nat/add chain=srcnat src-address=192.168.238.0/30 out-interface=$wanIf action=masquerade comment="[tayga-unified:nat64] Container DNS64 WAN masquerade"
+}
+
+# --- 10b. Policy Routing for NAT64 Pool (Prevents route collision when CLAT and NAT64 coexist) ---
+:if ([:len [/routing/table/find where name="wan-direct"]] = 0) do={
+    /routing/table/add name=wan-direct fib comment="[tayga-unified:nat64] Dedicated WAN routing table"
+}
+:if ([:len [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0"]] = 0) do={
+    /ip/route/add dst-address=0.0.0.0/0 gateway=$wanGw routing-table=wan-direct comment="[tayga-unified:nat64] Direct WAN default route"
+}
+:if ([:len [/routing/rule/find where src-address="192.168.240.0/20"]] = 0) do={
+    /routing/rule/add src-address=192.168.240.0/20 table=wan-direct action=lookup-only-in-table comment="[tayga-unified:nat64] NAT64 pool policy rule"
+}
+
+# --- 10c. IPv6 Forward Transit between CLAT and NAT64 Bridges (for local coexistence) ---
+:if ([:len [/interface/bridge/find where name="bridge-clat"]] > 0) do={
+    :if ([:len [/ipv6/firewall/filter/find where comment="[tayga-unified:nat64:fwd-clat] CLAT to NAT64 bridge transit"]] = 0) do={
+        /ipv6/firewall/filter/add chain=forward in-interface=bridge-clat out-interface=bridge-nat64 action=accept comment="[tayga-unified:nat64:fwd-clat] CLAT to NAT64 bridge transit"
+    }
+    :if ([:len [/ipv6/firewall/filter/find where comment="[tayga-unified:nat64:fwd-ret] NAT64 to CLAT bridge transit"]] = 0) do={
+        /ipv6/firewall/filter/add chain=forward in-interface=bridge-nat64 out-interface=bridge-clat action=accept comment="[tayga-unified:nat64:fwd-ret] NAT64 to CLAT bridge transit"
+    }
+}
+
+# --- 11. Create and Start Container ---
+:local existingNatCont [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
+:if ([:len $existingNatCont] = 0) do={
+    :put ("--> Creating container from " . $imagePath . "...")
+    /container/add file=$imagePath \
+        root-dir=$rootfsPath \
+        interface=veth-nat64 \
+        envlist=tayga-nat64-envs \
+        memory-high=128M \
+        memory-max=192M \
+        start-on-boot=yes \
+        restart-policy=on-failure \
+        restart-interval=10s \
+        logging=yes \
+        comment="[tayga-unified:nat64] TAYGA NAT64 Container"
+    :delay 3s
+}
+
+:local contId [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
+:if ([:len $contId] > 0) do={
+    :local isRun [/container/get $contId running]
+    :if ($isRun != true) do={
+        :put "--> Starting container..."
+        /container/start $contId
+    }
+}
+
+# Poll for running state (up to 30s)
+:put "--> Waiting for NAT64 + DNS64 initialization..."
+:local contRunning false
+:for i from=1 to=30 do={
+    :if ($contRunning = false) do={
+        :local r [/container/get $contId running]
+        :if ($r = true) do={
+            :set contRunning true
+        } else={
+            :delay 1s
+        }
+    }
+}
+
+:put "============================================================"
+:put " TAYGA NAT64 + DNS64 Installation Complete!"
+:put " DNS64 server available at fc68::2 / 192.168.238.2"
+:put "============================================================"

@@ -1,0 +1,16 @@
+.git
+.github
+*.tar
+*.gz
+*.o
+*.gcda
+*.gcno
+tayga
+taygabe
+pref64-discover
+unit_*
+tools/probe-tun-offload
+dist/
+release/
+perf-sessions/
+docs/
