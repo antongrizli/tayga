@@ -50,6 +50,8 @@ void usage(int code) {
 			"--pidfile FILE     : Write process ID of daemon to FILE\n"
 			"--mktun            : Create the persistent TUN interface\n"
 			"--rmtun            : Remove the persistent TUN interface\n"
+			"--tun-offload MODE : Offload mode: off, tcp, or auto (default: off)\n"
+			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
 	exit(code);
@@ -285,10 +287,6 @@ int main(int argc, char **argv)
 		{ "stdout", 0, 0, 0 },
 		{ "journal", 0, 0, 0 },
 		{ "help", 0, 0, 'h' },
-		{ "syslog", 0, 0, 0 },
-		{ "stdout", 0, 0, 0 },
-		{ "journal", 0, 0, 0 },
-		{ "help", 0, 0, 'h' },
 		{ "config", 1, 0, 'c' },
 		{ "nodetach", 0, 0, 'n' },
 		{ "user", 1, 0, 'u' },
@@ -297,6 +295,7 @@ int main(int argc, char **argv)
 		{ "pidfile", 1, 0, 'p' },
 		{ "debug", 0, 0, 'd' },
 		{ "tun-offload", 1, 0, 1001 },
+		{ "check-offload", 0, 0, 1002 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -307,6 +306,8 @@ int main(int argc, char **argv)
 		if (c == -1)
 			break;
 		switch (c) {
+		case 1002:
+			return tun_check_offload_support();
 		case 1001:
 			if (strcasecmp(optarg, "off") == 0) {
 				gcfg.tun_offload = TUN_OFFLOAD_OFF;

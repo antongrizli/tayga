@@ -269,7 +269,9 @@ run_iperf() {
   if test "$PERF_MODE" != none && command -v perf >/dev/null 2>&1; then
     perf --version > "$run_dir/perf-version.txt" 2>&1 || true
     if test "$PERF_MODE" = stat; then
-      perf stat -x ';' -o "$run_dir/perf-stat.csv" -e task-clock,context-switches,cpu-migrations,page-faults -p "$clat_pid" -- sleep "$DURATION" \
+      perf stat -x ';' -o "$run_dir/perf-stat.csv" \
+        -e task-clock,context-switches,cpu-migrations,page-faults,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev \
+        -p "$clat_pid" -- sleep "$DURATION" \
         >"$run_dir/perf-stat.stdout" 2>"$run_dir/perf-stat.stderr" &
     else
       perf record -o "$run_dir/perf.data" -e cpu-clock -F 99 --call-graph fp -p "$clat_pid" -- sleep "$DURATION" \
@@ -386,6 +388,21 @@ if os.path.exists(stat_before_path) and os.path.exists(stat_after_path):
             sys_softirq_cores = softirq_delta / clk_tck / elapsed
     except Exception:
         pass
+perf_stat_metrics = {}
+perf_csv_path = os.path.join(run_dir, "perf-stat.csv")
+if os.path.exists(perf_csv_path):
+    try:
+        for line in open(perf_csv_path):
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) >= 3 and parts[0] != "<not counted>":
+                try:
+                    val = float(parts[0].replace(",", ""))
+                    event = parts[2]
+                    perf_stat_metrics[event] = val
+                except ValueError:
+                    pass
+    except Exception:
+        pass
 result = dict(direction=direction, clients=len(reports), expected_clients=int(os.environ.get("CLIENTS", len(reports))),
               capture_valid=True, workload_valid=True, acceptance_pass=True, degraded_reasons=[],
               sent_mbps=sent, received_mbps=received,
@@ -393,6 +410,7 @@ result = dict(direction=direction, clients=len(reports), expected_clients=int(os
               tayga_core_per_gbps=cores / (received / 1000) if received else None,
               system_busy_cores=sys_busy_cores,
               system_softirq_cores=sys_softirq_cores,
+              perf_stat_metrics=perf_stat_metrics,
               received_application_MBps=received_bytes / elapsed / 1_000_000,
               router_rclat_packets_per_second=router_packets / elapsed,
               router_rclat_delta=router_delta, clat_tun_delta=clat_delta, tun_drops=tun_drops,

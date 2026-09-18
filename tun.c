@@ -281,6 +281,42 @@ int netlink_route_dev_modify(int ifidx,
 	return netlink_wait_for_ack(fd);
 }
 
+int tun_check_offload_support(void)
+{
+#ifdef __linux__
+	int fd = open("/dev/net/tun", O_RDWR);
+	if (fd < 0) {
+		printf("OFFLOAD_CHECK: FAIL (cannot open /dev/net/tun: %s)\n", strerror(errno));
+		return 1;
+	}
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
+	snprintf(ifr.ifr_name, IFNAMSIZ, "tun_chk_%d", (int)getpid());
+	if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+		printf("OFFLOAD_CHECK: FAIL (IFF_VNET_HDR ioctl failed: %s)\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	int sz = 0;
+	if (ioctl(fd, TUNGETVNETHDRSZ, &sz) < 0) {
+		sz = 10;
+	}
+	unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+	if (ioctl(fd, TUNSETOFFLOAD, offload_flags) < 0) {
+		printf("OFFLOAD_CHECK: FAIL (TUNSETOFFLOAD ioctl failed: %s)\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	printf("OFFLOAD_CHECK: OK (IFF_VNET_HDR supported, vnet_hdr_sz=%d, TSO4|TSO6|CSUM available)\n", sz);
+	return 0;
+#else
+	printf("OFFLOAD_CHECK: NOT_SUPPORTED (Linux TUN only)\n");
+	return 1;
+#endif
+}
+
 int tun_setup(int do_mktun, int do_rmtun)
 {
 	struct ifreq ifr;
@@ -304,6 +340,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			slog(LOG_WARNING, "Unable to attach tun with IFF_VNET_HDR (%s), falling back to offload=off\n",
 				strerror(errno));
 			gcfg.tun_offload = TUN_OFFLOAD_OFF;
+			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
@@ -328,7 +365,20 @@ int tun_setup(int do_mktun, int do_rmtun)
 		unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
 		if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, offload_flags) < 0) {
 			if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
-				slog(LOG_WARNING, "TUNSETOFFLOAD failed (%s), disabling offload\n", strerror(errno));
+				slog(LOG_WARNING, "TUNSETOFFLOAD failed (%s), re-opening clean tun without offload\n", strerror(errno));
+				close(gcfg.tun_fd);
+				gcfg.tun_fd = open("/dev/net/tun", O_RDWR);
+				if (gcfg.tun_fd < 0) {
+					slog(LOG_CRIT, "Unable to re-open /dev/net/tun: %s\n", strerror(errno));
+					return ERROR_REJECT;
+				}
+				memset(&ifr, 0, sizeof(ifr));
+				ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+				strcpy(ifr.ifr_name, gcfg.tundev);
+				if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
+					slog(LOG_CRIT, "Unable to re-attach tun without offload: %s\n", strerror(errno));
+					return ERROR_REJECT;
+				}
 				gcfg.tun_offload = TUN_OFFLOAD_OFF;
 				gcfg.vnet_hdr_sz = 0;
 			} else {

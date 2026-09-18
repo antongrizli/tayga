@@ -526,6 +526,7 @@ int journal_printv_with_location(
 
 /* tun.c */
 int tun_setup(int do_mktun, int do_rmtun);
+int tun_check_offload_support(void);
 int set_nonblock(int fd);
 void tun_read(uint8_t * recv_buf,int tun_fd);
 ssize_t tun_write(int tun_fd, const void *buf, size_t len);

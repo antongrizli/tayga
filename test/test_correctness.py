@@ -78,6 +78,13 @@ def main():
     sh("ip netns exec clatns sysctl -w net.ipv4.ip_forward=1 >/dev/null")
     sh("ip netns exec clatns sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null")
 
+    # Setup server interface and routing
+    sh("ip -n server link set lo up")
+    sh("ip -n server link set server0 up")
+    sh("ip -n server -6 addr add 2600:464::2/64 dev server0")
+    sh("ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo")
+    sh("ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0")
+
     # Start TAYGA with CLAT_OFFLOAD=tcp
     tayga = subprocess.Popen(["ip", "netns", "exec", "clatns", "env",
                              "PREF64=64:ff9b::/96", "ROUTER4=172.31.64.1",
@@ -86,17 +93,16 @@ def main():
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     srv_nc = srv_nc_dl = None
     try:
-        time.sleep(1)
-
-        sh("ip -n server link set lo up")
-        sh("ip -n server link set server0 up")
-        sh("ip -n server -6 addr add 2600:464::2/64 dev server0")
-        sh("ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo")
-        sh("ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0")
-
-        # 3. Test ICMP Ping
-        ping_out, _, ping_rc = sh("ip netns exec client ping -c 3 -W 1 11.0.0.2")
-        assert ping_rc == 0, f"Ping failed: {ping_out}"
+        # Wait for CLAT readiness
+        ready = False
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 6:
+            _, _, rc = sh("ip netns exec client ping -c 1 -W 1 11.0.0.2")
+            if rc == 0:
+                ready = True
+                break
+            time.sleep(0.3)
+        assert ready, "CLAT ping failed to become ready"
         print("[PASS] ICMP Echo Request / Reply verified")
 
         # 4. Test TCP Upload (20 MB)

@@ -54,12 +54,37 @@ tayga
 Check your system log (`/var/log/syslog` or `/var/log/messages`) for status
 information.
 
-If you are having difficulty configuring `tayga`, use the `-d` option to run the
-`tayga` process in the foreground and send all log messages to stdout:
-
 ```sh
 tayga -d
 ```
+
+## Hardware Offload & Performance (GSO / GRO)
+
+TAYGA supports high-performance kernel offloads (**GSO**, **GRO**, and **Checksum Offload**) via VirtIO network headers (`IFF_VNET_HDR`), achieving a **95.5% reduction in system calls** (from 62k to 2.8k/sec) and up to **4× lower CPU usage** at 300 Mbps:
+
+```conf
+# In tayga.conf:
+# off  - Standard packet-by-packet operation (safe default)
+# tcp  - Enable TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
+# auto - Probe kernel at startup; enable if supported, fallback to off
+tun-offload auto
+```
+
+Or via command-line flags:
+```sh
+# Start with auto-detected offloads
+tayga --tun-offload auto
+
+# Test host kernel & TUN offload capabilities before launch
+tayga --check-offload
+```
+
+For container and script deployments:
+```sh
+export CLAT_OFFLOAD=auto
+```
+
+See [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) and [**Verification Report**](perf-sessions/GSO-FINAL-REPORT.md) for architecture, benchmarks, and MikroTik RouterOS deployment details.
 
 ## CLAT performance harness
 
