@@ -46,7 +46,7 @@ jobs:
       - name: Test MODE=diagnose in container
         run: docker run --rm -e MODE=diagnose tayga-smoke:test
 
-      - name: Functional Test: CLAT Mode Launch & TUN Creation
+      - name: "Functional Test: CLAT Mode Launch & TUN Creation"
         run: |
           docker run -d --name test-clat --cap-add=NET_ADMIN --device /dev/net/tun -e PREF64=64:ff9b::/96 -e ROUTER4=172.17.0.1 tayga-smoke:test
           sleep 3
@@ -55,7 +55,7 @@ jobs:
           docker stop test-clat
           docker rm test-clat
 
-      - name: Functional Test: NAT64 Mode Launch (TAYGA + Unbound DNS64 Supervisor)
+      - name: "Functional Test: NAT64 Mode Launch (TAYGA + Unbound DNS64 Supervisor)"
         run: |
           docker run -d --name test-nat64 --cap-add=NET_ADMIN --device /dev/net/tun -e MODE=nat64 tayga-smoke:test
           sleep 3
