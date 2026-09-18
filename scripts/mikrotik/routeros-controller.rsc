@@ -47,7 +47,19 @@
         :set ageValid true
     } on-error={ :set ageValid false }
     :if ($ageValid = true and $lockAge >= 300s) do={
-        :log warn ("[tayga-controller] Stale lock detected (owner=" . $TAYGA_LOCK_OWNER . ", age=" . [:tostr $lockAge] . "). Overriding lock.")
+        :local jobRunning false
+        :do {
+            :if ($TAYGA_LOCK_OWNER = "controller") do={
+                :if ([:len [/system/script/job find where script="tayga-controller"]] > 1) do={
+                    :set jobRunning true
+                }
+            }
+        } on-error={}
+        :if ($jobRunning = false) do={
+            :log warn ("[tayga-controller] Stale lock detected (owner=" . $TAYGA_LOCK_OWNER . ", age=" . [:tostr $lockAge] . "). Overriding lock.")
+        } else={
+            :set isLocked true
+        }
     } else={
         :set isLocked true
     }
@@ -162,6 +174,21 @@
         }
     }
 
+    :local nat64Table [/routing/table/find where name="tayga-probe-nat64"]
+    :if ([:len $nat64Table] = 0) do={
+        /routing/table/add name=tayga-probe-nat64 fib comment="[tayga-unified:nat64] Isolated NAT64 Probe Table"
+    } else={
+        :local nComm [/routing/table/get ($nat64Table->0) comment]
+        :if (!($nComm ~ "^\\[tayga-unified:nat64\\]")) do={
+            :log error "[tayga-controller] ABORT: Table 'tayga-probe-nat64' exists and is NOT owned by tayga-unified project. Refusing to modify."
+            :if ($TAYGA_LOCK_TOKEN = $myToken) do={
+                :set TAYGA_LOCK_OWNER "none"
+                :set TAYGA_LOCK_TOKEN ""
+            }
+            :return nil
+        }
+    }
+
     # Strictly detect direct WAN gateway belonging specifically to $wanIf
     :local directWanGw ""
     :local wanRoutes [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active and !comment~"^\\[tayga-unified"]
@@ -206,6 +233,12 @@
     :local clatProbeRoute [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified:clat"]
     :if ([:len $clatProbeRoute] = 0) do={
         /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
+    }
+
+    # Ensure isolated NAT64 probe route exists in 'tayga-probe-nat64'
+    :local nat64ProbeRoute [/ipv6/route/find where routing-table="tayga-probe-nat64" and dst-address="64:ff9b::/96" and comment~"^\\[tayga-unified:nat64"]
+    :if ([:len $nat64ProbeRoute] = 0) do={
+        /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 routing-table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Route"
     }
 
     # --- Zero-Leak Probing Phase ---
@@ -304,52 +337,84 @@
             }
 
             # 2. Controlled Priority Switch & Verification:
-            # Deprioritize CLAT default route (distance=210) so direct WAN (distance 1 or 2) can take over
             :local directSwitchOk false
+            :local origClatDisabled true
+            :local origClatDistance 1
+            :local clatRouteExists false
+
             :if ([:len $clatDefaultRoute] > 0) do={
-                :if ([/ip/route/get ($clatDefaultRoute->0) disabled] = false) do={
-                    /ip/route/set ($clatDefaultRoute->0) distance=210
-                }
+                :set clatRouteExists true
+                :set origClatDisabled [/ip/route/get ($clatDefaultRoute->0) disabled]
+                :set origClatDistance [/ip/route/get ($clatDefaultRoute->0) distance]
             }
 
-            # Verify that the direct WAN route actually wins and becomes active in main
-            :local activeDefRoutes [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes]
-            :local myWanWon false
-            :local conflictPresent false
+            :do {
+                :if ($clatRouteExists = true and $origClatDisabled = false) do={
+                    # Find maximum distance among active or target WAN routes to ensure CLAT deprioritization wins
+                    :local maxWanDist 1
+                    :foreach wr in=$wanRoutes do={
+                        :do {
+                            :local wd [/ip/route/get $wr distance]
+                            :if ($wd > $maxWanDist) do={ :set maxWanDist $wd }
+                        } on-error={}
+                    }
+                    :local testDist ($maxWanDist + 10)
+                    :if ($testDist > 254) do={ :set testDist 254 }
+                    /ip/route/set ($clatDefaultRoute->0) distance=$testDist
+                }
 
-            :foreach ad in=$activeDefRoutes do={
-                :local gw [/ip/route/get $ad gateway]
-                :local immGw ""
-                :do { :set immGw [/ip/route/get $ad immediate-gw] } on-error={}
-                :if ($gw = $wanIf or $gw = $directWanGw or $immGw ~ $wanIf) do={
-                    :set myWanWon true
+                # Bounded wait with polling for route table convergence (up to 2 seconds, 500ms steps)
+                :local convergeWait 0
+                :local myWanWon false
+                :local conflictPresent false
+
+                :while (($convergeWait < 4) and ($myWanWon = false) and ($conflictPresent = false)) do={
+                    :delay 500ms
+                    :set convergeWait ($convergeWait + 1)
+                    :local activeDefRoutes [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes]
+                    :set myWanWon false
+                    :set conflictPresent false
+
+                    :foreach ad in=$activeDefRoutes do={
+                        :local gw [/ip/route/get $ad gateway]
+                        :local immGw ""
+                        :do { :set immGw [/ip/route/get $ad immediate-gw] } on-error={}
+                        :if ($gw = $wanIf or $gw = $directWanGw or $immGw ~ $wanIf) do={
+                            :set myWanWon true
+                        } else={
+                            :if ($gw = "172.31.64.2") do={
+                                # CLAT route still active (hasn't ceded priority yet)
+                            } else={
+                                :set conflictPresent true
+                                :log warn ("[tayga-controller] Foreign active default route detected with gateway=" . $gw)
+                            }
+                        }
+                    }
+                }
+
+                :if ($myWanWon = true and $conflictPresent = false) do={
+                    :set directSwitchOk true
+                    # Direct WAN route is confirmed active and winning! Safely disable CLAT default route and standby container
+                    :if ($clatRouteExists = true) do={
+                        /ip/route/set ($clatDefaultRoute->0) disabled=yes distance=1
+                    }
+                    :if ([:len $clatConts] > 0) do={
+                        :local cId ($clatConts->0)
+                        :if ([/container/get $cId running] = true) do={
+                            :log info "[tayga-controller] Placing CLAT container into standby..."
+                            /container/stop $cId
+                        }
+                    }
                 } else={
-                    :if ($gw = "172.31.64.2") do={
-                        # CLAT route still active
-                    } else={
-                        :set conflictPresent true
-                        :log warn ("[tayga-controller] Foreign active default route detected with gateway=" . $gw)
+                    :log error "[tayga-controller] Direct WAN route did not win path selection in main! Restoring original CLAT route state."
+                    :if ($clatRouteExists = true) do={
+                        /ip/route/set ($clatDefaultRoute->0) disabled=$origClatDisabled distance=$origClatDistance
                     }
                 }
-            }
-
-            :if ($myWanWon = true and $conflictPresent = false) do={
-                :set directSwitchOk true
-                # Direct WAN route is confirmed active and winning! Safely disable CLAT default route and standby container
-                :if ([:len $clatDefaultRoute] > 0) do={
-                    /ip/route/set ($clatDefaultRoute->0) disabled=yes distance=1
-                }
-                :if ([:len $clatConts] > 0) do={
-                    :local cId ($clatConts->0)
-                    :if ([/container/get $cId running] = true) do={
-                        :log info "[tayga-controller] Placing CLAT container into standby..."
-                        /container/stop $cId
-                    }
-                }
-            } else={
-                :log error "[tayga-controller] Direct WAN route did not win path selection in main! Rolling back CLAT route priority."
-                :if ([:len $clatDefaultRoute] > 0) do={
-                    /ip/route/set ($clatDefaultRoute->0) disabled=no distance=1
+            } on-error={
+                :log error "[tayga-controller] Exception during priority switch test! Restoring original CLAT route state."
+                :if ($clatRouteExists = true) do={
+                    /ip/route/set ($clatDefaultRoute->0) disabled=$origClatDisabled distance=$origClatDistance
                 }
             }
 
@@ -377,7 +442,7 @@
                                 :log warn "[tayga-controller] DNS64 resolution probe to fc68::2 failed."
                             }
 
-                            :local pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 count=2]
+                            :local pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 routing-table=tayga-probe-nat64 count=2]
                             :if ($pCount > 0) do={
                                 :set nat64PingOk true
                             } else={
@@ -429,8 +494,28 @@
                     }
                 }
             } else={
-                # Direct switch failed: retain CLAT_ACTIVE
-                :set nextState "CLAT_ACTIVE"
+                # Direct switch failed: verify if CLAT was already active and running before retaining CLAT_ACTIVE
+                :if ($TAYGA_STATE = "CLAT_ACTIVE") do={
+                    :local clatRunning false
+                    :if ([:len $clatConts] > 0) do={
+                        :if ([/container/get ($clatConts->0) running] = true) do={ :set clatRunning true }
+                    }
+                    :local clatOk false
+                    :if ($clatRunning = true) do={
+                        :local cPing [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=2]
+                        :if ($cPing > 0) do={ :set clatOk true }
+                    }
+                    :if ($clatOk = true) do={
+                        :set nextState "CLAT_ACTIVE"
+                    } else={
+                        :log error "[tayga-controller] Direct switch failed and CLAT probe failed! Transitioning to DEGRADED."
+                        :set nextState "DEGRADED"
+                    }
+                } else={
+                    # CLAT was not previously active (was in DIRECT, DISCOVERING, or NAT64_ACTIVE)
+                    :log warn ("[tayga-controller] Direct WAN route inactive or conflict present in main while in state " . $TAYGA_STATE . ". Transitioning to DEGRADED.")
+                    :set nextState "DEGRADED"
+                }
             }
         } else={
             :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TAYGA_DIRECT_PASS_COUNT . "/" . $recoveryThreshold . "), awaiting recovery threshold.")
@@ -472,8 +557,15 @@
                     :set clatProbeOk true
                 }
 
-                :if ($clatProbeOk = true) do={
+                    :if ($clatProbeOk = true) do={
                     :set TAYGA_CLAT_FAIL_COUNT 0
+
+                    # Verify lock token and update heartbeat before making routing changes
+                    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "controller") do={
+                        :log error "[tayga-controller] Lock ownership lost! Aborting route modifications."
+                        :error "Aborted: lock lost"
+                    }
+                    :set TAYGA_LOCK_TIME [/system/resource/get uptime]
 
                     # Transactional Route Switching: strictly matching managed $wanIf
                     :local switchSuccess true

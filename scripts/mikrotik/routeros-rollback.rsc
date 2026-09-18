@@ -27,11 +27,27 @@
     :local busy false
     :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
         :local age 0s
-        :do { :set age ($curUp - $TAYGA_LOCK_TIME) } on-error={ :set age 999s }
-        :if ($age < 120s) do={
-            :set busy true
+        :local ageValid false
+        :do {
+            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set ageValid true
+        } on-error={ :set ageValid false }
+        :if ($ageValid = true and $age >= 300s) do={
+            :local jobRunning false
+            :do {
+                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                    :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
+                        :set jobRunning true
+                    }
+                }
+            } on-error={}
+            :if ($jobRunning = false) do={
+                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+            } else={
+                :set busy true
+            }
         } else={
-            :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . "...")
+            :set busy true
         }
     }
     :if ($busy = false) do={
@@ -177,6 +193,7 @@
         :local isRunning false
         :for i from=1 to=30 do={
             :if ($isRunning = false) do={
+                :set TAYGA_LOCK_TIME [/system/resource/get uptime]
                 :local r [/container/get $cid running]
                 :if ($r = true) do={
                     :set isRunning true
@@ -201,6 +218,11 @@
 
     # --- 8. Re-enable Default Route ONLY if Probe Succeeded ---
     :if ($probeOk = true) do={
+        :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "rollback") do={
+            :put " [FAIL] Lock was lost before default route could be restored."
+            :error "Aborted: lock lost"
+        }
+        :set TAYGA_LOCK_TIME [/system/resource/get uptime]
         :local envAct [/container/envs/find where list="tayga-clat-envs" and key="ACTIVE_SLOT"]
         :if ([:len $envAct] > 0) do={ /container/envs/set ($envAct->0) value=$restoreSlot }
 

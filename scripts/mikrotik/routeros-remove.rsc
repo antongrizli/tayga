@@ -28,11 +28,27 @@
     :local busy false
     :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
         :local age 0s
-        :do { :set age ($curUp - $TAYGA_LOCK_TIME) } on-error={ :set age 999s }
-        :if ($age < 120s) do={
-            :set busy true
+        :local ageValid false
+        :do {
+            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set ageValid true
+        } on-error={ :set ageValid false }
+        :if ($ageValid = true and $age >= 300s) do={
+            :local jobRunning false
+            :do {
+                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                    :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
+                        :set jobRunning true
+                    }
+                }
+            } on-error={}
+            :if ($jobRunning = false) do={
+                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+            } else={
+                :set busy true
+            }
         } else={
-            :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . "...")
+            :set busy true
         }
     }
     :if ($busy = false) do={
@@ -53,6 +69,11 @@
 }
 
 :do {
+    # Verify lock ownership was maintained before making network state changes
+    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "remove") do={
+        :put " [FAIL] Lock was lost before remove operations could start."
+        :error "Aborted: lock lost"
+    }
     # 1. Restore specifically parked direct WAN default routes if any
     :put "--> Restoring parked direct WAN routes..."
     :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
@@ -109,6 +130,18 @@
             /routing/table/remove ($clatTable->0)
         } else={
             :put "--> Table 'tayga-probe-clat' contains foreign routes or was not created by this project (retaining table)."
+        }
+    }
+
+    :local nat64Table [/routing/table/find where name="tayga-probe-nat64"]
+    :if ([:len $nat64Table] > 0) do={
+        :local nComm [/routing/table/get ($nat64Table->0) comment]
+        /ipv6/route/remove [find where routing-table="tayga-probe-nat64" and comment~"^\\[tayga-unified"]
+        :local remainingNat64Routes [/ipv6/route/find where routing-table="tayga-probe-nat64"]
+        :if ([:len $remainingNat64Routes] = 0 and ($nComm ~ "^\\[tayga-unified")) do={
+            /routing/table/remove ($nat64Table->0)
+        } else={
+            :put "--> Table 'tayga-probe-nat64' contains foreign routes or was not created by this project (retaining table)."
         }
     }
 

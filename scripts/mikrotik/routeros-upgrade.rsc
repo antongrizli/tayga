@@ -32,11 +32,27 @@
     :local busy false
     :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
         :local age 0s
-        :do { :set age ($curUp - $TAYGA_LOCK_TIME) } on-error={ :set age 999s }
-        :if ($age < 120s) do={
-            :set busy true
+        :local ageValid false
+        :do {
+            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set ageValid true
+        } on-error={ :set ageValid false }
+        :if ($ageValid = true and $age >= 300s) do={
+            :local jobRunning false
+            :do {
+                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                    :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
+                        :set jobRunning true
+                    }
+                }
+            } on-error={}
+            :if ($jobRunning = false) do={
+                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+            } else={
+                :set busy true
+            }
         } else={
-            :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . "...")
+            :set busy true
         }
     }
     :if ($busy = false) do={
@@ -277,7 +293,7 @@
 
     # --- 8. Promote Candidate OR Execute INSTANT ZERO-EXTRACTION ROLLBACK ---
     # Verify lock ownership was maintained before making network state changes
-    :if ($TAYGA_LOCK_TOKEN != $myToken) do={
+    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "upgrade") do={
         :put " [FAIL] Lock was hijacked by another process. Halting upgrade."
         :error "Aborted: lock lost"
     }
@@ -317,6 +333,7 @@
                 /container/stop $fc
                 :local w 0
                 :while (([/container/get $fc stopped] != true) && ($w < 15)) do={
+                    :set TAYGA_LOCK_TIME [/system/resource/get uptime]
                     :delay 1s
                     :set w ($w + 1)
                 }
@@ -325,11 +342,17 @@
         }
 
         # 2. INSTANTLY Restart preserved old container (< 1s, zero file extraction)
+        :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "upgrade") do={
+            :put " [FAIL] Lock was lost before rollback could complete."
+            :error "Aborted: lock lost"
+        }
+        :set TAYGA_LOCK_TIME [/system/resource/get uptime]
         :put ("--> Instantly restarting preserved working container from slot " . $prevSlot . "...")
         /container/start $oldCont
         :local restoredRunning false
         :for i from=1 to=15 do={
             :if ($restoredRunning = false) do={
+                :set TAYGA_LOCK_TIME [/system/resource/get uptime]
                 :local r [/container/get $oldCont running]
                 :if ($r = true) do={ :set restoredRunning true } else={ :delay 1s }
             }

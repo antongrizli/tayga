@@ -231,6 +231,23 @@
     /ip/route/add dst-address=192.168.240.0/20 gateway=192.168.238.2 comment="[tayga-unified:nat64] NAT64 dynamic pool route"
 }
 
+# --- 9b. Isolated Probe Routing Table and Route for NAT64 Health Probing ---
+:local nat64Table [/routing/table/find where name="tayga-probe-nat64"]
+:if ([:len $nat64Table] = 0) do={
+    :put "--> Creating isolated routing table tayga-probe-nat64..."
+    /routing/table/add name=tayga-probe-nat64 fib comment="[tayga-unified:nat64] Isolated NAT64 Probe Table"
+} else={
+    :local nComm [/routing/table/get ($nat64Table->0) comment]
+    :if (!($nComm ~ "^\\[tayga-unified")) do={
+        :put " [FAIL] Routing table 'tayga-probe-nat64' already exists and is not owned by this project."
+        :error "Aborted: routing table tayga-probe-nat64 already exists and is unowned"
+    }
+}
+:if ([:len [/ipv6/route/find where routing-table="tayga-probe-nat64" and dst-address="64:ff9b::/96" and comment~"^\\[tayga-unified"]] = 0) do={
+    :put "--> Adding isolated NAT64 probe route in table tayga-probe-nat64..."
+    /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 routing-table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Route"
+}
+
 # --- 10. Configure NAT44 Masquerade for Dynamic Pool and Container DNS64 Transport ---
 :if ([:len [/ip/firewall/nat/find where comment="[tayga-unified:nat64] NAT64 pool masquerade"]] = 0) do={
     :put ("--> Adding NAT44 srcnat masquerade for 192.168.240.0/20 on WAN (" . $wanIf . ")...")
