@@ -217,14 +217,29 @@
 }
 
 # --- 15. Create Isolated Routing Tables for Zero-Leak Probing ---
-:if ([:len [/routing/table/find where name="wan-direct"]] = 0) do={
+# Migration cleanup: Remove any legacy /32 probe route from main table
+:do { /ip/route/remove [find where dst-address="1.1.1.1/32" and comment~"^\\[tayga-unified"] } on-error={}
+
+:local wanTable [/routing/table/find where name="wan-direct"]
+:if ([:len $wanTable] = 0) do={
     :put "--> Creating isolated routing table wan-direct..."
     /routing/table/add name=wan-direct fib comment="[tayga-unified:direct] Isolated Direct WAN Routing Table"
+} else={
+    :local tComm [/routing/table/get ($wanTable->0) comment]
+    :if (!($tComm ~ "^\\[tayga-unified")) do={
+        :put "--> [WARN] Existing table 'wan-direct' is not owned by this project."
+    }
 }
 
-:if ([:len [/routing/table/find where name="tayga-probe-clat"]] = 0) do={
+:local clatTable [/routing/table/find where name="tayga-probe-clat"]
+:if ([:len $clatTable] = 0) do={
     :put "--> Creating isolated routing table tayga-probe-clat..."
     /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
+} else={
+    :local cComm [/routing/table/get ($clatTable->0) comment]
+    :if (!($cComm ~ "^\\[tayga-unified")) do={
+        :put "--> [WARN] Existing table 'tayga-probe-clat' is not owned by this project."
+    }
 }
 
 # --- 16. Create Container (Decoupled: Standby Mode start-on-boot=no) ---

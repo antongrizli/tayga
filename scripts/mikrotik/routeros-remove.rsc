@@ -12,8 +12,20 @@
 :put " Removing TAYGA Unified Installation..."
 :put "============================================================"
 
-# 1. Restore parked direct WAN default routes if any
+# 1. Restore specifically parked direct WAN default routes if any
 :put "--> Restoring parked direct WAN routes..."
+:global TAYGA_PARKED_ROUTE_IDS
+:if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
+    :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+        :do {
+            :put ("--> Re-enabling route: " . $pid)
+            /ip/route/enable $pid
+        } on-error={}
+    }
+    :set TAYGA_PARKED_ROUTE_IDS [:toarray ""]
+}
+
+# Also restore any legacy tagged orig-wan-default routes
 :local origRoutes [/ip/route/find where comment~"^\\[tayga-unified:orig-wan-default\\]"]
 :foreach r in=$origRoutes do={
     /ip/route/set $r disabled=no comment="[orig-wan-default]"
@@ -25,15 +37,38 @@
     /system/scheduler/remove [find where name="tayga-controller"]
     /system/scheduler/remove [find where comment~"^\\[tayga-unified"]
 } on-error={}
+
+# Remove project routes in main table (including legacy /32 probe route)
 /ip/route/remove [find where comment~"^\\[tayga-unified"]
 /ipv6/route/remove [find where comment~"^\\[tayga-unified"]
 :do {
     /routing/rule/remove [find where comment~"^\\[tayga-unified"]
-    /ip/route/remove [find where routing-table="wan-direct"]
-    /ip/route/remove [find where routing-table="tayga-probe-clat"]
-    /routing/table/remove [find where name="wan-direct"]
-    /routing/table/remove [find where name="tayga-probe-clat"]
 } on-error={}
+
+# Remove routes in project tables and safe table removal
+:local wanTable [/routing/table/find where name="wan-direct"]
+:if ([:len $wanTable] > 0) do={
+    :local tComm [/routing/table/get ($wanTable->0) comment]
+    /ip/route/remove [find where routing-table="wan-direct" and comment~"^\\[tayga-unified"]
+    :local remainingRoutes [/ip/route/find where routing-table="wan-direct"]
+    :if ([:len $remainingRoutes] = 0 and ($tComm ~ "^\\[tayga-unified")) do={
+        /routing/table/remove ($wanTable->0)
+    } else={
+        :put "--> Table 'wan-direct' contains foreign routes or was not created by this project (retaining table)."
+    }
+}
+
+:local clatTable [/routing/table/find where name="tayga-probe-clat"]
+:if ([:len $clatTable] > 0) do={
+    :local cComm [/routing/table/get ($clatTable->0) comment]
+    /ip/route/remove [find where routing-table="tayga-probe-clat" and comment~"^\\[tayga-unified"]
+    :local remainingClatRoutes [/ip/route/find where routing-table="tayga-probe-clat"]
+    :if ([:len $remainingClatRoutes] = 0 and ($cComm ~ "^\\[tayga-unified")) do={
+        /routing/table/remove ($clatTable->0)
+    } else={
+        :put "--> Table 'tayga-probe-clat' contains foreign routes or was not created by this project (retaining table)."
+    }
+}
 
 # 2. Remove Firewall NAT & Filter Rules owned by this project
 :put "--> Removing TAYGA firewall rules..."

@@ -18,22 +18,29 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-upgrade.rsc
 # ==============================================================================
 
-# --- 0. Wait for Active Controller Cycle to Complete ---
+# --- 0. Acquire Maintenance Lock & Wait for Controller ---
+:global TAYGA_MAINTENANCE_LOCK true
 :global TAYGA_CONTROLLER_BUSY
-:global TAYGA_MAINTENANCE_LOCK
 
 :local waitCtrl 0
-:while ($TAYGA_CONTROLLER_BUSY = true and $waitCtrl < 15) do={
+:while ($TAYGA_CONTROLLER_BUSY = true and $waitCtrl < 20) do={
     :put "--> Waiting for background controller run to finish before upgrade..."
     :delay 1s
     :set waitCtrl ($waitCtrl + 1)
 }
-:set TAYGA_MAINTENANCE_LOCK true
+:if ($TAYGA_CONTROLLER_BUSY = true) do={
+    :put " [FAIL] Active controller run did not finish within 20s timeout. Aborting upgrade."
+    :set TAYGA_MAINTENANCE_LOCK false
+    :error "Aborted: controller busy timeout"
+}
 
 :do {
     :put "============================================================"
     :put " Starting State-Driven Dual-Slot (A/B) TAYGA Upgrade..."
     :put "============================================================"
+
+    # Migration cleanup: Remove any legacy /32 probe route from main table
+    :do { /ip/route/remove [find where dst-address="1.1.1.1/32" and comment~"^\\[tayga-unified"] } on-error={}
 
     # --- 1. Detect Storage Slot & Image Paths ---
     :local extSlot "usb1"
