@@ -4,10 +4,14 @@ set -eu
 # Helper to enable kernel forwarding safely
 enable_forwarding() {
   key=$1
-  if sysctl -w "$key=1" >/dev/null 2>&1 || [ "$(sysctl -n "$key" 2>/dev/null)" = "1" ]; then
+  if sysctl -w "$key=1" >/dev/null 2>&1; then
     return 0
   fi
-  echo "WARNING: Cannot set $key=1 and current value is not 1; forwarding should be enabled on the host" >&2
+  if [ "$(sysctl -n "$key" 2>/dev/null)" = "1" ]; then
+    return 0
+  fi
+  echo "ERROR: Kernel forwarding for $key is disabled ($key=0) and cannot be enabled in this container namespace. Enable forwarding on the host or launch container with --sysctl $key=1." >&2
+  exit 1
 }
 
 # Validate unsigned integer helper

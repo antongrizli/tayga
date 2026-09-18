@@ -28,6 +28,7 @@
 :global TAYGA_DIRECT_FAIL_COUNT
 :global TAYGA_DIRECT_PASS_COUNT
 :global TAYGA_CLAT_FAIL_COUNT
+:global TAYGA_NAT64_FAIL_COUNT
 
 # 1. Check Disabled State
 :if ($TAYGA_STATE = "DISABLED") do={
@@ -40,13 +41,15 @@
 :local isLocked false
 :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
     :local lockAge 0s
+    :local ageValid false
     :do {
         :set lockAge ($curUptime - $TAYGA_LOCK_TIME)
-    } on-error={ :set lockAge 999s }
-    :if ($lockAge < 120s) do={
-        :set isLocked true
-    } else={
+        :set ageValid true
+    } on-error={ :set ageValid false }
+    :if ($ageValid = true and $lockAge >= 300s) do={
         :log warn ("[tayga-controller] Stale lock detected (owner=" . $TAYGA_LOCK_OWNER . ", age=" . [:tostr $lockAge] . "). Overriding lock.")
+    } else={
+        :set isLocked true
     }
 }
 
@@ -67,6 +70,7 @@
     :if ([:len $TAYGA_DIRECT_FAIL_COUNT] = 0) do={ :set TAYGA_DIRECT_FAIL_COUNT 0 }
     :if ([:len $TAYGA_DIRECT_PASS_COUNT] = 0) do={ :set TAYGA_DIRECT_PASS_COUNT 0 }
     :if ([:len $TAYGA_CLAT_FAIL_COUNT] = 0) do={ :set TAYGA_CLAT_FAIL_COUNT 0 }
+    :if ([:len $TAYGA_NAT64_FAIL_COUNT] = 0) do={ :set TAYGA_NAT64_FAIL_COUNT 0 }
     :if ([:len $TAYGA_PARKED_ROUTE_IDS] = 0) do={ :set TAYGA_PARKED_ROUTE_IDS [:toarray ""] }
 
     # Policy Defaults
@@ -261,7 +265,8 @@
                 }
                 :if ($allExist = true) do={ :set nat64ConfigValid true }
             } else={
-                :set nat64ConfigValid true
+                :log error "[tayga-controller] ALLOW_LOCAL_NAT64=yes requires at least one interface in IPV6_ONLY_LAN_INTERFACES."
+                :set nat64ConfigValid false
             }
         } else={
             :log warn "[tayga-controller] ALLOW_LOCAL_NAT64=yes requested, but NAT64 container or prefix route is missing."
@@ -298,12 +303,41 @@
                 :set TAYGA_PARKED_ROUTE_IDS $remainingParked
             }
 
-            # 2. Safety Gate: Verify at least one direct WAN default route is active in main BEFORE withdrawing CLAT!
-            :local activeWanDef [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes and !comment~"^\\[tayga-unified"]
-            :if ([:len $activeWanDef] > 0) do={
-                # Direct WAN default route is active; safe to disable CLAT default route and put container in standby
+            # 2. Controlled Priority Switch & Verification:
+            # Deprioritize CLAT default route (distance=210) so direct WAN (distance 1 or 2) can take over
+            :local directSwitchOk false
+            :if ([:len $clatDefaultRoute] > 0) do={
+                :if ([/ip/route/get ($clatDefaultRoute->0) disabled] = false) do={
+                    /ip/route/set ($clatDefaultRoute->0) distance=210
+                }
+            }
+
+            # Verify that the direct WAN route actually wins and becomes active in main
+            :local activeDefRoutes [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes]
+            :local myWanWon false
+            :local conflictPresent false
+
+            :foreach ad in=$activeDefRoutes do={
+                :local gw [/ip/route/get $ad gateway]
+                :local immGw ""
+                :do { :set immGw [/ip/route/get $ad immediate-gw] } on-error={}
+                :if ($gw = $wanIf or $gw = $directWanGw or $immGw ~ $wanIf) do={
+                    :set myWanWon true
+                } else={
+                    :if ($gw = "172.31.64.2") do={
+                        # CLAT route still active
+                    } else={
+                        :set conflictPresent true
+                        :log warn ("[tayga-controller] Foreign active default route detected with gateway=" . $gw)
+                    }
+                }
+            }
+
+            :if ($myWanWon = true and $conflictPresent = false) do={
+                :set directSwitchOk true
+                # Direct WAN route is confirmed active and winning! Safely disable CLAT default route and standby container
                 :if ([:len $clatDefaultRoute] > 0) do={
-                    /ip/route/set ($clatDefaultRoute->0) disabled=yes
+                    /ip/route/set ($clatDefaultRoute->0) disabled=yes distance=1
                 }
                 :if ([:len $clatConts] > 0) do={
                     :local cId ($clatConts->0)
@@ -313,71 +347,90 @@
                     }
                 }
             } else={
-                :log error "[tayga-controller] No direct WAN default route is active in main! Retaining CLAT default route to avoid traffic loss."
+                :log error "[tayga-controller] Direct WAN route did not win path selection in main! Rolling back CLAT route priority."
+                :if ([:len $clatDefaultRoute] > 0) do={
+                    /ip/route/set ($clatDefaultRoute->0) disabled=no distance=1
+                }
             }
 
-            # 3. Handle NAT64 activation if requested and valid
-            :if ($allowLocalNat64 = "yes") do={
-                :if ($nat64ConfigValid = true) do={
-                    :local nId ($nat64Conts->0)
-                    :if ([/container/get $nId running] != true) do={
-                        :log info "[tayga-controller] Starting NAT64 container..."
-                        /container/start $nId
-                        :delay 3s
-                    }
-                    :if ([:len $nat64Route] > 0) do={
-                        /ipv6/route/set ($nat64Route->0) disabled=no
-                    }
-
-                    # Verify NAT64 readiness (container running, DNS64 resolve, translation ping)
-                    :local nRunning [/container/get $nId running]
-                    :local dns64Ok false
-                    :local nat64PingOk false
-
-                    :if ($nRunning = true) do={
-                        :do {
-                            :local res [:resolve "ipv4only.arpa" server=fc68::2]
-                            :if ([:tostr $res] ~ "^64:ff9b::") do={ :set dns64Ok true }
-                        } on-error={
-                            :log warn "[tayga-controller] DNS64 resolution probe to fc68::2 failed."
+            :if ($directSwitchOk = true) do={
+                # 3. Handle NAT64 activation if requested and valid
+                :if ($allowLocalNat64 = "yes") do={
+                    :if ($nat64ConfigValid = true) do={
+                        :local nId ($nat64Conts->0)
+                        :if ([/container/get $nId running] != true) do={
+                            :log info "[tayga-controller] Starting NAT64 container..."
+                            /container/start $nId
+                            :delay 3s
                         }
 
-                        :local pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 count=2]
-                        :if ($pCount > 0) do={
-                            :set nat64PingOk true
+                        # Verify NAT64 readiness BEFORE enabling user route in main
+                        :local nRunning [/container/get $nId running]
+                        :local dns64Ok false
+                        :local nat64PingOk false
+
+                        :if ($nRunning = true) do={
+                            :do {
+                                :local res [:resolve domain-name="ipv4only.arpa" server=fc68::2 type=ipv6]
+                                :if ([:tostr $res] ~ "^64:ff9b::") do={ :set dns64Ok true }
+                            } on-error={
+                                :log warn "[tayga-controller] DNS64 resolution probe to fc68::2 failed."
+                            }
+
+                            :local pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 count=2]
+                            :if ($pCount > 0) do={
+                                :set nat64PingOk true
+                            } else={
+                                :log warn "[tayga-controller] NAT64 data-plane translation ping failed."
+                            }
+                        }
+
+                        :if ($nRunning = true and $dns64Ok = true and $nat64PingOk = true) do={
+                            :set TAYGA_NAT64_FAIL_COUNT 0
+                            # Enable user-facing prefix route in main ONLY after verified
+                            :if ([:len $nat64Route] > 0) do={
+                                /ipv6/route/set ($nat64Route->0) disabled=no
+                            }
+                            :set nextState "NAT64_ACTIVE"
                         } else={
-                            :log warn "[tayga-controller] NAT64 data-plane translation ping failed."
+                            :set TAYGA_NAT64_FAIL_COUNT ($TAYGA_NAT64_FAIL_COUNT + 1)
+                            # If service was previously NAT64_ACTIVE, apply failure hysteresis threshold (>=2) before disabling
+                            :if ($TAYGA_STATE = "NAT64_ACTIVE" and $TAYGA_NAT64_FAIL_COUNT < 2) do={
+                                :log warn ("[tayga-controller] NAT64 probe failed (" . $TAYGA_NAT64_FAIL_COUNT . "/2). Awaiting failure threshold.")
+                            } else={
+                                :if ([:len $nat64Route] > 0) do={
+                                    /ipv6/route/set ($nat64Route->0) disabled=yes
+                                }
+                                :log warn ("[tayga-controller] NAT64 verifying: running=" . [:tostr $nRunning] . ", dns64=" . [:tostr $dns64Ok] . ", ping=" . [:tostr $nat64PingOk] . ". State: PREPARING_NAT64")
+                                :set nextState "PREPARING_NAT64"
+                            }
                         }
-                    }
-
-                    :if ($nRunning = true and $dns64Ok = true and $nat64PingOk = true) do={
-                        :set nextState "NAT64_ACTIVE"
                     } else={
-                        :log warn ("[tayga-controller] NAT64 verifying: running=" . [:tostr $nRunning] . ", dns64=" . [:tostr $dns64Ok] . ", ping=" . [:tostr $nat64PingOk] . ". State: PREPARING_NAT64")
-                        :set nextState "PREPARING_NAT64"
+                        :set nextState "CONFIG_ERROR"
+                        # Teardown invalid NAT64
+                        :if ([:len $nat64Conts] > 0) do={
+                            :local nId ($nat64Conts->0)
+                            :if ([/container/get $nId running] = true) do={ /container/stop $nId }
+                        }
+                        :if ([:len $nat64Route] > 0) do={ /ipv6/route/set ($nat64Route->0) disabled=yes }
                     }
                 } else={
-                    :set nextState "CONFIG_ERROR"
-                    # Teardown invalid NAT64
+                    :set nextState "DIRECT"
+                    # Stop NAT64 container if running
                     :if ([:len $nat64Conts] > 0) do={
                         :local nId ($nat64Conts->0)
-                        :if ([/container/get $nId running] = true) do={ /container/stop $nId }
+                        :if ([/container/get $nId running] = true) do={
+                            :log info "[tayga-controller] Placing NAT64 container into standby..."
+                            /container/stop $nId
+                        }
                     }
-                    :if ([:len $nat64Route] > 0) do={ /ipv6/route/set ($nat64Route->0) disabled=yes }
+                    :if ([:len $nat64Route] > 0) do={
+                        /ipv6/route/set ($nat64Route->0) disabled=yes
+                    }
                 }
             } else={
-                :set nextState "DIRECT"
-                # Stop NAT64 container if running
-                :if ([:len $nat64Conts] > 0) do={
-                    :local nId ($nat64Conts->0)
-                    :if ([/container/get $nId running] = true) do={
-                        :log info "[tayga-controller] Placing NAT64 container into standby..."
-                        /container/stop $nId
-                    }
-                }
-                :if ([:len $nat64Route] > 0) do={
-                    /ipv6/route/set ($nat64Route->0) disabled=yes
-                }
+                # Direct switch failed: retain CLAT_ACTIVE
+                :set nextState "CLAT_ACTIVE"
             }
         } else={
             :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TAYGA_DIRECT_PASS_COUNT . "/" . $recoveryThreshold . "), awaiting recovery threshold.")

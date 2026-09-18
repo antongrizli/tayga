@@ -205,6 +205,8 @@
             :local extWait 0
             :local isExtracted false
             :while (($isExtracted = false) && ($extWait < 180)) do={
+                # Refresh lock heartbeat to prevent controller from stealing lock
+                :set TAYGA_LOCK_TIME [/system/resource/get uptime]
                 :local isStopped [/container/get $cId stopped]
                 :if ($isStopped = true) do={
                     :set isExtracted true
@@ -274,6 +276,12 @@
     }
 
     # --- 8. Promote Candidate OR Execute INSTANT ZERO-EXTRACTION ROLLBACK ---
+    # Verify lock ownership was maintained before making network state changes
+    :if ($TAYGA_LOCK_TOKEN != $myToken) do={
+        :put " [FAIL] Lock was hijacked by another process. Halting upgrade."
+        :error "Aborted: lock lost"
+    }
+
     :if ($upgradeOk = true) do={
         :put "--> Promoting candidate to active production container..."
         :local candId [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]

@@ -74,7 +74,7 @@ jobs:
 
       - name: "Functional Test: CLAT Mode Launch & TUN Creation"
         run: |
-          docker run -d --name test-clat --cap-add=NET_ADMIN --device /dev/net/tun -e PREF64=64:ff9b::/96 -e ROUTER4=172.17.0.1 tayga-smoke:test
+          docker run -d --name test-clat --cap-add=NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 -e PREF64=64:ff9b::/96 -e ROUTER4=172.17.0.1 tayga-smoke:test
           sleep 3
           docker logs test-clat
           docker ps --filter "name=test-clat" --filter "status=running" | grep test-clat
@@ -84,7 +84,7 @@ jobs:
 
       - name: "Functional Test: NAT64 Mode Launch (TAYGA + Unbound DNS64 Supervisor)"
         run: |
-          docker run -d --name test-nat64 --cap-add=NET_ADMIN --device /dev/net/tun -e MODE=nat64 tayga-smoke:test
+          docker run -d --name test-nat64 --cap-add=NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 -e MODE=nat64 tayga-smoke:test
           sleep 3
           docker logs test-nat64
           docker ps --filter "name=test-nat64" --filter "status=running" | grep test-nat64
