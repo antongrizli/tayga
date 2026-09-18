@@ -5,7 +5,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -O2
 LDFLAGS ?= -flto=auto
 LDLIBS := -lpthread
-SOURCES := nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c
+SOURCES := nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c gso.c
 
 #Default installation paths (may be overridden by environment variables)
 prefix ?= /usr/local
@@ -93,11 +93,12 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile unit_checksum unit_ip4_id unit_tun
+test: unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso
 	./unit_conffile
 	./unit_checksum
 	./unit_ip4_id
 	./unit_tun
+	./unit_gso
 
 # these are only valid for GCC
 TEST_CFLAGS := $(CFLAGS) -Werror -coverage -DCOVERAGE_TESTING
@@ -116,6 +117,12 @@ unit_ip4_id: test/unit_ip4_id.c nat64.c tayga.h
 
 unit_tun: test/unit_tun.c tun.c log.c tayga.h
 	$(CC) $(CFLAGS) -I. -o unit_tun test/unit_tun.c tun.c log.c -Wl,--wrap=write -Wl,--wrap=writev
+
+unit_gso: test/unit_gso.c gso.c addrmap.c nat64.c tun.c log.c tayga.h gso.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c nat64.c tun.c log.c $(LDFLAGS) -lpthread
+
+tools/probe-tun-offload: tools/probe-tun-offload.c
+	$(CC) $(CFLAGS) -o tools/probe-tun-offload tools/probe-tun-offload.c
 
 .PHONY: integration
 integration: tayga
@@ -144,7 +151,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar
-	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso tools/probe-tun-offload *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

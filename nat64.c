@@ -127,7 +127,7 @@ static void log_pkt6(int err, struct pkt *p, const char *msg)
 		type, saddr, daddr, (p->header_len + p->data_len),p->data_proto,msg);
 }
 
-static uint16_t ip_checksum(void *d, uint32_t c)
+uint16_t ip_checksum(void *d, uint32_t c)
 {
 	uint32_t sum = 0xffff;
 	uint16_t *p = d;
@@ -146,7 +146,7 @@ static uint16_t ip_checksum(void *d, uint32_t c)
 	return ~sum;
 }
 
-static inline uint16_t ones_add(uint16_t a, uint16_t b)
+uint16_t ones_add(uint16_t a, uint16_t b)
 {
 	uint32_t sum = (uint16_t)~a + (uint16_t)~b;
 
@@ -154,7 +154,7 @@ static inline uint16_t ones_add(uint16_t a, uint16_t b)
 }
 
 
-static uint16_t ip4_checksum(struct ip4 *ip4, uint32_t data_len, uint8_t proto)
+uint16_t ip4_checksum(struct ip4 *ip4, uint32_t data_len, uint8_t proto)
 {
 	uint32_t sum = 0;
 	uint16_t *p;
@@ -172,7 +172,7 @@ static uint16_t ip4_checksum(struct ip4 *ip4, uint32_t data_len, uint8_t proto)
 	return ~sum;
 }
 
-static uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto)
+uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto)
 {
 	uint32_t sum = 0;
 	uint16_t *p;
@@ -355,6 +355,10 @@ static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 			return ERROR_DROP;
 		}
 		tck = (uint16_t *)(p->data + 16);
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			*tck = htons(gso_calc_tcp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+			return ERROR_NONE;
+		}
 		break;
 	/* Any other protocol */
 	default:
@@ -436,7 +440,15 @@ static void xlate_4to6_data(struct pkt *p)
 #ifdef __linux__
 		uint8_t *out = p->data - sizeof(struct ip6);
 		memcpy(out, &header.ip6, sizeof(struct ip6));
-		tun_write(p->tun_fd, out, sizeof(struct ip6) + p->data_len);
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			struct virtio_net_hdr_raw out_vhdr = p->vhdr;
+			out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
+			out_vhdr.csum_start = sizeof(struct ip6);
+			out_vhdr.csum_offset = 16;
+			tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip6) + p->data_len);
+		} else {
+			tun_write(p->tun_fd, out, sizeof(struct ip6) + p->data_len);
+		}
 #else
 		iov[0].iov_base = &header;
 		iov[0].iov_len = sizeof(struct tun_pi) + sizeof(struct ip6);
@@ -750,6 +762,13 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 
 void handle_ip4(struct pkt *p)
 {
+	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
+		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+			if (gso_translate_tcp_4to6(p) == 0)
+				return;
+		}
+	}
+
 	if (unlikely(parse_ip4(p) < 0)) return; //error already logged
 	if (unlikely(p->ip4->ttl == 0 ||
 			ip_checksum(p->ip4, p->header_len) ||
@@ -978,6 +997,10 @@ static int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 			return ERROR_DROP;
 		}
 		tck = (uint16_t *)(p->data + 16);
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			*tck = htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+			return ERROR_NONE;
+		}
 		break;
 	/* Other */
 	default:
@@ -1037,7 +1060,15 @@ static void xlate_6to4_data(struct pkt *p)
 #ifdef __linux__
 	uint8_t *out = p->data - sizeof(struct ip4);
 	memcpy(out, &header.ip4, sizeof(struct ip4));
-	tun_write(p->tun_fd, out, sizeof(struct ip4) + p->data_len);
+	if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+		struct virtio_net_hdr_raw out_vhdr = p->vhdr;
+		out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
+		out_vhdr.csum_start = sizeof(struct ip4);
+		out_vhdr.csum_offset = 16;
+		tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip4) + p->data_len);
+	} else {
+		tun_write(p->tun_fd, out, sizeof(struct ip4) + p->data_len);
+	}
 #else
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
@@ -1325,6 +1356,13 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 
 void handle_ip6(struct pkt *p)
 {
+	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
+		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+			if (gso_translate_tcp_6to4(p) == 0)
+				return;
+		}
+	}
+
 	if (unlikely(parse_ip6(p,0))) return;
 	if (unlikely(p->ip6->hop_limit == 0 ||
 			p->header_len + p->data_len !=

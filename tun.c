@@ -295,11 +295,51 @@ int tun_setup(int do_mktun, int do_rmtun)
 
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+	if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+		ifr.ifr_flags |= IFF_VNET_HDR;
+	}
 	strcpy(ifr.ifr_name, gcfg.tundev);
 	if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
-		slog(LOG_CRIT, "Unable to attach tun device %s, aborting: "
-				"%s\n", gcfg.tundev, strerror(errno));
-		return ERROR_REJECT;
+		if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
+			slog(LOG_WARNING, "Unable to attach tun with IFF_VNET_HDR (%s), falling back to offload=off\n",
+				strerror(errno));
+			gcfg.tun_offload = TUN_OFFLOAD_OFF;
+			ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
+				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
+					gcfg.tundev, strerror(errno));
+				return ERROR_REJECT;
+			}
+		} else {
+			slog(LOG_CRIT, "Unable to attach tun device %s, aborting: "
+					"%s\n", gcfg.tundev, strerror(errno));
+			return ERROR_REJECT;
+		}
+	}
+
+	if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+		int sz = 0;
+		if (ioctl(gcfg.tun_fd, TUNGETVNETHDRSZ, &sz) < 0) {
+			slog(LOG_WARNING, "TUNGETVNETHDRSZ failed (%s), defaulting to 10 bytes\n", strerror(errno));
+			sz = 10;
+		}
+		gcfg.vnet_hdr_sz = sz;
+
+		unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+		if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, offload_flags) < 0) {
+			if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
+				slog(LOG_WARNING, "TUNSETOFFLOAD failed (%s), disabling offload\n", strerror(errno));
+				gcfg.tun_offload = TUN_OFFLOAD_OFF;
+				gcfg.vnet_hdr_sz = 0;
+			} else {
+				slog(LOG_CRIT, "TUNSETOFFLOAD failed: %s, aborting\n", strerror(errno));
+				return ERROR_REJECT;
+			}
+		} else {
+			slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM\n", gcfg.vnet_hdr_sz);
+		}
+	} else {
+		gcfg.vnet_hdr_sz = 0;
 	}
 
 	if (do_mktun) {
@@ -424,6 +464,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 	/* Setup multiqueue additional queues */
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+	if (gcfg.vnet_hdr_sz > 0)
+		ifr.ifr_flags |= IFF_VNET_HDR;
 	strcpy(ifr.ifr_name, gcfg.tundev);
 	for(int i = 0; i < gcfg.workers; i++) {
 		gcfg.tun_fd_addl[i] = open("/dev/net/tun", O_RDWR);
@@ -436,6 +478,10 @@ int tun_setup(int do_mktun, int do_rmtun)
 			slog(LOG_CRIT, "Unable to attach tun device %s, aborting: "
 					"%s\n", gcfg.tundev, strerror(errno));
 			exit(1);
+		}
+		if (gcfg.vnet_hdr_sz > 0) {
+			unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+			ioctl(gcfg.tun_fd_addl[i], TUNSETOFFLOAD, offload_flags);
 		}
 	}
 
@@ -567,6 +613,12 @@ int tun_setup(int do_mktun, int do_rmtun)
  */
 ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 {
+	if (unlikely(gcfg.vnet_hdr_sz > 0)) {
+		struct virtio_net_hdr_raw vhdr;
+		memset(&vhdr, 0, sizeof(vhdr));
+		return tun_write_vnet(tun_fd, &vhdr, buf, len);
+	}
+
 	ssize_t ret;
 
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -596,11 +648,30 @@ ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 	return -1;
 }
 
+ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const void *buf, size_t len)
+{
+	if (gcfg.vnet_hdr_sz > 0) {
+		struct iovec iov[2];
+		iov[0].iov_base = (void *)vhdr;
+		iov[0].iov_len = gcfg.vnet_hdr_sz;
+		iov[1].iov_base = (void *)buf;
+		iov[1].iov_len = len;
+		return tun_writev(tun_fd, iov, 2);
+	}
+	return tun_write(tun_fd, buf, len);
+}
+
 /* tun_writev: Write vectored buffers to the TUN device.
  * Retries on EINTR (up to 5 attempts) and verifies total length matches written bytes.
  */
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 {
+	if (unlikely(gcfg.vnet_hdr_sz > 0 && iov[0].iov_len != (size_t)gcfg.vnet_hdr_sz)) {
+		struct virtio_net_hdr_raw vhdr;
+		memset(&vhdr, 0, sizeof(vhdr));
+		return tun_writev_vnet(tun_fd, &vhdr, iov, iovcnt);
+	}
+
 	size_t total_len = 0;
 	ssize_t ret;
 
@@ -633,13 +704,33 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 	return -1;
 }
 
+ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const struct iovec *iov, int iovcnt)
+{
+	if (gcfg.vnet_hdr_sz > 0) {
+		struct iovec iov_with_vnet[iovcnt + 1];
+		iov_with_vnet[0].iov_base = (void *)vhdr;
+		iov_with_vnet[0].iov_len = gcfg.vnet_hdr_sz;
+		for (int i = 0; i < iovcnt; i++)
+			iov_with_vnet[i + 1] = iov[i];
+		return tun_writev(tun_fd, iov_with_vnet, iovcnt + 1);
+	}
+	return tun_writev(tun_fd, iov, iovcnt);
+}
+
 
 void tun_read(uint8_t * recv_buf,int tun_fd)
 {
 	int ret;
 	struct pkt pbuf, *p = &pbuf;
+	uint8_t *read_ptr = recv_buf + HEADROOM;
+	size_t read_len = RECV_BUF_SIZE - HEADROOM;
 
-	ret = read(tun_fd, recv_buf + HEADROOM, RECV_BUF_SIZE - HEADROOM);
+	if (gcfg.vnet_hdr_sz > 0) {
+		read_ptr -= gcfg.vnet_hdr_sz;
+		read_len += gcfg.vnet_hdr_sz;
+	}
+
+	ret = read(tun_fd, read_ptr, read_len);
 	if (unlikely(ret < 0)) {
 		if (errno == EAGAIN)
 			return;
@@ -647,26 +738,47 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 				"device: %s\n", strerror(errno));
 		return;
 	}
-	if (unlikely(ret < 1)) {
-		slog(LOG_WARNING, "short read from tun device "
-				"(%d bytes)\n", ret);
-		return;
+
+	if (gcfg.vnet_hdr_sz > 0) {
+		if (unlikely(ret <= gcfg.vnet_hdr_sz)) {
+			slog(LOG_WARNING, "short read with vnet header (%d bytes)\n", ret);
+			return;
+		}
+		*p = (struct pkt){
+			.tun_fd = tun_fd,
+			.ip4 = NULL,
+			.ip6 = NULL,
+			.ip6_frag = NULL,
+			.icmp = NULL,
+			.data_proto = 0,
+			.data = recv_buf + HEADROOM,
+			.data_len = (uint32_t)(ret - gcfg.vnet_hdr_sz),
+			.header_len = 0,
+			.has_vhdr = 1,
+		};
+		memcpy(&p->vhdr, read_ptr, gcfg.vnet_hdr_sz);
+	} else {
+		if (unlikely(ret < 1)) {
+			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
+			return;
+		}
+		if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
+			slog(LOG_WARNING, "dropping oversized packet\n");
+			return;
+		}
+		*p = (struct pkt){
+			.tun_fd = tun_fd,
+			.ip4 = NULL,
+			.ip6 = NULL,
+			.ip6_frag = NULL,
+			.icmp = NULL,
+			.data_proto = 0,
+			.data = recv_buf + HEADROOM,
+			.data_len = (uint32_t)ret,
+			.header_len = 0,
+			.has_vhdr = 0,
+		};
 	}
-	if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
-		slog(LOG_WARNING, "dropping oversized packet\n");
-		return;
-	}
-	*p = (struct pkt){
-		.tun_fd = tun_fd,
-		.ip4 = NULL,
-		.ip6 = NULL,
-		.ip6_frag = NULL,
-		.icmp = NULL,
-		.data_proto = 0,
-		.data = recv_buf + HEADROOM,
-		.data_len = (uint32_t)ret,
-		.header_len = 0,
-	};
 #ifdef __linux__
 	switch (p->data[0] >> 4) {
 	case 4:

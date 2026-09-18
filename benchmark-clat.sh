@@ -18,8 +18,10 @@ PERF_MODE=${PERF_MODE:-none}
 MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}
 MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}
 TUN_TXQLEN=${TUN_TXQLEN:-1000}
+CLAT_OFFLOAD=${CLAT_OFFLOAD:-off}
 
 case "$PROTOCOL" in tcp|udp) ;; *) echo 'PROTOCOL must be tcp or udp' >&2; exit 64;; esac
+case "$CLAT_OFFLOAD" in off|tcp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, tcp or auto' >&2; exit 64;; esac
 case "$PERF_MODE" in none|stat|record) ;; *) echo 'PERF_MODE must be none, stat or record' >&2; exit 64;; esac
 case "$DURATION:$WARMUP" in *[!0-9:]*|:) echo 'DURATION and WARMUP must be integers' >&2; exit 64;; esac
 case "$MAX_TUN_DROPS" in ''|*[!0-9]*) echo 'MAX_TUN_DROPS must be a non-negative integer' >&2; exit 64;; esac
@@ -91,7 +93,7 @@ ip -n clatns -6 route add default via fd9b:64:1:fe::1
 ip netns exec clatns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec clatns sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
 ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 \
-  CLAT_WORKERS="$WORKERS" /usr/local/sbin/clat-start.sh \
+  CLAT_WORKERS="$WORKERS" CLAT_OFFLOAD="$CLAT_OFFLOAD" /usr/local/sbin/clat-start.sh \
   >"$ARTIFACT_DIR/clat.log" 2>&1 &
 clat_pid=$!
 
@@ -181,7 +183,7 @@ start_clients() {
   local client_no client_addr gate
   for client_no in $(seq 1 "$CLIENTS"); do
     client_addr="192.168.88.$((client_no + 1))"
-    set -- -c 11.0.0.2 -p "$((5200 + client_no))" -B "$client_addr" -P "$FLOWS" -t "$duration" -J
+    set -- -c 11.0.0.2 -p "$((5200 + client_no))" -B "$client_addr" -P "$FLOWS" -t "$duration" --connect-timeout 5000 -J
     test "$direction" = download && set -- "$@" -R
     test "$direction" = bidir && set -- "$@" --bidir
     test "$PROTOCOL" = udp && set -- "$@" -u -l "$DATAGRAM_SIZE"
@@ -189,6 +191,7 @@ start_clients() {
     test -n "$RATE" && set -- "$@" -b "$RATE"
     if test "$gated" = yes; then
       gate="$run_dir/gate-$client_no"
+      rm -f "$gate"
       mkfifo "$gate"
       printf '%s\n' "$gate" >> "$run_dir/gates"
       ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" iperf3 "$@" \
@@ -203,6 +206,29 @@ start_clients() {
 
 wait_clients() {
   local run_dir=$1
+  local timeout_limit=${2:-$((DURATION + 15))}
+  local deadline=$(( $(uptime_seconds | cut -d. -f1) + timeout_limit ))
+  local running=1
+  while [ "$running" -gt 0 ] && [ "$(uptime_seconds | cut -d. -f1)" -lt "$deadline" ]; do
+    running=0
+    while read -r child_pid; do
+      if kill -0 "$child_pid" 2>/dev/null; then
+        running=$((running + 1))
+      fi
+    done < "$run_dir/pids"
+    [ "$running" -gt 0 ] && sleep 0.5
+  done
+
+  if [ "$running" -gt 0 ]; then
+    echo "Clients timed out after ${timeout_limit}s! Capturing diagnostic state..." >&2
+    ip -n clatns -s link show > "$run_dir/clat.timeout.links" 2>&1 || true
+    cat /proc/"$clat_pid"/status > "$run_dir/clat.timeout.status" 2>&1 || true
+    while read -r child_pid; do
+      kill -9 "$child_pid" 2>/dev/null || true
+    done < "$run_dir/pids"
+    return 1
+  fi
+
   local status=0 child_pid
   while read -r child_pid; do wait "$child_pid" || status=1; done < "$run_dir/pids"
   return "$status"
@@ -237,6 +263,7 @@ run_iperf() {
   ip -n router -j -s link show > "$run_dir/router.links.before.json"
   cat /proc/softirqs > "$run_dir/softirqs.before"
   cat /proc/net/softnet_stat > "$run_dir/softnet.before"
+  cat /proc/stat > "$run_dir/proc_stat.before"
   local perf_pid=
   local perf_status=0
   if test "$PERF_MODE" != none && command -v perf >/dev/null 2>&1; then
@@ -281,6 +308,7 @@ run_iperf() {
   ip -n router -j -s link show > "$run_dir/router.links.after.json"
   cat /proc/softirqs > "$run_dir/softirqs.after"
   cat /proc/net/softnet_stat > "$run_dir/softnet.after"
+  cat /proc/stat > "$run_dir/proc_stat.after"
   printf '%s\n' "$status" > "$run_dir/exit-status"
   python3 - "$run_dir" "$direction" "$ticks_before" "$ticks_after" "$uptime_before" "$uptime_after" "$monotonic_before" "$monotonic_after" "$PROTOCOL" "$MAX_UDP_LOSS_PERCENT" "$MAX_TUN_DROPS" <<'PY'
 import glob, json, os, sys
@@ -335,11 +363,36 @@ clat_delta = delta(os.path.join(run_dir, "clat.links.before.json"),
                    os.path.join(run_dir, "clat.links.after.json"), "clat")
 router_packets = router_delta["rx"]["packets"] + router_delta["tx"]["packets"]
 tun_drops = clat_delta["rx"]["dropped"] + clat_delta["tx"]["dropped"]
+sys_busy_cores = None
+sys_softirq_cores = None
+stat_before_path = os.path.join(run_dir, "proc_stat.before")
+stat_after_path = os.path.join(run_dir, "proc_stat.after")
+if os.path.exists(stat_before_path) and os.path.exists(stat_after_path):
+    try:
+        def read_cpu_line(path):
+            for l in open(path):
+                if l.startswith("cpu "):
+                    return [int(x) for x in l.split()[1:]]
+            return None
+        c_b = read_cpu_line(stat_before_path)
+        c_a = read_cpu_line(stat_after_path)
+        if c_b and c_a:
+            total_delta = sum(c_a) - sum(c_b)
+            idle_delta = (c_a[3] + c_a[4]) - (c_b[3] + c_b[4])
+            softirq_delta = c_a[6] - c_b[6]
+            busy_delta = total_delta - idle_delta
+            clk_tck = os.sysconf("SC_CLK_TCK")
+            sys_busy_cores = busy_delta / clk_tck / elapsed
+            sys_softirq_cores = softirq_delta / clk_tck / elapsed
+    except Exception:
+        pass
 result = dict(direction=direction, clients=len(reports), expected_clients=int(os.environ.get("CLIENTS", len(reports))),
               capture_valid=True, workload_valid=True, acceptance_pass=True, degraded_reasons=[],
               sent_mbps=sent, received_mbps=received,
               retransmits=retransmits, tayga_cpu_cores=cores,
               tayga_core_per_gbps=cores / (received / 1000) if received else None,
+              system_busy_cores=sys_busy_cores,
+              system_softirq_cores=sys_softirq_cores,
               received_application_MBps=received_bytes / elapsed / 1_000_000,
               router_rclat_packets_per_second=router_packets / elapsed,
               router_rclat_delta=router_delta, clat_tun_delta=clat_delta, tun_drops=tun_drops,

@@ -125,6 +125,15 @@ static void signal_read(void)
 			dynamic_maint(gcfg.dynamic_pool, 1);
 		}
 		slog(LOG_NOTICE, "Exiting on signal %d\n", sig);
+		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+			slog(LOG_NOTICE, "GSO Stats: rx_pkts=%llu, tx_pkts=%llu, rx_bytes=%llu, tx_bytes=%llu, fallback_pkts=%llu, invalid_pkts=%llu\n",
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_rx, memory_order_relaxed),
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_tx, memory_order_relaxed),
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_rx, memory_order_relaxed),
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_tx, memory_order_relaxed),
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_fallback_pkts, memory_order_relaxed),
+				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_invalid_pkts, memory_order_relaxed));
+		}
 		if (gcfg.log_out == LOG_TO_SYSLOG) {
 			closelog();
 		} else if (gcfg.log_out == LOG_TO_JOURNAL) {
@@ -287,7 +296,7 @@ int main(int argc, char **argv)
 		{ "chroot", 0, 0, 'r' },
 		{ "pidfile", 1, 0, 'p' },
 		{ "debug", 0, 0, 'd' },
-		{ "debug", 0, 0, 'd' },
+		{ "tun-offload", 1, 0, 1001 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -298,6 +307,17 @@ int main(int argc, char **argv)
 		if (c == -1)
 			break;
 		switch (c) {
+		case 1001:
+			if (strcasecmp(optarg, "off") == 0) {
+				gcfg.tun_offload = TUN_OFFLOAD_OFF;
+			} else if (strcasecmp(optarg, "tcp") == 0) {
+				gcfg.tun_offload = TUN_OFFLOAD_TCP;
+			} else if (strcasecmp(optarg, "auto") == 0) {
+				gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+			} else {
+				die("Error: invalid value for --tun-offload (must be off, tcp, or auto)");
+			}
+			break;
 		case 0:
 			switch (longind) {
 				case 0: /* --mktun */

@@ -704,6 +704,22 @@ static int config_workers(int ln, int arg_count, char **args)
 }
 
 
+static int config_tun_offload(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	if (strcasecmp(args[0], "off") == 0) {
+		gcfg.tun_offload = TUN_OFFLOAD_OFF;
+	} else if (strcasecmp(args[0], "tcp") == 0) {
+		gcfg.tun_offload = TUN_OFFLOAD_TCP;
+	} else if (strcasecmp(args[0], "auto") == 0) {
+		gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+	} else {
+		slog(LOG_CRIT, "Error: invalid value for tun-offload on line %d (must be off, tcp, or auto)\n", ln);
+		return ERROR_REJECT;
+	}
+	return 0;
+}
+
 struct {
 	/* Long name */
 	char *name;
@@ -729,6 +745,7 @@ struct {
 	{ "log"	,			config_log, 		   -1 },
 	{ "offlink-mtu"	,  	config_offlink_mtu,		1 },
 	{ "workers"	,  		config_workers,			1 },
+	{ "tun-offload"	,	config_tun_offload,		1 },
 	{ NULL, NULL, 0 }
 };
 
@@ -748,6 +765,8 @@ int config_init(void)
 	gcfg.wkpf_strict = 1;
 	gcfg.udp_cksum_mode = UDP_CKSUM_DROP;
 	gcfg.workers = -1;
+	gcfg.tun_offload = TUN_OFFLOAD_OFF;
+	gcfg.vnet_hdr_sz = 0;
 	INIT_LIST_HEAD(&gcfg.tun_ip4_list);
 	INIT_LIST_HEAD(&gcfg.tun_ip6_list);
 	INIT_LIST_HEAD(&gcfg.tun_rt4_list);

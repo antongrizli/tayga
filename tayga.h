@@ -53,6 +53,7 @@
 #error "Could not find headers for platform"
 #endif
 #include "list.h"
+#include "gso.h"
 
 #ifdef COVERAGE_TESTING
 //for coverage testing
@@ -231,6 +232,8 @@ struct pkt {
 	uint8_t *data;
 	uint32_t data_len;
 	uint32_t header_len; /* inc IP hdr for v4 but excl IP hdr for v6 */
+	struct virtio_net_hdr_raw vhdr;
+	int has_vhdr;
 };
 
 // Ensure that the data field has enough alignment for ip4 and ip6 structs
@@ -415,6 +418,10 @@ struct config {
 	pthread_mutex_t map_mutex;
 	pthread_t threads[MAX_WORKERS];
 	int tun_fd_addl[MAX_WORKERS];
+
+	//Offload parameters
+	enum tun_offload_mode tun_offload;
+	int vnet_hdr_sz;
 };
 
 /// Logging flags
@@ -500,6 +507,10 @@ void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
 uint16_t next_ip4_ident(void);
 void set_ip4_ident_counter(uint16_t val);
+uint16_t ip_checksum(void *d, uint32_t c);
+uint16_t ones_add(uint16_t a, uint16_t b);
+uint16_t ip4_checksum(struct ip4 *ip4, uint32_t data_len, uint8_t proto);
+uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto);
 
 /* log.c */
 #define STRINGIFY_IMPL(x) #x
@@ -518,7 +529,9 @@ int tun_setup(int do_mktun, int do_rmtun);
 int set_nonblock(int fd);
 void tun_read(uint8_t * recv_buf,int tun_fd);
 ssize_t tun_write(int tun_fd, const void *buf, size_t len);
+ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const void *buf, size_t len);
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);
+ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const struct iovec *iov, int iovcnt);
 
 
 #endif /* #ifndef __TAYGA_H__ */

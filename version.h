@@ -1,8 +1,8 @@
 #ifndef __TAYGA_VERSION_H__
 #define __TAYGA_VERSION_H__
 
-#define TAYGA_VERSION "0.9.6-20-g4591e40-dirty"
-#define TAYGA_BRANCH  "heads/main-dirty"
-#define TAYGA_COMMIT  "4591e407f04348bdafeed084c734a77104d44893"
+#define TAYGA_VERSION "0.9.6-21-ga5aeef4-dirty"
+#define TAYGA_BRANCH  "heads/codex/gso-gro-dirty"
+#define TAYGA_COMMIT  "a5aeef49986dd0e3b1d8cd0c75741bc704b1eba3"
 
 #endif /* #ifndef __TAYGA_VERSION_H__ */
