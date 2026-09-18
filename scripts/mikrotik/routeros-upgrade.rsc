@@ -18,6 +18,8 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-upgrade.rsc
 # ==============================================================================
 
+:global TAYGA_MAINTENANCE_LOCK true
+
 :put "============================================================"
 :put " Starting State-Driven Dual-Slot (A/B) TAYGA Upgrade..."
 :put "============================================================"
@@ -39,12 +41,38 @@
     }
 }
 :local basePath ($extSlot . "/telekom-xlat")
-:local imagePath ($basePath . "/images/tayga-arm64.tar")
-:local prevImagePath ($basePath . "/images/tayga-arm64-prev.tar")
+
+# CPU architecture-aware local image filename
+:local cpuArch [/system/resource/get architecture-name]
+:local localTarName "tayga-arm64.tar"
+:if ($cpuArch = "x86_64" or $cpuArch = "amd64") do={ :set localTarName "tayga-amd64.tar" }
+:if ($cpuArch = "arm") do={ :set localTarName "tayga-armv7.tar" }
+:local imagePath ($basePath . "/images/" . $localTarName)
+
+# --- Remote Image & Registry Configuration (Overridable via global variables) ---
+:global USE_REGISTRY
+:global REMOTE_IMAGE
+:global REGISTRY_URL
+
+:local useRegistry false
+:if ($USE_REGISTRY = true) do={ :set useRegistry true }
+
+:local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
+:if ([:len $REMOTE_IMAGE] > 0) do={ :set remoteImage $REMOTE_IMAGE }
+
+:local registryUrl "https://ghcr.io"
+:if ([:len $REGISTRY_URL] > 0) do={ :set registryUrl $REGISTRY_URL }
+
+# Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
+:local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
+:if ($useRegistry = false and $hasLocalTar = false) do={
+    :put ("--> Local image " . $imagePath . " not found; switching to GHCR registry pull (" . $remoteImage . ")...")
+    :set useRegistry true
+}
 
 # --- 2. Check Prerequisites Before Modifying Services ---
-:if ([:len [/file/find where name=$imagePath]] = 0) do={
-    :put (" [FAIL] Upgrade image archive '" . $imagePath . "' not found on storage drive.")
+:if ($useRegistry = false and $hasLocalTar = false) do={
+    :put (" [FAIL] Upgrade image archive '" . $imagePath . "' not found and USE_REGISTRY is false.")
     :error "Aborted: missing container image archive"
 }
 
@@ -129,19 +157,64 @@
 # --- 7. Deploy upgraded candidate container into target slot ---
 :local upgradeOk true
 :do {
-    :put ("--> Extracting candidate image into " . $targetRootfs . "...")
-    /container/add file=$imagePath \
-        root-dir=$targetRootfs \
-        interface=veth-clat \
-        envlist=tayga-clat-envs \
-        memory-high=128M \
-        memory-max=192M \
-        start-on-boot=yes \
-        restart-policy=on-failure \
-        restart-interval=10s \
-        logging=yes \
-        comment=("[tayga-unified:clat:candidate] TAYGA CLAT Container (Slot " . $targetSlot . ")")
-    :delay 3s
+    :if ($useRegistry = true) do={
+        :put ("--> Setting container registry URL: " . $registryUrl . "...")
+        :do { /container/config/set registry-url=$registryUrl } on-error={}
+        
+        :put ("--> Pulling candidate remote image '" . $remoteImage . "' into " . $targetRootfs . "...")
+        /container/add remote-image=$remoteImage \
+            root-dir=$targetRootfs \
+            interface=veth-clat \
+            envlist=tayga-clat-envs \
+            memory-high=128M \
+            memory-max=192M \
+            start-on-boot=yes \
+            restart-policy=on-failure \
+            restart-interval=10s \
+            logging=yes \
+            comment=("[tayga-unified:clat:candidate] TAYGA CLAT Container (Slot " . $targetSlot . ")")
+        
+        # RouterOS pulls and extracts remote image in background: wait until extraction completes (status stopped)
+        :put "--> Downloading and extracting layers from GHCR (may take 10-60s)..."
+        :local candCont [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
+        :if ([:len $candCont] > 0) do={
+            :local candId ($candCont->0)
+            :local extWait 0
+            :local isExtracted false
+            :while (($isExtracted = false) && ($extWait < 180)) do={
+                :local isStopped [/container/get $candId stopped]
+                :if ($isStopped = true) do={
+                    :set isExtracted true
+                } else={
+                    :delay 2s
+                    :set extWait ($extWait + 2)
+                }
+            }
+            :if ($isExtracted = false) do={
+                :put " [FAIL] Remote image download/extraction timed out (180s)."
+                :set upgradeOk false
+            } else={
+                :put " [PASS] Container image layers downloaded and extracted successfully."
+            }
+        } else={
+            :set upgradeOk false
+            :put " [FAIL] Candidate container entry was not created."
+        }
+    } else={
+        :put ("--> Extracting local candidate image " . $imagePath . " into " . $targetRootfs . "...")
+        /container/add file=$imagePath \
+            root-dir=$targetRootfs \
+            interface=veth-clat \
+            envlist=tayga-clat-envs \
+            memory-high=128M \
+            memory-max=192M \
+            start-on-boot=yes \
+            restart-policy=on-failure \
+            restart-interval=10s \
+            logging=yes \
+            comment=("[tayga-unified:clat:candidate] TAYGA CLAT Container (Slot " . $targetSlot . ")")
+        :delay 3s
+    }
 } on-error={
     :set upgradeOk false
     :put " [FAIL] Failed to extract/add candidate container."
@@ -265,3 +338,6 @@
         :put "============================================================"
     }
 }
+
+:set TAYGA_MAINTENANCE_LOCK false
+

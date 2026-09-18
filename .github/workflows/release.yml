@@ -348,6 +348,44 @@ jobs:
 
           ---
 
+          ### ⚡ One-Liner Quick Deploy on MikroTik (Directly from this Release)
+
+          Paste one of these commands directly into your **RouterOS Terminal** (fetches verified scripts directly from this release):
+
+          #### 1. Deploy CLAT (Customer-Side 464XLAT Translator RFC 6877):
+          ```routeros
+          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-clat.rsc" dst-path=install-clat.rsc; /import install-clat.rsc
+          ```
+
+          #### 2. Deploy NAT64 + DNS64 (Server-Side Translator RFC 6146 / 6147):
+          ```routeros
+          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-nat64.rsc" dst-path=install-nat64.rsc; /import install-nat64.rsc
+          ```
+
+          #### 3. Zero-Downtime A/B Upgrade (Automatically pulls latest container image from GHCR):
+          ```routeros
+          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-upgrade.rsc" dst-path=upgrade.rsc; /import upgrade.rsc
+          ```
+
+          #### 4. Instant Rollback to Last Known Good Slot:
+          ```routeros
+          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-rollback.rsc" dst-path=rollback.rsc; /import rollback.rsc
+          ```
+
+          #### 5. Safe Removal (Cleans up project without affecting router interfaces):
+          ```routeros
+          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-remove.rsc" dst-path=remove.rsc; /import remove.rsc
+          ```
+
+          ---
+
+          ### 💻 Or Deploy Remotely via SSH from Mac / Linux:
+          ```bash
+          curl -fsSL https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-clat.rsc | ssh admin@<router-ip>
+          ```
+
+          ---
+
           ### 📦 Published Container Images (GitHub Container Registry)
 
           | Image | Description | Architectures |
@@ -358,10 +396,10 @@ jobs:
 
           ---
 
-          ### 🛠️ MikroTik RouterOS 7 Deployment Guide
+          ### 🛠️ Offline / Manual TAR File Installation Guide
 
-          #### Option A: Offline / Direct Upload (Recommended for isolated routers)
-          1. Download the container archive for your architecture:
+          For air-gapped or isolated routers without internet access:
+          1. Download the container archive for your architecture from the release assets below:
              - **ARM64** (`tayga-arm64.tar`): RB5009, Chateau 5G/ax, CCR2004, CCR2116, hAP ax3, L009.
              - **ARMv7** (`tayga-armv7.tar`): hAP ac2, hAP ac3, hAP ax2, RB4011.
              - **AMD64** (`tayga-amd64.tar`): Cloud Hosted Router (CHR), x86 PC.
@@ -371,24 +409,6 @@ jobs:
              ```routeros
              /import routeros-install-clat.rsc
              ```
-
-          #### Option B: Online Direct Pull from GHCR
-          Configure RouterOS container registry and install with `useRegistry=true`:
-          ```routeros
-          /container/config/set registry-url=https://ghcr.io
-          # Then run the installer configured for remote registry pull
-          /import routeros-install-clat.rsc
-          ```
-
-          #### 🔄 Zero-Downtime Dual-Slot (A/B) Upgrade & Rollback
-          To upgrade a running deployment safely without manual downtime:
-          ```routeros
-          # Upload new tayga-arm64.tar and run:
-          /import routeros-upgrade.rsc
-
-          # In case of any issue, instant zero-extraction rollback:
-          /import routeros-rollback.rsc
-          ```
 
           ---
 

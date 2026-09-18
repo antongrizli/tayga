@@ -12,8 +12,12 @@
 :put " Removing TAYGA Unified Installation..."
 :put "============================================================"
 
-# 1. Remove Routes owned by this project
-:put "--> Removing TAYGA routes..."
+# 1. Remove Scheduler & Routes owned by this project
+:put "--> Removing TAYGA scheduler and routes..."
+:do {
+    /system/scheduler/remove [find where name="tayga-controller"]
+    /system/scheduler/remove [find where comment~"^\\[tayga-unified"]
+} on-error={}
 /ip/route/remove [find where comment~"^\\[tayga-unified"]
 /ipv6/route/remove [find where comment~"^\\[tayga-unified"]
 :do {

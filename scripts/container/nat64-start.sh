@@ -73,9 +73,12 @@ data-dir ${DATA_DIR}
 wkpf-strict false
 CONF_EOF
 
-# Generate unbound.conf for DNS64
-mkdir -p /run/unbound
-cat > /run/unbound.conf <<CONF_EOF
+ENABLE_DNS64="${ENABLE_DNS64:-yes}"
+
+# Generate unbound.conf for DNS64 if enabled
+if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
+  mkdir -p /run/unbound
+  cat > /run/unbound.conf <<CONF_EOF
 server:
     verbosity: 1
     interface: 0.0.0.0
@@ -98,16 +101,17 @@ forward-zone:
     name: "."
 CONF_EOF
 
-# Add forward addresses to unbound.conf
-OLD_IFS="$IFS"
-IFS=","
-for upstream in $DNS64_UPSTREAM; do
-  trimmed=$(echo "$upstream" | tr -d ' ')
-  if [ -n "$trimmed" ]; then
-    echo "    forward-addr: $trimmed" >> /run/unbound.conf
-  fi
-done
-IFS="$OLD_IFS"
+  # Add forward addresses to unbound.conf
+  OLD_IFS="$IFS"
+  IFS=","
+  for upstream in $DNS64_UPSTREAM; do
+    trimmed=$(echo "$upstream" | tr -d ' ')
+    if [ -n "$trimmed" ]; then
+      echo "    forward-addr: $trimmed" >> /run/unbound.conf
+    fi
+  done
+  IFS="$OLD_IFS"
+fi
 
 # Make tunnel adapter
 echo "==> Creating tunnel adapter nat64..."
@@ -119,7 +123,7 @@ ip -6 route replace "$TAYGA_PREF64" dev nat64
 enable_forwarding net.ipv4.ip_forward
 enable_forwarding net.ipv6.conf.all.forwarding
 
-# Supervisor setup: manage both TAYGA and Unbound
+# Supervisor setup: manage TAYGA and optional Unbound
 TAYGA_PID=""
 UNBOUND_PID=""
 
@@ -138,9 +142,11 @@ cleanup() {
 
 trap 'cleanup 0' INT TERM HUP
 
-echo "==> Starting Unbound DNS64..."
-/usr/sbin/unbound -d -c /run/unbound.conf &
-UNBOUND_PID=$!
+if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
+  echo "==> Starting Unbound DNS64..."
+  /usr/sbin/unbound -d -c /run/unbound.conf &
+  UNBOUND_PID=$!
+fi
 
 echo "==> Starting TAYGA..."
 /usr/sbin/tayga -c /run/tayga.conf -d &
@@ -148,7 +154,7 @@ TAYGA_PID=$!
 
 # Monitor child processes; exit with code 1 if either dies
 while true; do
-  if ! kill -0 "$UNBOUND_PID" 2>/dev/null; then
+  if [ -n "$UNBOUND_PID" ] && ! kill -0 "$UNBOUND_PID" 2>/dev/null; then
     echo "ERROR: Unbound DNS64 exited unexpectedly" >&2
     cleanup 1
   fi

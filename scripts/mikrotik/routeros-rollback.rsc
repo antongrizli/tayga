@@ -13,6 +13,8 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-rollback.rsc
 # ==============================================================================
 
+:global TAYGA_MAINTENANCE_LOCK true
+
 :put "============================================================"
 :put " Starting Emergency CLAT Rollback..."
 :put "============================================================"
@@ -48,7 +50,13 @@
     }
 }
 :local basePath ($extSlot . "/telekom-xlat")
-:local imagePath ($basePath . "/images/tayga-arm64.tar")
+
+# CPU architecture-aware local image filename
+:local cpuArch [/system/resource/get architecture-name]
+:local localTarName "tayga-arm64.tar"
+:if ($cpuArch = "x86_64" or $cpuArch = "amd64") do={ :set localTarName "tayga-amd64.tar" }
+:if ($cpuArch = "arm") do={ :set localTarName "tayga-armv7.tar" }
+:local imagePath ($basePath . "/images/" . $localTarName)
 :local prevImagePath ($basePath . "/images/tayga-arm64-prev.tar")
 
 # --- 4. Determine Target Rollback Slot from Confirmed LAST_GOOD_SLOT ---
@@ -161,3 +169,5 @@
     :put " Inspect logs: /log print where topics~'container'"
     :put "============================================================"
 }
+
+:set TAYGA_MAINTENANCE_LOCK false

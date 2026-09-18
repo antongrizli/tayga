@@ -30,8 +30,36 @@
 }
 :local basePath ($extSlot . "/telekom-xlat")
 :local preflightScript ($basePath . "/scripts/routeros-preflight.rsc")
-:local imagePath ($basePath . "/images/tayga-arm64.tar")
+:local controllerScript ($basePath . "/scripts/routeros-controller.rsc")
 :local rootfsPath ($basePath . "/rootfs/clat-a")
+
+# CPU architecture-aware local image filename
+:local cpuArch [/system/resource/get architecture-name]
+:local localTarName "tayga-arm64.tar"
+:if ($cpuArch = "x86_64" or $cpuArch = "amd64") do={ :set localTarName "tayga-amd64.tar" }
+:if ($cpuArch = "arm") do={ :set localTarName "tayga-armv7.tar" }
+:local imagePath ($basePath . "/images/" . $localTarName)
+
+# --- Remote Image & Registry Configuration (Overridable via global variables) ---
+:global USE_REGISTRY
+:global REMOTE_IMAGE
+:global REGISTRY_URL
+
+:local useRegistry false
+:if ($USE_REGISTRY = true) do={ :set useRegistry true }
+
+:local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
+:if ([:len $REMOTE_IMAGE] > 0) do={ :set remoteImage $REMOTE_IMAGE }
+
+:local registryUrl "https://ghcr.io"
+:if ([:len $REGISTRY_URL] > 0) do={ :set registryUrl $REGISTRY_URL }
+
+# Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
+:local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
+:if ($useRegistry = false and $hasLocalTar = false) do={
+    :put ("--> Local image " . $imagePath . " not found; switching to GHCR registry pull (" . $remoteImage . ")...")
+    :set useRegistry true
+}
 
 # --- 2. Run Preflight Audit First (Strict CLAT Mode) ---
 :global AUDITMODE "clat"
@@ -42,11 +70,10 @@
 }
 
 # --- 3. Check Required Image Archive on Storage ---
-:local imageFound [:len [/file/find where name=$imagePath]]
-:if ($imageFound = 0) do={
-    :put (" [FAIL] Required image archive '" . $imagePath . "' not found on storage drive.")
-    :put (" Upload the image first: scp dist/tayga-arm64.tar admin@<router-ip>:" . $imagePath)
-    :error "Aborted: missing container image archive"
+:if ($useRegistry = false and $hasLocalTar = false) do={
+    :put (" [FAIL] Required image archive '" . $imagePath . "' not found and USE_REGISTRY is false.")
+    :put (" Either upload TAR to '" . $imagePath . "' or set :global USE_REGISTRY true before /import")
+    :error "Aborted: missing container image source"
 }
 
 # --- 4. Collision Check: Ensure Interface Names are not Claimed by Other Projects ---
@@ -117,6 +144,11 @@
 :put "--> Configuring container environment list tayga-clat-envs..."
 :local envEntries {
     {"MODE"; "clat"};
+    {"POLICY"; "auto"};
+    {"PREFER_DIRECT_IPV4"; "yes"};
+    {"LAN_REQUIRES_IPV4"; "yes"};
+    {"ALLOW_LOCAL_NAT64"; "no"};
+    {"IPV6_ONLY_LAN_INTERFACES"; ""};
     {"TAYGA_WORKERS"; "3"};
     {"TAYGA_OFFLOAD"; "off"};
     {"TAYGA_OFFLINK_MTU"; "1280"};
@@ -184,79 +216,98 @@
     }
 }
 
-# --- 15. Create and Start Container (matches any CLAT container instance) ---
+# --- 15. Create Isolated Routing Table 'wan-direct' for Zero-Leak Probing ---
+:if ([:len [/routing/table/find where name="wan-direct"]] = 0) do={
+    :put "--> Creating isolated routing table wan-direct..."
+    /routing/table/add name=wan-direct fib comment="[tayga-unified:direct] Isolated Direct WAN Routing Table"
+}
+
+# --- 16. Create Container (Decoupled: Standby Mode start-on-boot=no) ---
 :local existingCont [/container/find where comment~"^\\[tayga-unified:clat\\]"]
 :if ([:len $existingCont] = 0) do={
-    :put ("--> Creating container from " . $imagePath . "...")
-    /container/add file=$imagePath \
-        root-dir=$rootfsPath \
-        interface=veth-clat \
-        envlist=tayga-clat-envs \
-        memory-high=128M \
-        memory-max=192M \
-        start-on-boot=yes \
-        restart-policy=on-failure \
-        restart-interval=10s \
-        logging=yes \
-        comment="[tayga-unified:clat] TAYGA CLAT Container (Slot clat-a)"
-    :delay 3s
-}
-
-:local contId [/container/find where comment~"^\\[tayga-unified:clat\\]"]
-:if ([:len $contId] > 0) do={
-    :local isRun [/container/get $contId running]
-    :if ($isRun != true) do={
-        :put "--> Starting container..."
-        /container/start $contId
-    }
-}
-
-# Poll for running state (up to 30s)
-:put "--> Waiting for container startup and RFC 7050 discovery..."
-:local contRunning false
-:for i from=1 to=30 do={
-    :if ($contRunning = false) do={
-        :local r [/container/get $contId running]
-        :if ($r = true) do={
-            :set contRunning true
-        } else={
-            :delay 1s
+    :if ($useRegistry = true) do={
+        :put ("--> Setting container registry URL: " . $registryUrl . "...")
+        :do { /container/config/set registry-url=$registryUrl } on-error={}
+        :put ("--> Pulling remote container image '" . $remoteImage . "' into " . $rootfsPath . "...")
+        /container/add remote-image=$remoteImage \
+            root-dir=$rootfsPath \
+            interface=veth-clat \
+            envlist=tayga-clat-envs \
+            memory-high=128M \
+            memory-max=192M \
+            start-on-boot=no \
+            restart-policy=on-failure \
+            restart-interval=10s \
+            logging=yes \
+            comment="[tayga-unified:clat] TAYGA CLAT Container (Slot clat-a)"
+        
+        :put "--> Downloading and extracting container layers from GHCR (may take 10-60s)..."
+        :local candCont [/container/find where comment~"^\\[tayga-unified:clat\\]"]
+        :if ([:len $candCont] > 0) do={
+            :local cId ($candCont->0)
+            :local extWait 0
+            :local isExtracted false
+            :while (($isExtracted = false) && ($extWait < 180)) do={
+                :local isStopped [/container/get $cId stopped]
+                :if ($isStopped = true) do={
+                    :set isExtracted true
+                } else={
+                    :delay 2s
+                    :set extWait ($extWait + 2)
+                }
+            }
+            :if ($isExtracted = false) do={
+                :error "Aborted: remote image download/extraction timed out (180s)"
+            } else={
+                :put " [PASS] Container layers downloaded and extracted successfully."
+            }
         }
+    } else={
+        :put ("--> Creating container from local image " . $imagePath . "...")
+        /container/add file=$imagePath \
+            root-dir=$rootfsPath \
+            interface=veth-clat \
+            envlist=tayga-clat-envs \
+            memory-high=128M \
+            memory-max=192M \
+            start-on-boot=no \
+            restart-policy=on-failure \
+            restart-interval=10s \
+            logging=yes \
+            comment="[tayga-unified:clat] TAYGA CLAT Container (Slot clat-a)"
+        :delay 3s
     }
 }
 
-# Additional warm-up for DNS64 resolution
-:delay 5s
-
-# --- 14. Configure Probe Route & Test Connectivity ---
+# --- 17. Configure Standby Candidate Probe Route & Inactive Default Route ---
 :if ([:len [/ip/route/find where comment="[tayga-unified:clat:probe] Probe Route"]] = 0) do={
     :put "--> Adding probe route 1.1.1.1/32 via 172.31.64.2..."
     /ip/route/add dst-address=1.1.1.1/32 gateway=172.31.64.2 distance=1 comment="[tayga-unified:clat:probe] Probe Route"
 }
 
-:put "--> Testing CLAT probe ping (1.1.1.1 src 172.31.64.1 count 3)..."
-:local probeOk false
-:local pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
-:if ($pingRx > 0) do={
-    :set probeOk true
-    :put (" [PASS] CLAT probe ping successful (" . $pingRx . "/3 received)!")
-} else={
-    :put " [WARN] Probe ping received 0 packets. Check container logs: /log print where topics~'container'"
+:if ([:len [/ip/route/find where comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"]] = 0) do={
+    :put "--> Adding standby default IPv4 route 0.0.0.0/0 via 172.31.64.2 (disabled=yes)..."
+    /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=10 disabled=yes comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
 }
 
-# --- 15. Activate Default Route ONLY if Probe Succeeded ---
-:if ($probeOk = true) do={
-    :if ([:len [/ip/route/find where comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"]] = 0) do={
-        :put "--> Activating default IPv4 route 0.0.0.0/0 via 172.31.64.2 (distance 10)..."
-        /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=10 comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
-    }
-    :put "============================================================"
-    :put " TAYGA CLAT Installation Complete & Active!"
-    :put "============================================================"
+# --- 18. Register Network State Controller in Scheduler ---
+:local schedId [/system/scheduler/find where name="tayga-controller"]
+:if ([:len $schedId] = 0) do={
+    :put "--> Registering Network State Controller in /system/scheduler (interval: 15s)..."
+    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerScript) comment="[tayga-unified:controller] Network State Controller"
 } else={
-    :put "============================================================"
-    :put " TAYGA CLAT Installed. Default route NOT activated automatically"
-    :put " because probe test did not receive replies. Check logs and"
-    :put " run routeros-verify.rsc to inspect."
-    :put "============================================================"
+    :put "--> Updating /system/scheduler tayga-controller..."
+    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerScript)
 }
+
+# --- 19. Initial Network State Controller Evaluation ---
+:put "--> Running initial Network State Controller cycle..."
+:do {
+    /import file-name=$controllerScript
+} on-error={
+    :put " [WARN] Controller initial execution encountered a non-fatal error; scheduler will retry."
+}
+
+:put "============================================================"
+:put " TAYGA CLAT Installation Complete & Controlled by State Machine!"
+:put "============================================================"
