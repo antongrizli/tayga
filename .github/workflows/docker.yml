@@ -52,7 +52,7 @@ jobs:
           sleep 3
           docker logs test-clat
           docker ps --filter "name=test-clat" --filter "status=running" | grep test-clat
-          docker logs test-clat | grep "TAYGA Unified CLAT"
+          docker logs test-clat 2>&1 | grep "TAYGA Unified CLAT"
           docker stop test-clat
           docker rm test-clat
 
@@ -62,8 +62,8 @@ jobs:
           sleep 3
           docker logs test-nat64
           docker ps --filter "name=test-nat64" --filter "status=running" | grep test-nat64
-          docker logs test-nat64 | grep "TAYGA Unified NAT64"
-          docker logs test-nat64 | grep "start of service (unbound"
+          docker logs test-nat64 2>&1 | grep "TAYGA Unified NAT64"
+          docker logs test-nat64 2>&1 | grep "start of service (unbound"
           docker stop test-nat64
           docker rm test-nat64
 
