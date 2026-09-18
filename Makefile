@@ -38,6 +38,7 @@ help:
 	@echo 'all             - Compile tayga (produces ./tayga)'
 	@echo 'static          - Compile tayga with static linkage (produces ./tayga)'
 	@echo 'test            - Run the test suite'
+	@echo 'release         - Bump version.h, commit and create git tag (e.g. make release VERSION=1.0.0)'
 	@echo 'integration     - Run integration tests. Requires root permissions'
 	@echo 'man             - Generate man pages from markdown (requires pandoc)'
 	@echo 'install         - Installs tayga and manpages'
@@ -54,6 +55,30 @@ help:
 	@echo 'LIVE            - Install on a live system (daemon-reload)'
 	@echo 'WITH_SYSTEMD    - Install systemd scripts'
 	@echo 'WITH_OPENRC     - Install OpenRC scripts and example config'
+
+# Create a local release: update version.h, commit and tag
+.PHONY: release
+release:
+	@if [ -z "$(strip $(VERSION))" ]; then \
+		echo "ERROR: Specify VERSION (e.g. make release VERSION=1.0.0)" >&2; \
+		exit 1; \
+	fi
+	@RAW_VER="$(VERSION)"; \
+	CLEAN_VER="$${RAW_VER#v}"; \
+	CLEAN_VER="$${CLEAN_VER#version-}"; \
+	CLEAN_VER="$${CLEAN_VER#version}"; \
+	TAG="v$${CLEAN_VER}"; \
+	echo "==> Preparing release $${TAG} (version $${CLEAN_VER})..."; \
+	printf '#ifndef __TAYGA_VERSION_H__\n#define __TAYGA_VERSION_H__\n\n#define TAYGA_VERSION "%s"\n#define TAYGA_BRANCH  "%s"\n#define TAYGA_COMMIT  "RELEASE"\n\n#endif /* #ifndef __TAYGA_VERSION_H__ */\n' \
+		"$${CLEAN_VER}" "$${TAG}" > version.h; \
+	git add version.h; \
+	git commit -m "chore(release): $${TAG}"; \
+	git tag -a "$${TAG}" -m "Release $${TAG}"; \
+	echo "============================================================"; \
+	echo "  Release $${TAG} created locally!"; \
+	echo "  To publish to GitHub, run:"; \
+	echo "    git push origin main --tags"; \
+	echo "============================================================"
 
 # Version determination (can be overridden via make VERSION=1.0.0 COMMIT=... BRANCH=...)
 VERSION ?= $(shell $(GIT) describe --tags --always --dirty 2>/dev/null)
