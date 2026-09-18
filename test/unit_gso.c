@@ -90,15 +90,18 @@ static uint16_t compute_full_tcp_cksum(const void *src, const void *dst, int is_
 	}
 
 	uint32_t tcp_hdr_len = (tcp->doff_res >> 4) * 4;
-	const uint16_t *tw = (const uint16_t *)tcp;
+	const uint8_t *tb = (const uint8_t *)tcp;
 	for (uint32_t i = 0; i < tcp_hdr_len / 2; i++) {
 		if (i == 8) continue; /* skip cksum field */
-		sum += tw[i];
+		uint16_t word;
+		memcpy(&word, tb + i * 2, sizeof(word));
+		sum += word;
 	}
 
-	const uint16_t *pw = (const uint16_t *)payload;
 	for (uint32_t i = 0; i < payload_len / 2; i++) {
-		sum += pw[i];
+		uint16_t word;
+		memcpy(&word, payload + i * 2, sizeof(word));
+		sum += word;
 	}
 	if (payload_len & 1) {
 		sum += htons((uint16_t)payload[payload_len - 1] << 8);

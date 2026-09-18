@@ -9,28 +9,6 @@
 
 struct gso_worker_stats g_gso_stats = {0};
 
-/*
- * Pseudo-header checksum calculation helpers
- */
-static inline uint32_t csum_partial_fold(uint32_t sum)
-{
-	sum = (sum & 0xffff) + (sum >> 16);
-	sum = (sum & 0xffff) + (sum >> 16);
-	return sum;
-}
-
-static inline uint32_t csum_add_u16(uint32_t sum, uint16_t val)
-{
-	sum += val;
-	return sum;
-}
-
-static inline uint32_t csum_sub_u16(uint32_t sum, uint16_t val)
-{
-	sum += (uint16_t)(~val);
-	return sum;
-}
-
 uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t tcp_len)
 {
 	uint32_t sum = 0;

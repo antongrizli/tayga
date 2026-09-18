@@ -94,6 +94,7 @@ void test_config_compare(void) {
     expectl(gcfg.wkpf_strict, tcfg.wkpf_strict, "wkpf_strict");
     expectl(gcfg.log_opts, tcfg.log_opts, "log_opts");
     expectl(gcfg.udp_cksum_mode, tcfg.udp_cksum_mode, "udp_cksum_mode");
+    expectl(gcfg.tun_offload, tcfg.tun_offload, "tun_offload");
     expectl(gcfg.tun_up, tcfg.tun_up, "tun_up");
 
     /* Pointers in gcfg which are not touched by conffile.c */
@@ -260,6 +261,7 @@ void test_config_init(void) {
     tcfg.cache_size = 1<<13;
     tcfg.wkpf_strict = 1;
     tcfg.workers = -1;
+    tcfg.tun_offload = TUN_OFFLOAD_OFF;
     tcfg.tun_up = 0;
 
     /* Make sure config is the size we expect
@@ -269,7 +271,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),2192,"sizeof");
+    expectl(sizeof(struct config),2200,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */
@@ -791,6 +793,31 @@ void test_config_read(void) {
     expect(config_read(conffile),"Failed");
 
 
+    /* Test Case - tun-offload invalid */
+    if(!print_fail_only) printf("TEST CASE: tun-offload invalid\n");
+    fd = fopen(conffile,"w");
+    expect((long)fd,"fopen");
+    if(!fd) return;
+    testcase = "tun-offload something\n";
+    fwrite(testcase,strlen(testcase),1,fd);
+    fclose(fd);
+    
+    config_init();
+    expect(config_read(conffile),"Failed");
+
+    /* Test Case - tun-offload tcp */
+    if(!print_fail_only) printf("TEST CASE: tun-offload tcp\n");
+    fd = fopen(conffile,"w");
+    expect((long)fd,"fopen");
+    if(!fd) return;
+    testcase = "tun-offload tcp\n";
+    fwrite(testcase,strlen(testcase),1,fd);
+    fclose(fd);
+    
+    config_init();
+    expect(!config_read(conffile),"Passed");
+    expectl(gcfg.tun_offload, TUN_OFFLOAD_TCP, "tun_offload");
+
     /* Test Case - tun-up invalid  */
     if(!print_fail_only) printf("TEST CASE: tun-up invalid\n");
     fd = fopen(conffile,"w");
@@ -1075,6 +1102,7 @@ void test_config_read(void) {
 #if MAX_WORKERS > 0
         "workers 7\n"
 #endif
+        "tun-offload tcp\n"
         "tun-up yes\n"
         "tun-ip 192.168.0.0/24\n"
         "tun-ip 2001:db8:6969::/64\n"
@@ -1102,6 +1130,7 @@ void test_config_read(void) {
 #else
     tcfg.workers = -1;
 #endif
+    tcfg.tun_offload = TUN_OFFLOAD_TCP;
     tcfg.log_opts = (LOG_OPT_DROP | LOG_OPT_ICMP | LOG_OPT_REJECT | LOG_OPT_SELF | LOG_OPT_DYN | LOG_OPT_CONFIG);
     tcfg.tun_up = 1;
     tmap4[0] = "192.168.5.42/32 type 0 mask 255.255.255.255";
