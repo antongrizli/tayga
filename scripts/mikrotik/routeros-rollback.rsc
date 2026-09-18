@@ -13,161 +13,182 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-rollback.rsc
 # ==============================================================================
 
-:global TAYGA_MAINTENANCE_LOCK true
+# --- 0. Wait for Active Controller Cycle to Complete ---
+:global TAYGA_CONTROLLER_BUSY
+:global TAYGA_MAINTENANCE_LOCK
 
-:put "============================================================"
-:put " Starting Emergency CLAT Rollback..."
-:put "============================================================"
-
-# --- 1. Verify Prerequisites Before Making Any Changes ---
-:if ([:len [/interface/veth/find where name="veth-clat"]] = 0) do={
-    :put " [FAIL] Required interface 'veth-clat' not found. Rollback is only valid for CLAT installations."
-    :error "Aborted: veth-clat interface missing"
+:local waitCtrl 0
+:while ($TAYGA_CONTROLLER_BUSY = true and $waitCtrl < 15) do={
+    :put "--> Waiting for background controller run to finish before rollback..."
+    :delay 1s
+    :set waitCtrl ($waitCtrl + 1)
 }
+:set TAYGA_MAINTENANCE_LOCK true
 
-# --- 2. Withdraw default route ONLY (service routes must remain active for probe) ---
-:put "--> Disabling default route (preserving service probe and mapped IPv6 routes)..."
-/ip/route/disable [find where comment~"^\\[tayga-unified:clat:default\\]"]
+:do {
+    :put "============================================================"
+    :put " Starting Emergency CLAT Rollback..."
+    :put "============================================================"
 
-# Ensure service routes are enabled for testing
-/ip/route/enable [find where comment~"^\\[tayga-unified:clat:probe\\]"]
-/ipv6/route/enable [find where comment~"^\\[tayga-unified:clat\\]"]
+    # --- 1. Verify Prerequisites Before Making Any Changes ---
+    :if ([:len [/interface/veth/find where name="veth-clat"]] = 0) do={
+        :put " [FAIL] Required interface 'veth-clat' not found. Rollback is only valid for CLAT installations."
+        :error "Aborted: veth-clat interface missing"
+    }
 
-# --- 3. Detect Storage Slot & Paths ---
-:local extSlot "usb1"
-:local diskId [/disk/find where slot="usb1" or name="usb1"]
-:if ([:len $diskId] = 0) do={
-    :set diskId [/disk/find where slot="pcie1" or name="pcie1"]
-    :if ([:len $diskId] > 0) do={ :set extSlot "pcie1" } else={
-        :foreach d in=[/disk/find where fs="ext4"] do={
-            :if ($extSlot = "usb1") do={
-                :do { :set extSlot [/disk/get $d slot] } on-error={
-                    :do { :set extSlot [/disk/get $d name] } on-error={}
+    # Ensure isolated CLAT probe table exists
+    :if ([:len [/routing/table/find where name="tayga-probe-clat"]] = 0) do={
+        /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
+    }
+    :if ([:len [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]] = 0) do={
+        /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
+    }
+
+    # --- 2. Withdraw default route ONLY (service routes must remain active for probe) ---
+    :put "--> Disabling default route (preserving service probe and mapped IPv6 routes)..."
+    /ip/route/disable [find where comment~"^\\[tayga-unified:clat:default\\]"]
+
+    # Ensure service IPv6 return routes are active
+    /ipv6/route/enable [find where comment~"^\\[tayga-unified:clat\\]"]
+
+    # --- 3. Detect Storage Slot & Paths ---
+    :local extSlot "usb1"
+    :local diskId [/disk/find where slot="usb1" or name="usb1"]
+    :if ([:len $diskId] = 0) do={
+        :set diskId [/disk/find where slot="pcie1" or name="pcie1"]
+        :if ([:len $diskId] > 0) do={ :set extSlot "pcie1" } else={
+            :foreach d in=[/disk/find where fs="ext4"] do={
+                :if ($extSlot = "usb1") do={
+                    :do { :set extSlot [/disk/get $d slot] } on-error={
+                        :do { :set extSlot [/disk/get $d name] } on-error={}
+                    }
+                    :set diskId $d
                 }
-                :set diskId $d
             }
         }
     }
-}
-:local basePath ($extSlot . "/telekom-xlat")
+    :local basePath ($extSlot . "/telekom-xlat")
 
-# CPU architecture-aware local image filename
-:local cpuArch [/system/resource/get architecture-name]
-:local localTarName "tayga-arm64.tar"
-:if ($cpuArch = "x86_64" or $cpuArch = "amd64") do={ :set localTarName "tayga-amd64.tar" }
-:if ($cpuArch = "arm") do={ :set localTarName "tayga-armv7.tar" }
-:local imagePath ($basePath . "/images/" . $localTarName)
-:local prevImagePath ($basePath . "/images/tayga-arm64-prev.tar")
+    # CPU architecture-aware local image filename
+    :local cpuArch [/system/resource/get architecture-name]
+    :local localTarName "tayga-arm64.tar"
+    :if ($cpuArch = "x86_64" or $cpuArch = "amd64") do={ :set localTarName "tayga-amd64.tar" }
+    :if ($cpuArch = "arm") do={ :set localTarName "tayga-armv7.tar" }
+    :local imagePath ($basePath . "/images/" . $localTarName)
+    :local prevImagePath ($basePath . "/images/tayga-arm64-prev.tar")
 
-# --- 4. Determine Target Rollback Slot from Confirmed LAST_GOOD_SLOT ---
-:local restoreSlot "clat-a"
-:local envGood [/container/envs/find where list="tayga-clat-envs" and key="LAST_GOOD_SLOT"]
-:if ([:len $envGood] > 0) do={
-    :set restoreSlot [/container/envs/get ($envGood->0) value]
-}
-:local baseRootfs ($basePath . "/rootfs/" . $restoreSlot)
-:put ("--> Target Rollback Slot: " . $restoreSlot . " (" . $baseRootfs . ")")
-
-# --- 5. Stop and Remove Any Failing / Candidate CLAT Containers ---
-:local clatConts [/container/find where comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
-:foreach c in=$clatConts do={
-    :local cRoot [/container/get $c root-dir]
-    :if (!($cRoot ~ $restoreSlot)) do={
-        :put ("--> Stopping unconfirmed / candidate container on " . $cRoot . "...")
-        /container/stop $c
-        :local waits 0
-        :while (([/container/get $c stopped] != true) && ($waits < 30)) do={
-            :delay 1s
-            :set waits ($waits + 1)
-        }
-        :if ([/container/get $c stopped] != true) do={
-            :put " [FAIL] Container did not stop within 30s timeout. Aborting rollback."
-            :error "Aborted: container stop timed out"
-        }
-        /container/remove $c
+    # --- 4. Determine Target Rollback Slot from Confirmed LAST_GOOD_SLOT ---
+    :local restoreSlot "clat-a"
+    :local envGood [/container/envs/find where list="tayga-clat-envs" and key="LAST_GOOD_SLOT"]
+    :if ([:len $envGood] > 0) do={
+        :set restoreSlot [/container/envs/get ($envGood->0) value]
     }
-}
+    :local baseRootfs ($basePath . "/rootfs/" . $restoreSlot)
+    :put ("--> Target Rollback Slot: " . $restoreSlot . " (" . $baseRootfs . ")")
 
-# --- 6. Start or Re-create Confirmed Container for LAST_GOOD_SLOT ---
-:local goodCont [/container/find where root-dir~$restoreSlot and comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
-:if ([:len $goodCont] = 0) do={
-    :local targetImg $prevImagePath
-    :if ([:len [/file/find where name=$prevImagePath]] = 0) do={
-        :if ([:len [/file/find where name=$imagePath]] > 0) do={
-            :put "--> Previous image archive not found; using verified base image archive..."
-            :set targetImg $imagePath
-        } else={
-            :put " [FAIL] No container definition or valid image archive found for rollback."
-            :error "Aborted: missing rollback container and image archive"
-        }
-    }
-    
-    :put ("--> Re-creating container from " . $targetImg . " into slot " . $restoreSlot . "...")
-    /container/add file=$targetImg \
-        root-dir=$baseRootfs \
-        interface=veth-clat \
-        envlist=tayga-clat-envs \
-        memory-high=128M \
-        memory-max=192M \
-        start-on-boot=yes \
-        restart-policy=on-failure \
-        restart-interval=10s \
-        logging=yes \
-        comment=("[tayga-unified:clat] TAYGA CLAT Container (Slot " . $restoreSlot . ")")
-    :delay 3s
-    :set goodCont [/container/find where root-dir~$restoreSlot and comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
-}
-
-:if ([:len $goodCont] > 0) do={
-    :local cid ($goodCont->0)
-    :local isRun [/container/get $cid running]
-    :if ($isRun != true) do={
-        :put "--> Starting restored container..."
-        /container/start $cid
-    }
-    
-    # Poll for running state (up to 30s)
-    :local isRunning false
-    :for i from=1 to=30 do={
-        :if ($isRunning = false) do={
-            :local r [/container/get $cid running]
-            :if ($r = true) do={
-                :set isRunning true
-            } else={
+    # --- 5. Stop and Remove Any Failing / Candidate CLAT Containers ---
+    :local clatConts [/container/find where comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
+    :foreach c in=$clatConts do={
+        :local cRoot [/container/get $c root-dir]
+        :if (!($cRoot ~ $restoreSlot)) do={
+            :put ("--> Stopping unconfirmed / candidate container on " . $cRoot . "...")
+            /container/stop $c
+            :local waits 0
+            :while (([/container/get $c stopped] != true) && ($waits < 30)) do={
                 :delay 1s
+                :set waits ($waits + 1)
+            }
+            :if ([/container/get $c stopped] != true) do={
+                :put " [FAIL] Container did not stop within 30s timeout. Aborting rollback."
+                :error "Aborted: container stop timed out"
+            }
+            /container/remove $c
+        }
+    }
+
+    # --- 6. Start or Re-create Confirmed Container for LAST_GOOD_SLOT ---
+    :local goodCont [/container/find where root-dir~$restoreSlot and comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
+    :if ([:len $goodCont] = 0) do={
+        :local targetImg $prevImagePath
+        :if ([:len [/file/find where name=$prevImagePath]] = 0) do={
+            :if ([:len [/file/find where name=$imagePath]] > 0) do={
+                :put "--> Previous image archive not found; using verified base image archive..."
+                :set targetImg $imagePath
+            } else={
+                :put " [FAIL] No container definition or valid image archive found for rollback."
+                :error "Aborted: missing rollback container and image archive"
+            }
+        }
+
+        :put ("--> Re-creating container from " . $targetImg . " into slot " . $restoreSlot . "...")
+        /container/add file=$targetImg \
+            root-dir=$baseRootfs \
+            interface=veth-clat \
+            envlist=tayga-clat-envs \
+            memory-high=128M \
+            memory-max=192M \
+            start-on-boot=no \
+            restart-policy=on-failure \
+            restart-interval=10s \
+            logging=yes \
+            comment=("[tayga-unified:clat] TAYGA CLAT Container (Slot " . $restoreSlot . ")")
+        :delay 3s
+        :set goodCont [/container/find where root-dir~$restoreSlot and comment~"^\\[tayga-unified:clat" and interface="veth-clat"]
+    }
+
+    :if ([:len $goodCont] > 0) do={
+        :local cid ($goodCont->0)
+        :local isRun [/container/get $cid running]
+        :if ($isRun != true) do={
+            :put "--> Starting restored container..."
+            /container/start $cid
+        }
+
+        # Poll for running state (up to 30s)
+        :local isRunning false
+        :for i from=1 to=30 do={
+            :if ($isRunning = false) do={
+                :local r [/container/get $cid running]
+                :if ($r = true) do={
+                    :set isRunning true
+                } else={
+                    :delay 1s
+                }
             }
         }
     }
-}
 
-:put "--> Waiting 5s for translation warm-up..."
-:delay 5s
+    :put "--> Waiting 5s for translation warm-up..."
+    :delay 5s
 
-# --- 7. Probe Verification ---
-:put "--> Testing end-to-end probe ping (1.1.1.1)..."
-:local probeOk false
-:local pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
-:if ($pingRx > 0) do={
-    :set probeOk true
-    :put (" [PASS] Probe test successful (" . $pingRx . "/3 received) after rollback!")
-}
+    # --- 7. Probe Verification via Isolated Probe Table ---
+    :put "--> Testing end-to-end probe ping via tayga-probe-clat..."
+    :local probeOk false
+    :local pingRx [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
+    :if ($pingRx > 0) do={
+        :set probeOk true
+        :put (" [PASS] Probe test successful (" . $pingRx . "/3 received) after rollback!")
+    }
 
-# --- 8. Re-enable Default Route ONLY if Probe Succeeded ---
-:if ($probeOk = true) do={
-    :local envAct [/container/envs/find where list="tayga-clat-envs" and key="ACTIVE_SLOT"]
-    :if ([:len $envAct] > 0) do={ /container/envs/set ($envAct->0) value=$restoreSlot }
-    
-    :put "--> Restoring default route..."
-    /ip/route/enable [find where comment~"^\\[tayga-unified:clat:default\\]"]
-    :put "============================================================"
-    :put (" Rollback Completed Successfully. Active Slot: " . $restoreSlot)
-    :put "============================================================"
-} else={
-    :put "============================================================"
-    :put " WARNING: Container restored but probe ping did not respond."
-    :put " Default route left disabled to prevent traffic blackholing."
-    :put " Inspect logs: /log print where topics~'container'"
-    :put "============================================================"
+    # --- 8. Re-enable Default Route ONLY if Probe Succeeded ---
+    :if ($probeOk = true) do={
+        :local envAct [/container/envs/find where list="tayga-clat-envs" and key="ACTIVE_SLOT"]
+        :if ([:len $envAct] > 0) do={ /container/envs/set ($envAct->0) value=$restoreSlot }
+
+        :put "--> Restoring default route..."
+        /ip/route/enable [find where comment~"^\\[tayga-unified:clat:default\\]"]
+        :put "============================================================"
+        :put (" Rollback Completed Successfully. Active Slot: " . $restoreSlot)
+        :put "============================================================"
+    } else={
+        :put "============================================================"
+        :put " WARNING: Container restored but probe ping did not respond."
+        :put " Default route left disabled to prevent traffic blackholing."
+        :put " Inspect logs: /log print where topics~'container'"
+        :put "============================================================"
+    }
+} on-error={
+    :put " [ERROR] Unhandled error during rollback."
 }
 
 :set TAYGA_MAINTENANCE_LOCK false

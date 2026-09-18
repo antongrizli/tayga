@@ -12,7 +12,14 @@
 :put " Removing TAYGA Unified Installation..."
 :put "============================================================"
 
-# 1. Remove Scheduler & Routes owned by this project
+# 1. Restore parked direct WAN default routes if any
+:put "--> Restoring parked direct WAN routes..."
+:local origRoutes [/ip/route/find where comment~"^\\[tayga-unified:orig-wan-default\\]"]
+:foreach r in=$origRoutes do={
+    /ip/route/set $r disabled=no comment="[orig-wan-default]"
+}
+
+# 2. Remove Scheduler & Routes owned by this project
 :put "--> Removing TAYGA scheduler and routes..."
 :do {
     /system/scheduler/remove [find where name="tayga-controller"]
@@ -23,7 +30,9 @@
 :do {
     /routing/rule/remove [find where comment~"^\\[tayga-unified"]
     /ip/route/remove [find where routing-table="wan-direct"]
+    /ip/route/remove [find where routing-table="tayga-probe-clat"]
     /routing/table/remove [find where name="wan-direct"]
+    /routing/table/remove [find where name="tayga-probe-clat"]
 } on-error={}
 
 # 2. Remove Firewall NAT & Filter Rules owned by this project

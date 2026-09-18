@@ -240,7 +240,7 @@
             restart-interval=10s \
             logging=yes \
             comment="[tayga-unified:nat64] TAYGA NAT64 Container"
-        
+
         :put "--> Downloading and extracting container layers from GHCR (may take 10-60s)..."
         :local candCont [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
         :if ([:len $candCont] > 0) do={

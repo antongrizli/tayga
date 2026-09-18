@@ -216,10 +216,15 @@
     }
 }
 
-# --- 15. Create Isolated Routing Table 'wan-direct' for Zero-Leak Probing ---
+# --- 15. Create Isolated Routing Tables for Zero-Leak Probing ---
 :if ([:len [/routing/table/find where name="wan-direct"]] = 0) do={
     :put "--> Creating isolated routing table wan-direct..."
     /routing/table/add name=wan-direct fib comment="[tayga-unified:direct] Isolated Direct WAN Routing Table"
+}
+
+:if ([:len [/routing/table/find where name="tayga-probe-clat"]] = 0) do={
+    :put "--> Creating isolated routing table tayga-probe-clat..."
+    /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
 }
 
 # --- 16. Create Container (Decoupled: Standby Mode start-on-boot=no) ---
@@ -240,7 +245,7 @@
             restart-interval=10s \
             logging=yes \
             comment="[tayga-unified:clat] TAYGA CLAT Container (Slot clat-a)"
-        
+
         :put "--> Downloading and extracting container layers from GHCR (may take 10-60s)..."
         :local candCont [/container/find where comment~"^\\[tayga-unified:clat\\]"]
         :if ([:len $candCont] > 0) do={
@@ -279,15 +284,15 @@
     }
 }
 
-# --- 17. Configure Standby Candidate Probe Route & Inactive Default Route ---
-:if ([:len [/ip/route/find where comment="[tayga-unified:clat:probe] Probe Route"]] = 0) do={
-    :put "--> Adding probe route 1.1.1.1/32 via 172.31.64.2..."
-    /ip/route/add dst-address=1.1.1.1/32 gateway=172.31.64.2 distance=1 comment="[tayga-unified:clat:probe] Probe Route"
+# --- 17. Configure Isolated Probe Route & Standby Default Route ---
+:if ([:len [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]] = 0) do={
+    :put "--> Adding isolated CLAT probe route in table tayga-probe-clat..."
+    /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
 }
 
-:if ([:len [/ip/route/find where comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"]] = 0) do={
+:if ([:len [/ip/route/find where comment~"^\\[tayga-unified:clat:default\\]" and routing-table="main"]] = 0) do={
     :put "--> Adding standby default IPv4 route 0.0.0.0/0 via 172.31.64.2 (disabled=yes)..."
-    /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=10 disabled=yes comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
+    /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=1 routing-table=main disabled=yes comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
 }
 
 # --- 18. Register Network State Controller in Scheduler ---

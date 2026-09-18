@@ -93,7 +93,7 @@
     }
     :local diskFreeMB ($diskFreeBytes / 1048576)
     :put (" [INFO] Storage detected: slot=" . $extSlot . ", fs=" . $diskFs . ", free=" . $diskFreeMB . " MB")
-    
+
     :if ($diskFs = "ext4") do={
         :put " [PASS] Storage filesystem is ext4 (required for container rootfs)."
         :set passCount ($passCount + 1)
@@ -101,7 +101,7 @@
         :put (" [FAIL] Storage filesystem is '" . $diskFs . "'. RouterOS containers require ext4 formatted storage.")
         :set failCount ($failCount + 1)
     }
-    
+
     :if ($diskFreeMB > 100) do={
         :put (" [PASS] Free disk space: " . $diskFreeMB . " MB (sufficient for TAR & rootfs).")
         :set passCount ($passCount + 1)

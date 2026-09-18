@@ -7,7 +7,8 @@ enable_forwarding() {
   if sysctl -w "$key=1" >/dev/null 2>&1 || [ "$(sysctl -n "$key" 2>/dev/null)" = "1" ]; then
     return 0
   fi
-  echo "WARNING: Cannot set $key=1 and current value is not 1; forwarding should be enabled on the host" >&2
+  echo "ERROR: Kernel forwarding for $key is disabled and cannot be set (forwarding must be enabled on host)" >&2
+  exit 1
 }
 
 # Validate unsigned integer helper
@@ -70,7 +71,7 @@ case "$TAYGA_OFFLOAD_VAL" in
 esac
 
 PREF64="${PREF64:-auto}"
-PREF64_STRICT="${PREF64_STRICT:-false}"
+FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-false}"
 
 if [ "$PREF64" = "auto" ]; then
   echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."
@@ -82,12 +83,12 @@ if [ "$PREF64" = "auto" ]; then
     PREF64="$DISCOVERED"
     echo "==> Discovered PREF64: $PREF64"
   else
-    if [ "$PREF64_STRICT" = "true" ]; then
-      echo "ERROR: RFC 7050 discovery failed and PREF64_STRICT=true. Set PREF64 explicitly (e.g. PREF64=64:ff9b::/96) or check DNS64 connectivity." >&2
-      exit 1
-    else
-      echo "WARNING: RFC 7050 discovery failed (DNS64 unreachable / no LTE). Falling back to Well-Known Prefix 64:ff9b::/96 (RFC 6052)" >&2
+    if [ "$FALLBACK_TO_WELL_KNOWN_PREFIX" = "true" ]; then
+      echo "WARNING: RFC 7050 discovery failed. FALLBACK_TO_WELL_KNOWN_PREFIX=true: using 64:ff9b::/96 (RFC 6052)" >&2
       PREF64="64:ff9b::/96"
+    else
+      echo "ERROR: RFC 7050 discovery failed (DNS64 / ipv4only.arpa unreachable). Set PREF64 explicitly (e.g. PREF64=64:ff9b::/96) or enable FALLBACK_TO_WELL_KNOWN_PREFIX=true." >&2
+      exit 1
     fi
   fi
 fi
