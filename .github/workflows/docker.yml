@@ -50,6 +50,7 @@ jobs:
         run: |
           docker run -d --name test-clat --cap-add=NET_ADMIN --device /dev/net/tun -e PREF64=64:ff9b::/96 -e ROUTER4=172.17.0.1 tayga-smoke:test
           sleep 3
+          docker logs test-clat
           docker ps --filter "name=test-clat" --filter "status=running" | grep test-clat
           docker logs test-clat | grep "TAYGA Unified CLAT"
           docker stop test-clat
@@ -59,6 +60,7 @@ jobs:
         run: |
           docker run -d --name test-nat64 --cap-add=NET_ADMIN --device /dev/net/tun -e MODE=nat64 tayga-smoke:test
           sleep 3
+          docker logs test-nat64
           docker ps --filter "name=test-nat64" --filter "status=running" | grep test-nat64
           docker logs test-nat64 | grep "TAYGA Unified NAT64"
           docker logs test-nat64 | grep "start of service (unbound"
