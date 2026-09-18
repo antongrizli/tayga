@@ -41,18 +41,18 @@
 :local imagePath ($basePath . "/images/" . $localTarName)
 
 # --- Remote Image & Registry Configuration (Overridable via global variables) ---
-:global USE_REGISTRY
-:global REMOTE_IMAGE
-:global REGISTRY_URL
+:global UseRegistry
+:global RemoteImage
+:global RegistryUrl
 
 :local useRegistry false
-:if ($USE_REGISTRY = true) do={ :set useRegistry true }
+:if ($UseRegistry = true) do={ :set useRegistry true }
 
 :local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
-:if ([:len $REMOTE_IMAGE] > 0) do={ :set remoteImage $REMOTE_IMAGE }
+:if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
-:if ([:len $REGISTRY_URL] > 0) do={ :set registryUrl $REGISTRY_URL }
+:if ([:len $RegistryUrl] > 0) do={ :set registryUrl $RegistryUrl }
 
 # Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
 :local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
@@ -71,8 +71,8 @@
 
 # --- 3. Check Required Image Archive on Storage ---
 :if ($useRegistry = false and $hasLocalTar = false) do={
-    :put (" [FAIL] Required image archive '" . $imagePath . "' not found and USE_REGISTRY is false.")
-    :put (" Either upload TAR to '" . $imagePath . "' or set :global USE_REGISTRY true before /import")
+    :put (" [FAIL] Required image archive '" . $imagePath . "' not found and UseRegistry is false.")
+    :put (" Either upload TAR to '" . $imagePath . "' or set :global UseRegistry true before /import")
     :error "Aborted: missing container image source"
 }
 
@@ -145,10 +145,10 @@
 :local envEntries {
     {"MODE"; "clat"};
     {"POLICY"; "auto"};
-    {"PREFER_DIRECT_IPV4"; "yes"};
+    {"PreferDirectIpv4"; "yes"};
     {"LAN_REQUIRES_IPV4"; "yes"};
-    {"ALLOW_LOCAL_NAT64"; "no"};
-    {"IPV6_ONLY_LAN_INTERFACES"; ""};
+    {"AllowLocalNat64"; "no"};
+    {"Ipv6OnlyLanInterfaces"; ""};
     {"TAYGA_WORKERS"; "3"};
     {"TAYGA_OFFLOAD"; "off"};
     {"TAYGA_OFFLINK_MTU"; "1280"};

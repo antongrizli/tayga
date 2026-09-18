@@ -9,10 +9,10 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-enable.rsc
 # ==============================================================================
 
-:global TAYGA_STATE "DISCOVERING"
-:global TAYGA_DIRECT_FAIL_COUNT 0
-:global TAYGA_DIRECT_PASS_COUNT 0
-:global TAYGA_CLAT_FAIL_COUNT 0
+:global TaygaState "DISCOVERING"
+:global TaygaDirectFailCount 0
+:global TaygaDirectPassCount 0
+:global TaygaClatFailCount 0
 
 :put "============================================================"
 :put " Enabling TAYGA Service & Network State Controller..."

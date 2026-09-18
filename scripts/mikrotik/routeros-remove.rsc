@@ -8,11 +8,11 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-remove.rsc
 # ==============================================================================
 
-:global TAYGA_LOCK_OWNER
-:global TAYGA_LOCK_TOKEN
-:global TAYGA_LOCK_TIME
-:global TAYGA_STATE
-:global TAYGA_PARKED_ROUTE_IDS
+:global TaygaLockOwner
+:global TaygaLockToken
+:global TaygaLockTime
+:global TaygaState
+:global TaygaParkedRouteIds
 
 :put "============================================================"
 :put " Removing TAYGA Unified Installation..."
@@ -26,24 +26,24 @@
 :while ($acquired = false and $waitCount < 20) do={
     :local curUp [/system/resource/get uptime]
     :local busy false
-    :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+    :if ([:len $TaygaLockOwner] > 0 and $TaygaLockOwner != "none") do={
         :local age 0s
         :local ageValid false
         :do {
-            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set age ($curUp - $TaygaLockTime)
             :set ageValid true
         } on-error={ :set ageValid false }
         :if ($ageValid = true and $age >= 300s) do={
             :local jobRunning false
             :do {
-                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                :if ($TaygaLockOwner = "controller") do={
                     :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
                         :set jobRunning true
                     }
                 }
             } on-error={}
             :if ($jobRunning = false) do={
-                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+                :put ("--> Overriding stale lock held by " . $TaygaLockOwner . " (age=" . [:tostr $age] . ")...")
             } else={
                 :set busy true
             }
@@ -52,12 +52,12 @@
         }
     }
     :if ($busy = false) do={
-        :set TAYGA_LOCK_OWNER "remove"
-        :set TAYGA_LOCK_TOKEN $myToken
-        :set TAYGA_LOCK_TIME $curUp
+        :set TaygaLockOwner "remove"
+        :set TaygaLockToken $myToken
+        :set TaygaLockTime $curUp
         :set acquired true
     } else={
-        :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCount . "/20s)...")
+        :put ("--> System locked by " . $TaygaLockOwner . "; waiting for lock release (" . $waitCount . "/20s)...")
         :delay 1s
         :set waitCount ($waitCount + 1)
     }
@@ -70,14 +70,14 @@
 
 :do {
     # Verify lock ownership was maintained before making network state changes
-    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "remove") do={
+    :if ($TaygaLockToken != $myToken or $TaygaLockOwner != "remove") do={
         :put " [FAIL] Lock was lost before remove operations could start."
         :error "Aborted: lock lost"
     }
     # 1. Restore specifically parked direct WAN default routes if any
     :put "--> Restoring parked direct WAN routes..."
-    :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
-        :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+    :if ([:len $TaygaParkedRouteIds] > 0) do={
+        :foreach pid in=$TaygaParkedRouteIds do={
             :do {
                 :if ([:len [/ip/route/find where .id=$pid]] > 0) do={
                     :put ("--> Re-enabling route: " . $pid)
@@ -85,7 +85,7 @@
                 }
             } on-error={}
         }
-        :set TAYGA_PARKED_ROUTE_IDS [:toarray ""]
+        :set TaygaParkedRouteIds [:toarray ""]
     }
 
     # Also restore any legacy tagged orig-wan-default routes
@@ -194,8 +194,8 @@
     /interface/bridge/remove [find where comment~"^\\[tayga-unified"]
 
     # 9. Clear global variables
-    :set TAYGA_STATE ""
-    :set TAYGA_PARKED_ROUTE_IDS [:toarray ""]
+    :set TaygaState ""
+    :set TaygaParkedRouteIds [:toarray ""]
 
     :put "============================================================"
     :put " TAYGA Unified components cleanly removed!"
@@ -206,7 +206,7 @@
 }
 
 # Release Unified Lock strictly by token match
-:if ($TAYGA_LOCK_TOKEN = $myToken) do={
-    :set TAYGA_LOCK_OWNER "none"
-    :set TAYGA_LOCK_TOKEN ""
+:if ($TaygaLockToken = $myToken) do={
+    :set TaygaLockOwner "none"
+    :set TaygaLockToken ""
 }

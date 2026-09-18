@@ -3,7 +3,7 @@
 # ==============================================================================
 # 1. Acquires Unified Lock (owner=disable) and disables scheduler
 # 2. Waits for any active controller run to finish (with strict 20s timeout)
-# 3. Sets persistent TAYGA_STATE to DISABLED
+# 3. Sets persistent TaygaState to DISABLED
 # 4. Disables CLAT default route and re-enables parked direct WAN default routes
 # 5. Cleanly stops running TAYGA CLAT and NAT64 containers
 # 6. Releases Unified Lock
@@ -12,11 +12,11 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-disable.rsc
 # ==============================================================================
 
-:global TAYGA_LOCK_OWNER
-:global TAYGA_LOCK_TOKEN
-:global TAYGA_LOCK_TIME
-:global TAYGA_STATE
-:global TAYGA_PARKED_ROUTE_IDS
+:global TaygaLockOwner
+:global TaygaLockToken
+:global TaygaLockTime
+:global TaygaState
+:global TaygaParkedRouteIds
 
 :put "============================================================"
 :put " Disabling TAYGA Service & Network State Controller..."
@@ -30,24 +30,24 @@
 :while ($acquired = false and $waitCount < 20) do={
     :local curUp [/system/resource/get uptime]
     :local busy false
-    :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+    :if ([:len $TaygaLockOwner] > 0 and $TaygaLockOwner != "none") do={
         :local age 0s
         :local ageValid false
         :do {
-            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set age ($curUp - $TaygaLockTime)
             :set ageValid true
         } on-error={ :set ageValid false }
         :if ($ageValid = true and $age >= 300s) do={
             :local jobRunning false
             :do {
-                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                :if ($TaygaLockOwner = "controller") do={
                     :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
                         :set jobRunning true
                     }
                 }
             } on-error={}
             :if ($jobRunning = false) do={
-                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+                :put ("--> Overriding stale lock held by " . $TaygaLockOwner . " (age=" . [:tostr $age] . ")...")
             } else={
                 :set busy true
             }
@@ -56,12 +56,12 @@
         }
     }
     :if ($busy = false) do={
-        :set TAYGA_LOCK_OWNER "disable"
-        :set TAYGA_LOCK_TOKEN $myToken
-        :set TAYGA_LOCK_TIME $curUp
+        :set TaygaLockOwner "disable"
+        :set TaygaLockToken $myToken
+        :set TaygaLockTime $curUp
         :set acquired true
     } else={
-        :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCount . "/20s)...")
+        :put ("--> System locked by " . $TaygaLockOwner . "; waiting for lock release (" . $waitCount . "/20s)...")
         :delay 1s
         :set waitCount ($waitCount + 1)
     }
@@ -74,7 +74,7 @@
 
 :do {
     # Verify lock ownership was maintained before making network state changes
-    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "disable") do={
+    :if ($TaygaLockToken != $myToken or $TaygaLockOwner != "disable") do={
         :put " [FAIL] Lock was lost before disable operations could start."
         :error "Aborted: lock lost"
     }
@@ -83,7 +83,7 @@
     /system/scheduler/disable [find where name="tayga-controller"]
 
     # 3. Set persistent state to DISABLED
-    :set TAYGA_STATE "DISABLED"
+    :set TaygaState "DISABLED"
 
     # 4. Disable CLAT default route in main table
     :put "--> Withdrawing CLAT default route..."
@@ -95,9 +95,9 @@
 
     # 6. Restore specifically parked direct WAN default routes
     :put "--> Restoring parked direct WAN default routes..."
-    :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
+    :if ([:len $TaygaParkedRouteIds] > 0) do={
         :local remainingParked [:toarray ""]
-        :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+        :foreach pid in=$TaygaParkedRouteIds do={
             :local restored false
             :do {
                 :if ([:len [/ip/route/find where .id=$pid]] > 0) do={
@@ -112,7 +112,7 @@
                 :set remainingParked ($remainingParked, $pid)
             }
         }
-        :set TAYGA_PARKED_ROUTE_IDS $remainingParked
+        :set TaygaParkedRouteIds $remainingParked
     }
 
     # 7. Stop running containers cleanly
@@ -133,7 +133,7 @@
 }
 
 # Release Unified Lock strictly by token match
-:if ($TAYGA_LOCK_TOKEN = $myToken) do={
-    :set TAYGA_LOCK_OWNER "none"
-    :set TAYGA_LOCK_TOKEN ""
+:if ($TaygaLockToken = $myToken) do={
+    :set TaygaLockOwner "none"
+    :set TaygaLockToken ""
 }

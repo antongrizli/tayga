@@ -40,34 +40,34 @@
 :local imagePath ($basePath . "/images/" . $localTarName)
 
 # --- Remote Image & Registry Configuration (Overridable via global variables) ---
-:global USE_REGISTRY
-:global REMOTE_IMAGE
-:global REGISTRY_URL
+:global UseRegistry
+:global RemoteImage
+:global RegistryUrl
 :global POLICY
-:global PREFER_DIRECT_IPV4
-:global ALLOW_LOCAL_NAT64
-:global IPV6_ONLY_LAN_INTERFACES
+:global PreferDirectIpv4
+:global AllowLocalNat64
+:global Ipv6OnlyLanInterfaces
 
 :local policy "auto"
 :if ([:len $POLICY] > 0) do={ :set policy $POLICY }
 
 :local preferDirectIpv4 "yes"
-:if ([:len $PREFER_DIRECT_IPV4] > 0) do={ :set preferDirectIpv4 $PREFER_DIRECT_IPV4 }
+:if ([:len $PreferDirectIpv4] > 0) do={ :set preferDirectIpv4 $PreferDirectIpv4 }
 
 :local allowLocalNat64 "yes"
-:if ([:len $ALLOW_LOCAL_NAT64] > 0) do={ :set allowLocalNat64 $ALLOW_LOCAL_NAT64 }
+:if ([:len $AllowLocalNat64] > 0) do={ :set allowLocalNat64 $AllowLocalNat64 }
 
 :local ipv6OnlyLanIfaces ""
-:if ([:len $IPV6_ONLY_LAN_INTERFACES] > 0) do={ :set ipv6OnlyLanIfaces $IPV6_ONLY_LAN_INTERFACES }
+:if ([:len $Ipv6OnlyLanInterfaces] > 0) do={ :set ipv6OnlyLanIfaces $Ipv6OnlyLanInterfaces }
 
 :local useRegistry false
-:if ($USE_REGISTRY = true) do={ :set useRegistry true }
+:if ($UseRegistry = true) do={ :set useRegistry true }
 
 :local remoteImage "ghcr.io/antongrizli/tayga-nat64:latest"
-:if ([:len $REMOTE_IMAGE] > 0) do={ :set remoteImage $REMOTE_IMAGE }
+:if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
-:if ([:len $REGISTRY_URL] > 0) do={ :set registryUrl $REGISTRY_URL }
+:if ([:len $RegistryUrl] > 0) do={ :set registryUrl $RegistryUrl }
 
 # Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
 :local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
@@ -86,8 +86,8 @@
 
 # Check container image source
 :if ($useRegistry = false and $hasLocalTar = false) do={
-    :put (" [FAIL] Required image archive '" . $imagePath . "' not found and USE_REGISTRY is false.")
-    :put (" Either upload TAR to '" . $imagePath . "' or set :global USE_REGISTRY true before /import")
+    :put (" [FAIL] Required image archive '" . $imagePath . "' not found and UseRegistry is false.")
+    :put (" Either upload TAR to '" . $imagePath . "' or set :global UseRegistry true before /import")
     :error "Aborted: missing container image source"
 }
 
@@ -199,9 +199,9 @@
 :put "--> Configuring shared policy environment list tayga-policy-envs..."
 :local policyEntries {
     {"POLICY"; $policy};
-    {"PREFER_DIRECT_IPV4"; $preferDirectIpv4};
-    {"ALLOW_LOCAL_NAT64"; $allowLocalNat64};
-    {"IPV6_ONLY_LAN_INTERFACES"; $ipv6OnlyLanIfaces}
+    {"PreferDirectIpv4"; $preferDirectIpv4};
+    {"AllowLocalNat64"; $allowLocalNat64};
+    {"Ipv6OnlyLanInterfaces"; $ipv6OnlyLanIfaces}
 }
 :foreach item in=$policyEntries do={
     :local k ($item->0)

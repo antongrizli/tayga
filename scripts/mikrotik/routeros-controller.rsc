@@ -20,18 +20,18 @@
 # ==============================================================================
 
 # --- Global State & Unified Lock Variables ---
-:global TAYGA_LOCK_OWNER
-:global TAYGA_LOCK_TOKEN
-:global TAYGA_LOCK_TIME
-:global TAYGA_STATE
-:global TAYGA_PARKED_ROUTE_IDS
-:global TAYGA_DIRECT_FAIL_COUNT
-:global TAYGA_DIRECT_PASS_COUNT
-:global TAYGA_CLAT_FAIL_COUNT
-:global TAYGA_NAT64_FAIL_COUNT
+:global TaygaLockOwner
+:global TaygaLockToken
+:global TaygaLockTime
+:global TaygaState
+:global TaygaParkedRouteIds
+:global TaygaDirectFailCount
+:global TaygaDirectPassCount
+:global TaygaClatFailCount
+:global TaygaNat64FailCount
 
 # 1. Check Disabled State
-:if ($TAYGA_STATE = "DISABLED") do={
+:if ($TaygaState = "DISABLED") do={
     :log debug "[tayga-controller] System is in DISABLED state. Skipping execution."
     :return nil
 }
@@ -39,24 +39,24 @@
 # 2. Unified Lock Manager: Check Ownership, Expiration, and Mutual Exclusion
 :local curUptime [/system/resource/get uptime]
 :local isLocked false
-:if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+:if ([:len $TaygaLockOwner] > 0 and $TaygaLockOwner != "none") do={
     :local lockAge 0s
     :local ageValid false
     :do {
-        :set lockAge ($curUptime - $TAYGA_LOCK_TIME)
+        :set lockAge ($curUptime - $TaygaLockTime)
         :set ageValid true
     } on-error={ :set ageValid false }
     :if ($ageValid = true and $lockAge >= 300s) do={
         :local jobRunning false
         :do {
-            :if ($TAYGA_LOCK_OWNER = "controller") do={
+            :if ($TaygaLockOwner = "controller") do={
                 :if ([:len [/system/script/job find where script="tayga-controller"]] > 1) do={
                     :set jobRunning true
                 }
             }
         } on-error={}
         :if ($jobRunning = false) do={
-            :log warn ("[tayga-controller] Stale lock detected (owner=" . $TAYGA_LOCK_OWNER . ", age=" . [:tostr $lockAge] . "). Overriding lock.")
+            :log warn ("[tayga-controller] Stale lock detected (owner=" . $TaygaLockOwner . ", age=" . [:tostr $lockAge] . "). Overriding lock.")
         } else={
             :set isLocked true
         }
@@ -66,24 +66,24 @@
 }
 
 :if ($isLocked = true) do={
-    :log info ("[tayga-controller] System locked by owner: " . $TAYGA_LOCK_OWNER . ". Skipping controller cycle.")
+    :log info ("[tayga-controller] System locked by owner: " . $TaygaLockOwner . ". Skipping controller cycle.")
     :return nil
 }
 
 :local myToken ("ctrl-" . [:tostr [/system/clock/get time]] . "-" . [:rndnum from=1000 to=9999])
-:set TAYGA_LOCK_OWNER "controller"
-:set TAYGA_LOCK_TOKEN $myToken
-:set TAYGA_LOCK_TIME $curUptime
+:set TaygaLockOwner "controller"
+:set TaygaLockToken $myToken
+:set TaygaLockTime $curUptime
 
 # Main Protected Execution Block
 :do {
     # Initialize State Counters & Arrays
-    :if ([:len $TAYGA_STATE] = 0) do={ :set TAYGA_STATE "DISCOVERING" }
-    :if ([:len $TAYGA_DIRECT_FAIL_COUNT] = 0) do={ :set TAYGA_DIRECT_FAIL_COUNT 0 }
-    :if ([:len $TAYGA_DIRECT_PASS_COUNT] = 0) do={ :set TAYGA_DIRECT_PASS_COUNT 0 }
-    :if ([:len $TAYGA_CLAT_FAIL_COUNT] = 0) do={ :set TAYGA_CLAT_FAIL_COUNT 0 }
-    :if ([:len $TAYGA_NAT64_FAIL_COUNT] = 0) do={ :set TAYGA_NAT64_FAIL_COUNT 0 }
-    :if ([:len $TAYGA_PARKED_ROUTE_IDS] = 0) do={ :set TAYGA_PARKED_ROUTE_IDS [:toarray ""] }
+    :if ([:len $TaygaState] = 0) do={ :set TaygaState "DISCOVERING" }
+    :if ([:len $TaygaDirectFailCount] = 0) do={ :set TaygaDirectFailCount 0 }
+    :if ([:len $TaygaDirectPassCount] = 0) do={ :set TaygaDirectPassCount 0 }
+    :if ([:len $TaygaClatFailCount] = 0) do={ :set TaygaClatFailCount 0 }
+    :if ([:len $TaygaNat64FailCount] = 0) do={ :set TaygaNat64FailCount 0 }
+    :if ([:len $TaygaParkedRouteIds] = 0) do={ :set TaygaParkedRouteIds [:toarray ""] }
 
     # Policy Defaults
     :local policy "auto"
@@ -109,21 +109,21 @@
 
     :local val [$findEnv "POLICY"]
     :if ([:len $val] > 0) do={ :set policy $val }
-    :set val [$findEnv "PREFER_DIRECT_IPV4"]
+    :set val [$findEnv "PreferDirectIpv4"]
     :if ([:len $val] > 0) do={ :set preferDirectIpv4 $val }
     :set val [$findEnv "LAN_REQUIRES_IPV4"]
     :if ([:len $val] > 0) do={ :set lanRequiresIpv4 $val }
-    :set val [$findEnv "ALLOW_LOCAL_NAT64"]
+    :set val [$findEnv "AllowLocalNat64"]
     :if ([:len $val] > 0) do={ :set allowLocalNat64 $val }
-    :set val [$findEnv "IPV6_ONLY_LAN_INTERFACES"]
+    :set val [$findEnv "Ipv6OnlyLanInterfaces"]
     :if ([:len $val] > 0) do={ :set ipv6OnlyLanIfaces $val }
 
     # Early check for POLICY=manual (Read-only monitor mode)
     :if ($policy = "manual") do={
         :log debug "[tayga-controller] POLICY=manual. Running in monitor-only mode."
-        :if ($TAYGA_LOCK_TOKEN = $myToken) do={
-            :set TAYGA_LOCK_OWNER "none"
-            :set TAYGA_LOCK_TOKEN ""
+        :if ($TaygaLockToken = $myToken) do={
+            :set TaygaLockOwner "none"
+            :set TaygaLockToken ""
         }
         :return nil
     }
@@ -151,9 +151,9 @@
         :local tComm [/routing/table/get ($wanTable->0) comment]
         :if (!($tComm ~ "^\\[tayga-unified:direct\\]")) do={
             :log error "[tayga-controller] ABORT: Table 'wan-direct' exists and is NOT owned by tayga-unified project. Refusing to modify."
-            :if ($TAYGA_LOCK_TOKEN = $myToken) do={
-                :set TAYGA_LOCK_OWNER "none"
-                :set TAYGA_LOCK_TOKEN ""
+            :if ($TaygaLockToken = $myToken) do={
+                :set TaygaLockOwner "none"
+                :set TaygaLockToken ""
             }
             :return nil
         }
@@ -166,9 +166,9 @@
         :local cComm [/routing/table/get ($clatTable->0) comment]
         :if (!($cComm ~ "^\\[tayga-unified:clat\\]")) do={
             :log error "[tayga-controller] ABORT: Table 'tayga-probe-clat' exists and is NOT owned by tayga-unified project. Refusing to modify."
-            :if ($TAYGA_LOCK_TOKEN = $myToken) do={
-                :set TAYGA_LOCK_OWNER "none"
-                :set TAYGA_LOCK_TOKEN ""
+            :if ($TaygaLockToken = $myToken) do={
+                :set TaygaLockOwner "none"
+                :set TaygaLockToken ""
             }
             :return nil
         }
@@ -181,9 +181,9 @@
         :local nComm [/routing/table/get ($nat64Table->0) comment]
         :if (!($nComm ~ "^\\[tayga-unified:nat64\\]")) do={
             :log error "[tayga-controller] ABORT: Table 'tayga-probe-nat64' exists and is NOT owned by tayga-unified project. Refusing to modify."
-            :if ($TAYGA_LOCK_TOKEN = $myToken) do={
-                :set TAYGA_LOCK_OWNER "none"
-                :set TAYGA_LOCK_TOKEN ""
+            :if ($TaygaLockToken = $myToken) do={
+                :set TaygaLockOwner "none"
+                :set TaygaLockToken ""
             }
             :return nil
         }
@@ -206,8 +206,8 @@
     }
 
     # If active route not found, check previously parked routes
-    :if ([:len $directWanGw] = 0 and [:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
-        :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+    :if ([:len $directWanGw] = 0 and [:len $TaygaParkedRouteIds] > 0) do={
+        :foreach pid in=$TaygaParkedRouteIds do={
             :do {
                 :local pgw [/ip/route/get $pid gateway]
                 :if ([:len $directWanGw] = 0 and [:len $pgw] > 0) do={ :set directWanGw $pgw }
@@ -256,12 +256,12 @@
 
     # 2. IPv6 WAN Probe
     :local ipv6Ok false
-    :local ping6_1 [/ping 2606:4700:4700::1111 count=2]
-    :if ($ping6_1 > 0) do={
+    :local ping61 [/ping 2606:4700:4700::1111 count=2]
+    :if ($ping61 > 0) do={
         :set ipv6Ok true
     } else={
-        :local ping6_2 [/ping 2001:4860:4860::8888 count=2]
-        :if ($ping6_2 > 0) do={ :set ipv6Ok true }
+        :local ping62 [/ping 2001:4860:4860::8888 count=2]
+        :if ($ping62 > 0) do={ :set ipv6Ok true }
     }
 
     # Containers and Route references
@@ -279,7 +279,7 @@
     }
 
     # --- Finite State Machine (FSM) Evaluation ---
-    :local nextState $TAYGA_STATE
+    :local nextState $TaygaState
 
     # Check NAT64 prerequisites if requested
     :local nat64ConfigValid false
@@ -298,24 +298,24 @@
                 }
                 :if ($allExist = true) do={ :set nat64ConfigValid true }
             } else={
-                :log error "[tayga-controller] ALLOW_LOCAL_NAT64=yes requires at least one interface in IPV6_ONLY_LAN_INTERFACES."
+                :log error "[tayga-controller] AllowLocalNat64=yes requires at least one interface in Ipv6OnlyLanInterfaces."
                 :set nat64ConfigValid false
             }
         } else={
-            :log warn "[tayga-controller] ALLOW_LOCAL_NAT64=yes requested, but NAT64 container or prefix route is missing."
+            :log warn "[tayga-controller] AllowLocalNat64=yes requested, but NAT64 container or prefix route is missing."
         }
     }
 
     :if ($directIpv4Ok = true and $preferDirectIpv4 = "yes") do={
-        :set TAYGA_DIRECT_FAIL_COUNT 0
-        :set TAYGA_DIRECT_PASS_COUNT ($TAYGA_DIRECT_PASS_COUNT + 1)
+        :set TaygaDirectFailCount 0
+        :set TaygaDirectPassCount ($TaygaDirectPassCount + 1)
 
-        :if ($TAYGA_DIRECT_PASS_COUNT >= $recoveryThreshold or $TAYGA_STATE = "DISCOVERING" or $TAYGA_STATE = "DIRECT" or $TAYGA_STATE = "NAT64_ACTIVE" or $TAYGA_STATE = "PREPARING_NAT64") do={
+        :if ($TaygaDirectPassCount >= $recoveryThreshold or $TaygaState = "DISCOVERING" or $TaygaState = "DIRECT" or $TaygaState = "NAT64_ACTIVE" or $TaygaState = "PREPARING_NAT64") do={
             # Direct IPv4 is healthy
-            # 1. Verified Unparking of WAN routes from TAYGA_PARKED_ROUTE_IDS
-            :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
+            # 1. Verified Unparking of WAN routes from TaygaParkedRouteIds
+            :if ([:len $TaygaParkedRouteIds] > 0) do={
                 :local remainingParked [:toarray ""]
-                :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+                :foreach pid in=$TaygaParkedRouteIds do={
                     :local restored false
                     :do {
                         :if ([:len [/ip/route/find where .id=$pid]] > 0) do={
@@ -333,7 +333,7 @@
                         :set remainingParked ($remainingParked, $pid)
                     }
                 }
-                :set TAYGA_PARKED_ROUTE_IDS $remainingParked
+                :set TaygaParkedRouteIds $remainingParked
             }
 
             # 2. Controlled Priority Switch & Verification:
@@ -451,17 +451,17 @@
                         }
 
                         :if ($nRunning = true and $dns64Ok = true and $nat64PingOk = true) do={
-                            :set TAYGA_NAT64_FAIL_COUNT 0
+                            :set TaygaNat64FailCount 0
                             # Enable user-facing prefix route in main ONLY after verified
                             :if ([:len $nat64Route] > 0) do={
                                 /ipv6/route/set ($nat64Route->0) disabled=no
                             }
                             :set nextState "NAT64_ACTIVE"
                         } else={
-                            :set TAYGA_NAT64_FAIL_COUNT ($TAYGA_NAT64_FAIL_COUNT + 1)
+                            :set TaygaNat64FailCount ($TaygaNat64FailCount + 1)
                             # If service was previously NAT64_ACTIVE, apply failure hysteresis threshold (>=2) before disabling
-                            :if ($TAYGA_STATE = "NAT64_ACTIVE" and $TAYGA_NAT64_FAIL_COUNT < 2) do={
-                                :log warn ("[tayga-controller] NAT64 probe failed (" . $TAYGA_NAT64_FAIL_COUNT . "/2). Awaiting failure threshold.")
+                            :if ($TaygaState = "NAT64_ACTIVE" and $TaygaNat64FailCount < 2) do={
+                                :log warn ("[tayga-controller] NAT64 probe failed (" . $TaygaNat64FailCount . "/2). Awaiting failure threshold.")
                             } else={
                                 :if ([:len $nat64Route] > 0) do={
                                     /ipv6/route/set ($nat64Route->0) disabled=yes
@@ -495,7 +495,7 @@
                 }
             } else={
                 # Direct switch failed: verify if CLAT was already active and running before retaining CLAT_ACTIVE
-                :if ($TAYGA_STATE = "CLAT_ACTIVE") do={
+                :if ($TaygaState = "CLAT_ACTIVE") do={
                     :local clatRunning false
                     :if ([:len $clatConts] > 0) do={
                         :if ([/container/get ($clatConts->0) running] = true) do={ :set clatRunning true }
@@ -513,20 +513,20 @@
                     }
                 } else={
                     # CLAT was not previously active (was in DIRECT, DISCOVERING, or NAT64_ACTIVE)
-                    :log warn ("[tayga-controller] Direct WAN route inactive or conflict present in main while in state " . $TAYGA_STATE . ". Transitioning to DEGRADED.")
+                    :log warn ("[tayga-controller] Direct WAN route inactive or conflict present in main while in state " . $TaygaState . ". Transitioning to DEGRADED.")
                     :set nextState "DEGRADED"
                 }
             }
         } else={
-            :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TAYGA_DIRECT_PASS_COUNT . "/" . $recoveryThreshold . "), awaiting recovery threshold.")
+            :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TaygaDirectPassCount . "/" . $recoveryThreshold . "), awaiting recovery threshold.")
         }
     } else={
         # Direct IPv4 failed or not preferred
-        :set TAYGA_DIRECT_PASS_COUNT 0
-        :set TAYGA_DIRECT_FAIL_COUNT ($TAYGA_DIRECT_FAIL_COUNT + 1)
+        :set TaygaDirectPassCount 0
+        :set TaygaDirectFailCount ($TaygaDirectFailCount + 1)
 
-        :if (($TAYGA_STATE = "DIRECT" or $TAYGA_STATE = "NAT64_ACTIVE" or $TAYGA_STATE = "PREPARING_NAT64") and $TAYGA_DIRECT_FAIL_COUNT < $failThreshold) do={
-            :log warn ("[tayga-controller] Direct IPv4 probe failed (" . $TAYGA_DIRECT_FAIL_COUNT . "/" . $failThreshold . "). Awaiting fail threshold.")
+        :if (($TaygaState = "DIRECT" or $TaygaState = "NAT64_ACTIVE" or $TaygaState = "PREPARING_NAT64") and $TaygaDirectFailCount < $failThreshold) do={
+            :log warn ("[tayga-controller] Direct IPv4 probe failed (" . $TaygaDirectFailCount . "/" . $failThreshold . "). Awaiting fail threshold.")
         } else={
             # Direct IPv4 confirmed down (failures >= failThreshold); teardown NAT64 and prepare CLAT path!
             :if ([:len $nat64Route] > 0) do={ /ipv6/route/set ($nat64Route->0) disabled=yes }
@@ -558,14 +558,14 @@
                 }
 
                     :if ($clatProbeOk = true) do={
-                    :set TAYGA_CLAT_FAIL_COUNT 0
+                    :set TaygaClatFailCount 0
 
                     # Verify lock token and update heartbeat before making routing changes
-                    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "controller") do={
+                    :if ($TaygaLockToken != $myToken or $TaygaLockOwner != "controller") do={
                         :log error "[tayga-controller] Lock ownership lost! Aborting route modifications."
                         :error "Aborted: lock lost"
                     }
-                    :set TAYGA_LOCK_TIME [/system/resource/get uptime]
+                    :set TaygaLockTime [/system/resource/get uptime]
 
                     # Transactional Route Switching: strictly matching managed $wanIf
                     :local switchSuccess true
@@ -628,26 +628,26 @@
                             } on-error={}
                             :if ($restored = false) do={
                                 # Save un-restored route for retry by future cycles
-                                :set TAYGA_PARKED_ROUTE_IDS ($TAYGA_PARKED_ROUTE_IDS, $r)
+                                :set TaygaParkedRouteIds ($TaygaParkedRouteIds, $r)
                             }
                         }
                         :set nextState "DEGRADED"
                     } else={
-                        # Success: Accumulate newly parked routes into TAYGA_PARKED_ROUTE_IDS with deduplication
+                        # Success: Accumulate newly parked routes into TaygaParkedRouteIds with deduplication
                         :foreach r in=$newlyParked do={
                             :local isDupl false
-                            :foreach ex in=$TAYGA_PARKED_ROUTE_IDS do={ :if ($ex = $r) do={ :set isDupl true } }
-                            :if ($isDupl = false) do={ :set TAYGA_PARKED_ROUTE_IDS ($TAYGA_PARKED_ROUTE_IDS, $r) }
+                            :foreach ex in=$TaygaParkedRouteIds do={ :if ($ex = $r) do={ :set isDupl true } }
+                            :if ($isDupl = false) do={ :set TaygaParkedRouteIds ($TaygaParkedRouteIds, $r) }
                         }
                         :set nextState "CLAT_ACTIVE"
                     }
                 } else={
                     # CLAT probe ping failed
-                    :set TAYGA_CLAT_FAIL_COUNT ($TAYGA_CLAT_FAIL_COUNT + 1)
-                    :log warn ("[tayga-controller] CLAT probe failed (failures=" . $TAYGA_CLAT_FAIL_COUNT . "/" . $clatFailThreshold . ")")
+                    :set TaygaClatFailCount ($TaygaClatFailCount + 1)
+                    :log warn ("[tayga-controller] CLAT probe failed (failures=" . $TaygaClatFailCount . "/" . $clatFailThreshold . ")")
 
                     # Apply symmetric hysteresis threshold
-                    :if ($TAYGA_CLAT_FAIL_COUNT >= $clatFailThreshold or $TAYGA_STATE = "PREPARING_CLAT") do={
+                    :if ($TaygaClatFailCount >= $clatFailThreshold or $TaygaState = "PREPARING_CLAT") do={
                         :log error "[tayga-controller] CLAT path unavailable. Entering DEGRADED state."
                         :set nextState "DEGRADED"
 
@@ -670,16 +670,16 @@
     }
 
     # Update State Transition
-    :if ($TAYGA_STATE != $nextState) do={
-        :log info ("[tayga-controller] State transition: " . $TAYGA_STATE . " -> " . $nextState)
-        :set TAYGA_STATE $nextState
+    :if ($TaygaState != $nextState) do={
+        :log info ("[tayga-controller] State transition: " . $TaygaState . " -> " . $nextState)
+        :set TaygaState $nextState
     }
 } on-error={
     :log error "[tayga-controller] Unhandled exception during controller execution."
 }
 
 # Release Controller Lock strictly by token match
-:if ($TAYGA_LOCK_TOKEN = $myToken) do={
-    :set TAYGA_LOCK_OWNER "none"
-    :set TAYGA_LOCK_TOKEN ""
+:if ($TaygaLockToken = $myToken) do={
+    :set TaygaLockOwner "none"
+    :set TaygaLockToken ""
 }

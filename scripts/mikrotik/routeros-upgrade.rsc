@@ -19,9 +19,9 @@
 # ==============================================================================
 
 # --- 0. Acquire Unified Lock (owner=upgrade) ---
-:global TAYGA_LOCK_OWNER
-:global TAYGA_LOCK_TOKEN
-:global TAYGA_LOCK_TIME
+:global TaygaLockOwner
+:global TaygaLockToken
+:global TaygaLockTime
 
 :local myToken ("upgrade-" . [:tostr [/system/clock/get time]] . "-" . [:rndnum from=1000 to=9999])
 :local waitCtrl 0
@@ -30,24 +30,24 @@
 :while ($acquired = false and $waitCtrl < 20) do={
     :local curUp [/system/resource/get uptime]
     :local busy false
-    :if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+    :if ([:len $TaygaLockOwner] > 0 and $TaygaLockOwner != "none") do={
         :local age 0s
         :local ageValid false
         :do {
-            :set age ($curUp - $TAYGA_LOCK_TIME)
+            :set age ($curUp - $TaygaLockTime)
             :set ageValid true
         } on-error={ :set ageValid false }
         :if ($ageValid = true and $age >= 300s) do={
             :local jobRunning false
             :do {
-                :if ($TAYGA_LOCK_OWNER = "controller") do={
+                :if ($TaygaLockOwner = "controller") do={
                     :if ([:len [/system/script/job find where script="tayga-controller"]] > 0) do={
                         :set jobRunning true
                     }
                 }
             } on-error={}
             :if ($jobRunning = false) do={
-                :put ("--> Overriding stale lock held by " . $TAYGA_LOCK_OWNER . " (age=" . [:tostr $age] . ")...")
+                :put ("--> Overriding stale lock held by " . $TaygaLockOwner . " (age=" . [:tostr $age] . ")...")
             } else={
                 :set busy true
             }
@@ -56,12 +56,12 @@
         }
     }
     :if ($busy = false) do={
-        :set TAYGA_LOCK_OWNER "upgrade"
-        :set TAYGA_LOCK_TOKEN $myToken
-        :set TAYGA_LOCK_TIME $curUp
+        :set TaygaLockOwner "upgrade"
+        :set TaygaLockToken $myToken
+        :set TaygaLockTime $curUp
         :set acquired true
     } else={
-        :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCtrl . "/20s)...")
+        :put ("--> System locked by " . $TaygaLockOwner . "; waiting for lock release (" . $waitCtrl . "/20s)...")
         :delay 1s
         :set waitCtrl ($waitCtrl + 1)
     }
@@ -106,18 +106,18 @@
     :local imagePath ($basePath . "/images/" . $localTarName)
 
     # --- Remote Image & Registry Configuration (Overridable via global variables) ---
-    :global USE_REGISTRY
-    :global REMOTE_IMAGE
-    :global REGISTRY_URL
+    :global UseRegistry
+    :global RemoteImage
+    :global RegistryUrl
 
     :local useRegistry false
-    :if ($USE_REGISTRY = true) do={ :set useRegistry true }
+    :if ($UseRegistry = true) do={ :set useRegistry true }
 
     :local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
-    :if ([:len $REMOTE_IMAGE] > 0) do={ :set remoteImage $REMOTE_IMAGE }
+    :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
     :local registryUrl "https://ghcr.io"
-    :if ([:len $REGISTRY_URL] > 0) do={ :set registryUrl $REGISTRY_URL }
+    :if ([:len $RegistryUrl] > 0) do={ :set registryUrl $RegistryUrl }
 
     # Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
     :local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
@@ -128,7 +128,7 @@
 
     # --- 2. Check Prerequisites Before Modifying Services ---
     :if ($useRegistry = false and $hasLocalTar = false) do={
-        :put (" [FAIL] Upgrade image archive '" . $imagePath . "' not found and USE_REGISTRY is false.")
+        :put (" [FAIL] Upgrade image archive '" . $imagePath . "' not found and UseRegistry is false.")
         :error "Aborted: missing container image archive"
     }
 
@@ -222,7 +222,7 @@
             :local isExtracted false
             :while (($isExtracted = false) && ($extWait < 180)) do={
                 # Refresh lock heartbeat to prevent controller from stealing lock
-                :set TAYGA_LOCK_TIME [/system/resource/get uptime]
+                :set TaygaLockTime [/system/resource/get uptime]
                 :local isStopped [/container/get $cId stopped]
                 :if ($isStopped = true) do={
                     :set isExtracted true
@@ -293,7 +293,7 @@
 
     # --- 8. Promote Candidate OR Execute INSTANT ZERO-EXTRACTION ROLLBACK ---
     # Verify lock ownership was maintained before making network state changes
-    :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "upgrade") do={
+    :if ($TaygaLockToken != $myToken or $TaygaLockOwner != "upgrade") do={
         :put " [FAIL] Lock was hijacked by another process. Halting upgrade."
         :error "Aborted: lock lost"
     }
@@ -333,7 +333,7 @@
                 /container/stop $fc
                 :local w 0
                 :while (([/container/get $fc stopped] != true) && ($w < 15)) do={
-                    :set TAYGA_LOCK_TIME [/system/resource/get uptime]
+                    :set TaygaLockTime [/system/resource/get uptime]
                     :delay 1s
                     :set w ($w + 1)
                 }
@@ -342,17 +342,17 @@
         }
 
         # 2. INSTANTLY Restart preserved old container (< 1s, zero file extraction)
-        :if ($TAYGA_LOCK_TOKEN != $myToken or $TAYGA_LOCK_OWNER != "upgrade") do={
+        :if ($TaygaLockToken != $myToken or $TaygaLockOwner != "upgrade") do={
             :put " [FAIL] Lock was lost before rollback could complete."
             :error "Aborted: lock lost"
         }
-        :set TAYGA_LOCK_TIME [/system/resource/get uptime]
+        :set TaygaLockTime [/system/resource/get uptime]
         :put ("--> Instantly restarting preserved working container from slot " . $prevSlot . "...")
         /container/start $oldCont
         :local restoredRunning false
         :for i from=1 to=15 do={
             :if ($restoredRunning = false) do={
-                :set TAYGA_LOCK_TIME [/system/resource/get uptime]
+                :set TaygaLockTime [/system/resource/get uptime]
                 :local r [/container/get $oldCont running]
                 :if ($r = true) do={ :set restoredRunning true } else={ :delay 1s }
             }
@@ -384,7 +384,7 @@
 }
 
 # Release Unified Lock strictly by token match
-:if ($TAYGA_LOCK_TOKEN = $myToken) do={
-    :set TAYGA_LOCK_OWNER "none"
-    :set TAYGA_LOCK_TOKEN ""
+:if ($TaygaLockToken = $myToken) do={
+    :set TaygaLockOwner "none"
+    :set TaygaLockToken ""
 }
