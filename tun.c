@@ -40,6 +40,42 @@ int set_nonblock(int fd)
     return 0;
 }
 
+int tun_check_offload_support(void)
+{
+#ifdef __linux__
+	int fd = open("/dev/net/tun", O_RDWR);
+	if (fd < 0) {
+		printf("OFFLOAD_CHECK: FAIL (cannot open /dev/net/tun: %s)\n", strerror(errno));
+		return 1;
+	}
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
+	snprintf(ifr.ifr_name, IFNAMSIZ, "tun_chk_%d", (int)getpid());
+	if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+		printf("OFFLOAD_CHECK: FAIL (IFF_VNET_HDR ioctl failed: %s)\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	int sz = 0;
+	if (ioctl(fd, TUNGETVNETHDRSZ, &sz) < 0) {
+		sz = 10;
+	}
+	unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+	if (ioctl(fd, TUNSETOFFLOAD, offload_flags) < 0) {
+		printf("OFFLOAD_CHECK: FAIL (TUNSETOFFLOAD ioctl failed: %s)\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	printf("OFFLOAD_CHECK: OK (IFF_VNET_HDR supported, vnet_hdr_sz=%d, TSO4|TSO6|CSUM available)\n", sz);
+	return 0;
+#else
+	printf("OFFLOAD_CHECK: NOT_SUPPORTED (Linux TUN only)\n");
+	return 1;
+#endif
+}
+
 #ifdef __linux__
 int netlink_wait_for_ack(int fd)
 {
@@ -279,42 +315,6 @@ int netlink_route_dev_modify(int ifidx,
 
     /* Receive ACK */
 	return netlink_wait_for_ack(fd);
-}
-
-int tun_check_offload_support(void)
-{
-#ifdef __linux__
-	int fd = open("/dev/net/tun", O_RDWR);
-	if (fd < 0) {
-		printf("OFFLOAD_CHECK: FAIL (cannot open /dev/net/tun: %s)\n", strerror(errno));
-		return 1;
-	}
-	struct ifreq ifr;
-	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
-	snprintf(ifr.ifr_name, IFNAMSIZ, "tun_chk_%d", (int)getpid());
-	if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-		printf("OFFLOAD_CHECK: FAIL (IFF_VNET_HDR ioctl failed: %s)\n", strerror(errno));
-		close(fd);
-		return 1;
-	}
-	int sz = 0;
-	if (ioctl(fd, TUNGETVNETHDRSZ, &sz) < 0) {
-		sz = 10;
-	}
-	unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-	if (ioctl(fd, TUNSETOFFLOAD, offload_flags) < 0) {
-		printf("OFFLOAD_CHECK: FAIL (TUNSETOFFLOAD ioctl failed: %s)\n", strerror(errno));
-		close(fd);
-		return 1;
-	}
-	close(fd);
-	printf("OFFLOAD_CHECK: OK (IFF_VNET_HDR supported, vnet_hdr_sz=%d, TSO4|TSO6|CSUM available)\n", sz);
-	return 0;
-#else
-	printf("OFFLOAD_CHECK: NOT_SUPPORTED (Linux TUN only)\n");
-	return 1;
-#endif
 }
 
 int tun_setup(int do_mktun, int do_rmtun)
