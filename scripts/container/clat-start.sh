@@ -7,8 +7,7 @@ enable_forwarding() {
   if sysctl -w "$key=1" >/dev/null 2>&1 || [ "$(sysctl -n "$key" 2>/dev/null)" = "1" ]; then
     return 0
   fi
-  echo "ERROR: Kernel forwarding for $key is disabled and cannot be set (forwarding must be enabled on host)" >&2
-  exit 1
+  echo "WARNING: Cannot set $key=1 and current value is not 1; forwarding should be enabled on the host" >&2
 }
 
 # Validate unsigned integer helper

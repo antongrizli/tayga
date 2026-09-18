@@ -14,6 +14,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
+
 jobs:
   test-and-verify:
     name: Run Unit Tests & C Code Verification

@@ -16,6 +16,9 @@ on:
 # permissions are set per job
 permissions: { }
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
+
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   test-linux:
