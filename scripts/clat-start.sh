@@ -10,8 +10,17 @@ enable_forwarding() {
 }
 
 PREF64=${PREF64:-auto}
-if [ "$PREF64" = auto ]; then
-  PREF64=$(/usr/local/sbin/pref64-discover)
+if [ "$PREF64" = "auto" ]; then
+  DISCOVERED=""
+  if [ -x /usr/local/sbin/pref64-discover ]; then
+    DISCOVERED=$(/usr/local/sbin/pref64-discover 2>/dev/null || true)
+  fi
+  if [ -n "$DISCOVERED" ]; then
+    PREF64="$DISCOVERED"
+  else
+    echo "WARNING: RFC 7050 discovery failed. Falling back to 64:ff9b::/96" >&2
+    PREF64="64:ff9b::/96"
+  fi
 fi
 TUN=clat
 V4_CLIENT=${CLAT_V4_CLIENT:-192.0.0.1}

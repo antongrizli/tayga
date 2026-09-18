@@ -70,17 +70,25 @@ case "$TAYGA_OFFLOAD_VAL" in
 esac
 
 PREF64="${PREF64:-auto}"
+PREF64_STRICT="${PREF64_STRICT:-false}"
+
 if [ "$PREF64" = "auto" ]; then
   echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."
+  DISCOVERED=""
   if [ -x /usr/local/sbin/pref64-discover ]; then
-    PREF64=$(/usr/local/sbin/pref64-discover) || {
-      echo "ERROR: RFC 7050 discovery failed. Set PREF64 explicitly (e.g. PREF64=64:ff9b::/96) or check DNS64 connectivity." >&2
-      exit 1
-    }
+    DISCOVERED=$(/usr/local/sbin/pref64-discover 2>/dev/null || true)
+  fi
+  if [ -n "$DISCOVERED" ]; then
+    PREF64="$DISCOVERED"
     echo "==> Discovered PREF64: $PREF64"
   else
-    echo "ERROR: /usr/local/sbin/pref64-discover not found and PREF64=auto" >&2
-    exit 1
+    if [ "$PREF64_STRICT" = "true" ]; then
+      echo "ERROR: RFC 7050 discovery failed and PREF64_STRICT=true. Set PREF64 explicitly (e.g. PREF64=64:ff9b::/96) or check DNS64 connectivity." >&2
+      exit 1
+    else
+      echo "WARNING: RFC 7050 discovery failed (DNS64 unreachable / no LTE). Falling back to Well-Known Prefix 64:ff9b::/96 (RFC 6052)" >&2
+      PREF64="64:ff9b::/96"
+    fi
   fi
 fi
 
