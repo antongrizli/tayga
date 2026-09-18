@@ -1,26 +1,27 @@
 # ==============================================================================
 # RouterOS 7 Network State Controller: Dynamic Mode Selection & Route Management
 # ==============================================================================
-# Automates runtime mode selection between DIRECT IPv4 and CLAT (RFC 6877)
-# based on real-time WAN capability and LAN requirements.
+# Automates runtime mode selection between DIRECT IPv4, CLAT (RFC 6877), and
+# NAT64 (RFC 6146/6147) based on real-time WAN capability and LAN requirements.
 #
 # FSM States:
 #   - DISCOVERING     : Initial state / evaluating available WAN paths
 #   - DIRECT          : Direct WAN IPv4 is active and healthy (CLAT in standby)
+#   - NAT64_ACTIVE    : Direct WAN IPv4 + Local NAT64/DNS64 active for IPv6 LAN
 #   - PREPARING_CLAT  : Direct IPv4 failed; starting/probing CLAT container
 #   - CLAT_ACTIVE     : CLAT verified end-to-end; default IPv4 route active via CLAT
 #   - DEGRADED        : No working IPv4 transit (direct down, CLAT/PLAT unreachable)
 #   - DISABLED        : Manually disabled by administrator via routeros-disable.rsc
+#   - CONFIG_ERROR    : Invalid policy configuration (e.g. missing LAN interfaces)
 #
 # Usage:
 #   Run periodically via /system/scheduler (default: every 15s)
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-controller.rsc
 # ==============================================================================
 
-# --- Global State & Concurrency Mutex Variables ---
-:global TAYGA_MAINTENANCE_LOCK
-:global TAYGA_CONTROLLER_BUSY
-:global TAYGA_BUSY_TICKS
+# --- Global State & Unified Lock Variables ---
+:global TAYGA_LOCK_OWNER
+:global TAYGA_LOCK_TIME
 :global TAYGA_STATE
 :global TAYGA_PARKED_ROUTE_IDS
 :global TAYGA_DIRECT_FAIL_COUNT
@@ -33,24 +34,16 @@
     :return nil
 }
 
-# 2. Concurrency Guard: Check Maintenance Lock (Upgrade/Rollback/Disable in progress)
-:if ($TAYGA_MAINTENANCE_LOCK = true) do={
-    :log info "[tayga-controller] Maintenance or upgrade in progress (lock=true). Skipping controller run."
-    :return nil
-}
-
-# 3. Concurrency Mutex Guard with Stale Lock Recovery
-:if ($TAYGA_CONTROLLER_BUSY = true) do={
-    :if ([:len $TAYGA_BUSY_TICKS] = 0) do={ :set TAYGA_BUSY_TICKS 0 }
-    :set TAYGA_BUSY_TICKS ($TAYGA_BUSY_TICKS + 1)
-    :if ($TAYGA_BUSY_TICKS < 4) do={
-        :log debug ("[tayga-controller] Another controller run is in progress (ticks=" . $TAYGA_BUSY_TICKS . "). Skipping.")
+# 2. Unified Lock Manager: Check Ownership and Mutual Exclusion
+:local curUptime [/system/resource/get uptime]
+:if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none") do={
+    :if ($TAYGA_LOCK_OWNER != "controller") do={
+        :log info ("[tayga-controller] System locked by owner: " . $TAYGA_LOCK_OWNER . ". Skipping controller cycle.")
         :return nil
     }
-    :log warn "[tayga-controller] Stale busy lock detected (>=4 ticks / 60s). Self-healing lock."
 }
-:set TAYGA_CONTROLLER_BUSY true
-:set TAYGA_BUSY_TICKS 0
+:set TAYGA_LOCK_OWNER "controller"
+:set TAYGA_LOCK_TIME $curUptime
 
 # Main Protected Execution Block
 :do {
@@ -87,17 +80,10 @@
     :local envIpv6Lan [/container/envs/find where list="tayga-clat-envs" and key="IPV6_ONLY_LAN_INTERFACES"]
     :if ([:len $envIpv6Lan] > 0) do={ :set ipv6OnlyLanIfaces [/container/envs/get ($envIpv6Lan->0) value] }
 
-    # Informative log if unsupported or unconfigured NAT64 is requested
-    :if ($allowLocalNat64 = "yes") do={
-        :if ([:len $ipv6OnlyLanIfaces] = 0) do={
-            :log warn "[tayga-controller] ALLOW_LOCAL_NAT64=yes ignored: IPV6_ONLY_LAN_INTERFACES is empty. Auto-NAT64 requires explicit interface list."
-        }
-    }
-
     # Early check for POLICY=manual (Read-only monitor mode)
     :if ($policy = "manual") do={
         :log debug "[tayga-controller] POLICY=manual. Running in monitor-only mode."
-        :set TAYGA_CONTROLLER_BUSY false
+        :if ($TAYGA_LOCK_OWNER = "controller") do={ :set TAYGA_LOCK_OWNER "none" }
         :return nil
     }
 
@@ -116,14 +102,16 @@
         }
     }
 
-    # Ensure Isolated Routing Tables exist with strict ownership verification
+    # Strict Table Ownership Verification: refuse to touch unowned tables
     :local wanTable [/routing/table/find where name="wan-direct"]
     :if ([:len $wanTable] = 0) do={
         /routing/table/add name=wan-direct fib comment="[tayga-unified:direct] Isolated Direct WAN Routing Table"
     } else={
         :local tComm [/routing/table/get ($wanTable->0) comment]
-        :if (!($tComm ~ "^\\[tayga-unified")) do={
-            :log warn "[tayga-controller] Existing routing table 'wan-direct' is not owned by this project. Using with caution."
+        :if (!($tComm ~ "^\\[tayga-unified:direct\\]")) do={
+            :log error "[tayga-controller] ABORT: Table 'wan-direct' exists and is NOT owned by tayga-unified project. Refusing to modify."
+            :if ($TAYGA_LOCK_OWNER = "controller") do={ :set TAYGA_LOCK_OWNER "none" }
+            :return nil
         }
     }
 
@@ -132,18 +120,26 @@
         /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
     } else={
         :local cComm [/routing/table/get ($clatTable->0) comment]
-        :if (!($cComm ~ "^\\[tayga-unified")) do={
-            :log warn "[tayga-controller] Existing routing table 'tayga-probe-clat' is not owned by this project. Using with caution."
+        :if (!($cComm ~ "^\\[tayga-unified:clat\\]")) do={
+            :log error "[tayga-controller] ABORT: Table 'tayga-probe-clat' exists and is NOT owned by tayga-unified project. Refusing to modify."
+            :if ($TAYGA_LOCK_OWNER = "controller") do={ :set TAYGA_LOCK_OWNER "none" }
+            :return nil
         }
     }
 
-    # Strictly detect direct WAN gateway on $wanIf
+    # Strictly detect direct WAN gateway belonging specifically to $wanIf
     :local directWanGw ""
     :local wanRoutes [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active and !comment~"^\\[tayga-unified"]
     :foreach wr in=$wanRoutes do={
+        :local isMyWan false
         :local gw [/ip/route/get $wr gateway]
-        :if ($gw = $wanIf or $gw ~ "^[0-9]" or $gw ~ "^[a-fA-F0-9]") do={
-            :if ([:len $directWanGw] = 0) do={ :set directWanGw $gw }
+        :if ($gw = $wanIf) do={ :set isMyWan true }
+        :do {
+            :local immGw [/ip/route/get $wr immediate-gw]
+            :if ($immGw ~ $wanIf) do={ :set isMyWan true }
+        } on-error={}
+        :if ($isMyWan = true and [:len $directWanGw] = 0) do={
+            :set directWanGw $gw
         }
     }
 
@@ -158,8 +154,8 @@
     }
     :if ([:len $directWanGw] = 0) do={ :set directWanGw $wanIf }
 
-    # Sync probe route in 'wan-direct'
-    :local tableRoute [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0"]
+    # Sync probe route in 'wan-direct' (strictly owned route)
+    :local tableRoute [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified:direct"]
     :if ([:len $tableRoute] = 0) do={
         :if ([:len $directWanGw] > 0) do={
             /ip/route/add dst-address=0.0.0.0/0 gateway=$directWanGw routing-table=wan-direct comment="[tayga-unified:direct:probe] Direct WAN Probe Route"
@@ -172,13 +168,13 @@
     }
 
     # Ensure isolated CLAT probe route exists in 'tayga-probe-clat'
-    :local clatProbeRoute [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]
+    :local clatProbeRoute [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified:clat"]
     :if ([:len $clatProbeRoute] = 0) do={
         /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
     }
 
     # --- Zero-Leak Probing Phase ---
-    # 1. Direct WAN IPv4 Probe
+    # 1. Direct WAN IPv4 Probe via wan-direct
     :local directIpv4Ok false
     :if ([:len $directWanGw] > 0) do={
         :local ping1 [/ping 1.1.1.1 routing-table=wan-direct count=2]
@@ -201,70 +197,130 @@
     }
 
     # Containers and Route references
-    :local conts [/container/find where comment~"^\\[tayga-unified:clat\\]"]
+    :local clatConts [/container/find where comment~"^\\[tayga-unified:clat\\]"]
+    :local nat64Conts [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
     :local clatDefaultRoute [/ip/route/find where comment~"^\\[tayga-unified:clat:default\\]" and routing-table="main"]
+    :local nat64Route [/ipv6/route/find where comment~"^\\[tayga-unified:nat64:prefix\\]"]
 
     # --- Finite State Machine (FSM) Evaluation ---
     :local nextState $TAYGA_STATE
+
+    # Check NAT64 prerequisites if requested
+    :local nat64ConfigValid false
+    :if ($allowLocalNat64 = "yes") do={
+        :if ([:len $ipv6OnlyLanIfaces] > 0) do={
+            :local ifaceList [:toarray $ipv6OnlyLanIfaces]
+            :local allExist true
+            :foreach ifName in=$ifaceList do={
+                :if ([:len [/interface/find where name=$ifName]] = 0) do={
+                    :set allExist false
+                    :log error ("[tayga-controller] Configured IPV6_ONLY_LAN_INTERFACE '" . $ifName . "' does NOT exist!")
+                }
+            }
+            :if ($allExist = true) do={ :set nat64ConfigValid true }
+        } else={
+            :log warn "[tayga-controller] ALLOW_LOCAL_NAT64=yes requested, but IPV6_ONLY_LAN_INTERFACES is empty."
+        }
+    }
 
     :if ($directIpv4Ok = true and $preferDirectIpv4 = "yes") do={
         :set TAYGA_DIRECT_FAIL_COUNT 0
         :set TAYGA_DIRECT_PASS_COUNT ($TAYGA_DIRECT_PASS_COUNT + 1)
 
-        :if ($TAYGA_STATE = "DIRECT") do={
-            # Steady state DIRECT: ensure CLAT default route is disabled
+        :if ($TAYGA_DIRECT_PASS_COUNT >= $recoveryThreshold or $TAYGA_STATE = "DISCOVERING" or $TAYGA_STATE = "DIRECT" or $TAYGA_STATE = "NAT64_ACTIVE") do={
+            # Direct IPv4 is healthy
+            # 1. Disable CLAT default route if active
             :if ([:len $clatDefaultRoute] > 0) do={
-                :if ([/ip/route/get ($clatDefaultRoute->0) disabled] = false) do={
-                    /ip/route/set ($clatDefaultRoute->0) disabled=yes
+                /ip/route/set ($clatDefaultRoute->0) disabled=yes
+            }
+
+            # 2. Verified Unparking of WAN routes from TAYGA_PARKED_ROUTE_IDS
+            :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
+                :local remainingParked [:toarray ""]
+                :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
+                    :local restored false
+                    :do {
+                        :if ([:len [/ip/route/find where .id=$pid]] > 0) do={
+                            /ip/route/enable $pid
+                            :if ([/ip/route/get $pid disabled] = false) do={
+                                :set restored true
+                                :log info ("[tayga-controller] Successfully re-enabled parked WAN route: " . $pid)
+                            }
+                        } else={
+                            # Route was deleted externally; do not retain
+                            :set restored true
+                        }
+                    } on-error={}
+                    :if ($restored = false) do={
+                        :set remainingParked ($remainingParked, $pid)
+                    }
+                }
+                :set TAYGA_PARKED_ROUTE_IDS $remainingParked
+            }
+
+            # 3. Put CLAT container into standby
+            :if ([:len $clatConts] > 0) do={
+                :local cId ($clatConts->0)
+                :if ([/container/get $cId running] = true) do={
+                    :log info "[tayga-controller] Placing CLAT container into standby..."
+                    /container/stop $cId
+                }
+            }
+
+            # 4. Handle NAT64 activation if requested and valid
+            :if ($allowLocalNat64 = "yes") do={
+                :if ($nat64ConfigValid = true) do={
+                    :set nextState "NAT64_ACTIVE"
+                    :if ([:len $nat64Conts] > 0) do={
+                        :local nId ($nat64Conts->0)
+                        :if ([/container/get $nId running] != true) do={
+                            :log info "[tayga-controller] Starting NAT64 container..."
+                            /container/start $nId
+                        }
+                    }
+                    :if ([:len $nat64Route] > 0) do={
+                        /ipv6/route/set ($nat64Route->0) disabled=no
+                    }
+                } else={
+                    :set nextState "CONFIG_ERROR"
+                }
+            } else={
+                :set nextState "DIRECT"
+                # Stop NAT64 container if running
+                :if ([:len $nat64Conts] > 0) do={
+                    :local nId ($nat64Conts->0)
+                    :if ([/container/get $nId running] = true) do={
+                        :log info "[tayga-controller] Placing NAT64 container into standby..."
+                        /container/stop $nId
+                    }
+                }
+                :if ([:len $nat64Route] > 0) do={
+                    /ipv6/route/set ($nat64Route->0) disabled=yes
                 }
             }
         } else={
-            # Check recovery hysteresis threshold
-            :if ($TAYGA_DIRECT_PASS_COUNT >= $recoveryThreshold or $TAYGA_STATE = "DISCOVERING") do={
-                :log info ("[tayga-controller] Direct WAN IPv4 verified (passes=" . $TAYGA_DIRECT_PASS_COUNT . "). Switching to DIRECT mode.")
-                :set nextState "DIRECT"
-
-                # 1. Disable CLAT default route
-                :if ([:len $clatDefaultRoute] > 0) do={
-                    /ip/route/set ($clatDefaultRoute->0) disabled=yes
-                }
-
-                # 2. Re-enable specifically parked WAN default routes
-                :if ([:len $TAYGA_PARKED_ROUTE_IDS] > 0) do={
-                    :foreach pid in=$TAYGA_PARKED_ROUTE_IDS do={
-                        :do {
-                            :log info ("[tayga-controller] Re-enabling parked WAN route: " . $pid)
-                            /ip/route/enable $pid
-                        } on-error={}
-                    }
-                    :set TAYGA_PARKED_ROUTE_IDS [:toarray ""]
-                }
-
-                # 3. Put CLAT container into standby
-                :if ([:len $conts] > 0) do={
-                    :local cId ($conts->0)
-                    :if ([/container/get $cId running] = true) do={
-                        :log info "[tayga-controller] Placing CLAT container into standby..."
-                        /container/stop $cId
-                    }
-                }
-            } else={
-                :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TAYGA_DIRECT_PASS_COUNT . "/" . $recoveryThreshold . "), awaiting recovery threshold.")
-            }
+            :log info ("[tayga-controller] Direct IPv4 probe passing (" . $TAYGA_DIRECT_PASS_COUNT . "/" . $recoveryThreshold . "), awaiting recovery threshold.")
         }
     } else={
         # Direct IPv4 failed or not preferred
         :set TAYGA_DIRECT_PASS_COUNT 0
         :set TAYGA_DIRECT_FAIL_COUNT ($TAYGA_DIRECT_FAIL_COUNT + 1)
 
-        :if ($TAYGA_STATE = "DIRECT" and $TAYGA_DIRECT_FAIL_COUNT < $failThreshold) do={
+        # Disable NAT64 route since IPv4 WAN is unavailable
+        :if ([:len $nat64Route] > 0) do={ /ipv6/route/set ($nat64Route->0) disabled=yes }
+        :if ([:len $nat64Conts] > 0) do={
+            :local nId ($nat64Conts->0)
+            :if ([/container/get $nId running] = true) do={ /container/stop $nId }
+        }
+
+        :if (($TAYGA_STATE = "DIRECT" or $TAYGA_STATE = "NAT64_ACTIVE") and $TAYGA_DIRECT_FAIL_COUNT < $failThreshold) do={
             :log warn ("[tayga-controller] Direct IPv4 probe failed (" . $TAYGA_DIRECT_FAIL_COUNT . "/" . $failThreshold . "). Awaiting fail threshold.")
         } else={
-            # Direct IPv4 down; prepare and verify CLAT path
+            # Direct IPv4 confirmed down; prepare CLAT path
             :if ($lanRequiresIpv4 = "yes") do={
-                # Start container if stopped
-                :if ([:len $conts] > 0) do={
-                    :local cId ($conts->0)
+                # Start CLAT container if stopped
+                :if ([:len $clatConts] > 0) do={
+                    :local cId ($clatConts->0)
                     :if ([/container/get $cId running] != true) do={
                         :log info "[tayga-controller] Starting CLAT container..."
                         /container/start $cId
@@ -272,7 +328,7 @@
                     }
                 }
 
-                # Data-plane verification via isolated probe table
+                # CLAT Data-Plane Verification via isolated probe table
                 :local clatProbeOk false
                 :local clatPing [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
                 :if ($clatPing > 0) do={
@@ -281,54 +337,73 @@
 
                 :if ($clatProbeOk = true) do={
                     :set TAYGA_CLAT_FAIL_COUNT 0
-                    :set nextState "CLAT_ACTIVE"
 
-                    # Transactional Route Switching: Scoped to specific WAN routes
-                    :local activeScopedWan [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active and (gateway=$wanIf or gateway=$directWanGw) and !comment~"^\\[tayga-unified"]
-                    :if ([:len $activeScopedWan] > 0) do={
-                        :log info "[tayga-controller] Parking active direct WAN default routes..."
-                        :local newParked [:toarray ""]
-                        :foreach r in=$activeScopedWan do={
-                            :do {
-                                /ip/route/disable $r
-                                :set newParked ($newParked, $r)
-                            } on-error={
-                                :log error "[tayga-controller] Failed to park route. Aborting route switch."
-                            }
+                    # Transactional Route Switching: strictly matching managed $wanIf
+                    :local switchSuccess true
+                    :local newlyParked [:toarray ""]
+                    :local activeScopedWan [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active and (gateway=$wanIf or gateway=$directWanGw or immediate-gw~$wanIf) and !comment~"^\\[tayga-unified"]
+
+                    :foreach r in=$activeScopedWan do={
+                        :do {
+                            /ip/route/disable $r
+                            :set newlyParked ($newlyParked, $r)
+                        } on-error={
+                            :set switchSuccess false
+                            :log error "[tayga-controller] Failed to disable WAN route. Initiating transaction rollback."
                         }
-                        :set TAYGA_PARKED_ROUTE_IDS $newParked
                     }
 
-                    # Enable CLAT default route in main table
-                    :if ([:len $clatDefaultRoute] > 0) do={
-                        /ip/route/set ($clatDefaultRoute->0) disabled=no distance=1
+                    :if ($switchSuccess = true) do={
+                        :do {
+                            # Enable/Add CLAT default route in main table
+                            :if ([:len $clatDefaultRoute] > 0) do={
+                                /ip/route/set ($clatDefaultRoute->0) disabled=no distance=1
+                            } else={
+                                /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=1 routing-table=main comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
+                            }
+
+                            # Verify active route in main points to CLAT
+                            :local winDef [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes]
+                            :local clatWon false
+                            :foreach wd in=$winDef do={
+                                :if ([/ip/route/get $wd gateway] = "172.31.64.2") do={ :set clatWon true }
+                            }
+                            :if ($clatWon = false) do={
+                                :set switchSuccess false
+                                :log error "[tayga-controller] CLAT route did not win path selection. Foreign route conflict detected."
+                            }
+                        } on-error={
+                            :set switchSuccess false
+                        }
+                    }
+
+                    :if ($switchSuccess = false) do={
+                        # Transaction Rollback: Re-enable newly parked routes and disable CLAT route
+                        :log warn "[tayga-controller] Rolling back route switch transaction..."
+                        :foreach r in=$newlyParked do={
+                            :do { /ip/route/enable $r } on-error={}
+                        }
+                        :if ([:len $clatDefaultRoute] > 0) do={
+                            :do { /ip/route/set ($clatDefaultRoute->0) disabled=yes } on-error={}
+                        }
+                        :set nextState "DEGRADED"
                     } else={
-                        /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=1 routing-table=main comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
-                    }
-
-                    # Continuous Active Route Verification: Verify 0.0.0.0/0 in main wins
-                    :local winningDef [/ip/route/find where routing-table="main" and dst-address="0.0.0.0/0" and active=yes]
-                    :if ([:len $winningDef] > 0) do={
-                        :local winGw [/ip/route/get ($winningDef->0) gateway]
-                        :if ($winGw != "172.31.64.2") do={
-                            :log warn ("[tayga-controller] Routing drift detected! Active default gateway is " . $winGw . " instead of CLAT. Re-asserting CLAT priority.")
-                            :local compRoute ($winningDef->0)
-                            :if (!([/ip/route/get $compRoute comment] ~ "^\\[tayga-unified")) do={
-                                :do {
-                                    /ip/route/disable $compRoute
-                                    :set TAYGA_PARKED_ROUTE_IDS ($TAYGA_PARKED_ROUTE_IDS, $compRoute)
-                                } on-error={}
-                            }
+                        # Success: Accumulate newly parked routes into TAYGA_PARKED_ROUTE_IDS with deduplication
+                        :foreach r in=$newlyParked do={
+                            :local isDupl false
+                            :foreach ex in=$TAYGA_PARKED_ROUTE_IDS do={ :if ($ex = $r) do={ :set isDupl true } }
+                            :if ($isDupl = false) do={ :set TAYGA_PARKED_ROUTE_IDS ($TAYGA_PARKED_ROUTE_IDS, $r) }
                         }
+                        :set nextState "CLAT_ACTIVE"
                     }
                 } else={
-                    # CLAT probe failed
+                    # CLAT probe ping failed
                     :set TAYGA_CLAT_FAIL_COUNT ($TAYGA_CLAT_FAIL_COUNT + 1)
                     :log warn ("[tayga-controller] CLAT probe failed (failures=" . $TAYGA_CLAT_FAIL_COUNT . "/" . $clatFailThreshold . ")")
 
-                    # Apply symmetric hysteresis threshold before tearing down CLAT
+                    # Apply symmetric hysteresis threshold
                     :if ($TAYGA_CLAT_FAIL_COUNT >= $clatFailThreshold or $TAYGA_STATE = "PREPARING_CLAT") do={
-                        :log error "[tayga-controller] CLAT transit unavailable. Entering DEGRADED state."
+                        :log error "[tayga-controller] CLAT path unavailable. Entering DEGRADED state."
                         :set nextState "DEGRADED"
 
                         # Disable CLAT default route to avoid traffic blackholing
@@ -353,9 +428,10 @@
         :set TAYGA_STATE $nextState
     }
 } on-error={
-    :log error "[tayga-controller] Unhandled exception during controller execution; releasing lock."
+    :log error "[tayga-controller] Unhandled exception during controller execution."
 }
 
-# Release Controller Concurrency Lock
-:set TAYGA_CONTROLLER_BUSY false
-:set TAYGA_BUSY_TICKS 0
+# Release Controller Lock strictly by owner
+:if ($TAYGA_LOCK_OWNER = "controller") do={
+    :set TAYGA_LOCK_OWNER "none"
+}

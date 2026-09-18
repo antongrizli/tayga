@@ -13,21 +13,22 @@
 #   /import file-name=usb1/telekom-xlat/scripts/routeros-rollback.rsc
 # ==============================================================================
 
-# --- 0. Acquire Maintenance Lock & Wait for Controller ---
-:global TAYGA_MAINTENANCE_LOCK true
-:global TAYGA_CONTROLLER_BUSY
+# --- 0. Acquire Unified Lock (owner=rollback) ---
+:global TAYGA_LOCK_OWNER
+:global TAYGA_LOCK_TIME
 
 :local waitCtrl 0
-:while ($TAYGA_CONTROLLER_BUSY = true and $waitCtrl < 20) do={
-    :put "--> Waiting for background controller run to finish before rollback..."
+:while ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "rollback" and $waitCtrl < 20) do={
+    :put ("--> System locked by " . $TAYGA_LOCK_OWNER . "; waiting for lock release (" . $waitCtrl . "/20s)...")
     :delay 1s
     :set waitCtrl ($waitCtrl + 1)
 }
-:if ($TAYGA_CONTROLLER_BUSY = true) do={
-    :put " [FAIL] Active controller run did not finish within 20s timeout. Aborting rollback."
-    :set TAYGA_MAINTENANCE_LOCK false
-    :error "Aborted: controller busy timeout"
+:if ([:len $TAYGA_LOCK_OWNER] > 0 and $TAYGA_LOCK_OWNER != "none" and $TAYGA_LOCK_OWNER != "rollback") do={
+    :put " [FAIL] Lock could not be acquired within 20s timeout. Aborting rollback."
+    :error "Aborted: lock busy"
 }
+:set TAYGA_LOCK_OWNER "rollback"
+:set TAYGA_LOCK_TIME [/system/resource/get uptime]
 
 :do {
     :put "============================================================"
@@ -198,4 +199,7 @@
     :put " [ERROR] Unhandled error during rollback."
 }
 
-:set TAYGA_MAINTENANCE_LOCK false
+# Release Unified Lock strictly by owner
+:if ($TAYGA_LOCK_OWNER = "rollback") do={
+    :set TAYGA_LOCK_OWNER "none"
+}

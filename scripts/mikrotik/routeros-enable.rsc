@@ -10,7 +10,6 @@
 # ==============================================================================
 
 :global TAYGA_STATE "DISCOVERING"
-:global TAYGA_CONTROLLER_BUSY false
 :global TAYGA_DIRECT_FAIL_COUNT 0
 :global TAYGA_DIRECT_PASS_COUNT 0
 :global TAYGA_CLAT_FAIL_COUNT 0

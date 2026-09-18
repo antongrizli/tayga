@@ -202,13 +202,19 @@
 }
 
 # --- 10b. Policy Routing for NAT64 Pool (Prevents route collision when CLAT and NAT64 coexist) ---
-:if ([:len [/routing/table/find where name="wan-direct"]] = 0) do={
-    /routing/table/add name=wan-direct fib comment="[tayga-unified:nat64] Dedicated WAN routing table"
+:local wanTable [/routing/table/find where name="wan-direct"]
+:if ([:len $wanTable] = 0) do={
+    /routing/table/add name=wan-direct fib comment="[tayga-unified:direct] Isolated Direct WAN Routing Table"
+} else={
+    :local tComm [/routing/table/get ($wanTable->0) comment]
+    :if (!($tComm ~ "^\\[tayga-unified")) do={
+        :put "--> [WARN] Existing table 'wan-direct' is not owned by this project."
+    }
 }
-:if ([:len [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0"]] = 0) do={
+:if ([:len [/ip/route/find where routing-table="wan-direct" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified"]] = 0) do={
     /ip/route/add dst-address=0.0.0.0/0 gateway=$wanGw routing-table=wan-direct comment="[tayga-unified:nat64] Direct WAN default route"
 }
-:if ([:len [/routing/rule/find where src-address="192.168.240.0/20"]] = 0) do={
+:if ([:len [/routing/rule/find where src-address="192.168.240.0/20" and comment~"^\\[tayga-unified"]] = 0) do={
     /routing/rule/add src-address=192.168.240.0/20 table=wan-direct action=lookup-only-in-table comment="[tayga-unified:nat64] NAT64 pool policy rule"
 }
 
@@ -222,7 +228,7 @@
     }
 }
 
-# --- 11. Create and Start Container ---
+# --- 11. Create Container (Standby Mode: start-on-boot=no) ---
 :local existingNatCont [/container/find where comment~"^\\[tayga-unified:nat64\\]"]
 :if ([:len $existingNatCont] = 0) do={
     :if ($useRegistry = true) do={
@@ -235,7 +241,7 @@
             envlist=tayga-nat64-envs \
             memory-high=128M \
             memory-max=192M \
-            start-on-boot=yes \
+            start-on-boot=no \
             restart-policy=on-failure \
             restart-interval=10s \
             logging=yes \
@@ -270,7 +276,7 @@
             envlist=tayga-nat64-envs \
             memory-high=128M \
             memory-max=192M \
-            start-on-boot=yes \
+            start-on-boot=no \
             restart-policy=on-failure \
             restart-interval=10s \
             logging=yes \
