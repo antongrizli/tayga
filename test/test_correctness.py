@@ -3,7 +3,7 @@ import subprocess
 import time
 import hashlib
 import os
-import sys
+import shlex
 
 def sh(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -84,65 +84,104 @@ def main():
                              "CLAT_WORKERS=2", "CLAT_OFFLOAD=tcp",
                              "/usr/local/sbin/clat-start.sh"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
+    srv_nc = srv_nc_dl = None
+    try:
+        time.sleep(1)
 
-    sh("ip -n server link set lo up")
-    sh("ip -n server link set server0 up")
-    sh("ip -n server -6 addr add 2600:464::2/64 dev server0")
-    sh("ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo")
-    sh("ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0")
+        sh("ip -n server link set lo up")
+        sh("ip -n server link set server0 up")
+        sh("ip -n server -6 addr add 2600:464::2/64 dev server0")
+        sh("ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo")
+        sh("ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0")
 
-    # 3. Test ICMP Ping
-    ping_out, _, ping_rc = sh("ip netns exec client ping -c 3 -W 1 11.0.0.2")
-    assert ping_rc == 0, f"Ping failed: {ping_out}"
-    print("[PASS] ICMP Echo Request / Reply verified")
+        # 3. Test ICMP Ping
+        ping_out, _, ping_rc = sh("ip netns exec client ping -c 3 -W 1 11.0.0.2")
+        assert ping_rc == 0, f"Ping failed: {ping_out}"
+        print("[PASS] ICMP Echo Request / Reply verified")
 
-    # 4. Test TCP Upload (20 MB)
-    for f in [up_received, dl_received]:
-        if os.path.exists(f): os.remove(f)
+        # 4. Test TCP Upload (20 MB)
+        for f in [up_received, dl_received]:
+            if os.path.exists(f): os.remove(f)
 
-    # Server receives on port 9999
-    srv_nc = subprocess.Popen("ip netns exec server socat -u TCP6-LISTEN:9999,reuseaddr,bind=64:ff9b::b00:2 OPEN:/tmp/upload_received.bin,creat,trunc",
-                              shell=True)
-    time.sleep(0.5)
-    sh("ip netns exec client socat -u OPEN:/tmp/test_20mb.bin TCP4:11.0.0.2:9999")
-    srv_nc.wait(timeout=10)
+        # Server receives on port 9999
+        srv_nc = subprocess.Popen(shlex.split("ip netns exec server socat -u TCP6-LISTEN:9999,reuseaddr,bind=[64:ff9b::b00:2] OPEN:/tmp/upload_received.bin,creat,trunc"))
+        time.sleep(0.5)
+        sh("ip netns exec client socat -u OPEN:/tmp/test_20mb.bin TCP4:11.0.0.2:9999")
+        srv_nc.wait(timeout=10)
 
-    with open(up_received, "rb") as f:
-        up_hash = hashlib.sha256(f.read()).hexdigest()
-    print(f"Upload Result:   SHA-256 = {up_hash}")
-    assert up_hash == expected_hash, f"Upload hash mismatch! Expected {expected_hash}, got {up_hash}"
-    print("[PASS] TCP Upload 20 MB file integrity verified")
+        with open(up_received, "rb") as f:
+            up_hash = hashlib.sha256(f.read()).hexdigest()
+        print(f"Upload Result:   SHA-256 = {up_hash}")
+        assert up_hash == expected_hash, f"Upload hash mismatch! Expected {expected_hash}, got {up_hash}"
+        print("[PASS] TCP Upload 20 MB file integrity verified")
 
-    # 5. Test TCP Download (20 MB)
-    srv_nc_dl = subprocess.Popen("ip netns exec server socat -u OPEN:/tmp/test_20mb.bin TCP6-LISTEN:9998,reuseaddr,bind=64:ff9b::b00:2",
-                                 shell=True)
-    time.sleep(0.5)
-    sh("ip netns exec client socat -u TCP4:11.0.0.2:9998 OPEN:/tmp/download_received.bin,creat,trunc")
-    srv_nc_dl.wait(timeout=10)
+        # 5. Test TCP Download (20 MB)
+        srv_nc_dl = subprocess.Popen(shlex.split("ip netns exec server socat -u OPEN:/tmp/test_20mb.bin TCP6-LISTEN:9998,reuseaddr,bind=[64:ff9b::b00:2]"))
+        time.sleep(0.5)
+        sh("ip netns exec client socat -u TCP4:11.0.0.2:9998 OPEN:/tmp/download_received.bin,creat,trunc")
+        srv_nc_dl.wait(timeout=10)
 
-    with open(dl_received, "rb") as f:
-        dl_hash = hashlib.sha256(f.read()).hexdigest()
-    print(f"Download Result: SHA-256 = {dl_hash}")
-    assert dl_hash == expected_hash, f"Download hash mismatch! Expected {expected_hash}, got {dl_hash}"
-    print("[PASS] TCP Download 20 MB file integrity verified")
+        with open(dl_received, "rb") as f:
+            dl_hash = hashlib.sha256(f.read()).hexdigest()
+        print(f"Download Result: SHA-256 = {dl_hash}")
+        assert dl_hash == expected_hash, f"Download hash mismatch! Expected {expected_hash}, got {dl_hash}"
+        print("[PASS] TCP Download 20 MB file integrity verified")
 
-    # 6. Test UDP Datagram Echo
-    udp_srv = subprocess.Popen("ip netns exec server socat -u UDP6-RECV:9997,bind=64:ff9b::b00:2 SYSTEM:'cat > /tmp/udp_received.txt'",
-                               shell=True)
-    time.sleep(0.5)
-    sh("ip netns exec client sh -c \"printf 'HELLO_UDP_VERIFY_12345' | socat -u - UDP4-DATAGRAM:11.0.0.2:9997\"")
-    time.sleep(0.5)
-    udp_srv.terminate()
-    udp_content = open("/tmp/udp_received.txt").read() if os.path.exists("/tmp/udp_received.txt") else ""
-    assert "HELLO_UDP_VERIFY_12345" in udp_content, f"UDP echo failed, got '{udp_content}'"
-    print("[PASS] UDP datagram translation verified")
+        # 6. Test UDP delivery (IPv4 -> IPv6; this is not an echo test).
+        # UDP bind parses an optional port, so IPv6 literals need brackets.
+        udp_payload = b"HELLO_UDP_VERIFY_12345"
+        udp_received = "/tmp/udp_received.txt"
+        with open(udp_received, "wb") as received:
+            udp_srv = subprocess.Popen(
+                ["ip", "netns", "exec", "server", "socat", "-u",
+                 "UDP6-RECV:9997,bind=[64:ff9b::b00:2]", "-"],
+                stdout=received, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    if udp_srv.poll() is not None:
+                        raise RuntimeError(f"UDP receiver failed: {udp_srv.stderr.read()}")
+                    listeners, _, rc = sh("ip netns exec server ss -H -lun6 'sport = :9997'")
+                    if rc == 0 and listeners.strip():
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("UDP receiver did not become ready within 5s")
+                    time.sleep(0.05)
+                subprocess.run(
+                    ["ip", "netns", "exec", "client", "socat", "-u", "-",
+                     "UDP4-DATAGRAM:11.0.0.2:9997"],
+                    input=udp_payload, check=True, timeout=5)
+                deadline = time.monotonic() + 5
+                while os.path.getsize(udp_received) < len(udp_payload):
+                    if udp_srv.poll() is not None:
+                        raise RuntimeError(f"UDP receiver exited: {udp_srv.stderr.read()}")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("UDP datagram was not received within 5s")
+                    time.sleep(0.05)
+            finally:
+                udp_srv.terminate()
+                try:
+                    udp_srv.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    udp_srv.kill()
+                    udp_srv.wait()
+                udp_srv.stderr.close()
+        with open(udp_received, "rb") as received:
+            udp_content = received.read()
+        assert udp_payload == udp_content, f"UDP delivery failed, got {udp_content!r}"
+        print("[PASS] UDP IPv4 -> IPv6 datagram integrity verified")
 
-    # Cleanup TAYGA & netns
-    tayga.terminate()
-    tayga.wait(timeout=2)
-    for ns in ["client", "router", "clatns", "server"]:
-        sh(f"ip netns del {ns} 2>/dev/null")
+    finally:
+        for process in (srv_nc, srv_nc_dl, tayga):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        for ns in ["client", "router", "clatns", "server"]:
+            sh(f"ip netns del {ns} 2>/dev/null")
 
     print("\nALL INTEGRITY & CORRECTNESS TESTS PASSED SUCCESSFULLY!")
 
