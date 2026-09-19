@@ -420,11 +420,11 @@
 
 :local schedId [/system/scheduler/find where name="tayga-controller"]
 :if ([:len $schedId] = 0) do={
-    :put ("--> Registering Network State Controller in /system/scheduler (" . $controllerToRun . ", interval: 15s)...")
-    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerToRun) comment="[tayga-unified:controller] Network State Controller"
+    :put ("--> Registering Network State Controller in /system/scheduler (" . $controllerToRun . ", interval: 15s, start-time: startup)...")
+    /system/scheduler/add name="tayga-controller" interval=15s start-time=startup on-event=("/import file-name=" . $controllerToRun) comment="[tayga-unified:controller] Network State Controller"
 } else={
     :put ("--> Updating /system/scheduler tayga-controller (" . $controllerToRun . ")...")
-    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerToRun)
+    /system/scheduler/set $schedId start-time=startup interval=15s on-event=("/import file-name=" . $controllerToRun)
 }
 
 # --- 13. Reset State & Run Initial Network State Controller Evaluation ---
