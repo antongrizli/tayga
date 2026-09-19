@@ -427,7 +427,12 @@
     /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerToRun)
 }
 
-# --- 13. Initial Network State Controller Evaluation ---
+# --- 13. Reset State & Run Initial Network State Controller Evaluation ---
+:global TaygaState "DISCOVERING"
+:global TaygaDirectFailCount 0
+:global TaygaDirectPassCount 0
+:global TaygaNat64FailCount 0
+
 :put "--> Running initial Network State Controller cycle..."
 :do {
     /import file-name=$controllerToRun

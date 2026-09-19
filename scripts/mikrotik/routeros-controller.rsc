@@ -322,7 +322,9 @@
                 :set nat64ConfigValid false
             }
         } else={
-            :log warn "[tayga-controller] AllowLocalNat64=yes requested, but NAT64 container or prefix route is missing."
+            # NAT64 container or route not installed; gracefully disable local NAT64
+            :set nat64ConfigValid false
+            :set allowLocalNat64 "no"
         }
     }
 

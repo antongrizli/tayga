@@ -189,6 +189,13 @@
     :local envId [/container/envs/find where list="tayga-clat-envs" and key=$k]
     :if ([:len $envId] = 0) do={
         /container/envs/add list=tayga-clat-envs key=$k value=$v
+    } else={
+        :if ($k = "PREF64" and [/container/envs/get ($envId->0) value] = "auto") do={
+            /container/envs/set ($envId->0) value="64:ff9b::/96"
+        }
+        :if ($k = "FALLBACK_TO_WELL_KNOWN_PREFIX") do={
+            /container/envs/set ($envId->0) value="true"
+        }
     }
 }
 
@@ -325,6 +332,30 @@
     }
 }
 
+# --- 16b. Start TAYGA CLAT Container Initially ---
+:local candCont [/container/find where comment~"^\\[tayga-unified:clat\\]"]
+:if ([:len $candCont] > 0) do={
+    :local cId ($candCont->0)
+    :if ([/container/get $cId running] != true) do={
+        :put "--> Starting TAYGA CLAT container..."
+        /container/start $cId
+        :local cWait 0
+        :while (($cWait < 15) and ([/container/get $cId running] != true)) do={
+            :delay 1s
+            :set cWait ($cWait + 1)
+        }
+        :if ([/container/get $cId running] = true) do={
+            :put " [PASS] TAYGA CLAT container started successfully."
+        }
+    }
+}
+
+# Ensure shared policy envs do not enable local NAT64 in CLAT mode
+:local policyNatId [/container/envs/find where list="tayga-policy-envs" and key="AllowLocalNat64"]
+:if ([:len $policyNatId] > 0) do={
+    /container/envs/set ($policyNatId->0) value="no"
+}
+
 # --- 17. Configure Isolated Probe Route & Standby Default Route ---
 :if ([:len [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]] = 0) do={
     :put "--> Adding isolated CLAT probe route in table tayga-probe-clat..."
@@ -370,7 +401,12 @@
     /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerToRun)
 }
 
-# --- 19. Initial Network State Controller Evaluation ---
+# --- 19. Reset State & Run Initial Network State Controller Evaluation ---
+:global TaygaState "DISCOVERING"
+:global TaygaDirectFailCount 0
+:global TaygaDirectPassCount 0
+:global TaygaClatFailCount 0
+
 :put "--> Running initial Network State Controller cycle..."
 :do {
     /import file-name=$controllerToRun
