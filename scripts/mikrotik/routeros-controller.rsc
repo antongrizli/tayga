@@ -553,10 +553,12 @@
         :set TaygaDirectPassCount 0
         :set TaygaDirectFailCount ($TaygaDirectFailCount + 1)
 
-        :if (($TaygaState = "DIRECT" or $TaygaState = "NAT64_ACTIVE" or $TaygaState = "PREPARING_NAT64") and $TaygaDirectFailCount < $failThreshold) do={
+        :local hasActiveDirectWan ([:len $wanRoutes] > 0)
+
+        :if ($hasActiveDirectWan = true and ($TaygaState = "DIRECT" or $TaygaState = "NAT64_ACTIVE" or $TaygaState = "PREPARING_NAT64") and $TaygaDirectFailCount < $failThreshold) do={
             :log warn ("[tayga-controller] Direct IPv4 probe failed (" . $TaygaDirectFailCount . "/" . $failThreshold . "). Awaiting fail threshold.")
         } else={
-            # Direct IPv4 confirmed down (failures >= failThreshold); teardown NAT64 and prepare CLAT path!
+            # Direct IPv4 confirmed down (failures >= failThreshold or route gone); teardown NAT64 and prepare CLAT path!
             :if ([:len $nat64Route] > 0) do={ /ipv6/route/set ($nat64Route->0) disabled=yes }
             :if ([:len $nat64Conts] > 0) do={
                 :local nId ($nat64Conts->0)
@@ -574,7 +576,12 @@
                     :if ([/container/get $cId running] != true) do={
                         :log info "[tayga-controller] Starting CLAT container..."
                         /container/start $cId
-                        :delay 3s
+                        :local cWait 0
+                        :while (($cWait < 16) and ([/container/get $cId running] != true)) do={
+                            :delay 500ms
+                            :set cWait ($cWait + 1)
+                        }
+                        :delay 2s
                     }
                 }
 
