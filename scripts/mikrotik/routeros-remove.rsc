@@ -121,6 +121,10 @@
         }
     }
 
+    # Remove Policy Routing Rules owned by this project
+    :put "--> Removing TAYGA policy routing rules..."
+    /routing/rule/remove [find where comment~"^\\[tayga-unified"]
+
     :local clatTable [/routing/table/find where name="tayga-probe-clat"]
     :if ([:len $clatTable] > 0) do={
         :local cComm [/routing/table/get ($clatTable->0) comment]

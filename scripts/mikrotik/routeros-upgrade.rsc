@@ -161,12 +161,15 @@
     :put ("--> Active Slot : " . $prevSlot . " (" . $curRootDir . ")")
     :put ("--> Target Slot : " . $targetSlot . " (" . $targetRootfs . ")")
 
-    # Ensure isolated CLAT probe table exists
+    # Ensure isolated CLAT probe table & routing rule exist
     :if ([:len [/routing/table/find where name="tayga-probe-clat"]] = 0) do={
         /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
     }
     :if ([:len [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]] = 0) do={
         /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
+    }
+    :if ([:len [/routing/rule/find where table="tayga-probe-clat" and comment~"^\\[tayga-unified:clat"]] = 0) do={
+        /routing/rule/add src-address=172.31.64.1/32 action=lookup-only-in-table table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Rule"
     }
 
     # --- 4. Withdraw Default Route during Upgrade Window ---
@@ -189,6 +192,12 @@
     # Clean up any leftover candidate container from previous failed attempts
     :local staleCand [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
     :if ([:len $staleCand] > 0) do={
+        :do { /container/stop ($staleCand->0) } on-error={}
+        :local scw 0
+        :while (([/container/get ($staleCand->0) stopped] != true) && ($scw < 15)) do={
+            :delay 1s
+            :set scw ($scw + 1)
+        }
         :do { /container/remove ($staleCand->0) } on-error={}
     }
 
@@ -282,7 +291,10 @@
     :if ($upgradeOk = true) do={
         :delay 5s
         :put "--> Testing end-to-end probe ping via tayga-probe-clat..."
-        :local pingRx [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
+        :local pingRx 0
+        :do {
+            :set pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+        } on-error={}
         :if ($pingRx > 0) do={
             :put (" [PASS] Probe test successful (" . $pingRx . "/3 received)!")
         } else={
@@ -364,7 +376,10 @@
 
         # Verify probe on restored container before re-enabling default route
         :delay 3s
-        :local restorePingRx [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
+        :local restorePingRx 0
+        :do {
+            :set restorePingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+        } on-error={}
         :if ($restorePingRx > 0) do={
             :put "--> Restored container probe OK. Re-enabling default route..."
             /ip/route/enable [find where comment~"^\\[tayga-unified:clat:default\\]"]

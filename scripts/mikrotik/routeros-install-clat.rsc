@@ -306,6 +306,10 @@
     :put "--> Adding isolated CLAT probe route in table tayga-probe-clat..."
     /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
 }
+:if ([:len [/routing/rule/find where table="tayga-probe-clat" and comment~"^\\[tayga-unified:clat"]] = 0) do={
+    :put "--> Adding isolated CLAT probe routing rule for 172.31.64.1..."
+    /routing/rule/add src-address=172.31.64.1/32 action=lookup-only-in-table table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Rule"
+}
 
 :if ([:len [/ip/route/find where comment~"^\\[tayga-unified:clat:default\\]" and routing-table="main"]] = 0) do={
     :put "--> Adding standby default IPv4 route 0.0.0.0/0 via 172.31.64.2 (disabled=yes)..."

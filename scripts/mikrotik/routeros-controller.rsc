@@ -229,28 +229,48 @@
         }
     }
 
-    # Ensure isolated CLAT probe route exists in 'tayga-probe-clat'
+    # Ensure isolated CLAT probe route & rule exist in 'tayga-probe-clat'
     :local clatProbeRoute [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0" and comment~"^\\[tayga-unified:clat"]
     :if ([:len $clatProbeRoute] = 0) do={
         /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
     }
+    :if ([:len [/routing/rule/find where table="tayga-probe-clat" and comment~"^\\[tayga-unified:clat"]] = 0) do={
+        /routing/rule/add src-address=172.31.64.1/32 action=lookup-only-in-table table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Rule"
+    }
 
-    # Ensure isolated NAT64 probe route exists in 'tayga-probe-nat64'
+    # Ensure isolated NAT64 probe route & rule exist in 'tayga-probe-nat64'
     :local nat64ProbeRoute [/ipv6/route/find where routing-table="tayga-probe-nat64" and dst-address="64:ff9b::/96" and comment~"^\\[tayga-unified:nat64"]
     :if ([:len $nat64ProbeRoute] = 0) do={
         /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 routing-table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Route"
     }
+    :if ([:len [/routing/rule/find where table="tayga-probe-nat64" and comment~"^\\[tayga-unified:nat64"]] = 0) do={
+        /routing/rule/add src-address=fc68::1/128 action=lookup-only-in-table table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Rule"
+    }
 
     # --- Zero-Leak Probing Phase ---
-    # 1. Direct WAN IPv4 Probe via wan-direct
+    # 1. Direct WAN IPv4 Probe
     :local directIpv4Ok false
     :if ([:len $directWanGw] > 0) do={
-        :local ping1 [/ping 1.1.1.1 routing-table=wan-direct count=2]
+        :local ping1 0
+        :do {
+            :set ping1 [/ping 1.1.1.1 interface=$wanIf count=2]
+        } on-error={}
         :if ($ping1 > 0) do={
             :set directIpv4Ok true
         } else={
-            :local ping2 [/ping 8.8.8.8 routing-table=wan-direct count=2]
-            :if ($ping2 > 0) do={ :set directIpv4Ok true }
+            :local ping2 0
+            :do {
+                :set ping2 [/ping 8.8.8.8 interface=$wanIf count=2]
+            } on-error={}
+            :if ($ping2 > 0) do={
+                :set directIpv4Ok true
+            } else={
+                :local pingGw 0
+                :do {
+                    :set pingGw [/ping $directWanGw count=2]
+                } on-error={}
+                :if ($pingGw > 0) do={ :set directIpv4Ok true }
+            }
         }
     }
 
@@ -442,7 +462,10 @@
                                 :log warn "[tayga-controller] DNS64 resolution probe to fc68::2 failed."
                             }
 
-                            :local pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 routing-table=tayga-probe-nat64 count=2]
+                            :local pCount 0
+                            :do {
+                                :set pCount [/ping 64:ff9b::1.1.1.1 src-address=fc68::1 count=2]
+                            } on-error={}
                             :if ($pCount > 0) do={
                                 :set nat64PingOk true
                             } else={
@@ -502,7 +525,10 @@
                     }
                     :local clatOk false
                     :if ($clatRunning = true) do={
-                        :local cPing [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=2]
+                        :local cPing 0
+                        :do {
+                            :set cPing [/ping 1.1.1.1 src-address=172.31.64.1 count=2]
+                        } on-error={}
                         :if ($cPing > 0) do={ :set clatOk true }
                     }
                     :if ($clatOk = true) do={
@@ -552,7 +578,10 @@
 
                 # CLAT Data-Plane Verification via isolated probe table
                 :local clatProbeOk false
-                :local clatPing [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
+                :local clatPing 0
+                :do {
+                    :set clatPing [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+                } on-error={}
                 :if ($clatPing > 0) do={
                     :set clatProbeOk true
                 }

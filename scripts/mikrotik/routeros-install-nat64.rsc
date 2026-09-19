@@ -247,6 +247,10 @@
     :put "--> Adding isolated NAT64 probe route in table tayga-probe-nat64..."
     /ipv6/route/add dst-address=64:ff9b::/96 gateway=fc68::2 routing-table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Route"
 }
+:if ([:len [/routing/rule/find where table="tayga-probe-nat64" and comment~"^\\[tayga-unified:nat64"]] = 0) do={
+    :put "--> Adding isolated NAT64 probe routing rule for fc68::1..."
+    /routing/rule/add src-address=fc68::1/128 action=lookup-only-in-table table=tayga-probe-nat64 comment="[tayga-unified:nat64:probe] NAT64 Probe Rule"
+}
 
 # --- 10. Configure NAT44 Masquerade for Dynamic Pool and Container DNS64 Transport ---
 :if ([:len [/ip/firewall/nat/find where comment="[tayga-unified:nat64] NAT64 pool masquerade"]] = 0) do={

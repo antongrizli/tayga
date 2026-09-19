@@ -81,12 +81,15 @@
         :error "Aborted: veth-clat interface missing"
     }
 
-    # Ensure isolated CLAT probe table exists
+    # Ensure isolated CLAT probe table & routing rule exist
     :if ([:len [/routing/table/find where name="tayga-probe-clat"]] = 0) do={
         /routing/table/add name=tayga-probe-clat fib comment="[tayga-unified:clat] Isolated CLAT Probe Table"
     }
     :if ([:len [/ip/route/find where routing-table="tayga-probe-clat" and dst-address="0.0.0.0/0"]] = 0) do={
         /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 routing-table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Route"
+    }
+    :if ([:len [/routing/rule/find where table="tayga-probe-clat" and comment~"^\\[tayga-unified:clat"]] = 0) do={
+        /routing/rule/add src-address=172.31.64.1/32 action=lookup-only-in-table table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Rule"
     }
 
     # --- 2. Withdraw default route ONLY (service routes must remain active for probe) ---
@@ -210,7 +213,10 @@
     # --- 7. Probe Verification via Isolated Probe Table ---
     :put "--> Testing end-to-end probe ping via tayga-probe-clat..."
     :local probeOk false
-    :local pingRx [/ping 1.1.1.1 src-address=172.31.64.1 routing-table=tayga-probe-clat count=3]
+    :local pingRx 0
+    :do {
+        :set pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+    } on-error={}
     :if ($pingRx > 0) do={
         :set probeOk true
         :put (" [PASS] Probe test successful (" . $pingRx . "/3 received) after rollback!")
