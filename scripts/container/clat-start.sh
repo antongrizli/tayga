@@ -74,7 +74,7 @@ case "$TAYGA_OFFLOAD_VAL" in
 esac
 
 PREF64="${PREF64:-auto}"
-FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-false}"
+FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-true}"
 
 if [ "$PREF64" = "auto" ]; then
   echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."

@@ -161,8 +161,10 @@
     /interface/bridge/port/add bridge=bridge-clat interface=veth-clat comment="[tayga-unified:clat] VETH bridge port"
 }
 
-# --- 10. Configure Container Environment Variables (preserves existing user values) ---
-:put "--> Configuring container environment list tayga-clat-envs..."
+# --- 10. Configure Container Environment Variables & DNS ---
+:put "--> Configuring container environment list tayga-clat-envs and DNS..."
+:do { /container/config/set dns=2001:4860:4860::8888,2606:4700:4700::1111,1.1.1.1,8.8.8.8 } on-error={}
+
 :local envEntries {
     {"MODE"; "clat"};
     {"POLICY"; "auto"};
@@ -173,7 +175,8 @@
     {"TAYGA_WORKERS"; "3"};
     {"TAYGA_OFFLOAD"; "off"};
     {"TAYGA_OFFLINK_MTU"; "1280"};
-    {"PREF64"; "auto"};
+    {"PREF64"; "64:ff9b::/96"};
+    {"FALLBACK_TO_WELL_KNOWN_PREFIX"; "true"};
     {"ROUTER4"; "172.31.64.1"};
     {"ACTIVE_SLOT"; "clat-a"};
     {"LAST_GOOD_SLOT"; "clat-a"};
@@ -337,27 +340,40 @@
     /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.64.2 distance=1 routing-table=main disabled=yes comment="[tayga-unified:clat:default] Default route via TAYGA CLAT"
 }
 
-# --- 18. Register Network State Controller in Scheduler ---
+# --- 18. Download & Register Network State Controller in Scheduler ---
+:local controllerToRun $controllerScript
+:if ([:len [/file/find where name=$controllerToRun]] = 0) do={
+    :if ([:len [/file/find where name="routeros-controller.rsc"]] > 0) do={
+        :set controllerToRun "routeros-controller.rsc"
+    } else={
+        :put "--> Fetching controller script..."
+        :do {
+            /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path=$controllerScript
+        } on-error={
+            :do {
+                /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+                :set controllerToRun "routeros-controller.rsc"
+            } on-error={}
+        }
+    }
+}
+:if ([:len [/file/find where name=$controllerToRun]] = 0 and [:len [/file/find where name="routeros-controller.rsc"]] > 0) do={
+    :set controllerToRun "routeros-controller.rsc"
+}
+
 :local schedId [/system/scheduler/find where name="tayga-controller"]
 :if ([:len $schedId] = 0) do={
-    :put "--> Registering Network State Controller in /system/scheduler (interval: 15s)..."
-    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerScript) comment="[tayga-unified:controller] Network State Controller"
+    :put ("--> Registering Network State Controller in /system/scheduler (" . $controllerToRun . ", interval: 15s)...")
+    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerToRun) comment="[tayga-unified:controller] Network State Controller"
 } else={
-    :put "--> Updating /system/scheduler tayga-controller..."
-    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerScript)
+    :put ("--> Updating /system/scheduler tayga-controller (" . $controllerToRun . ")...")
+    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerToRun)
 }
 
 # --- 19. Initial Network State Controller Evaluation ---
-:if ([:len [/file/find where name=$controllerScript]] = 0) do={
-    :do {
-        :put ("--> Fetching controller script to " . $controllerScript . "...")
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path=$controllerScript
-    } on-error={}
-}
-
 :put "--> Running initial Network State Controller cycle..."
 :do {
-    /import file-name=$controllerScript
+    /import file-name=$controllerToRun
 } on-error={
     :put " [WARN] Controller initial execution encountered a non-fatal error; scheduler will retry."
 }

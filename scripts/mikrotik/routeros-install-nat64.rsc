@@ -396,21 +396,41 @@
     }
 }
 
-# --- 12. Register Network State Controller in Scheduler ---
+# --- 12. Download & Register Network State Controller in Scheduler ---
 :local controllerScript ($basePath . "/scripts/routeros-controller.rsc")
+:local controllerToRun $controllerScript
+:if ([:len [/file/find where name=$controllerToRun]] = 0) do={
+    :if ([:len [/file/find where name="routeros-controller.rsc"]] > 0) do={
+        :set controllerToRun "routeros-controller.rsc"
+    } else={
+        :put "--> Fetching controller script..."
+        :do {
+            /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path=$controllerScript
+        } on-error={
+            :do {
+                /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+                :set controllerToRun "routeros-controller.rsc"
+            } on-error={}
+        }
+    }
+}
+:if ([:len [/file/find where name=$controllerToRun]] = 0 and [:len [/file/find where name="routeros-controller.rsc"]] > 0) do={
+    :set controllerToRun "routeros-controller.rsc"
+}
+
 :local schedId [/system/scheduler/find where name="tayga-controller"]
 :if ([:len $schedId] = 0) do={
-    :put "--> Registering Network State Controller in /system/scheduler (interval: 15s)..."
-    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerScript) comment="[tayga-unified:controller] Network State Controller"
+    :put ("--> Registering Network State Controller in /system/scheduler (" . $controllerToRun . ", interval: 15s)...")
+    /system/scheduler/add name="tayga-controller" interval=15s on-event=("/import file-name=" . $controllerToRun) comment="[tayga-unified:controller] Network State Controller"
 } else={
-    :put "--> Updating /system/scheduler tayga-controller..."
-    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerScript)
+    :put ("--> Updating /system/scheduler tayga-controller (" . $controllerToRun . ")...")
+    /system/scheduler/set $schedId on-event=("/import file-name=" . $controllerToRun)
 }
 
 # --- 13. Initial Network State Controller Evaluation ---
 :put "--> Running initial Network State Controller cycle..."
 :do {
-    /import file-name=$controllerScript
+    /import file-name=$controllerToRun
 } on-error={
     :put " [WARN] Controller initial execution encountered a non-fatal error; scheduler will retry."
 }
