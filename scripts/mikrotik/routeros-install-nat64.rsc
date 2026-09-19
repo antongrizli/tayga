@@ -77,11 +77,32 @@
 }
 
 # --- 2. Run Preflight Audit First (NAT64 Mode) ---
-:global AUDITMODE "nat64"
-:do {
-    /import file-name=$preflightScript
-} on-error={
-    :error "Installation aborted: preflight audit failed."
+:local preflightToRun $preflightScript
+:if ([:len [/file/find where name=$preflightToRun]] = 0) do={
+    :if ([:len [/file/find where name="routeros-preflight.rsc"]] > 0) do={
+        :set preflightToRun "routeros-preflight.rsc"
+    } else={
+        :put "--> Fetching preflight audit script..."
+        :do {
+            /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path=$preflightScript
+        } on-error={
+            :do {
+                /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
+                :set preflightToRun "routeros-preflight.rsc"
+            } on-error={}
+        }
+    }
+}
+
+:if ([:len [/file/find where name=$preflightToRun]] > 0) do={
+    :global AUDITMODE "nat64"
+    :do {
+        /import file-name=$preflightToRun
+    } on-error={
+        :error "Installation aborted: preflight audit failed."
+    }
+} else={
+    :put " [WARN] Preflight script not found; skipping preflight audit."
 }
 
 # Check container image source
