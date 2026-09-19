@@ -327,6 +327,13 @@
 }
 
 # --- 19. Initial Network State Controller Evaluation ---
+:if ([:len [/file/find where name=$controllerScript]] = 0) do={
+    :do {
+        :put ("--> Fetching controller script to " . $controllerScript . "...")
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path=$controllerScript
+    } on-error={}
+}
+
 :put "--> Running initial Network State Controller cycle..."
 :do {
     /import file-name=$controllerScript
