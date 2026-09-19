@@ -70,19 +70,27 @@
         :put "--> Fetching preflight audit script..."
         :do {
             /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path=$preflightScript
+            :log info ("[tayga-installer] Downloaded preflight script to " . $preflightScript)
         } on-error={
             :do {
                 /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
                 :set preflightToRun "routeros-preflight.rsc"
+                :log info "[tayga-installer] Downloaded preflight script to routeros-preflight.rsc"
             } on-error={}
         }
     }
 }
+:if ([:len [/file/find where name=$preflightToRun]] = 0 and [:len [/file/find where name="routeros-preflight.rsc"]] > 0) do={
+    :set preflightToRun "routeros-preflight.rsc"
+}
 
 :if ([:len [/file/find where name=$preflightToRun]] > 0) do={
+    :put (" [PASS] Preflight script " . $preflightToRun . " ready.")
+    :log info ("[tayga-installer] Preflight script " . $preflightToRun . " loaded.")
     :global AUDITMODE "clat"
     :do {
         /import file-name=$preflightToRun
+        :log info "[tayga-installer] Preflight audit executed successfully."
     } on-error={
         :error "Installation aborted: preflight audit failed."
     }
@@ -380,10 +388,12 @@
         :put "--> Fetching controller script..."
         :do {
             /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path=$controllerScript
+            :log info ("[tayga-installer] Downloaded controller script to " . $controllerScript)
         } on-error={
             :do {
                 /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path="routeros-controller.rsc"
                 :set controllerToRun "routeros-controller.rsc"
+                :log info "[tayga-installer] Downloaded controller script to routeros-controller.rsc"
             } on-error={}
         }
     }
@@ -391,6 +401,9 @@
 :if ([:len [/file/find where name=$controllerToRun]] = 0 and [:len [/file/find where name="routeros-controller.rsc"]] > 0) do={
     :set controllerToRun "routeros-controller.rsc"
 }
+
+:put (" [PASS] Controller script " . $controllerToRun . " ready.")
+:log info ("[tayga-installer] Controller script " . $controllerToRun . " ready.")
 
 :local schedId [/system/scheduler/find where name="tayga-controller"]
 :if ([:len $schedId] = 0) do={
@@ -410,8 +423,11 @@
 :put "--> Running initial Network State Controller cycle..."
 :do {
     /import file-name=$controllerToRun
+    :put (" [PASS] Network State Controller executed successfully (State: " . $TaygaState . ").")
+    :log info ("[tayga-installer] Network State Controller executed successfully (State: " . $TaygaState . ").")
 } on-error={
     :put " [WARN] Controller initial execution encountered a non-fatal error; scheduler will retry."
+    :log warn "[tayga-installer] Controller initial execution encountered a non-fatal error; scheduler will retry."
 }
 
 :put "============================================================"

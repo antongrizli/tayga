@@ -712,6 +712,7 @@
         :log info ("[tayga-controller] State transition: " . $TaygaState . " -> " . $nextState)
         :set TaygaState $nextState
     }
+    :log info ("[tayga-controller] Controller cycle completed successfully. State: " . $TaygaState)
 } on-error={
     :log error "[tayga-controller] Unhandled exception during controller execution."
 }
