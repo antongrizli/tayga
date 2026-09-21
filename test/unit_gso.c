@@ -812,11 +812,17 @@ static void test_gso_ttl_hop_limit(void)
 		ssize_t n = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
 		assert(n > 0);
 
+#ifdef __linux__
+#define ICMP_PI_LEN 0
+#else
+#define ICMP_PI_LEN sizeof(struct tun_pi)
+#endif
+
 		if (hl <= 1) {
 			/* Expect ICMPv6 Time Exceeded (Type 3, Code 0) */
-			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + 10);
+			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + 10 + ICMP_PI_LEN);
 			assert(rx_ip6->next_header == 58); /* ICMPv6 */
-			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + sizeof(struct ip6));
+			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + ICMP_PI_LEN + sizeof(struct ip6));
 			assert(rx_icmp->type == 3); /* Time Exceeded */
 			assert(rx_icmp->code == 0); /* Hop limit exceeded in transit */
 		} else {
@@ -876,9 +882,9 @@ static void test_gso_ttl_hop_limit(void)
 
 		if (ttl_in <= 1) {
 			/* Expect ICMPv4 Time Exceeded (Type 11, Code 0) */
-			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + 10);
+			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + 10 + ICMP_PI_LEN);
 			assert(rx_ip4->proto == 1); /* ICMPv4 */
-			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + sizeof(struct ip4));
+			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + ICMP_PI_LEN + sizeof(struct ip4));
 			assert(rx_icmp->type == 11); /* Time Exceeded */
 			assert(rx_icmp->code == 0); /* TTL expired in transit */
 		} else {
