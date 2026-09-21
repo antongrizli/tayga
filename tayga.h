@@ -505,6 +505,10 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown);
 /* nat64.c */
 void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
+void log_pkt4(int err, struct pkt *p, const char *msg);
+void log_pkt6(int err, struct pkt *p, const char *msg);
+void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
+void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
 uint16_t next_ip4_ident(void);
 void set_ip4_ident_counter(uint16_t val);
 uint16_t ip_checksum(void *d, uint32_t c);

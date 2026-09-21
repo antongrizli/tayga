@@ -205,6 +205,18 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	if (gso_size == 0)
 		return -1;
 
+	/* RFC 7915 §5.1: If Hop Limit <= 1, discard and send ICMPv6 Time Exceeded */
+	if (unlikely(ip6->hop_limit <= 1)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_TCP;
+		log_pkt6(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp6_error(3, 0, 0, p);
+		return 0;
+	}
+
 	/* RFC 7915 §5.1 & RFC 6864 §4.3: check whether all segments get DF=1 */
 	uint32_t full_seg_ip4_len = sizeof(struct ip4) + tcp_hdr_len + gso_size;
 	uint32_t tail_len = payload_len % gso_size;
@@ -223,7 +235,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 
 	/* Extract fields from IPv6 header BEFORE forming IPv4 header at p->data + 20 */
 	uint8_t tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
-	uint8_t ttl = ip6->hop_limit > 1 ? (ip6->hop_limit - 1) : 1;
+	uint8_t ttl = ip6->hop_limit - 1;
 	struct in6_addr orig_ip6_src = ip6->src;
 	struct in6_addr orig_ip6_dst = ip6->dest;
 
@@ -281,7 +293,8 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		/* Copy TCP header and payload for tail */
 		memcpy(tail_tcp, tcp, tcp_hdr_len);
 		tail_tcp->seq = htonl(orig_seq + head_payload_len);
-		tail_tcp->flags = orig_flags; /* Keep original FIN / PSH */
+		/* RFC 3168 §6.1.5: CWR only on first segment; clear on tail while preserving FIN, PSH, ECE */
+		tail_tcp->flags = orig_flags & ~TCP_FLAG_CWR;
 		memcpy((uint8_t *)tail_tcp + tcp_hdr_len,
 		       (uint8_t *)tcp + tcp_hdr_len + head_payload_len,
 		       tail_len);
@@ -313,7 +326,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		}
 
 		atomic_fetch_add_explicit(&g_gso_stats.gso_split_tail_pkts, 1, memory_order_relaxed);
-		return (ret_head > 0) ? 0 : -1;
+		return 0;
 	}
 
 	/* Standard Fast-Path: Entire GSO aggregate has DF=1 and no small tail */
@@ -350,7 +363,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	}
 
 	atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
-	return -1;
+	return 0;
 }
 
 int gso_translate_tcp_4to6(struct pkt *p)
@@ -382,6 +395,18 @@ int gso_translate_tcp_4to6(struct pkt *p)
 
 	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
 
+	/* RFC 7915 §4.1: If TTL <= 1, discard and send ICMPv4 Time Exceeded */
+	if (unlikely(ip4->ttl <= 1)) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_TCP;
+		log_pkt4(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp4_error(11, 0, 0, p);
+		return 0;
+	}
+
 	/* Map addresses */
 	struct in6_addr src6, dst6;
 	if (map_ip4_to_ip6(&src6, &ip4->src) < 0 || map_ip4_to_ip6(&dst6, &ip4->dest) < 0)
@@ -397,7 +422,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)ip4->tos << 20));
 	ip6->payload_length = htons((uint16_t)tcp_len);
 	ip6->next_header = IPPROTO_TCP;
-	ip6->hop_limit = ip4->ttl > 1 ? (ip4->ttl - 1) : 1;
+	ip6->hop_limit = ip4->ttl - 1;
 	ip6->src = src6;
 	ip6->dest = dst6;
 
@@ -417,7 +442,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	}
 
 	atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
-	return -1;
+	return 0;
 }
 
 int gso_software_segment_and_send_6to4(struct pkt *p)
@@ -426,6 +451,19 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 	atomic_fetch_add_explicit(&g_gso_stats.gso_sw_seg_pkts, 1, memory_order_relaxed);
 
 	struct ip6 *ip6 = (struct ip6 *)p->data;
+
+	/* RFC 7915 §5.1: If Hop Limit <= 1, discard and send ICMPv6 Time Exceeded */
+	if (unlikely(ip6->hop_limit <= 1)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_TCP;
+		log_pkt6(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp6_error(3, 0, 0, p);
+		return 0;
+	}
+
 	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip6));
 	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
 	uint8_t *payload = p->data + sizeof(struct ip6) + tcp_hdr_len;
@@ -466,6 +504,10 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		if (!is_last) {
 			seg_tcp->flags &= ~(TCP_FLAG_FIN | TCP_FLAG_PSH);
 		}
+		/* RFC 3168 §6.1.5: CWR only on first segment */
+		if (offset > 0) {
+			seg_tcp->flags &= ~TCP_FLAG_CWR;
+		}
 
 		/* Copy payload */
 		if (seg_data_len > 0) {
@@ -487,7 +529,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 			ip4->ident = 0;
 		}
 
-		ip4->ttl = ip6->hop_limit > 1 ? (ip6->hop_limit - 1) : 1;
+		ip4->ttl = ip6->hop_limit - 1;
 		ip4->proto = IPPROTO_TCP;
 		ip4->src = src4;
 		ip4->dest = dst4;
@@ -522,6 +564,19 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 
 	struct ip4 *ip4 = (struct ip4 *)p->data;
 	uint32_t ip4_hdr_len = (ip4->ver_ihl & 0x0f) * 4;
+
+	/* RFC 7915 §4.1: If TTL <= 1, discard and send ICMPv4 Time Exceeded */
+	if (unlikely(ip4->ttl <= 1)) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_TCP;
+		log_pkt4(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp4_error(11, 0, 0, p);
+		return 0;
+	}
+
 	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + ip4_hdr_len);
 	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
 	uint8_t *payload = p->data + ip4_hdr_len + tcp_hdr_len;
@@ -559,6 +614,10 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		if (!is_last) {
 			seg_tcp->flags &= ~(TCP_FLAG_FIN | TCP_FLAG_PSH);
 		}
+		/* RFC 3168 §6.1.5: CWR only on first segment */
+		if (offset > 0) {
+			seg_tcp->flags &= ~TCP_FLAG_CWR;
+		}
 
 		if (seg_data_len > 0) {
 			memcpy((uint8_t *)seg_tcp + tcp_hdr_len, payload + offset, seg_data_len);
@@ -569,7 +628,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)ip4->tos << 20));
 		ip6->payload_length = htons((uint16_t)seg_tcp_total_len);
 		ip6->next_header = IPPROTO_TCP;
-		ip6->hop_limit = ip4->ttl > 1 ? (ip4->ttl - 1) : 1;
+		ip6->hop_limit = ip4->ttl - 1;
 		ip6->src = src6;
 		ip6->dest = dst6;
 

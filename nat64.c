@@ -63,7 +63,7 @@ struct ip4_error {
  * @param p   struct pkt which encountered the error
  * @param msg string message to include in the log
  */
-static void log_pkt4(int err, struct pkt *p, const char *msg)
+void log_pkt4(int err, struct pkt *p, const char *msg)
 {
 	const char * type = "";
 	if	   (gcfg.log_opts & err & LOG_OPT_SELF) 	type = "SELF";
@@ -99,7 +99,7 @@ static void log_pkt4(int err, struct pkt *p, const char *msg)
  * @param p   struct pkt which encountered the error
  * @param msg string message to include in the log
  */
-static void log_pkt6(int err, struct pkt *p, const char *msg)
+void log_pkt6(int err, struct pkt *p, const char *msg)
 {
 	const char * type = "";
 	if	   (gcfg.log_opts & err & LOG_OPT_SELF) 	type = "SELF";
@@ -249,7 +249,7 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
 }
 
-static void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word,
+void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word,
 		struct pkt *orig)
 {
 	struct icmp icmp;
@@ -837,7 +837,7 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
 }
 
-static void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,
+void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,
 				struct pkt *orig)
 {
 	struct icmp icmp;
