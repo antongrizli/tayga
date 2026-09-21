@@ -1008,24 +1008,36 @@ static void test_gso_mock_write_error(void)
 	/* Test 3: Head aggregate successfully sent, tail segment write fails */
 	{
 		int sv[2];
-		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
 		assert(set_nonblock(sv[0]) == 0);
 
 		const size_t head_dgram_sz = 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800;
 
-		/* Fill queue with Head-sized dummy datagrams until send fails with EAGAIN / EWOULDBLOCK */
-		uint8_t dummy[head_dgram_sz];
+		/* Fill stream buffer until send returns EAGAIN / EWOULDBLOCK */
+		uint8_t dummy[1024];
 		memset(dummy, 0xaa, sizeof(dummy));
-		int filled = 0;
-		while (send(sv[0], dummy, sizeof(dummy), 0) > 0) {
-			filled++;
+		size_t total_filled = 0;
+		while (1) {
+			ssize_t n = send(sv[0], dummy, sizeof(dummy), 0);
+			if (n > 0) {
+				total_filled += n;
+			} else {
+				break;
+			}
 		}
-		assert(filled > 0);
+		assert(total_filled > head_dgram_sz);
 
-		/* Drain exactly 1 dummy packet so sv[0] has capacity for exactly 1 Head-sized datagram */
+		/* Drain exactly head_dgram_sz bytes so sv[0] has capacity for exactly the Head datagram */
 		uint8_t drain[4096];
-		ssize_t nd = recv(sv[1], drain, sizeof(drain), 0);
-		assert(nd == (ssize_t)sizeof(dummy));
+		size_t drained = 0;
+		while (drained < head_dgram_sz) {
+			size_t to_read = head_dgram_sz - drained;
+			if (to_read > sizeof(drain))
+				to_read = sizeof(drain);
+			ssize_t nd = recv(sv[1], drain, to_read, 0);
+			assert(nd > 0);
+			drained += nd;
+		}
 
 		/* Construct split-tail GSO packet: 2 full segments (1400 each) + 1 tail segment (400 bytes) */
 		uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
@@ -1072,20 +1084,29 @@ static void test_gso_mock_write_error(void)
 		assert(curr_err == prev_err + 1);
 		assert(curr_tx == prev_tx + 1);
 
-		/* Drain remaining (filled - 1) dummy packets from sv[1] */
-		for (int i = 0; i < filled - 1; i++) {
-			ssize_t nr = recv(sv[1], drain, sizeof(drain), 0);
-			assert(nr == (ssize_t)sizeof(dummy));
+		/* Drain remaining dummy bytes from sv[1] */
+		size_t rem_dummy = total_filled - head_dgram_sz;
+		while (rem_dummy > 0) {
+			size_t to_read = rem_dummy > sizeof(drain) ? sizeof(drain) : rem_dummy;
+			ssize_t nr = recv(sv[1], drain, to_read, 0);
+			assert(nr > 0);
+			rem_dummy -= nr;
 		}
 
-		/* Now the next packet in queue MUST be the Head GSO aggregate */
+		/* Now the next bytes in stream MUST be the Head GSO aggregate */
 		uint8_t rx_buf[4096];
-		ssize_t nh = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
-		assert(nh == (ssize_t)head_dgram_sz);
+		size_t head_rcvd = 0;
+		while (head_rcvd < head_dgram_sz) {
+			size_t to_read = head_dgram_sz - head_rcvd;
+			ssize_t nr = recv(sv[1], rx_buf + head_rcvd, to_read, 0);
+			assert(nr > 0);
+			head_rcvd += nr;
+		}
+		assert(head_rcvd == head_dgram_sz);
 		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_TCPV4);
 
-		/* And no tail packet exists in the queue */
+		/* And no tail packet exists in the stream */
 		assert(set_nonblock(sv[1]) == 0);
 		ssize_t nt = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
 		assert(nt < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
