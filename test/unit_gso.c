@@ -1009,13 +1009,12 @@ static void test_gso_mock_write_error(void)
 	{
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
-
-		int sndbuf = 2048;
-		setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 		assert(set_nonblock(sv[0]) == 0);
 
-		/* Fill queue until send fails with EAGAIN / EWOULDBLOCK */
-		uint8_t dummy[500];
+		const size_t head_dgram_sz = 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800;
+
+		/* Fill queue with Head-sized dummy datagrams until send fails with EAGAIN / EWOULDBLOCK */
+		uint8_t dummy[head_dgram_sz];
 		memset(dummy, 0xaa, sizeof(dummy));
 		int filled = 0;
 		while (send(sv[0], dummy, sizeof(dummy), 0) > 0) {
@@ -1023,10 +1022,10 @@ static void test_gso_mock_write_error(void)
 		}
 		assert(filled > 0);
 
-		/* Drain exactly 1 dummy packet so sv[0] has capacity for exactly 1 datagram */
-		uint8_t drain[1024];
+		/* Drain exactly 1 dummy packet so sv[0] has capacity for exactly 1 Head-sized datagram */
+		uint8_t drain[4096];
 		ssize_t nd = recv(sv[1], drain, sizeof(drain), 0);
-		assert(nd == sizeof(dummy));
+		assert(nd == (ssize_t)sizeof(dummy));
 
 		/* Construct split-tail GSO packet: 2 full segments (1400 each) + 1 tail segment (400 bytes) */
 		uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
@@ -1076,13 +1075,13 @@ static void test_gso_mock_write_error(void)
 		/* Drain remaining (filled - 1) dummy packets from sv[1] */
 		for (int i = 0; i < filled - 1; i++) {
 			ssize_t nr = recv(sv[1], drain, sizeof(drain), 0);
-			assert(nr == sizeof(dummy));
+			assert(nr == (ssize_t)sizeof(dummy));
 		}
 
 		/* Now the next packet in queue MUST be the Head GSO aggregate */
 		uint8_t rx_buf[4096];
 		ssize_t nh = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
-		assert(nh == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
+		assert(nh == (ssize_t)head_dgram_sz);
 		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_TCPV4);
 

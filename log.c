@@ -188,7 +188,7 @@ int journal_printv_with_location(
         int priority, const char *file, const char *line, const char *func,
         const char *format, va_list ap)
 {
-    char pri[11] = "PRIORITY=0\n";
+    char pri[] = "PRIORITY=0\n";
     char msg[8 + MESSAGE_SIZE] = "MESSAGE=";
     struct iovec iov[10];
     size_t iovlen = 10;
@@ -219,7 +219,7 @@ int journal_printv_with_location(
     iov[0].iov_len = len + 8;
     /* PRIORITY= */
     iov[1].iov_base = pri;
-    iov[1].iov_len = sizeof pri;
+    iov[1].iov_len = sizeof(pri) - 1;
     /* CODE_FILE= */
     iov[2].iov_base = (char *)file;
     iov[2].iov_len = strlen(file);
