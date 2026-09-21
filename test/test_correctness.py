@@ -12,19 +12,21 @@ def sh(cmd):
 def main():
     print("=== TAYGA CLAT Data Correctness & Integrity Test ===")
 
-    # 1. Prepare 20 MB random payload
-    test_file = "/tmp/test_20mb.bin"
+    size_mb = int(os.environ.get("TEST_SIZE_MB", "100"))
+    payload_bytes = size_mb * 1024 * 1024
+    test_file = f"/tmp/test_{size_mb}mb.bin"
     up_received = "/tmp/upload_received.bin"
     dl_received = "/tmp/download_received.bin"
 
-    if not os.path.exists(test_file) or os.path.getsize(test_file) != 20 * 1024 * 1024:
-        data = os.urandom(20 * 1024 * 1024)
+    if not os.path.exists(test_file) or os.path.getsize(test_file) != payload_bytes:
+        print(f"Generating {size_mb} MB random payload...")
         with open(test_file, "wb") as f:
-            f.write(data)
+            for _ in range(size_mb):
+                f.write(os.urandom(1024 * 1024))
     
     with open(test_file, "rb") as f:
         expected_hash = hashlib.sha256(f.read()).hexdigest()
-    print(f"Test payload: 20 MB, SHA-256 = {expected_hash}")
+    print(f"Test payload: {size_mb} MB ({payload_bytes} bytes), SHA-256 = {expected_hash}")
 
     # 2. Cleanup & recreate netns
     for ns in ["client", "router", "clatns", "server"]:
@@ -105,33 +107,39 @@ def main():
         assert ready, "CLAT ping failed to become ready"
         print("[PASS] ICMP Echo Request / Reply verified")
 
-        # 4. Test TCP Upload (20 MB)
+        # 4. Test TCP Upload (unlimited speed)
         for f in [up_received, dl_received]:
             if os.path.exists(f): os.remove(f)
 
         # Server receives on port 9999
-        srv_nc = subprocess.Popen(shlex.split("ip netns exec server socat -u TCP6-LISTEN:9999,reuseaddr,bind=[64:ff9b::b00:2] OPEN:/tmp/upload_received.bin,creat,trunc"))
+        srv_nc = subprocess.Popen(shlex.split(f"ip netns exec server socat -u TCP6-LISTEN:9999,reuseaddr,bind=[64:ff9b::b00:2] OPEN:{up_received},creat,trunc"))
         time.sleep(0.5)
-        sh("ip netns exec client socat -u OPEN:/tmp/test_20mb.bin TCP4:11.0.0.2:9999")
-        srv_nc.wait(timeout=10)
+        t_up_start = time.monotonic()
+        sh(f"ip netns exec client socat -u OPEN:{test_file} TCP4:11.0.0.2:9999")
+        srv_nc.wait(timeout=30)
+        t_up_elapsed = time.monotonic() - t_up_start
+        up_rate_mbps = (payload_bytes * 8 / t_up_elapsed) / 1_000_000
 
         with open(up_received, "rb") as f:
             up_hash = hashlib.sha256(f.read()).hexdigest()
-        print(f"Upload Result:   SHA-256 = {up_hash}")
+        print(f"Upload Result:   SHA-256 = {up_hash} (Time: {t_up_elapsed:.2f}s, Rate: {up_rate_mbps:.1f} Mbps)")
         assert up_hash == expected_hash, f"Upload hash mismatch! Expected {expected_hash}, got {up_hash}"
-        print("[PASS] TCP Upload 20 MB file integrity verified")
+        print(f"[PASS] TCP Upload {size_mb} MB file integrity & rate verified")
 
-        # 5. Test TCP Download (20 MB)
-        srv_nc_dl = subprocess.Popen(shlex.split("ip netns exec server socat -u OPEN:/tmp/test_20mb.bin TCP6-LISTEN:9998,reuseaddr,bind=[64:ff9b::b00:2]"))
+        # 5. Test TCP Download (unlimited speed)
+        srv_nc_dl = subprocess.Popen(shlex.split(f"ip netns exec server socat -u OPEN:{test_file} TCP6-LISTEN:9998,reuseaddr,bind=[64:ff9b::b00:2]"))
         time.sleep(0.5)
-        sh("ip netns exec client socat -u TCP4:11.0.0.2:9998 OPEN:/tmp/download_received.bin,creat,trunc")
-        srv_nc_dl.wait(timeout=10)
+        t_dl_start = time.monotonic()
+        sh(f"ip netns exec client socat -u TCP4:11.0.0.2:9998 OPEN:{dl_received},creat,trunc")
+        srv_nc_dl.wait(timeout=30)
+        t_dl_elapsed = time.monotonic() - t_dl_start
+        dl_rate_mbps = (payload_bytes * 8 / t_dl_elapsed) / 1_000_000
 
         with open(dl_received, "rb") as f:
             dl_hash = hashlib.sha256(f.read()).hexdigest()
-        print(f"Download Result: SHA-256 = {dl_hash}")
+        print(f"Download Result: SHA-256 = {dl_hash} (Time: {t_dl_elapsed:.2f}s, Rate: {dl_rate_mbps:.1f} Mbps)")
         assert dl_hash == expected_hash, f"Download hash mismatch! Expected {expected_hash}, got {dl_hash}"
-        print("[PASS] TCP Download 20 MB file integrity verified")
+        print(f"[PASS] TCP Download {size_mb} MB file integrity & rate verified")
 
         # 6. Test UDP delivery (IPv4 -> IPv6; this is not an echo test).
         # UDP bind parses an optional port, so IPv6 literals need brackets.

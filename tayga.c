@@ -122,19 +122,21 @@ static void signal_read(void)
 				dynamic_maint(gcfg.dynamic_pool, 1);
 			continue;
 		}
+		/* If we got SIGUSR2, dump GSO statistics without exiting */
+		if(sig == SIGUSR2) {
+			slog(LOG_NOTICE, "Received SIGUSR2, reporting GSO statistics\n");
+			if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+				gso_dump_stats();
+			}
+			continue;
+		}
 		/* For any other signal prepare to exit cleanly */
 		if (gcfg.dynamic_pool) {
 			dynamic_maint(gcfg.dynamic_pool, 1);
 		}
 		slog(LOG_NOTICE, "Exiting on signal %d\n", sig);
 		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
-			slog(LOG_NOTICE, "GSO Stats: rx_pkts=%llu, tx_pkts=%llu, rx_bytes=%llu, tx_bytes=%llu, fallback_pkts=%llu, invalid_pkts=%llu\n",
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_rx, memory_order_relaxed),
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_tx, memory_order_relaxed),
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_rx, memory_order_relaxed),
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_tx, memory_order_relaxed),
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_fallback_pkts, memory_order_relaxed),
-				(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_invalid_pkts, memory_order_relaxed));
+			gso_dump_stats();
 		}
 		if (gcfg.log_out == LOG_TO_SYSLOG) {
 			closelog();

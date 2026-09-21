@@ -47,11 +47,17 @@ struct gso_worker_stats {
 	_Atomic uint64_t gso_pkts_tx;
 	_Atomic uint64_t gso_bytes_rx;
 	_Atomic uint64_t gso_bytes_tx;
+	_Atomic uint64_t gso_split_tail_pkts;
+	_Atomic uint64_t gso_sw_seg_pkts;
+	_Atomic uint64_t gso_sw_seg_out_pkts;
 	_Atomic uint64_t gso_fallback_pkts;
 	_Atomic uint64_t gso_invalid_pkts;
+	_Atomic uint64_t gso_tun_write_errors;
 };
 
 extern struct gso_worker_stats g_gso_stats;
+
+void gso_dump_stats(void);
 
 /* TCP Header definition for GSO inspection and translation */
 struct tcp_hdr {

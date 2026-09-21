@@ -57,6 +57,21 @@ if [ -z "$UPLINK_IF" ] || ! ip link show dev "$UPLINK_IF" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Proactively probe kernel TUN offload and GSO capability before launch
+if [ "$CLAT_OFFLOAD" != "off" ]; then
+  echo "==> Probing kernel TUN offload / GSO support..."
+  if tayga --check-offload; then
+    echo "==> Kernel TUN offload check: PASSED (IFF_VNET_HDR + TSO + CSUM supported)"
+  else
+    if [ "$CLAT_OFFLOAD" = "auto" ]; then
+      echo "WARNING: Kernel TUN offload probe failed; auto-fallback to offload=off" >&2
+      CLAT_OFFLOAD="off"
+    else
+      echo "WARNING: Kernel TUN offload probe failed; proceeding with requested offload=$CLAT_OFFLOAD" >&2
+    fi
+  fi
+fi
+
 # Enable GRO on uplink interface if offload is requested and ethtool is available
 if [ "$CLAT_OFFLOAD" != "off" ] && command -v ethtool >/dev/null 2>&1; then
   ethtool -K "$UPLINK_IF" gro on 2>/dev/null || true
