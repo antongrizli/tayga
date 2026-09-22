@@ -63,10 +63,12 @@ jobs:
           fetch-depth: 0
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc make libpthread-stubs0-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc make libpthread-stubs0-dev python3-pyroute2 python3-scapy
 
-      - name: Run C Test Suite
-        run: make test CC=gcc LDFLAGS=""
+      - name: Run C Test Suite & Netns Integration Tests
+        run: |
+          make test CC=gcc LDFLAGS=""
+          sudo make integration
 
   # 3. Build Standalone Static Linux Binaries
   build-static-binaries:
@@ -362,7 +364,7 @@ jobs:
           /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-nat64.rsc" dst-path=install-nat64.rsc; /import install-nat64.rsc
           ```
 
-          #### 3. Zero-Downtime A/B Upgrade (Automatically pulls latest container image from GHCR):
+          #### 3. Atomic A/B Upgrade with Automatic Rollback (Minimal interruption window, verified probe):
           ```routeros
           /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-upgrade.rsc" dst-path=upgrade.rsc; /import upgrade.rsc
           ```

@@ -1,16 +1,15 @@
 # ==============================================================================
-# RouterOS 7 Upgrade Script: State-Driven Dual-Slot (A/B) Upgrade & Instant Auto-Rollback
+# RouterOS 7 Upgrade Script: Atomic Dual-Slot (A/B) Upgrade & Instant Auto-Rollback
 # ==============================================================================
-# Upgrades container image with zero traffic blackholing and verified recovery:
-# 1. Verifies prerequisites: veth-clat, active CLAT container, new image TAR
+# Upgrades container image with minimal service interruption (~5-8s during container transition) and verified recovery:
+# 1. Verifies prerequisites: veth-clat, active CLAT container, target storage
 # 2. Reads persistent state (ACTIVE_SLOT, LAST_GOOD_SLOT)
 # 3. Targets alternate slot (clat-a <-> clat-b)
-# 4. Withdraws default route
-# 5. Cleanly stops active container (retained in stopped state for instant fallback)
-# 6. Deploys candidate container into target slot
-# 7. Starts candidate container and verifies end-to-end probe ping (/32)
-# 8. If probe succeeds: marks candidate verified, promotes slot, enables default route
-# 9. If probe fails: INSTANTLY restarts preserved previous container (< 1s, zero extraction)!
+# 4. Deploys candidate container into target slot (download & extract BEFORE stopping active)
+# 5. Only after candidate extraction completes: withdraws default route and stops active container
+# 6. Starts candidate container and verifies end-to-end multi-target probe ping
+# 7. If probe succeeds: marks candidate verified, promotes slot, enables default route
+# 8. If probe fails: INSTANTLY restarts preserved previous container (< 1s, zero extraction)!
 #
 # Supports continuous sequential upgrades: A -> B -> A (C) -> B (D) -> ...
 #
@@ -172,23 +171,6 @@
         /routing/rule/add src-address=172.31.64.1/32 action=lookup-only-in-table table=tayga-probe-clat comment="[tayga-unified:clat:probe] CLAT Probe Rule"
     }
 
-    # --- 4. Withdraw Default Route during Upgrade Window ---
-    :put "--> Withdrawing default route..."
-    /ip/route/disable [find where comment~"^\\[tayga-unified:clat:default\\]"]
-
-    # --- 5. Cleanly STOP Active Container (Preserved definition for instant fallback) ---
-    :put "--> Stopping running container (retaining definition for instant rollback)..."
-    /container/stop $oldCont
-    :local stopWait 0
-    :while (([/container/get $oldCont stopped] != true) && ($stopWait < 30)) do={
-        :delay 1s
-        :set stopWait ($stopWait + 1)
-    }
-    :if ([/container/get $oldCont stopped] != true) do={
-        :put " [FAIL] Active container did not stop cleanly within 30s timeout."
-        :error "Aborted: container stop timed out"
-    }
-
     # Clean up any leftover candidate container from previous failed attempts
     :local staleCand [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
     :if ([:len $staleCand] > 0) do={
@@ -206,7 +188,9 @@
         /file/remove [find where name=$targetRootfs]
     } on-error={}
 
-    # --- 6. Deploy Candidate Container into Target Slot ---
+    # --- 4. Deploy Candidate Container into Target Slot (Active container remains running) ---
+    :local txPhase "staging"
+
     :if ($useRegistry = true) do={
         :put ("--> Setting container registry URL: " . $registryUrl . "...")
         :do { /container/config/set registry-url=$registryUrl } on-error={}
@@ -222,28 +206,6 @@
             restart-interval=10s \
             logging=yes \
             comment="[tayga-unified:clat:candidate] Candidate Upgrade Container"
-
-        :put "--> Downloading and extracting candidate layers from GHCR (may take 10-60s)..."
-        :local candCont [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
-        :if ([:len $candCont] > 0) do={
-            :local cId ($candCont->0)
-            :local extWait 0
-            :local isExtracted false
-            :while (($isExtracted = false) && ($extWait < 180)) do={
-                # Refresh lock heartbeat to prevent controller from stealing lock
-                :set TaygaLockTime [/system/resource/get uptime]
-                :local isStopped [/container/get $cId stopped]
-                :if ($isStopped = true) do={
-                    :set isExtracted true
-                } else={
-                    :delay 2s
-                    :set extWait ($extWait + 2)
-                }
-            }
-            :if ($isExtracted = false) do={
-                :error "Aborted: remote image extraction timed out (180s)"
-            }
-        }
     } else={
         :put ("--> Extracting candidate image into " . $targetRootfs . "...")
         /container/add file=$imagePath \
@@ -257,34 +219,76 @@
             restart-interval=10s \
             logging=yes \
             comment="[tayga-unified:clat:candidate] Candidate Upgrade Container"
-        :delay 3s
     }
 
-    # --- 7. Start Candidate Container and Verify End-to-End Probe ---
-    :put "--> Starting candidate container..."
-    :local upgradeOk true
-    :local newCont [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
-    :if ([:len $newCont] > 0) do={
-        :local newId ($newCont->0)
-        /container/start $newId
-
-        :local isRunning false
-        :for i from=1 to=30 do={
-            :if ($isRunning = false) do={
-                :local r [/container/get $newId running]
-                :if ($r = true) do={
-                    :set isRunning true
-                } else={
-                    :delay 1s
-                }
+    :put "--> Waiting for candidate container extraction to complete while active container serves traffic..."
+    :local candCont [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
+    :if ([:len $candCont] > 0) do={
+        :local cId ($candCont->0)
+        :local extWait 0
+        :local isExtracted false
+        :while (($isExtracted = false) && ($extWait < 180)) do={
+            # Refresh lock heartbeat to prevent controller from stealing lock
+            :set TaygaLockTime [/system/resource/get uptime]
+            :local isStopped [/container/get $cId stopped]
+            :if ($isStopped = true) do={
+                :set isExtracted true
+            } else={
+                :delay 2s
+                :set extWait ($extWait + 2)
             }
         }
-        :if ($isRunning = false) do={
-            :set upgradeOk false
-            :put " [FAIL] Candidate container failed to reach running state."
+        :if ($isExtracted = false) do={
+            :error "Aborted: container image extraction timed out (180s)"
         }
     } else={
+        :error "Aborted: candidate container failed to create"
+    }
+
+    # --- 5. Cleanly Switch Over (Interruption window typically 5-8 seconds during container transition) ---
+    :set txPhase "switching"
+    :put "--> Candidate extracted. Withdrawing default route..."
+    /ip/route/disable [find where comment~"^\\[tayga-unified:clat:default\\]"]
+
+    :put "--> Stopping running container (retaining definition for instant rollback)..."
+    /container/stop $oldCont
+    :local stopWait 0
+    :while (([/container/get $oldCont stopped] != true) && ($stopWait < 30)) do={
+        :delay 1s
+        :set stopWait ($stopWait + 1)
+    }
+    :local upgradeOk true
+    :if ([/container/get $oldCont stopped] != true) do={
+        :put " [FAIL] Active container did not stop cleanly within 30s timeout."
         :set upgradeOk false
+    }
+
+    # --- 6. Start Candidate Container and Verify End-to-End Probe ---
+    :if ($upgradeOk = true) do={
+        :put "--> Starting candidate container..."
+        :local newCont [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
+        :if ([:len $newCont] > 0) do={
+            :local newId ($newCont->0)
+            /container/start $newId
+
+            :local isRunning false
+            :for i from=1 to=30 do={
+                :if ($isRunning = false) do={
+                    :local r [/container/get $newId running]
+                    :if ($r = true) do={
+                        :set isRunning true
+                    } else={
+                        :delay 1s
+                    }
+                }
+            }
+            :if ($isRunning = false) do={
+                :set upgradeOk false
+                :put " [FAIL] Candidate container failed to reach running state."
+            }
+        } else={
+            :set upgradeOk false
+        }
     }
 
     # Warm-up delay for RFC 7050 discovery / translation initialization
@@ -293,13 +297,18 @@
         :put "--> Testing end-to-end probe ping via tayga-probe-clat..."
         :local pingRx 0
         :do {
-            :set pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+            :set pingRx [/ping 1.1.1.1 src-address=172.31.64.1 count=2]
         } on-error={}
+        :if ($pingRx = 0) do={
+            :do {
+                :set pingRx [/ping 8.8.8.8 src-address=172.31.64.1 count=2]
+            } on-error={}
+        }
         :if ($pingRx > 0) do={
-            :put (" [PASS] Probe test successful (" . $pingRx . "/3 received)!")
+            :put (" [PASS] Probe test successful (" . $pingRx . "/2 received)!")
         } else={
             :set upgradeOk false
-            :put " [FAIL] Candidate probe ping returned 0 packets."
+            :put " [FAIL] Candidate probe ping returned 0 packets to 1.1.1.1 and 8.8.8.8."
         }
     }
 
@@ -396,6 +405,19 @@
     }
 } on-error={
     :put " [ERROR] Unhandled error occurred during upgrade."
+    :if ($txPhase = "switching") do={
+        :put " [EMERGENCY ROLLBACK] Restoring previous container and network state..."
+        :local fc [/container/find where comment~"^\\[tayga-unified:clat:candidate\\]"]
+        :if ([:len $fc] > 0) do={
+            :do { /container/stop ($fc->0) } on-error={}
+            :delay 1s
+            :do { /container/remove ($fc->0) } on-error={}
+        }
+        :do { /container/start $oldCont } on-error={}
+        :delay 2s
+        :do { /ip/route/enable [find where comment~"^\\[tayga-unified:clat:default\\]"] } on-error={}
+        :put " [EMERGENCY ROLLBACK] Restored previous active container and default route."
+    }
 }
 
 # Release Unified Lock strictly by token match

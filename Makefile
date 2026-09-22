@@ -5,7 +5,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -O2
 LDFLAGS ?= -flto=auto
 LDLIBS := -lpthread
-SOURCES := nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c gso.c
+SOURCES := nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c gso.c stats.c stats_exporter.c
 
 #Default installation paths (may be overridden by environment variables)
 prefix ?= /usr/local
@@ -119,13 +119,14 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64
+test: unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats
 	./unit_conffile
 	./unit_checksum
 	./unit_ip4_id
 	./unit_tun
 	./unit_gso
 	./unit_pref64
+	./unit_stats
 
 # these are only valid for GCC
 TEST_CFLAGS := $(CFLAGS) -Werror -coverage -DCOVERAGE_TESTING
@@ -139,17 +140,20 @@ unit_conffile: $(TEST_FILES) test/unit_conffile.c conffile.c addrmap.c tayga.h l
 unit_checksum: test/unit_checksum.c tayga.h
 	$(CC) $(CFLAGS) -I. -o unit_checksum test/unit_checksum.c $(LDFLAGS)
 
-unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c tayga.h gso.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c $(LDFLAGS) -lpthread
+unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c tayga.h gso.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c $(LDFLAGS) -lpthread
 
-unit_tun: test/unit_tun.c tun.c log.c tayga.h
-	$(CC) $(CFLAGS) -I. -o unit_tun test/unit_tun.c tun.c log.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS)
+unit_tun: test/unit_tun.c tun.c log.c stats.c tayga.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_tun test/unit_tun.c tun.c log.c stats.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS) -lpthread
 
-unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c tayga.h gso.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c $(LDFLAGS) -lpthread
+unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c tayga.h gso.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c $(LDFLAGS) -lpthread
 
 unit_pref64: test/unit_pref64.c src-helper/pref64-discover.c
 	$(CC) $(CFLAGS) -DPREF64_NO_MAIN -I. -o unit_pref64 test/unit_pref64.c src-helper/pref64-discover.c $(LDFLAGS)
+
+unit_stats: test/unit_stats.c stats.c stats_exporter.c log.c tayga.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_stats test/unit_stats.c stats.c stats_exporter.c log.c $(LDFLAGS) -lpthread
 
 pref64-discover: src-helper/pref64-discover.c
 	$(CC) $(CFLAGS) -I. -o pref64-discover src-helper/pref64-discover.c $(LDFLAGS)
@@ -184,7 +188,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64 tools/probe-tun-offload *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

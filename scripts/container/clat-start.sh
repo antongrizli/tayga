@@ -49,7 +49,7 @@ resolve_alias() {
 }
 
 TAYGA_WORKERS_VAL=$(resolve_alias "TAYGA_WORKERS" "${TAYGA_WORKERS:-}" "CLAT_WORKERS" "${CLAT_WORKERS:-}" "3")
-TAYGA_OFFLOAD_VAL=$(resolve_alias "TAYGA_OFFLOAD" "${TAYGA_OFFLOAD:-}" "CLAT_OFFLOAD" "${CLAT_OFFLOAD:-}" "off")
+TAYGA_OFFLOAD_VAL=$(resolve_alias "TAYGA_OFFLOAD" "${TAYGA_OFFLOAD:-}" "CLAT_OFFLOAD" "${CLAT_OFFLOAD:-}" "auto")
 TAYGA_OFFLINK_MTU_VAL=$(resolve_alias "TAYGA_OFFLINK_MTU" "${TAYGA_OFFLINK_MTU:-}" "CLAT_OFFLINK_MTU" "${CLAT_OFFLINK_MTU:-}" "1280")
 
 validate_uint "TAYGA_WORKERS" "$TAYGA_WORKERS_VAL"
@@ -74,23 +74,37 @@ case "$TAYGA_OFFLOAD_VAL" in
 esac
 
 PREF64="${PREF64:-auto}"
+UPLINK_DNS64="${UPLINK_DNS64:-${DNS64_SERVER:-}}"
 FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-true}"
+PREF64_SOURCE="manual"
 
 if [ "$PREF64" = "auto" ]; then
   echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."
   DISCOVERED=""
   if [ -x /usr/local/sbin/pref64-discover ]; then
-    DISCOVERED=$(/usr/local/sbin/pref64-discover 2>/dev/null || true)
+    if [ -n "$UPLINK_DNS64" ]; then
+      echo "--> Querying uplink DNS64 server: $UPLINK_DNS64"
+      DISCOVERED=$(/usr/local/sbin/pref64-discover -s "$UPLINK_DNS64" 2>/dev/null || true)
+    fi
+    if [ -z "$DISCOVERED" ]; then
+      DISCOVERED=$(/usr/local/sbin/pref64-discover 2>/dev/null || true)
+    fi
   fi
+
   if [ -n "$DISCOVERED" ]; then
     PREF64="$DISCOVERED"
+    PREF64_SOURCE="rfc7050_discovered"
     echo "==> Discovered PREF64: $PREF64"
   else
     if [ "$FALLBACK_TO_WELL_KNOWN_PREFIX" = "true" ]; then
       echo "WARNING: RFC 7050 discovery failed. FALLBACK_TO_WELL_KNOWN_PREFIX=true: using 64:ff9b::/96 (RFC 6052)" >&2
+      echo "WARNING: Well-known prefix requires end-to-end connectivity probe verification by controller." >&2
       PREF64="64:ff9b::/96"
+      PREF64_SOURCE="fallback_well_known"
     else
       echo "ERROR: RFC 7050 discovery failed (DNS64 / ipv4only.arpa unreachable). Set PREF64 explicitly (e.g. PREF64=64:ff9b::/96) or enable FALLBACK_TO_WELL_KNOWN_PREFIX=true." >&2
+      echo "--> Backing off 10s before exit to prevent rapid restart loops..." >&2
+      sleep 10
       exit 1
     fi
   fi
@@ -191,6 +205,20 @@ ip route replace default dev "$TUN"
 
 enable_forwarding net.ipv4.ip_forward
 enable_forwarding net.ipv6.conf.all.forwarding
+
+cat > /run/clat-info.json <<INFO_EOF
+{
+  "mode": "clat",
+  "pref64": "${PREF64}",
+  "pref64_source": "${PREF64_SOURCE}",
+  "uplink_interface": "${UPLINK_IF}",
+  "router4": "${ROUTER4}",
+  "workers": ${TAYGA_WORKERS_VAL},
+  "offload_requested": "${TAYGA_OFFLOAD_VAL}",
+  "offlink_mtu": ${TAYGA_OFFLINK_MTU_VAL},
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+INFO_EOF
 
 echo "==> Launching TAYGA daemon in foreground..."
 exec /usr/sbin/tayga -c /run/clat.conf -d

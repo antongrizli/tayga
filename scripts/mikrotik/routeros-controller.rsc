@@ -81,9 +81,18 @@
     :if ([:len $TaygaState] = 0) do={ :set TaygaState "DISCOVERING" }
     :if ([:len $TaygaDirectFailCount] = 0) do={ :set TaygaDirectFailCount 0 }
     :if ([:len $TaygaDirectPassCount] = 0) do={ :set TaygaDirectPassCount 0 }
-    :if ([:len $TaygaClatFailCount] = 0) do={ :set TaygaClatFailCount 0 }
-    :if ([:len $TaygaNat64FailCount] = 0) do={ :set TaygaNat64FailCount 0 }
     :if ([:len $TaygaParkedRouteIds] = 0) do={ :set TaygaParkedRouteIds [:toarray ""] }
+
+    # Sync and recover parked routes across reboot via persistent comment tag [tayga-parked:wan-direct]
+    :local orphanedParked [/ip/route/find where comment~"\\[tayga-parked:wan-direct\\]"]
+    :foreach op in=$orphanedParked do={
+        :local isDupl false
+        :foreach ex in=$TaygaParkedRouteIds do={ :if ($ex = $op) do={ :set isDupl true } }
+        :if ($isDupl = false) do={
+            :set TaygaParkedRouteIds ($TaygaParkedRouteIds, $op)
+            :log info ("[tayga-controller] Restored tracking for parked route persisting across reboot: " . $op)
+        }
+    }
 
     # Policy Defaults
     :local policy "auto"
@@ -344,6 +353,18 @@
                             /ip/route/enable $pid
                             :if ([/ip/route/get $pid disabled] = false) do={
                                 :set restored true
+                                :local c [/ip/route/get $pid comment]
+                                :if ($c ~ "\\[tayga-parked:wan-direct\\]") do={
+                                    :local tagPos [:find $c " [tayga-parked:wan-direct]"]
+                                    :if ([:len $tagPos] > 0) do={
+                                        /ip/route/set $pid comment=[:pick $c 0 $tagPos]
+                                    } else={
+                                        :set tagPos [:find $c "[tayga-parked:wan-direct]"]
+                                        :if ([:len $tagPos] > 0) do={
+                                            /ip/route/set $pid comment=[:pick $c 0 $tagPos]
+                                        }
+                                    }
+                                }
                                 :log info ("[tayga-controller] Successfully re-enabled parked WAN route: " . $pid)
                             }
                         } else={
@@ -356,6 +377,27 @@
                     }
                 }
                 :set TaygaParkedRouteIds $remainingParked
+            }
+
+            # Sweep any persistent tagged routes not captured in tracking
+            :local leftoverParked [/ip/route/find where comment~"\\[tayga-parked:wan-direct\\]"]
+            :foreach lp in=$leftoverParked do={
+                :do {
+                    /ip/route/enable $lp
+                    :if ([/ip/route/get $lp disabled] = false) do={
+                        :local c [/ip/route/get $lp comment]
+                        :local tagPos [:find $c " [tayga-parked:wan-direct]"]
+                        :if ([:len $tagPos] > 0) do={
+                            /ip/route/set $lp comment=[:pick $c 0 $tagPos]
+                        } else={
+                            :set tagPos [:find $c "[tayga-parked:wan-direct]"]
+                            :if ([:len $tagPos] > 0) do={
+                                /ip/route/set $lp comment=[:pick $c 0 $tagPos]
+                            }
+                        }
+                        :log info ("[tayga-controller] Unparked persistent tagged route: " . $lp)
+                    }
+                } on-error={}
             }
 
             # 2. Controlled Priority Switch & Verification:
@@ -530,6 +572,9 @@
                         :local cPing 0
                         :do {
                             :set cPing [/ping 1.1.1.1 src-address=172.31.64.1 count=2]
+                            :if ($cPing = 0) do={
+                                :set cPing [/ping 8.8.8.8 src-address=172.31.64.1 count=2]
+                            }
                         } on-error={}
                         :if ($cPing > 0) do={ :set clatOk true }
                     }
@@ -589,7 +634,10 @@
                 :local clatProbeOk false
                 :local clatPing 0
                 :do {
-                    :set clatPing [/ping 1.1.1.1 src-address=172.31.64.1 count=3]
+                    :set clatPing [/ping 1.1.1.1 src-address=172.31.64.1 count=2]
+                    :if ($clatPing = 0) do={
+                        :set clatPing [/ping 8.8.8.8 src-address=172.31.64.1 count=2]
+                    }
                 } on-error={}
                 :if ($clatPing > 0) do={
                     :set clatProbeOk true
@@ -612,6 +660,11 @@
 
                     :foreach r in=$activeScopedWan do={
                         :do {
+                            :local curC [/ip/route/get $r comment]
+                            :if (!($curC ~ "\\[tayga-parked:wan-direct\\]")) do={
+                                :local newC ($curC . " [tayga-parked:wan-direct]")
+                                /ip/route/set $r comment=$newC
+                            }
                             /ip/route/disable $r
                             :set newlyParked ($newlyParked, $r)
                         } on-error={
@@ -662,10 +715,24 @@
                             :local restored false
                             :do {
                                 /ip/route/enable $r
-                                :if ([/ip/route/get $r disabled] = false) do={ :set restored true }
+                                :if ([/ip/route/get $r disabled] = false) do={
+                                    :set restored true
+                                    :local c [/ip/route/get $r comment]
+                                    :if ($c ~ "\\[tayga-parked:wan-direct\\]") do={
+                                        :local tagPos [:find $c " [tayga-parked:wan-direct]"]
+                                        :if ([:len $tagPos] > 0) do={
+                                            /ip/route/set $r comment=[:pick $c 0 $tagPos]
+                                        } else={
+                                            :set tagPos [:find $c "[tayga-parked:wan-direct]"]
+                                            :if ([:len $tagPos] > 0) do={
+                                                /ip/route/set $r comment=[:pick $c 0 $tagPos]
+                                            }
+                                        }
+                                    }
+                                }
                             } on-error={}
                             :if ($restored = false) do={
-                                # Save un-restored route for retry by future cycles
+                                # Save un-restored route for retry by future cycles with tag intact
                                 :set TaygaParkedRouteIds ($TaygaParkedRouteIds, $r)
                             }
                         }

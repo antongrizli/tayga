@@ -113,7 +113,7 @@ Completely removes all bridges, VETH interfaces, IP addresses, NAT rules, and co
 |---|---|---|---|
 | `MODE` | `clat` | `clat`, `nat64`, `diagnose` | Operational mode dispatcher |
 | `TAYGA_WORKERS` | `3` | `0` .. `63` | Worker thread count (alias: `CLAT_WORKERS`) |
-| `TAYGA_OFFLOAD` | `off` | `off`, `tcp`, `auto` | TUN segmentation offload (alias: `CLAT_OFFLOAD`) |
+| `TAYGA_OFFLOAD` | `auto` | `off`, `tcp`, `auto` | TUN segmentation offload (alias: `CLAT_OFFLOAD`) |
 | `TAYGA_OFFLINK_MTU` | `1280` | `1280` .. `1500` | Offlink IPv6 MTU (alias: `CLAT_OFFLINK_MTU`) |
 | `PREF64` | `auto` | `auto` or `/32,/40,/48,/56,/64,/96` | NAT64 prefix (auto discovers via RFC 7050) |
 | `ROUTER4` | `172.31.64.1` | IPv4 address | RouterOS IPv4 gateway on transport bridge |

@@ -40,6 +40,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include "version.h"
+#include "stats.h"
 #include <net/if.h>
 #if defined(__linux__)
 #include <linux/if_tun.h>
@@ -501,6 +502,7 @@ int config_validate(void);
 struct map6 *assign_dynamic(const struct in6_addr *addr6);
 void load_dynamic(struct dynamic_pool *pool);
 void dynamic_maint(struct dynamic_pool *pool, int shutdown);
+void dynamic_get_stats(const struct dynamic_pool *pool, uint32_t *mapped, uint32_t *dormant, uint32_t *free_addrs);
 
 /* nat64.c */
 void handle_ip4(struct pkt *p);
@@ -538,5 +540,10 @@ ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const 
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);
 ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const struct iovec *iov, int iovcnt);
 
+
+/* stats_exporter.c */
+void telemetry_start(const char *status_path, int interval_sec);
+void telemetry_stop(void);
+void telemetry_trigger(void);
 
 #endif /* #ifndef __TAYGA_H__ */

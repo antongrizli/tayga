@@ -385,23 +385,27 @@ static void xlate_4to6_data(struct pkt *p)
 
 	ret = map_ip4_to_ip6(&header.ip6.dest, &p->ip4->dest);
 	if (ret == ERROR_REJECT) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_REJECT,p,"Unable to map destination address");
 		host_send_icmp4_error(3, 1, 0, p);
 
 		return;
 	}
 	else if(ret == ERROR_DROP) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_DROP,p,"Unable to map destination address");
 		return;
 	}
 
 	ret = map_ip4_to_ip6(&header.ip6.src, &p->ip4->src);
 	if (ret == ERROR_REJECT) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_REJECT,p,"Unable to map source address");
 		host_send_icmp4_error(3, 10, 0, p);
 		return;
 	}
 	else if(ret == ERROR_DROP) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_DROP,p,"Unable to map source address");
 		return;
 	}
@@ -431,8 +435,10 @@ static void xlate_4to6_data(struct pkt *p)
 	xlate_header_4to6(p, &header.ip6, p->data_len);
 	--header.ip6.hop_limit;
 
-	if (xlate_payload_4to6(p, &header.ip6,0) < 0)
+	if (xlate_payload_4to6(p, &header.ip6,0) < 0) {
+		stats_drop(p->data_len);
 		return;
+	}
 
 	TUN_SET_PROTO(&header.pi,  ETH_P_IPV6);
 
@@ -769,15 +775,20 @@ void handle_ip4(struct pkt *p)
 		}
 	}
 
-	if (unlikely(parse_ip4(p) < 0)) return; //error already logged
+	if (unlikely(parse_ip4(p) < 0)) {
+		stats_drop(p->data_len);
+		return; //error already logged
+	}
 	if (unlikely(p->ip4->ttl == 0 ||
 			ip_checksum(p->ip4, p->header_len) ||
 			p->header_len + p->data_len != ntohs(p->ip4->length))) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_DROP,p,"IP Header Invalid");
 		return;
 	}
 
 	if (unlikely(p->icmp && ip_checksum(p->data, p->data_len))) {
+		stats_drop(p->data_len);
 		log_pkt4(LOG_OPT_DROP,p,"ICMP Invalid Checksum");
 		return;
 	}
@@ -1021,24 +1032,28 @@ static void xlate_6to4_data(struct pkt *p)
 
 	ret = map_ip6_to_ip4(&header.ip4.dest, &p->ip6->dest, 0);
 	if (ret == ERROR_REJECT) {
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_REJECT,p,"Failed to map dest addr");
 		host_send_icmp6_error(1, 0, 0, p);
 		return;
 	}
 	else if (ret == ERROR_DROP){
 		/* Drop packet */
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_DROP,p,"Failed to map dest addr");
 		return;
 	}
 
 	ret = map_ip6_to_ip4(&header.ip4.src, &p->ip6->src, 1);
 	if (ret == ERROR_REJECT) {
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_REJECT,p,"Failed to map src addr");
 		host_send_icmp6_error(1, 5, 0, p);
 		return;
 	}
 	else if (ret == ERROR_DROP){
 		/* Drop packet */
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_DROP,p,"Failed to map src addr");
 		return;
 	}
@@ -1052,8 +1067,10 @@ static void xlate_6to4_data(struct pkt *p)
 	xlate_header_6to4(p, &header.ip4, p->data_len);
 	--header.ip4.ttl;
 
-	if (xlate_payload_6to4(p, &header.ip4,0) < 0)
+	if (xlate_payload_6to4(p, &header.ip4,0) < 0) {
+		stats_drop(p->data_len);
 		return;
+	}
 
 	header.ip4.cksum = ip4_header_checksum(&header.ip4);
 
@@ -1363,16 +1380,21 @@ void handle_ip6(struct pkt *p)
 		}
 	}
 
-	if (unlikely(parse_ip6(p,0))) return;
+	if (unlikely(parse_ip6(p,0))) {
+		stats_drop(p->data_len);
+		return;
+	}
 	if (unlikely(p->ip6->hop_limit == 0 ||
 			p->header_len + p->data_len !=
 				ntohs(p->ip6->payload_length))) {
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_DROP,p,"Insufficient Length");
 		return;
 	}
 
 	if (unlikely(p->icmp && ones_add(ip_checksum(p->data, p->data_len),
 				ip6_checksum(p->ip6, p->data_len, 58)))) {
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_DROP,p,"ICMP Invalid Checksum");
 		return;
 	}

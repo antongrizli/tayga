@@ -82,10 +82,44 @@
                 :if ([:len [/ip/route/find where .id=$pid]] > 0) do={
                     :put ("--> Re-enabling route: " . $pid)
                     /ip/route/enable $pid
+                    :if ([/ip/route/get $pid disabled] = false) do={
+                        :local c [/ip/route/get $pid comment]
+                        :if ($c ~ "\\[tayga-parked:wan-direct\\]") do={
+                            :local tagPos [:find $c " [tayga-parked:wan-direct]"]
+                            :if ([:len $tagPos] > 0) do={
+                                /ip/route/set $pid comment=[:pick $c 0 $tagPos]
+                            } else={
+                                :set tagPos [:find $c "[tayga-parked:wan-direct]"]
+                                :if ([:len $tagPos] > 0) do={
+                                    /ip/route/set $pid comment=[:pick $c 0 $tagPos]
+                                }
+                            }
+                        }
+                    }
                 }
             } on-error={}
         }
         :set TaygaParkedRouteIds [:toarray ""]
+    }
+
+    # Sweep any persistent tagged routes not captured in tracking
+    :local leftoverParked [/ip/route/find where comment~"\\[tayga-parked:wan-direct\\]"]
+    :foreach lp in=$leftoverParked do={
+        :do {
+            /ip/route/enable $lp
+            :if ([/ip/route/get $lp disabled] = false) do={
+                :local c [/ip/route/get $lp comment]
+                :local tagPos [:find $c " [tayga-parked:wan-direct]"]
+                :if ([:len $tagPos] > 0) do={
+                    /ip/route/set $lp comment=[:pick $c 0 $tagPos]
+                } else={
+                    :set tagPos [:find $c "[tayga-parked:wan-direct]"]
+                    :if ([:len $tagPos] > 0) do={
+                        /ip/route/set $lp comment=[:pick $c 0 $tagPos]
+                    }
+                }
+            }
+        } on-error={}
     }
 
     # Also restore any legacy tagged orig-wan-default routes

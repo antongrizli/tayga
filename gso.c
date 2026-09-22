@@ -6,6 +6,7 @@
 
 #include "tayga.h"
 #include "gso.h"
+#include "stats.h"
 
 struct gso_worker_stats g_gso_stats = {0};
 
@@ -142,19 +143,19 @@ int gso_validate_header(const struct pkt *p)
 		return 0;
 
 	if (gso_type != VIRTIO_NET_HDR_GSO_TCPV4 && gso_type != VIRTIO_NET_HDR_GSO_TCPV6) {
-		atomic_fetch_add_explicit(&g_gso_stats.gso_invalid_pkts, 1, memory_order_relaxed);
+		stats_gso_invalid();
 		return -1;
 	}
 
 	if (p->vhdr.gso_size == 0 || p->vhdr.hdr_len > p->data_len) {
-		atomic_fetch_add_explicit(&g_gso_stats.gso_invalid_pkts, 1, memory_order_relaxed);
+		stats_gso_invalid();
 		return -1;
 	}
 
 	if (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
 		if (p->vhdr.csum_start >= p->data_len ||
 		    (uint32_t)p->vhdr.csum_start + p->vhdr.csum_offset + 2 > p->data_len) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_invalid_pkts, 1, memory_order_relaxed);
+			stats_gso_invalid();
 			return -1;
 		}
 	}
@@ -164,17 +165,19 @@ int gso_validate_header(const struct pkt *p)
 
 void gso_dump_stats(void)
 {
+	struct tayga_stats s;
+	stats_get_snapshot(&s);
 	slog(LOG_NOTICE, "GSO Stats: rx_pkts=%llu, tx_pkts=%llu, rx_bytes=%llu, tx_bytes=%llu, split_tail=%llu, sw_seg_pkts=%llu, sw_seg_out=%llu, fallback_pkts=%llu, invalid_pkts=%llu, tun_write_err=%llu\n",
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_rx, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_pkts_tx, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_rx, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_bytes_tx, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_split_tail_pkts, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_sw_seg_pkts, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_sw_seg_out_pkts, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_fallback_pkts, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_invalid_pkts, memory_order_relaxed),
-		(unsigned long long)atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed));
+		(unsigned long long)s.gso_rx_pkts,
+		(unsigned long long)s.gso_tx_pkts,
+		(unsigned long long)s.gso_rx_bytes,
+		(unsigned long long)s.gso_tx_bytes,
+		(unsigned long long)s.gso_split_tail_pkts,
+		(unsigned long long)s.gso_sw_seg_pkts,
+		(unsigned long long)s.gso_sw_seg_out_pkts,
+		(unsigned long long)s.gso_fallback_pkts,
+		(unsigned long long)s.gso_invalid_pkts,
+		(unsigned long long)s.gso_tun_write_errors);
 }
 
 int gso_translate_tcp_6to4(struct pkt *p)
@@ -182,8 +185,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV6)
 		return -1;
 
-	atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_rx, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_rx, p->data_len, memory_order_relaxed);
+	stats_gso_rx(p->data_len);
 
 	if (gso_validate_header(p) <= 0)
 		return -1;
@@ -278,10 +280,9 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		size_t head_out_len = sizeof(struct ip4) + head_tcp_len;
 		ssize_t ret_head = tun_write_vnet(p->tun_fd, &out_vhdr, head_ip4, head_out_len);
 		if (ret_head > 0) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_tx, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_tx, head_out_len, memory_order_relaxed);
+			stats_gso_tx(head_out_len);
 		} else {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+			stats_gso_tun_write_error();
 		}
 
 		/* 2. Send Tail short segment separately (DF=0, unique ID) */
@@ -319,13 +320,12 @@ int gso_translate_tcp_6to4(struct pkt *p)
 
 		ssize_t ret_tail = tun_write(p->tun_fd, tail_ip4, sizeof(struct ip4) + tail_tcp_total_len);
 		if (ret_tail > 0) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_tx, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_tx, sizeof(struct ip4) + tail_tcp_total_len, memory_order_relaxed);
+			stats_gso_tx(sizeof(struct ip4) + tail_tcp_total_len);
 		} else {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+			stats_gso_tun_write_error();
 		}
 
-		atomic_fetch_add_explicit(&g_gso_stats.gso_split_tail_pkts, 1, memory_order_relaxed);
+		stats_gso_split_tail();
 		return 0;
 	}
 
@@ -357,12 +357,11 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	size_t out_len = sizeof(struct ip4) + tcp_len;
 	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip4, out_len);
 	if (ret > 0) {
-		atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_tx, 1, memory_order_relaxed);
-		atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_tx, out_len, memory_order_relaxed);
+		stats_gso_tx(out_len);
 		return 0;
 	}
 
-	atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+	stats_gso_tun_write_error();
 	return 0;
 }
 
@@ -371,8 +370,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV4)
 		return -1;
 
-	atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_rx, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_rx, p->data_len, memory_order_relaxed);
+	stats_gso_rx(p->data_len);
 
 	if (gso_validate_header(p) <= 0)
 		return -1;
@@ -436,19 +434,18 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	size_t out_len = sizeof(struct ip6) + tcp_len;
 	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, out, out_len);
 	if (ret > 0) {
-		atomic_fetch_add_explicit(&g_gso_stats.gso_pkts_tx, 1, memory_order_relaxed);
-		atomic_fetch_add_explicit(&g_gso_stats.gso_bytes_tx, out_len, memory_order_relaxed);
+		stats_gso_tx(out_len);
 		return 0;
 	}
 
-	atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+	stats_gso_tun_write_error();
 	return 0;
 }
 
 int gso_software_segment_and_send_6to4(struct pkt *p)
 {
-	atomic_fetch_add_explicit(&g_gso_stats.gso_fallback_pkts, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&g_gso_stats.gso_sw_seg_pkts, 1, memory_order_relaxed);
+	stats_gso_fallback();
+	stats_gso_sw_seg();
 
 	struct ip6 *ip6 = (struct ip6 *)p->data;
 
@@ -489,7 +486,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		uint32_t seg_tcp_total_len = tcp_hdr_len + seg_data_len;
 		uint32_t ip4_total = sizeof(struct ip4) + seg_tcp_total_len;
 		if (ip4_total > sizeof(seg_buf) - HEADROOM) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_invalid_pkts, 1, memory_order_relaxed);
+			stats_gso_invalid();
 			return -1;
 		}
 
@@ -544,9 +541,9 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		/* Send segment using tun_write */
 		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip4_total);
 		if (ret > 0) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_sw_seg_out_pkts, 1, memory_order_relaxed);
+			stats_gso_sw_seg_out(1);
 		} else {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+			stats_gso_tun_write_error();
 		}
 
 		offset += seg_data_len;
@@ -559,8 +556,8 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 int gso_software_segment_and_send_4to6(struct pkt *p)
 {
-	atomic_fetch_add_explicit(&g_gso_stats.gso_fallback_pkts, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&g_gso_stats.gso_sw_seg_pkts, 1, memory_order_relaxed);
+	stats_gso_fallback();
+	stats_gso_sw_seg();
 
 	struct ip4 *ip4 = (struct ip4 *)p->data;
 	uint32_t ip4_hdr_len = (ip4->ver_ihl & 0x0f) * 4;
@@ -601,7 +598,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		uint32_t seg_tcp_total_len = tcp_hdr_len + seg_data_len;
 		uint32_t ip6_total = sizeof(struct ip6) + seg_tcp_total_len;
 		if (ip6_total > sizeof(seg_buf) - HEADROOM) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_invalid_pkts, 1, memory_order_relaxed);
+			stats_gso_invalid();
 			return -1;
 		}
 
@@ -639,9 +636,9 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 
 		ssize_t ret = tun_write(p->tun_fd, seg_ip, sizeof(struct ip6) + seg_tcp_total_len);
 		if (ret > 0) {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_sw_seg_out_pkts, 1, memory_order_relaxed);
+			stats_gso_sw_seg_out(1);
 		} else {
-			atomic_fetch_add_explicit(&g_gso_stats.gso_tun_write_errors, 1, memory_order_relaxed);
+			stats_gso_tun_write_error();
 		}
 
 		offset += seg_data_len;

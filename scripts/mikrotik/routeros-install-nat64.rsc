@@ -203,7 +203,7 @@
     {"TAYGA_ADDR4"; "192.168.240.1"};
     {"TAYGA_ADDR6"; "fc68::2"};
     {"TAYGA_WORKERS"; "3"};
-    {"TAYGA_OFFLOAD"; "off"};
+    {"TAYGA_OFFLOAD"; "auto"};
     {"DNS64_UPSTREAM"; "1.1.1.1,8.8.8.8"}
 }
 :foreach item in=$envEntries do={

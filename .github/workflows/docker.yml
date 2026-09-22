@@ -1,13 +1,9 @@
-name: Build & Publish Unified Container Image to GHCR
+name: Build & Publish Dev Container Image to GHCR
 
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
-      - 'version*'
-      - '[0-9]*'
   workflow_dispatch:
 
 permissions:
@@ -156,9 +152,8 @@ jobs:
             TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
             TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.clean_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}:edge
+            ghcr.io/${{ steps.meta.outputs.repo }}:dev
             ghcr.io/${{ steps.meta.outputs.repo }}:sha-${{ steps.meta.outputs.sha }}
 
       - name: Build & Push Explicit CLAT Image (ghcr.io/${{ steps.meta.outputs.repo }}-clat)
@@ -174,9 +169,8 @@ jobs:
             TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
             TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.clean_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-clat:edge
+            ghcr.io/${{ steps.meta.outputs.repo }}-clat:dev
             ghcr.io/${{ steps.meta.outputs.repo }}-clat:sha-${{ steps.meta.outputs.sha }}
 
       - name: Build & Push Explicit NAT64 Image (ghcr.io/${{ steps.meta.outputs.repo }}-nat64)
@@ -192,7 +186,6 @@ jobs:
             TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
             TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
           tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.clean_ver }}
+            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:edge
+            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:dev
             ghcr.io/${{ steps.meta.outputs.repo }}-nat64:sha-${{ steps.meta.outputs.sha }}

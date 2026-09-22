@@ -78,6 +78,110 @@ int main(void)
     test_case("::1", NULL, -1);
     test_case("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", NULL, -1);
 
+    printf("Running parse_dns_response unit tests...\n");
+
+    extern int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
+                                  const char *expected_domain, struct in6_addr *out, int *prefix_len);
+
+    uint8_t pkt[256];
+    memset(pkt, 0, sizeof(pkt));
+
+    /* Build valid response: ID=0x1234, flags=0x8180 (QR=1, RD=1, RA=1, RCODE=0), QD=1, AN=1 */
+    pkt[0] = 0x12; pkt[1] = 0x34;
+    pkt[2] = 0x81; pkt[3] = 0x80;
+    pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT = 1 */
+    pkt[6] = 0x00; pkt[7] = 0x01; /* ANCOUNT = 1 */
+
+    /* QNAME: \x08ipv4only\x04arpa\x00 */
+    size_t p = 12;
+    pkt[p++] = 8;
+    memcpy(&pkt[p], "ipv4only", 8); p += 8;
+    pkt[p++] = 4;
+    memcpy(&pkt[p], "arpa", 4); p += 4;
+    pkt[p++] = 0;
+
+    /* QTYPE=AAAA (28), QCLASS=IN (1) */
+    pkt[p++] = 0x00; pkt[p++] = 0x1c;
+    pkt[p++] = 0x00; pkt[p++] = 0x01;
+
+    /* Answer: pointer 0xc00c */
+    pkt[p++] = 0xc0; pkt[p++] = 0x0c;
+    /* TYPE=AAAA (28), CLASS=IN (1), TTL=60 */
+    pkt[p++] = 0x00; pkt[p++] = 0x1c;
+    pkt[p++] = 0x00; pkt[p++] = 0x01;
+    pkt[p++] = 0x00; pkt[p++] = 0x00; pkt[p++] = 0x00; pkt[p++] = 0x3c;
+    /* RDLENGTH=16 */
+    pkt[p++] = 0x00; pkt[p++] = 0x10;
+
+    /* RDATA: 64:ff9b::192.0.0.170 */
+    struct in6_addr wka_ip;
+    inet_pton(AF_INET6, "64:ff9b::192.0.0.170", &wka_ip);
+    memcpy(&pkt[p], &wka_ip.s6_addr, 16);
+    p += 16;
+    size_t valid_len = p;
+
+    struct in6_addr out_p;
+    int plen_p = 0;
+
+    /* Test 1: Valid response */
+    int ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == 0);
+    assert(plen_p == 96);
+    char out_buf[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &out_p, out_buf, sizeof(out_buf));
+    assert(strcmp(out_buf, "64:ff9b::") == 0);
+    printf("PASS: parse_dns_response valid packet -> %s/%d\n", out_buf, plen_p);
+
+    /* Test 2: Mismatched transaction ID */
+    ret = parse_dns_response(pkt, valid_len, 0x9999, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    printf("PASS: parse_dns_response ID mismatch rejected\n");
+
+    /* Test 3: QR=0 (query, not response) */
+    pkt[2] &= ~0x80;
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    pkt[2] |= 0x80;
+    printf("PASS: parse_dns_response QR=0 rejected\n");
+
+    /* Test 4: TC=1 (truncated) */
+    pkt[2] |= 0x02;
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    pkt[2] &= ~0x02;
+    printf("PASS: parse_dns_response TC=1 rejected\n");
+
+    /* Test 5: RCODE=3 (NXDOMAIN) */
+    pkt[3] = (pkt[3] & 0xF0) | 0x03;
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    pkt[3] = (pkt[3] & 0xF0) | 0x00;
+    printf("PASS: parse_dns_response NXDOMAIN rejected\n");
+
+    /* Test 6: QNAME mismatch */
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "otherdomain.com", &out_p, &plen_p);
+    assert(ret == -1);
+    printf("PASS: parse_dns_response QNAME mismatch rejected\n");
+
+    /* Test 7: QTYPE mismatch */
+    pkt[27] = 0x01; /* QTYPE = A (1) instead of AAAA (28) */
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    pkt[27] = 0x1c; /* Restore QTYPE = AAAA */
+    printf("PASS: parse_dns_response QTYPE mismatch rejected\n");
+
+    /* Test 8: Truncated packet buffer */
+    ret = parse_dns_response(pkt, 20, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    printf("PASS: parse_dns_response truncated length rejected\n");
+
+    /* Test 9: Invalid AAAA rdlen (e.g. 4 bytes instead of 16) */
+    pkt[39] = 0x04; /* rdlen = 4 */
+    ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
+    assert(ret == -1);
+    pkt[39] = 0x10; /* Restore rdlen = 16 */
+    printf("PASS: parse_dns_response invalid rdlen rejected\n");
+
     printf("All unit_pref64 tests passed successfully!\n");
     return 0;
 }

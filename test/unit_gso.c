@@ -13,6 +13,12 @@
 #include <arpa/inet.h>
 #include "tayga.h"
 #include "gso.h"
+#include "stats.h"
+
+static inline void get_gso_snapshot(struct tayga_stats *s) {
+	stats_flush_worker();
+	stats_get_snapshot(s);
+}
 
 struct config gcfg;
 time_t now;
@@ -289,13 +295,14 @@ static void test_gso_translate_and_split(void)
 	p.vhdr.csum_offset = 16;
 	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-	uint64_t prev_split = atomic_load_explicit(&g_gso_stats.gso_split_tail_pkts, memory_order_relaxed);
+	struct tayga_stats s_prev, s_curr;
+	get_gso_snapshot(&s_prev);
 
 	int res = gso_translate_tcp_6to4(&p);
 	assert(res == 0);
 
-	uint64_t curr_split = atomic_load_explicit(&g_gso_stats.gso_split_tail_pkts, memory_order_relaxed);
-	assert(curr_split == prev_split + 1);
+	get_gso_snapshot(&s_curr);
+	assert(s_curr.gso_split_tail_pkts == s_prev.gso_split_tail_pkts + 1);
 
 	/* Inspect Datagram 1: Head GSO aggregate */
 	uint8_t rx_buf[4096];
@@ -944,14 +951,15 @@ static void test_gso_mock_write_error(void)
 		p.vhdr.csum_offset = 16;
 		p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-		uint64_t prev_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
+		struct tayga_stats s_prev, s_curr;
+		get_gso_snapshot(&s_prev);
 
 		int res = gso_translate_tcp_6to4(&p);
 		/* Must return 0 so caller doesn't re-parse corrupted buffer */
 		assert(res == 0);
 
-		uint64_t curr_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
-		assert(curr_err > prev_err);
+		get_gso_snapshot(&s_curr);
+		assert(s_curr.gso_tun_write_errors > s_prev.gso_tun_write_errors);
 
 		close(sv[0]);
 	}
@@ -994,13 +1002,14 @@ static void test_gso_mock_write_error(void)
 		p.vhdr.csum_offset = 16;
 		p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-		uint64_t prev_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
+		struct tayga_stats s_prev, s_curr;
+		get_gso_snapshot(&s_prev);
 
 		int res = gso_translate_tcp_4to6(&p);
 		assert(res == 0);
 
-		uint64_t curr_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
-		assert(curr_err > prev_err);
+		get_gso_snapshot(&s_curr);
+		assert(s_curr.gso_tun_write_errors > s_prev.gso_tun_write_errors);
 
 		close(sv[0]);
 	}
@@ -1018,28 +1027,27 @@ static void test_gso_mock_write_error(void)
 		memset(dummy, 0xaa, sizeof(dummy));
 		size_t total_filled = 0;
 		while (1) {
-			ssize_t n = send(sv[0], dummy, sizeof(dummy), 0);
-			if (n > 0) {
-				total_filled += n;
-			} else {
+			ssize_t nw = send(sv[0], dummy, sizeof(dummy), 0);
+			if (nw < 0) {
+				assert(errno == EAGAIN || errno == EWOULDBLOCK);
 				break;
 			}
+			total_filled += nw;
 		}
-		assert(total_filled > head_dgram_sz);
 
-		/* Drain exactly head_dgram_sz bytes so sv[0] has capacity for exactly the Head datagram */
-		uint8_t drain[4096];
+		/* Drain exactly head_dgram_sz bytes from stream so head aggregate will fit but tail will fail */
+		assert(set_nonblock(sv[1]) == 0);
+		uint8_t drain[1024];
 		size_t drained = 0;
 		while (drained < head_dgram_sz) {
 			size_t to_read = head_dgram_sz - drained;
-			if (to_read > sizeof(drain))
-				to_read = sizeof(drain);
-			ssize_t nd = recv(sv[1], drain, to_read, 0);
-			assert(nd > 0);
-			drained += nd;
+			if (to_read > sizeof(drain)) to_read = sizeof(drain);
+			ssize_t nr = recv(sv[1], drain, to_read, 0);
+			assert(nr > 0);
+			drained += nr;
 		}
 
-		/* Construct split-tail GSO packet: 2 full segments (1400 each) + 1 tail segment (400 bytes) */
+		/* Setup GSO packet with head + short tail */
 		uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
@@ -1055,6 +1063,7 @@ static void test_gso_mock_write_error(void)
 
 		tcp->src_port = htons(80);
 		tcp->dst_port = htons(54321);
+		tcp->seq = htonl(1000);
 		tcp->doff_res = (sizeof(struct tcp_hdr) / 4) << 4;
 		tcp->flags = TCP_FLAG_ACK;
 
@@ -1071,18 +1080,17 @@ static void test_gso_mock_write_error(void)
 		p.vhdr.csum_offset = 16;
 		p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-		uint64_t prev_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
-		uint64_t prev_tx = atomic_load_explicit(&g_gso_stats.gso_pkts_tx, memory_order_relaxed);
+		struct tayga_stats s_prev, s_curr;
+		get_gso_snapshot(&s_prev);
 
 		int res = gso_translate_tcp_6to4(&p);
 		/* Must return 0: packet was consumed and head was sent, no re-parsing */
 		assert(res == 0);
 
 		/* Verify: 1 packet (head) was transmitted, and tail produced 1 write error */
-		uint64_t curr_err = atomic_load_explicit(&g_gso_stats.gso_tun_write_errors, memory_order_relaxed);
-		uint64_t curr_tx = atomic_load_explicit(&g_gso_stats.gso_pkts_tx, memory_order_relaxed);
-		assert(curr_err == prev_err + 1);
-		assert(curr_tx == prev_tx + 1);
+		get_gso_snapshot(&s_curr);
+		assert(s_curr.gso_tun_write_errors == s_prev.gso_tun_write_errors + 1);
+		assert(s_curr.gso_tx_pkts == s_prev.gso_tx_pkts + 1);
 
 		/* Drain remaining dummy bytes from sv[1] */
 		size_t rem_dummy = total_filled - head_dgram_sz;
@@ -1121,6 +1129,7 @@ static void test_gso_mock_write_error(void)
 int main(void)
 {
 	printf("=== Running unit_gso test suite ===\n");
+	stats_init();
 	test_gso_validate();
 	test_gso_csum_update();
 	test_gso_csum_seed();

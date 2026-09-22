@@ -412,3 +412,30 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown)
 	/* Release map mutex when done */
 	pthread_mutex_unlock(&gcfg.map_mutex);
 }
+
+void dynamic_get_stats(const struct dynamic_pool *pool, uint32_t *mapped, uint32_t *dormant, uint32_t *free_addrs)
+{
+	uint32_t m = 0, d = 0, f = 0;
+	struct list_head *entry;
+
+	if (pool) {
+		pthread_mutex_lock(&gcfg.map_mutex);
+		list_for_each(entry, &pool->mapped_list)
+			m++;
+		list_for_each(entry, &pool->dormant_list)
+			d++;
+		list_for_each(entry, &pool->free_list) {
+			struct free_addr *fa = list_entry(entry, struct free_addr, list);
+			f += fa->count;
+		}
+		pthread_mutex_unlock(&gcfg.map_mutex);
+	}
+
+	if (mapped)
+		*mapped = m;
+	if (dormant)
+		*dormant = d;
+	if (free_addrs)
+		*free_addrs = f;
+}
+

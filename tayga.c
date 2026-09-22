@@ -17,16 +17,21 @@
  */
 
 #include "tayga.h"
+#include "stats.h"
+#include "gso.h"
 
 #include <stdarg.h>
 #include <signal.h>
 #include <getopt.h>
 #include <pwd.h>
 #include <grp.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 
 time_t now;
 static const char *progname;
 static int signalfds[2];
+static _Atomic bool g_shutdown = false;
 
 void usage(int code) {
 	fprintf(stderr,
@@ -122,12 +127,14 @@ static void signal_read(void)
 				dynamic_maint(gcfg.dynamic_pool, 1);
 			continue;
 		}
-		/* If we got SIGUSR2, dump GSO statistics without exiting */
+		/* If we got SIGUSR2, dump statistics without exiting */
 		if(sig == SIGUSR2) {
-			slog(LOG_NOTICE, "Received SIGUSR2, reporting GSO statistics\n");
+			slog(LOG_NOTICE, "Received SIGUSR2, reporting statistics\n");
+			stats_dump();
 			if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
 				gso_dump_stats();
 			}
+			telemetry_trigger();
 			continue;
 		}
 		/* For any other signal prepare to exit cleanly */
@@ -135,15 +142,8 @@ static void signal_read(void)
 			dynamic_maint(gcfg.dynamic_pool, 1);
 		}
 		slog(LOG_NOTICE, "Exiting on signal %d\n", sig);
-		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
-			gso_dump_stats();
-		}
-		if (gcfg.log_out == LOG_TO_SYSLOG) {
-			closelog();
-		} else if (gcfg.log_out == LOG_TO_JOURNAL) {
-			journal_cleanup();
-		}
-		exit(0);
+		atomic_store_explicit(&g_shutdown, true, memory_order_relaxed);
+		break;
 	}
 }
 
@@ -253,10 +253,40 @@ static void * worker(void * arg)
 	}
 
 	/* Enter worker loop */
+	stats_thread_init(idx);
 	slog(LOG_DEBUG,"Starting worker thread %d\n",idx);
-	for (;;) {
-		tun_read(recv_buf,gcfg.tun_fd_addl[idx]);
-	}	
+
+	struct pollfd pfd;
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = gcfg.tun_fd_addl[idx];
+	pfd.events = POLLIN;
+
+	struct timespec last_flush, mono_now;
+	clock_gettime(CLOCK_MONOTONIC, &last_flush);
+	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		int pret = poll(&pfd, 1, 500);
+		clock_gettime(CLOCK_MONOTONIC, &mono_now);
+		if (pret > 0) {
+			if (pfd.revents & POLLIN) {
+				tun_read(recv_buf, gcfg.tun_fd_addl[idx]);
+			}
+			if (mono_now.tv_sec - last_flush.tv_sec >= 1 && g_tls_priv.batch_count > 0) {
+				stats_flush_worker();
+				last_flush = mono_now;
+			}
+		} else if (pret == 0) {
+			stats_flush_idle();
+			last_flush = mono_now;
+		} else {
+			if (errno == EINTR)
+				continue;
+			slog(LOG_ERR, "worker %d poll returned error %s\n", idx, strerror(errno));
+			break;
+		}
+	}
+	stats_flush_worker();
+	free(recv_buf);
+	return NULL;
 }
 #endif //__linux__
 
@@ -281,6 +311,7 @@ int main(int argc, char **argv)
 
 	/* Init config structure */
 	if(config_init() < 0) return 1;
+	stats_init();
 
 	static struct option longopts[] = {
 		{ "mktun", 0, 0, 0 },
@@ -589,6 +620,16 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Initialize mutexes */
+	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) != 0) {
+		slog(LOG_CRIT, "Failed to initialize cache mutex\n");
+		exit(1);
+	}
+	if (pthread_mutex_init(&gcfg.map_mutex, NULL) != 0) {
+		slog(LOG_CRIT, "Failed to initialize map mutex\n");
+		exit(1);
+	}
+
 	signal_setup();
 
 	/* Print running information */
@@ -601,15 +642,7 @@ int main(int argc, char **argv)
 	if (gcfg.cache_size)
 		create_cache();
 
-	/* Initialize mutexes */
-	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) != 0) {
-		slog(LOG_CRIT, "Failed to initialize cache mutex\n");
-		exit(1);
-	}
-	if (pthread_mutex_init(&gcfg.map_mutex, NULL) != 0) {
-		slog(LOG_CRIT, "Failed to initialize map mutex\n");
-		exit(1);
-	}
+	telemetry_start("/run/tayga-status.json", 5);
 
 	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
 	if (!recv_buf) {
@@ -647,21 +680,38 @@ int main(int argc, char **argv)
 	}
 #endif
 
+
+	struct timespec last_main_flush, main_mono_now;
+	clock_gettime(CLOCK_MONOTONIC, &last_main_flush);
+	int exit_code = 0;
+
 	/* Main loop */
-	for (;;) {
-		ret = poll(pollfds, 2, POOL_CHECK_INTERVAL * 1000);
+	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		ret = poll(pollfds, 2, 500);
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			slog(LOG_ERR, "poll returned error %s\n",
-			strerror(errno));
-			exit(1);
+				strerror(errno));
+			atomic_store_explicit(&g_shutdown, true, memory_order_relaxed);
+			exit_code = 1;
+			break;
 		}
 		time(&now);
-		if (pollfds[0].revents)
-			signal_read();
-		if (pollfds[1].revents)
-			tun_read(recv_buf,gcfg.tun_fd);
+		clock_gettime(CLOCK_MONOTONIC, &main_mono_now);
+		if (ret > 0) {
+			if (pollfds[0].revents)
+				signal_read();
+			if (pollfds[1].revents)
+				tun_read(recv_buf, gcfg.tun_fd);
+			if (main_mono_now.tv_sec - last_main_flush.tv_sec >= 1 && g_tls_priv.batch_count > 0) {
+				stats_flush_worker();
+				last_main_flush = main_mono_now;
+			}
+		} else {
+			stats_flush_idle();
+			last_main_flush = main_mono_now;
+		}
 		if (gcfg.cache_size && (gcfg.last_cache_maint +
 						CACHE_CHECK_INTERVAL < now ||
 					gcfg.last_cache_maint > now)) {
@@ -675,5 +725,20 @@ int main(int argc, char **argv)
 			gcfg.last_dynamic_maint = now;
 		}
 	}
-	return 0;
+
+	/* Graceful shutdown */
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		pthread_join(gcfg.threads[i], NULL);
+	}
+#endif
+	stats_flush_worker();
+	stats_dump();
+	if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+		gso_dump_stats();
+	}
+	telemetry_stop();
+	free(recv_buf);
+
+	return exit_code;
 }

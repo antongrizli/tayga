@@ -162,7 +162,33 @@
 
 # --- 10. Configure Container Environment Variables & DNS ---
 :put "--> Configuring container environment list tayga-clat-envs and DNS..."
-:do { /container/config/set dns=2001:4860:4860::8888,2606:4700:4700::1111,1.1.1.1,8.8.8.8 } on-error={}
+:global UplinkDns64
+:local curContDns ""
+:do { :set curContDns [/container/config/get dns] } on-error={}
+
+:if ([:len $UplinkDns64] > 0) do={
+    :put ("--> Setting container DNS to detected UplinkDns64: " . $UplinkDns64 . "...")
+    :do { /container/config/set dns=$UplinkDns64 } on-error={}
+    :local dnsEnvId [/container/envs/find where list="tayga-clat-envs" and key="UPLINK_DNS64"]
+    :if ([:len $dnsEnvId] = 0) do={
+        /container/envs/add list=tayga-clat-envs key="UPLINK_DNS64" value=$UplinkDns64
+    } else={
+        /container/envs/set ($dnsEnvId->0) value=$UplinkDns64
+    }
+} else={
+    :if ([:len $curContDns] = 0) do={
+        :local sysDns [/ip/dns/get dynamic-servers]
+        :if ([:len $sysDns] > 0) do={
+            :put ("--> Setting container DNS from router dynamic DNS: " . $sysDns . "...")
+            :do { /container/config/set dns=$sysDns } on-error={}
+        } else={
+            :put "--> Setting default fallback container DNS..."
+            :do { /container/config/set dns=2001:4860:4860::8888,2606:4700:4700::1111,1.1.1.1,8.8.8.8 } on-error={}
+        }
+    } else={
+        :put ("--> Preserving existing container DNS configuration: " . $curContDns)
+    }
+}
 
 :local envEntries {
     {"MODE"; "clat"};
@@ -172,9 +198,9 @@
     {"AllowLocalNat64"; "no"};
     {"Ipv6OnlyLanInterfaces"; ""};
     {"TAYGA_WORKERS"; "3"};
-    {"TAYGA_OFFLOAD"; "off"};
+    {"TAYGA_OFFLOAD"; "auto"};
     {"TAYGA_OFFLINK_MTU"; "1280"};
-    {"PREF64"; "64:ff9b::/96"};
+    {"PREF64"; "auto"};
     {"FALLBACK_TO_WELL_KNOWN_PREFIX"; "true"};
     {"ROUTER4"; "172.31.64.1"};
     {"ACTIVE_SLOT"; "clat-a"};
@@ -188,13 +214,6 @@
     :local envId [/container/envs/find where list="tayga-clat-envs" and key=$k]
     :if ([:len $envId] = 0) do={
         /container/envs/add list=tayga-clat-envs key=$k value=$v
-    } else={
-        :if ($k = "PREF64" and [/container/envs/get ($envId->0) value] = "auto") do={
-            /container/envs/set ($envId->0) value="64:ff9b::/96"
-        }
-        :if ($k = "FALLBACK_TO_WELL_KNOWN_PREFIX") do={
-            /container/envs/set ($envId->0) value="true"
-        }
     }
 }
 

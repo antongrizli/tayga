@@ -16,6 +16,7 @@
  *  GNU General Public License for more details.
  */
 #include "tayga.h"
+#include "stats.h"
 #if defined(__linux__)
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -533,6 +534,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
 			ioctl(gcfg.tun_fd_addl[i], TUNSETOFFLOAD, offload_flags);
 		}
+		set_nonblock(gcfg.tun_fd_addl[i]);
 	}
 
 	/* Disable queue of main tun if we have >0 workers */
@@ -673,12 +675,21 @@ ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 
 	for (int attempt = 0; attempt < 5; attempt++) {
 		ret = write(tun_fd, buf, len);
-		if (likely(ret == (ssize_t)len))
+		if (likely(ret == (ssize_t)len)) {
+			if (len > 0) {
+				uint8_t ver = ((const uint8_t *)buf)[0] >> 4;
+				if (ver == 4)
+					stats_tx4((uint32_t)len);
+				else if (ver == 6)
+					stats_tx6((uint32_t)len);
+			}
 			return ret;
+		}
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			int saved_errno = errno;
+			stats_error();
 			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 				strerror(saved_errno));
 			errno = saved_errno;
@@ -686,12 +697,14 @@ ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 		}
 		/* Short write: packet was truncated by kernel/device.
 		 * Do not attempt to append remainder; drop, set errno = EIO, and log warning. */
+		stats_error();
 		slog(LOG_WARNING, "short write to tun device: wrote %zd of %zu bytes\n",
 			ret, len);
 		errno = EIO;
 		return -1;
 	}
 	int saved_errno = errno;
+	stats_error();
 	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 		strerror(saved_errno));
 	errno = saved_errno;
@@ -730,24 +743,43 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 
 	for (int attempt = 0; attempt < 5; attempt++) {
 		ret = writev(tun_fd, iov, iovcnt);
-		if (likely(ret == (ssize_t)total_len))
+		if (likely(ret == (ssize_t)total_len)) {
+			int ip_idx = 0;
+			if (gcfg.vnet_hdr_sz > 0 && iov[0].iov_len == (size_t)gcfg.vnet_hdr_sz)
+				ip_idx = 1;
+#ifndef __linux__
+			else if (iov[0].iov_len == sizeof(struct tun_pi))
+				ip_idx = 1;
+#endif
+			if (ip_idx < iovcnt && iov[ip_idx].iov_len > 0) {
+				uint8_t ver = ((const uint8_t *)iov[ip_idx].iov_base)[0] >> 4;
+				uint32_t ip_bytes = (uint32_t)(total_len - (ip_idx > 0 ? iov[0].iov_len : 0));
+				if (ver == 4)
+					stats_tx4(ip_bytes);
+				else if (ver == 6)
+					stats_tx6(ip_bytes);
+			}
 			return ret;
+		}
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			int saved_errno = errno;
+			stats_error();
 			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 				strerror(saved_errno));
 			errno = saved_errno;
 			return -1;
 		}
 		/* Short write: packet was truncated */
+		stats_error();
 		slog(LOG_WARNING, "short writev to tun device: wrote %zd of %zu bytes\n",
 			ret, total_len);
 		errno = EIO;
 		return -1;
 	}
 	int saved_errno = errno;
+	stats_error();
 	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
 		strerror(saved_errno));
 	errno = saved_errno;
@@ -784,6 +816,8 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 	if (unlikely(ret < 0)) {
 		if (errno == EAGAIN)
 			return;
+		stats_error();
+		stats_packet_done();
 		slog(LOG_ERR, "received error when reading from tun "
 				"device: %s\n", strerror(errno));
 		return;
@@ -791,6 +825,8 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 
 	if (gcfg.vnet_hdr_sz > 0) {
 		if (unlikely(ret <= gcfg.vnet_hdr_sz)) {
+			stats_drop(ret > 0 ? (uint32_t)ret : 0);
+			stats_packet_done();
 			slog(LOG_WARNING, "short read with vnet header (%d bytes)\n", ret);
 			return;
 		}
@@ -809,10 +845,14 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 		memcpy(&p->vhdr, read_ptr, gcfg.vnet_hdr_sz);
 	} else {
 		if (unlikely(ret < 1)) {
+			stats_drop(ret > 0 ? (uint32_t)ret : 0);
+			stats_packet_done();
 			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
 			return;
 		}
 		if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
+			stats_drop((uint32_t)ret);
+			stats_packet_done();
 			slog(LOG_WARNING, "dropping oversized packet\n");
 			return;
 		}
@@ -832,12 +872,15 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 #ifdef __linux__
 	switch (p->data[0] >> 4) {
 	case 4:
+		stats_rx4(p->data_len);
 		handle_ip4(p);
 		break;
 	case 6:
+		stats_rx6(p->data_len);
 		handle_ip6(p);
 		break;
 	default:
+		stats_drop(p->data_len);
 		slog(LOG_WARNING, "Dropping unknown IP version %u from "
 				"tun device\n", p->data[0] >> 4);
 		break;
@@ -846,6 +889,7 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 	{
 		struct tun_pi *pi = (struct tun_pi *)(recv_buf + HEADROOM);
 		if ((size_t)ret < sizeof(struct tun_pi)) {
+			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
 			return;
 		}
@@ -853,16 +897,20 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 		p->data_len = ret - sizeof(struct tun_pi);
 		switch (TUN_GET_PROTO(pi)) {
 		case ETH_P_IP:
+			stats_rx4(p->data_len);
 			handle_ip4(p);
 			break;
 		case ETH_P_IPV6:
+			stats_rx6(p->data_len);
 			handle_ip6(p);
 			break;
 		default:
+			stats_drop(p->data_len);
 			slog(LOG_WARNING, "Dropping unknown proto %04x from tun device\n",
 					ntohs(pi->proto));
 			break;
 		}
 	}
 #endif
+	stats_packet_done();
 }
