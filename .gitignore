@@ -23,6 +23,7 @@ unit_ip4_id
 unit_tun
 unit_gso
 unit_pref64
+unit_stats
 pref64-discover
 tayga.map
 perf-sessions
