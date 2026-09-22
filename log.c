@@ -49,6 +49,7 @@ void slog_impl(int priority, const char *file, const char *line, const char *fun
         default:
 		case LOG_TO_STDOUT:
 			vprintf(format, ap);
+			fflush(stdout);
 			break;
 		case LOG_TO_SYSLOG:
 			vsyslog(priority, format, ap);
