@@ -234,6 +234,8 @@
     # 9. Clear global variables
     :set TaygaState ""
     :set TaygaParkedRouteIds [:toarray ""]
+    :global EnableLanNat66
+    :set EnableLanNat66 false
 
     :put "============================================================"
     :put " TAYGA Unified components cleanly removed!"

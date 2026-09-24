@@ -263,3 +263,8 @@ ifdef CONT_PUSH
 endif
 	podman save -o $@ tayga-nat64
 	podman manifest rm tayga-nat64
+
+.PHONY: update-scripts-version
+update-scripts-version:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make update-scripts-version VERSION=<tag> [REPO=antongrizli/tayga]" >&2; exit 1; fi
+	./scripts/update-image-tags.sh "$(VERSION)" "$(or $(REPO),antongrizli/tayga)" scripts/mikrotik

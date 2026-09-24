@@ -48,11 +48,25 @@
 :local useRegistry false
 :if ($UseRegistry = true) do={ :set useRegistry true }
 
-:local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
+:local remoteImage "ghcr.io/antongrizli/tayga-clat:0.9.11"
 :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
 :if ([:len $RegistryUrl] > 0) do={ :set registryUrl $RegistryUrl }
+
+# --- Optional Cellular LAN IPv6 NAT66 Fallback (Overridable via global variables) ---
+:global EnableLanNat66
+:global LanBridge
+:global LanUlaPrefix
+
+:local enableLanNat66 false
+:if ($EnableLanNat66 = true) do={ :set enableLanNat66 true }
+
+:local lanBridge "bridge"
+:if ([:len $LanBridge] > 0) do={ :set lanBridge $LanBridge }
+
+:local lanUlaPrefix "fd00:88::1/64"
+:if ([:len $LanUlaPrefix] > 0) do={ :set lanUlaPrefix $LanUlaPrefix }
 
 # Auto-detect: if local TAR is not present on storage, automatically switch to GHCR pull
 :local hasLocalTar ([:len [/file/find where name=$imagePath]] > 0)
@@ -70,7 +84,7 @@
 :if ([:len [/file/find where name=$preflightToRun]] = 0) do={
     :put "--> Fetching preflight audit script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
         :log info "[tayga-installer] Downloaded preflight script to routeros-preflight.rsc"
     } on-error={}
 }
@@ -265,6 +279,34 @@
     }
 }
 
+# --- Optional Cellular LAN NAT66 Fallback for Carrier Networks without DHCPv6-PD ---
+:if ($enableLanNat66 = true) do={
+    :put ("--> [Cellular NAT66] Configuring LAN IPv6 ULA & Masquerade on WAN (" . $wanIf . ")...")
+    :local lanHasV6 [:len [/ipv6/address/find where interface=$lanBridge and !invalid and !link-local]]
+    :if ($lanHasV6 = 0) do={
+        :if ([:len [/ipv6/address/find where comment="[tayga-unified:clat] Cellular LAN ULA"]] = 0) do={
+            :put ("--> Assigning ULA prefix " . $lanUlaPrefix . " to " . $lanBridge . "...")
+            /ipv6/address/add address=$lanUlaPrefix interface=$lanBridge advertise=yes comment="[tayga-unified:clat] Cellular LAN ULA"
+        }
+    } else={
+        :put ("--> Preserving existing valid IPv6 address on " . $lanBridge)
+    }
+
+    :if ([:len [/ipv6/firewall/nat/find where comment="[tayga-unified:clat] LAN IPv6 Masquerade"]] = 0) do={
+        :put "--> Adding IPv6 NAT masquerade for LAN traffic on WAN..."
+        /ipv6/firewall/nat/add chain=srcnat in-interface=$lanBridge out-interface=$wanIf action=masquerade comment="[tayga-unified:clat] LAN IPv6 Masquerade"
+    }
+
+    :if ([:len [/ipv6/firewall/filter/find where comment="[tayga-unified:clat:fwd-lan] Allow LAN IPv6 egress"]] = 0) do={
+        :put "--> Adding IPv6 forward filter for LAN egress..."
+        :if ([:len $placeOpt] > 0) do={
+            /ipv6/firewall/filter/add place-before=$placeOpt chain=forward in-interface=$lanBridge out-interface=$wanIf action=accept comment="[tayga-unified:clat:fwd-lan] Allow LAN IPv6 egress"
+        } else={
+            /ipv6/firewall/filter/add chain=forward in-interface=$lanBridge out-interface=$wanIf action=accept comment="[tayga-unified:clat:fwd-lan] Allow LAN IPv6 egress"
+        }
+    }
+}
+
 # --- 15. Create Isolated Routing Tables for Zero-Leak Probing ---
 # Migration cleanup: Remove any legacy /32 probe route from main table
 :do { /ip/route/remove [find where dst-address="1.1.1.1/32" and comment~"^\\[tayga-unified"] } on-error={}
@@ -398,7 +440,7 @@
 :if ([:len [/file/find where name=$controllerToRun]] = 0) do={
     :put "--> Fetching controller script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-controller.rsc" dst-path="routeros-controller.rsc"
         :log info "[tayga-installer] Downloaded controller script to routeros-controller.rsc"
     } on-error={}
 }

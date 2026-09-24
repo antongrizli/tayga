@@ -63,7 +63,7 @@
 :local useRegistry false
 :if ($UseRegistry = true) do={ :set useRegistry true }
 
-:local remoteImage "ghcr.io/antongrizli/tayga-nat64:latest"
+:local remoteImage "ghcr.io/antongrizli/tayga-nat64:0.9.11"
 :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
@@ -85,7 +85,7 @@
 :if ([:len [/file/find where name=$preflightToRun]] = 0) do={
     :put "--> Fetching preflight audit script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
         :log info "[tayga-installer] Downloaded preflight script to routeros-preflight.rsc"
     } on-error={}
 }
@@ -404,7 +404,7 @@
 :if ([:len [/file/find where name=$controllerToRun]] = 0) do={
     :put "--> Fetching controller script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.10/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-controller.rsc" dst-path="routeros-controller.rsc"
         :log info "[tayga-installer] Downloaded controller script to routeros-controller.rsc"
     } on-error={}
 }

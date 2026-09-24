@@ -112,7 +112,7 @@
     :local useRegistry false
     :if ($UseRegistry = true) do={ :set useRegistry true }
 
-    :local remoteImage "ghcr.io/antongrizli/tayga-clat:latest"
+    :local remoteImage "ghcr.io/antongrizli/tayga-clat:0.9.11"
     :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
     :local registryUrl "https://ghcr.io"

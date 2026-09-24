@@ -132,7 +132,36 @@
     }
 }
 
-# --- 5. Collision & Foreign Object Ownership Check ---
+# --- 5. LAN IPv6 & Prefix Delegation (DHCPv6-PD) Readiness Audit ---
+:global LanBridge
+:local lanBr "bridge"
+:if ([:len $LanBridge] > 0) do={ :set lanBr $LanBridge }
+
+:local lanValidV6Count [:len [/ipv6/address/find where interface=$lanBr and !invalid and !link-local]]
+:local lanInvalidV6Count [:len [/ipv6/address/find where interface=$lanBr and invalid]]
+:local dhcpV6Searching [:len [/ipv6/dhcp-client/find where status="searching..."]]
+
+:if ($lanInvalidV6Count > 0) do={
+    :put (" [WARN] Detected " . $lanInvalidV6Count . " INVALID IPv6 address(es) on " . $lanBr . " (e.g. unassigned/missing pool).")
+    :set warnCount ($warnCount + 1)
+}
+
+:if ($lanValidV6Count > 0) do={
+    :put (" [PASS] Active IPv6 prefix/address present on LAN (" . $lanBr . ").")
+    :set passCount ($passCount + 1)
+} else={
+    :if ($dhcpV6Searching > 0 or [:len [/ipv6/dhcp-client/find]] = 0 or [:len [/ipv6/dhcp-client/find where disabled=yes]] > 0) do={
+        :put (" [WARN] No valid global IPv6 address on LAN (" . $lanBr . ") and DHCPv6-PD is not bound.")
+        :put "        Upstream WAN provider may not delegate an IPv6 prefix (common on LTE/5G)."
+        :put "        LAN clients will experience IPv6 blackholes unless Cellular NAT66 is enabled."
+        :put "        Recommendation: set ':global EnableLanNat66 true' before running routeros-install-clat.rsc"
+        :set warnCount ($warnCount + 1)
+    } else={
+        :put (" [INFO] No valid global IPv6 address on LAN (" . $lanBr . ").")
+    }
+}
+
+# --- 6. Collision & Foreign Object Ownership Check ---
 :local existingBridge [/interface/bridge/find where name="bridge-clat"]
 :if ([:len $existingBridge] > 0) do={
     :local bComm [/interface/bridge/get $existingBridge comment]

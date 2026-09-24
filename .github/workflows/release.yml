@@ -38,14 +38,15 @@ jobs:
 
           # Check if version.h is already synchronized
           if ! grep -q "\"${CLEAN_VER}\"" version.h; then
-            echo "==> Updating version.h to ${CLEAN_VER} (Commit: ${COMMIT_SHA})..."
+            echo "==> Updating version.h and release to ${CLEAN_VER} (Commit: ${COMMIT_SHA})..."
             printf '#ifndef __TAYGA_VERSION_H__\n#define __TAYGA_VERSION_H__\n\n#define TAYGA_VERSION "%s"\n#define TAYGA_BRANCH  "main"\n#define TAYGA_COMMIT  "%s"\n\n#endif /* #ifndef __TAYGA_VERSION_H__ */\n' \
               "${CLEAN_VER}" "${COMMIT_SHA}" > version.h
+            echo "RELEASE=${CLEAN_VER}" > release
 
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add version.h
-            git commit -m "chore(release): synchronize version.h to ${RAW_VER} [skip ci]" || true
+            git add version.h release
+            git commit -m "chore(release): synchronize version to ${RAW_VER} [skip ci]" || true
             git push origin HEAD:main || true
           else
             echo "✅ version.h is already up-to-date with ${CLEAN_VER}"
@@ -330,11 +331,43 @@ jobs:
           CLEAN_VER="${CLEAN_VER#version}"
           REPO_LC="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
 
-          # Copy individual RouterOS .rsc scripts to release assets
-          cp scripts/mikrotik/*.rsc release-assets/
+          echo "==> Preparing RouterOS scripts for release ${RAW_VER} (Repo: ${REPO_LC})..."
+          mkdir -p release-staging
+          cp scripts/mikrotik/*.rsc scripts/mikrotik/README.md release-staging/
 
-          # Create a single ZIP package of all RouterOS management scripts
-          (cd scripts/mikrotik && zip -r ../../release-assets/tayga-routeros-scripts.zip *.rsc README.md)
+          # Update container image tags and GitHub release URLs to pinned release version
+          ./scripts/update-image-tags.sh "${RAW_VER}" "${REPO_LC}" release-staging
+
+          # Verify that all target scripts have been pinned to the release tag and no ':latest' image remains
+          echo "==> Verifying image versions in release scripts..."
+          if grep -q "tayga-clat:latest" release-staging/*.rsc || grep -q "tayga-nat64:latest" release-staging/*.rsc; then
+            echo "❌ ERROR: Found unpinned ':latest' container image tag in release scripts!" >&2
+            exit 1
+          fi
+
+          if ! grep -q "ghcr.io/${REPO_LC}-clat:${RAW_VER}" release-staging/routeros-install-clat.rsc; then
+            echo "❌ ERROR: routeros-install-clat.rsc did not get updated to ghcr.io/${REPO_LC}-clat:${RAW_VER}!" >&2
+            exit 1
+          fi
+
+          if ! grep -q "ghcr.io/${REPO_LC}-nat64:${RAW_VER}" release-staging/routeros-install-nat64.rsc; then
+            echo "❌ ERROR: routeros-install-nat64.rsc did not get updated to ghcr.io/${REPO_LC}-nat64:${RAW_VER}!" >&2
+            exit 1
+          fi
+
+          if ! grep -q "ghcr.io/${REPO_LC}-clat:${RAW_VER}" release-staging/routeros-upgrade.rsc; then
+            echo "❌ ERROR: routeros-upgrade.rsc did not get updated to ghcr.io/${REPO_LC}-clat:${RAW_VER}!" >&2
+            exit 1
+          fi
+
+          echo "✅ Release scripts verified: pinned to ghcr.io/${REPO_LC}-*:${RAW_VER}"
+
+          # Copy pinned individual RouterOS .rsc scripts to release assets
+          cp release-staging/*.rsc release-assets/
+
+          # Create a single ZIP package of all RouterOS management scripts (with release-pinned image tags)
+          (cd release-staging && zip -r ../release-assets/tayga-routeros-scripts.zip *.rsc README.md)
+          rm -rf release-staging
 
           # Generate SHA256 checksums file
           cd release-assets

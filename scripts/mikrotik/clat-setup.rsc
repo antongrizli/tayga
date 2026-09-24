@@ -22,4 +22,4 @@
 /ip route add dst-address=0.0.0.0/0 gateway=192.168.238.2 distance=10 comment="Route IPv4 default via TAYGA CLAT"
 
 # 6. Add TAYGA CLAT container (fetches image from GitHub Container Registry)
-/container add remote-image="ghcr.io/antongrizli/tayga-clat:latest" interface=veth-clat name=tayga-clat workdir=/app logging=yes comment="TAYGA CLAT Container"
+/container add remote-image="ghcr.io/antongrizli/tayga-clat:0.9.11" interface=veth-clat name=tayga-clat workdir=/app logging=yes comment="TAYGA CLAT Container"

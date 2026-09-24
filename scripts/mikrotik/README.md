@@ -47,7 +47,7 @@ scp scripts/mikrotik/*.rsc admin@192.168.88.1:usb1/telekom-xlat/scripts/
 
 Alternatively, you can pull the multi-arch image directly from GitHub Container Registry:
 ```text
-ghcr.io/antongrizli/tayga:latest
+ghcr.io/antongrizli/tayga:0.9.11
 ```
 
 ---
@@ -67,7 +67,12 @@ Run the read-only preflight check to verify CPU architecture (ARM64), free RAM, 
 Deploys the container in CLAT mode, configures bridge/VETH, sets up NAT44, IPv6 firewall forward transit, and mandatory LTE WAN IPv6 masquerade, starts the container, validates end-to-end connectivity via probe ping `/32`, and safely enables the default route:
 
 ```routeros
+# For standard deployments with native DHCPv6-PD:
 /import file-name=usb1/telekom-xlat/scripts/routeros-install-clat.rsc
+
+# Optional: If your mobile provider does NOT support DHCPv6-PD (common on LTE/5G):
+# :global EnableLanNat66 true
+# /import file-name=usb1/telekom-xlat/scripts/routeros-install-clat.rsc
 ```
 
 ### Step 3: Verify Health & Diagnostics
@@ -144,3 +149,52 @@ Completely removes all bridges, VETH interfaces, IP addresses, NAT rules, and co
 # Inside container shell:
 /usr/local/sbin/diagnose.sh
 ```
+
+---
+
+## 7. Cellular WAN without DHCPv6-PD (Fixing test-ipv6.run Timeouts on LAN)
+
+### Problem Background
+In mobile cellular networks (LTE / 5G), carriers frequently allocate only a single `/64` interface address to the cellular modem (`lte1`) via 3GPP SLAAC (RFC 6459) and do **not** support DHCPv6 Prefix Delegation (DHCPv6-PD) on standard consumer APNs.
+
+When this occurs:
+1. `/ipv6/dhcp-client` remains stuck in `status=searching...`.
+2. Any LAN address pool configuration relying on PD fails (e.g. `;;; address pool error: pool not found (I - INVALID)`).
+3. If LAN devices configure ULA addresses (or retain stale prefixes), modern operating systems (macOS, Windows, iOS, Android) use RFC 8305 "Happy Eyeballs" and attempt IPv6 connections first. Because LAN IPv6 packets are blackholed at the router, **web pages take 20–30 seconds to load** while waiting for IPv6 timeouts before falling back to IPv4.
+4. Testing tools like `https://test-ipv6.run/` report:
+   > *"Your IPv6 connection times out when trying to connect. This suggests IPv6 is enabled but broken..."*
+
+### Automated Fix with Installer
+Before running `routeros-install-clat.rsc`, enable the LAN NAT66 fallback:
+
+```routeros
+:global EnableLanNat66 true
+:global LanBridge "bridge"       # Optional: defaults to "bridge"
+:global LanUlaPrefix "fd00:88::1/64" # Optional: defaults to "fd00:88::1/64"
+/import file-name=usb1/telekom-xlat/scripts/routeros-install-clat.rsc
+```
+
+This will automatically:
+- Assign an advertised ULA prefix to the specified LAN bridge if no valid IPv6 address exists.
+- Add an IPv6 NAT masquerade rule for LAN traffic going out the WAN interface.
+- Add firewall forward transit rules allowing LAN IPv6 egress.
+
+### Manual Fix for Existing Deployments
+If you have already deployed CLAT and need to fix LAN IPv6 immediately, run the following commands on RouterOS:
+
+```routeros
+# 1. Disable any invalid pool-bound IPv6 address on bridge
+/ipv6/address/disable [find where from-pool~"pd"]
+
+# 2. Assign a static ULA address to your LAN bridge and enable SLAAC advertisement
+/ipv6/address/add address=fd00:88::1/64 interface=bridge advertise=yes comment="[tayga-unified] ULA LAN"
+
+# 3. Add NAT66 masquerade for outgoing LAN IPv6 traffic on WAN
+/ipv6/firewall/nat/add chain=srcnat in-interface=bridge out-interface=lte1 action=masquerade comment="[tayga-unified] LAN IPv6 Masquerade"
+
+# 4. Ensure firewall forward filter allows LAN egress to WAN
+/ipv6/firewall/filter/add chain=forward in-interface=bridge out-interface=lte1 action=accept place-before=0 comment="[tayga-unified:clat:fwd-lan] Allow LAN IPv6 egress"
+```
+
+After applying, reconnect LAN devices (or toggle Wi-Fi). `https://test-ipv6.run/` will immediately report **10/10**, and IPv6 timeouts will be completely resolved.
+
