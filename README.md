@@ -2,7 +2,7 @@
 
 TAYGA is an out-of-kernel stateless NAT64 implementation for Linux and FreeBSD.  It uses the TUN driver to exchange packets with the kernel, which is the same driver used by OpenVPN and QEMU/KVM.  TAYGA needs no kernel patches or out-of-tree modules on either Linux or FreeBSD.
 
-TAYGA was originally developed by Nathan Lutchansky [(litech.org)](http://www.litech.org/tayga/) through version `0.9.2`. Following the last release in 2011, TAYGA was mainatined by several Linux distributions independently, including patches from the Debian project, and FreeBSD. These patches have been collected and merged together, and is now maintained from [@apalrd](https://github.com/apalrd) and from contributors here on Github.
+TAYGA was originally developed by Nathan Lutchansky [(litech.org)](http://www.litech.org/tayga/) through version `0.9.2`. Following the last release in 2011, TAYGA was maintained by several Linux distributions independently, including patches from the Debian project, and FreeBSD. These patches have been collected and merged together, and is now maintained from [@apalrd](https://github.com/apalrd) and from contributors here on Github.
 
 If you are interested in the mechanics of NAT64 and Stateless IP / ICMP Translation, see the [overview on the docs page](docs/README.md).
 
@@ -28,7 +28,7 @@ Next, if you would like dynamic maps to be persistent between `tayga` restarts, 
 mkdir -p /var/db/tayga
 ```
 
-Now create your site-specific `tayga.conf` configuration file.  The installed `tayga.conf.example` file can be copied to `tayga.conf` and modified to suit your site. Additionally, many example configurations are available in the [docs](docs/README.md))
+Now create your site-specific `tayga.conf` configuration file.  The installed `tayga.conf.example` file can be copied to `tayga.conf` and modified to suit your site. Additionally, many example configurations are available in the [docs](docs/README.md).
 
 Before starting the `tayga` daemon, the routing setup on your system will need to be changed to send IPv4 and IPv6 packets to `tayga`.  First create the TUN network interface:
 
@@ -119,7 +119,7 @@ By default `MAX_TUN_DROPS=0` and `MAX_UDP_LOSS_PERCENT=0`: a run crossing either
 limit is retained as an artifact but exits non-zero and is not valid for A/B.
 Results are written under `ARTIFACT_DIR` (default `/tmp/tayga-clat-results`).
 
-Для сравнения worker и размера UDP-пакета используйте matrix runner:
+To compare worker counts and UDP payload sizes, use the matrix runner:
 
 ```sh
 docker run --privileged --device /dev/net/tun --rm \
@@ -130,9 +130,9 @@ docker run --privileged --device /dev/net/tun --rm \
   tayga-clat:bench
 ```
 
-`summary.tsv` содержит статус каждого сочетания и его числовые результаты.
-При drops или UDP loss runner возвращает ненулевой код, но сохраняет JSON,
-stderr и счётчики для анализа.
+`summary.tsv` contains the status and numeric results for each combination.
+On drops or UDP loss, the runner returns a non-zero exit code while preserving the JSON,
+stderr, and counter artifacts for analysis.
 
 Set `PERF_MODE=stat` or `PERF_MODE=record` only in a Linux environment where
 the `perf` command and PMU/tracepoint permissions are available. The harness
