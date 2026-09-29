@@ -32,6 +32,14 @@ time_t now;
 static const char *progname;
 static int signalfds[2];
 static _Atomic bool g_shutdown = false;
+static _Atomic bool g_tun_io_failure = false;
+
+static void tun_io_fail(const char *where, int error)
+{
+	slog(LOG_ERR, "%s: %s; stopping TAYGA\n", where, strerror(error));
+	atomic_store_explicit(&g_tun_io_failure, true, memory_order_relaxed);
+	atomic_store_explicit(&g_shutdown, true, memory_order_relaxed);
+}
 
 void usage(int code) {
 	fprintf(stderr,
@@ -55,7 +63,7 @@ void usage(int code) {
 			"--pidfile FILE     : Write process ID of daemon to FILE\n"
 			"--mktun            : Create the persistent TUN interface\n"
 			"--rmtun            : Remove the persistent TUN interface\n"
-			"--tun-offload MODE : Offload mode: off, tcp, or auto (default: off)\n"
+			"--tun-offload MODE : Offload mode: off, tcp, or auto (default: auto)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
@@ -265,22 +273,41 @@ static void * worker(void * arg)
 	clock_gettime(CLOCK_MONOTONIC, &last_flush);
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
 		int pret = poll(&pfd, 1, 500);
-		clock_gettime(CLOCK_MONOTONIC, &mono_now);
 		if (pret > 0) {
-			if (pfd.revents & POLLIN) {
-				tun_read(recv_buf, gcfg.tun_fd_addl[idx]);
+			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				tun_io_fail("worker TUN poll reported a failed descriptor", EIO);
+				break;
 			}
+			if (pfd.revents & POLLIN) {
+				for (int reads = 0; reads < WORKER_BURST_BUDGET; reads++) {
+					int res = tun_read_packet(recv_buf, gcfg.tun_fd_addl[idx]);
+					if (res == TUN_READ_CONSUMED) {
+						continue;
+					}
+					if (res == TUN_READ_WOULDBLOCK) {
+						break;
+					}
+					if (res == TUN_READ_INTR) {
+						continue;
+					}
+					if (res == TUN_READ_FATAL)
+						tun_io_fail("worker TUN read failed", errno);
+					break;
+				}
+			}
+			clock_gettime(CLOCK_MONOTONIC, &mono_now);
 			if (mono_now.tv_sec - last_flush.tv_sec >= 1 && g_tls_priv.batch_count > 0) {
 				stats_flush_worker();
 				last_flush = mono_now;
 			}
 		} else if (pret == 0) {
+			clock_gettime(CLOCK_MONOTONIC, &mono_now);
 			stats_flush_idle();
 			last_flush = mono_now;
 		} else {
 			if (errno == EINTR)
 				continue;
-			slog(LOG_ERR, "worker %d poll returned error %s\n", idx, strerror(errno));
+			tun_io_fail("worker TUN poll failed", errno);
 			break;
 		}
 	}
@@ -697,21 +724,44 @@ int main(int argc, char **argv)
 			exit_code = 1;
 			break;
 		}
-		time(&now);
-		clock_gettime(CLOCK_MONOTONIC, &main_mono_now);
 		if (ret > 0) {
 			if (pollfds[0].revents)
 				signal_read();
-			if (pollfds[1].revents)
-				tun_read(recv_buf, gcfg.tun_fd);
+			if (pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				tun_io_fail("main TUN poll reported a failed descriptor", EIO);
+				exit_code = 1;
+				break;
+			}
+			if (pollfds[1].revents & POLLIN) {
+				for (int reads = 0; reads < WORKER_BURST_BUDGET; reads++) {
+					int res = tun_read_packet(recv_buf, gcfg.tun_fd);
+					if (res == TUN_READ_CONSUMED) {
+						continue;
+					}
+					if (res == TUN_READ_WOULDBLOCK) {
+						break;
+					}
+					if (res == TUN_READ_INTR) {
+						continue;
+					}
+					if (res == TUN_READ_FATAL) {
+						tun_io_fail("main TUN read failed", errno);
+						exit_code = 1;
+					}
+					break;
+				}
+			}
+			clock_gettime(CLOCK_MONOTONIC, &main_mono_now);
 			if (main_mono_now.tv_sec - last_main_flush.tv_sec >= 1 && g_tls_priv.batch_count > 0) {
 				stats_flush_worker();
 				last_main_flush = main_mono_now;
 			}
 		} else {
+			clock_gettime(CLOCK_MONOTONIC, &main_mono_now);
 			stats_flush_idle();
 			last_main_flush = main_mono_now;
 		}
+		time(&now);
 		if (gcfg.cache_size && (gcfg.last_cache_maint +
 						CACHE_CHECK_INTERVAL < now ||
 					gcfg.last_cache_maint > now)) {
@@ -731,6 +781,8 @@ int main(int argc, char **argv)
 	for (int i = 0; i < gcfg.workers; i++) {
 		pthread_join(gcfg.threads[i], NULL);
 	}
+	if (atomic_load_explicit(&g_tun_io_failure, memory_order_relaxed))
+		exit_code = 1;
 #endif
 	stats_flush_worker();
 	stats_dump();

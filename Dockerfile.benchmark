@@ -7,6 +7,7 @@ RUN apk add --no-cache \
     iperf3 \
     nftables \
     procps \
+    ethtool \
     python3 \
     py3-pip \
     unbound
@@ -31,7 +32,7 @@ RUN printf '%s\n' \
  && install -Dm0755 tayga /usr/sbin/tayga
 
 COPY telekom-nat64-minimal/start.sh /usr/local/sbin/start.sh
-COPY telekom-nat64-minimal/clat-start.sh /usr/local/sbin/clat-start.sh
+COPY tayga-clat-perf/scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
 COPY telekom-nat64-minimal/tayga.conf /etc/tayga.conf
 COPY telekom-nat64-minimal/unbound.conf /etc/unbound/unbound.conf
 COPY telekom-nat64-minimal/benchmark/compare-nat64.sh /usr/local/sbin/compare-nat64.sh

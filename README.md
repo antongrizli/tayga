@@ -64,9 +64,9 @@ TAYGA supports high-performance kernel offloads (**GSO**, **GRO**, and **Checksu
 
 ```conf
 # In tayga.conf:
-# off  - Standard packet-by-packet operation (safe default)
+# off  - Standard packet-by-packet operation (explicit baseline)
 # tcp  - Enable TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
-# auto - Probe kernel at startup; enable if supported, fallback to off
+# auto - Default; probe kernel at startup; enable if supported, fallback to off
 tun-offload auto
 ```
 

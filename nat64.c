@@ -299,13 +299,20 @@ static void xlate_header_4to6(struct pkt *p, struct ip6 *ip6,
 	ip6->hop_limit = p->ip4->ttl;
 }
 
-static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
+int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 {
 	uint16_t *tck;
 	uint16_t cksum;
 
-	/* Do not adjust fragment packets */
-	if (p->ip4->flags_offset & htons(IP4_F_MASK))
+	/* Partial checksums cannot be translated safely on any fragment. */
+	uint16_t ip4_frag = ntohs(p->ip4->flags_offset);
+	if ((ip4_frag & (IP4_F_MASK | IP4_F_MF)) && p->has_vhdr &&
+	    (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+		log_pkt4(LOG_OPT_DROP, p, "Fragmented packet with NEEDS_CSUM rejected");
+		return ERROR_DROP;
+	}
+	/* Noninitial fragments do not contain the transport checksum field. */
+	if (ip4_frag & IP4_F_MASK)
 		return ERROR_NONE;
 
 	switch (p->data_proto) {
@@ -325,25 +332,54 @@ static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 	/* UDP */
 	case 17:
 		if (p->data_len < 8) {
-			if (!em) log_pkt4(LOG_OPT_DROP,p,"Insufficient payload length for UDP Header");
+			if (em) return ERROR_NONE;
+			log_pkt4(LOG_OPT_DROP, p, "Insufficient payload length for UDP Header");
 			return ERROR_DROP;
+		}
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			if (p->vhdr.csum_start != p->header_len || p->vhdr.csum_offset != 6 ||
+			    (uint32_t)p->vhdr.csum_start + p->vhdr.csum_offset + 2 > ntohs(p->ip4->length)) {
+				log_pkt4(LOG_OPT_DROP, p, "Invalid UDP checksum offload metadata");
+				return ERROR_DROP;
+			}
+			uint16_t udp_len = ntohs(*(uint16_t *)(p->data + 4));
+			if (udp_len < 8 || udp_len > p->data_len) {
+				log_pkt4(LOG_OPT_DROP, p, "Invalid UDP header length");
+				return ERROR_DROP;
+			}
+			tck = (uint16_t *)(p->data + 6);
+			if (gcfg.vnet_hdr_sz == 0) {
+				*tck = 0;
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip6_checksum(ip6, p->data_len, IPPROTO_UDP));
+				if (*tck == 0)
+					*tck = 0xffff;
+				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			} else {
+				*tck = htons(gso_calc_udp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+			}
+			return ERROR_NONE;
 		}
 		tck = (uint16_t *)(p->data + 6);
 		if (!*tck) {
-			/* UDP packet has no checksum, how do we deal? */
+			/* UDP packet has genuinely no checksum */
+			if (em) {
+				if (gcfg.udp_cksum_mode == UDP_CKSUM_DROP)
+					return ERROR_DROP;
+				return ERROR_NONE;
+			}
 			switch(gcfg.udp_cksum_mode) {
 			default:
 			case UDP_CKSUM_DROP:
-				/* Do not handle zero checksum packets */
-				if (!em) log_pkt4(LOG_OPT_DROP,p,"Not configured to handle Zero UDP Checksum");
+				if (!em) log_pkt4(LOG_OPT_DROP, p, "Not configured to handle Zero UDP Checksum");
 				return ERROR_DROP;
 			case UDP_CKSUM_FWD:
-				/* Ignore the lack of checksum and forward anyway */
 				return ERROR_NONE;
 			case UDP_CKSUM_CALC:
-				/* Calculate a real UDP checksum, now */
-				*tck = ones_add(ip_checksum(p->data,p->data_len), /* Body */
-								ip6_checksum(ip6,p->data_len,17));/* IP6 header */
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip6_checksum(ip6, p->data_len, 17));
+				if (*tck == 0)
+					*tck = 0xffff;
 				return ERROR_NONE;
 			}
 		}
@@ -351,21 +387,48 @@ static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 	/* TCP */
 	case 6:
 		if (p->data_len < 20) {
-			if (!em) log_pkt4(LOG_OPT_DROP,p,"Insufficient payload length for TCP Header");
+			if (em) return ERROR_NONE;
+			log_pkt4(LOG_OPT_DROP, p, "Insufficient payload length for TCP Header");
 			return ERROR_DROP;
 		}
-		tck = (uint16_t *)(p->data + 16);
 		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
-			*tck = htons(gso_calc_tcp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+			if (p->vhdr.csum_start != p->header_len || p->vhdr.csum_offset != 16 ||
+			    (uint32_t)p->vhdr.csum_start + p->vhdr.csum_offset + 2 > ntohs(p->ip4->length)) {
+				log_pkt4(LOG_OPT_DROP, p, "Invalid TCP checksum offload metadata");
+				return ERROR_DROP;
+			}
+			uint8_t doff = ((p->data[12] >> 4) & 0x0f) * 4;
+			if (doff < 20 || doff > p->data_len) {
+				log_pkt4(LOG_OPT_DROP, p, "Invalid TCP data offset");
+				return ERROR_DROP;
+			}
+			tck = (uint16_t *)(p->data + 16);
+			if (gcfg.vnet_hdr_sz == 0) {
+				*tck = 0;
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip6_checksum(ip6, p->data_len, IPPROTO_TCP));
+				if (*tck == 0)
+					*tck = 0xffff;
+				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			} else {
+				*tck = htons(gso_calc_tcp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+			}
 			return ERROR_NONE;
 		}
+		tck = (uint16_t *)(p->data + 16);
 		break;
 	/* Any other protocol */
 	default:
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			log_pkt4(LOG_OPT_DROP, p, "Unsupported protocol for checksum offload");
+			return ERROR_DROP;
+		}
 		return ERROR_NONE;
 	}
-	/* Calculate checksum adjustment */
+	/* Calculate checksum adjustment (RFC 1624 incremental update) */
 	*tck = ones_add(*tck, ~convert_cksum(ip6, p->ip4));
+	if (*tck == 0)
+		*tck = 0xffff;
 	return ERROR_NONE;
 }
 
@@ -446,11 +509,12 @@ static void xlate_4to6_data(struct pkt *p)
 #ifdef __linux__
 		uint8_t *out = p->data - sizeof(struct ip6);
 		memcpy(out, &header.ip6, sizeof(struct ip6));
-		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+				(p->data_proto == IPPROTO_TCP || p->data_proto == IPPROTO_UDP)) {
 			struct virtio_net_hdr_raw out_vhdr = p->vhdr;
 			out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
 			out_vhdr.csum_start = sizeof(struct ip6);
-			out_vhdr.csum_offset = 16;
+			out_vhdr.csum_offset = p->data_proto == IPPROTO_UDP ? 6 : 16;
 			tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip6) + p->data_len);
 		} else {
 			tun_write(p->tun_fd, out, sizeof(struct ip6) + p->data_len);
@@ -464,6 +528,17 @@ static void xlate_4to6_data(struct pkt *p)
 		tun_writev(p->tun_fd, iov, 2);
 #endif
 	} else {
+		/* If packet had NEEDS_CSUM, complete it before fragmenting */
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			uint16_t *frag_tck = (uint16_t *)(p->data + (p->data_proto == IPPROTO_UDP ? 6 : 16));
+			*frag_tck = 0; /* Remove the pseudoheader seed before a full checksum. */
+			*frag_tck = ones_add(ip_checksum(p->data, p->data_len),
+			                     ip6_checksum(&header.ip6, p->data_len, p->data_proto));
+			if (*frag_tck == 0)
+				*frag_tck = 0xffff;
+			p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
+		}
+
 		header.ip6_frag.next_header = header.ip6.next_header;
 		header.ip6_frag.reserved = 0;
 		header.ip6_frag.ident = htonl(ntohs(p->ip4->ident));
@@ -770,9 +845,18 @@ void handle_ip4(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
 		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
-			if (gso_translate_tcp_4to6(p) == 0)
-				return;
+			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+			if (gtype == VIRTIO_NET_HDR_GSO_TCPV4) {
+				if (gso_translate_tcp_4to6(p) == 0)
+					return;
+			} else if (gtype == VIRTIO_NET_HDR_GSO_UDP_L4) {
+				if (gso_translate_udp_4to6(p) == 0)
+					return;
+			}
 		}
+		/* A rejected or partially emitted GSO aggregate is never a plain packet. */
+		stats_drop(p->data_len);
+		return;
 	}
 
 	if (unlikely(parse_ip4(p) < 0)) {
@@ -952,13 +1036,20 @@ static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,
 	ip4->cksum = 0;
 }
 
-static int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
+int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 {
 	uint16_t *tck;
 	uint16_t cksum;
 
-	/* Do not adjust fragments */
-	if (p->ip6_frag && (p->ip6_frag->offset_flags & ntohs(IP6_F_MASK)))
+	/* Partial checksums cannot be translated safely on any fragment. */
+	uint16_t ip6_frag = p->ip6_frag ? ntohs(p->ip6_frag->offset_flags) : 0;
+	if (p->ip6_frag && (ip6_frag & (IP6_F_MASK | IP6_F_MF)) && p->has_vhdr &&
+	    (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+		log_pkt6(LOG_OPT_DROP, p, "Fragmented packet with NEEDS_CSUM rejected");
+		return ERROR_DROP;
+	}
+	/* Noninitial fragments do not contain the transport checksum field. */
+	if (p->ip6_frag && (ip6_frag & IP6_F_MASK))
 		return ERROR_NONE;
 
 	switch (p->data_proto) {
@@ -978,25 +1069,54 @@ static int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 	/* UDP */
 	case 17:
 		if (p->data_len < 8) {
-			if(!em) log_pkt6(LOG_OPT_DROP,p,"Insufficient UDP Header Length");
+			if (em) return ERROR_NONE;
+			log_pkt6(LOG_OPT_DROP, p, "Insufficient UDP Header Length");
 			return ERROR_DROP;
+		}
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			if (p->vhdr.csum_start != sizeof(struct ip6) + p->header_len || p->vhdr.csum_offset != 6 ||
+			    (uint32_t)p->vhdr.csum_start + p->vhdr.csum_offset + 2 > sizeof(struct ip6) + ntohs(p->ip6->payload_length)) {
+				log_pkt6(LOG_OPT_DROP, p, "Invalid UDP checksum offload metadata");
+				return ERROR_DROP;
+			}
+			uint16_t udp_len = ntohs(*(uint16_t *)(p->data + 4));
+			if (udp_len < 8 || udp_len > p->data_len) {
+				log_pkt6(LOG_OPT_DROP, p, "Invalid UDP header length");
+				return ERROR_DROP;
+			}
+			tck = (uint16_t *)(p->data + 6);
+			if (gcfg.vnet_hdr_sz == 0) {
+				*tck = 0;
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip4_checksum(ip4, p->data_len, IPPROTO_UDP));
+				if (*tck == 0)
+					*tck = 0xffff;
+				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			} else {
+				*tck = htons(gso_calc_udp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+			}
+			return ERROR_NONE;
 		}
 		tck = (uint16_t *)(p->data + 6);
 		if (!*tck) {
-			/* UDP packet has no checksum, how do we deal? */
+			/* UDP packet has no checksum */
+			if (em) {
+				if (gcfg.udp_cksum_mode == UDP_CKSUM_DROP)
+					return ERROR_DROP;
+				return ERROR_NONE;
+			}
 			switch(gcfg.udp_cksum_mode) {
 			default:
 			case UDP_CKSUM_DROP:
-				/* Do not handle zero checksum packets */
-				if(!em) log_pkt6(LOG_OPT_DROP,p,"UDP Zero Checksum");
+				if (!em) log_pkt6(LOG_OPT_DROP, p, "UDP Zero Checksum");
 				return ERROR_DROP;
 			case UDP_CKSUM_FWD:
-				/* Ignore the lack of checksum and forward anyway */
 				return ERROR_NONE;
 			case UDP_CKSUM_CALC:
-				/* Calculate a real UDP checksum, now */
-				*tck = ones_add(ip_checksum(p->data,p->data_len), /* Body */
-								ip4_checksum(ip4,p->data_len,p->data_proto));		/* IP4 psuedo-header */
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip4_checksum(ip4, p->data_len, p->data_proto));
+				if (*tck == 0)
+					*tck = 0xffff;
 				return ERROR_NONE;
 			}
 		}
@@ -1004,21 +1124,48 @@ static int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 	/* TCP */
 	case 6:
 		if (p->data_len < 20) {
-			if(!em) log_pkt6(LOG_OPT_DROP,p,"Insufficient TCP Header Length");
+			if (em) return ERROR_NONE;
+			log_pkt6(LOG_OPT_DROP, p, "Insufficient TCP Header Length");
 			return ERROR_DROP;
 		}
-		tck = (uint16_t *)(p->data + 16);
 		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
-			*tck = htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+			if (p->vhdr.csum_start != sizeof(struct ip6) + p->header_len || p->vhdr.csum_offset != 16 ||
+			    (uint32_t)p->vhdr.csum_start + p->vhdr.csum_offset + 2 > sizeof(struct ip6) + ntohs(p->ip6->payload_length)) {
+				log_pkt6(LOG_OPT_DROP, p, "Invalid TCP checksum offload metadata");
+				return ERROR_DROP;
+			}
+			uint8_t doff = ((p->data[12] >> 4) & 0x0f) * 4;
+			if (doff < 20 || doff > p->data_len) {
+				log_pkt6(LOG_OPT_DROP, p, "Invalid TCP data offset");
+				return ERROR_DROP;
+			}
+			tck = (uint16_t *)(p->data + 16);
+			if (gcfg.vnet_hdr_sz == 0) {
+				*tck = 0;
+				*tck = ones_add(ip_checksum(p->data, p->data_len),
+				                ip4_checksum(ip4, p->data_len, IPPROTO_TCP));
+				if (*tck == 0)
+					*tck = 0xffff;
+				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			} else {
+				*tck = htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+			}
 			return ERROR_NONE;
 		}
+		tck = (uint16_t *)(p->data + 16);
 		break;
 	/* Other */
 	default:
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			log_pkt6(LOG_OPT_DROP, p, "Unsupported protocol for checksum offload");
+			return ERROR_DROP;
+		}
 		return ERROR_NONE;
 	}
-	/* Adjust checksum */
+	/* Adjust checksum (RFC 1624 incremental update) */
 	*tck = ones_add(*tck, convert_cksum(p->ip6, ip4));
+	if (*tck == 0)
+		*tck = 0xffff;
 	return ERROR_NONE;
 }
 
@@ -1077,11 +1224,12 @@ static void xlate_6to4_data(struct pkt *p)
 #ifdef __linux__
 	uint8_t *out = p->data - sizeof(struct ip4);
 	memcpy(out, &header.ip4, sizeof(struct ip4));
-	if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+	if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+			(p->data_proto == IPPROTO_TCP || p->data_proto == IPPROTO_UDP)) {
 		struct virtio_net_hdr_raw out_vhdr = p->vhdr;
 		out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
 		out_vhdr.csum_start = sizeof(struct ip4);
-		out_vhdr.csum_offset = 16;
+		out_vhdr.csum_offset = p->data_proto == IPPROTO_UDP ? 6 : 16;
 		tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip4) + p->data_len);
 	} else {
 		tun_write(p->tun_fd, out, sizeof(struct ip4) + p->data_len);
@@ -1375,9 +1523,18 @@ void handle_ip6(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
 		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
-			if (gso_translate_tcp_6to4(p) == 0)
-				return;
+			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+			if (gtype == VIRTIO_NET_HDR_GSO_TCPV6) {
+				if (gso_translate_tcp_6to4(p) == 0)
+					return;
+			} else if (gtype == VIRTIO_NET_HDR_GSO_UDP_L4) {
+				if (gso_translate_udp_6to4(p) == 0)
+					return;
+			}
 		}
+		/* A rejected or partially emitted GSO aggregate is never a plain packet. */
+		stats_drop(p->data_len);
+		return;
 	}
 
 	if (unlikely(parse_ip6(p,0))) {

@@ -10,7 +10,7 @@
 
 struct gso_worker_stats g_gso_stats = {0};
 
-uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t tcp_len)
+uint16_t gso_calc_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint8_t proto, uint32_t len)
 {
 	uint32_t sum = 0;
 	const uint16_t *p4 = (const uint16_t *)src4;
@@ -19,8 +19,8 @@ uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *
 	p4 = (const uint16_t *)dst4;
 	sum += ntohs(p4[0]);
 	sum += ntohs(p4[1]);
-	sum += IPPROTO_TCP;
-	sum += (tcp_len & 0xffff);
+	sum += proto;
+	sum += (len & 0xffff);
 
 	while (sum >> 16) {
 		sum = (sum & 0xffff) + (sum >> 16);
@@ -28,21 +28,41 @@ uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *
 	return (uint16_t)sum;
 }
 
-uint16_t gso_calc_tcp_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint32_t tcp_len)
+uint16_t gso_calc_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint8_t proto, uint32_t len)
 {
 	uint32_t sum = 0;
 	const uint16_t *p6 = (const uint16_t *)src6;
 	for (int i = 0; i < 8; i++) sum += ntohs(p6[i]);
 	p6 = (const uint16_t *)dst6;
 	for (int i = 0; i < 8; i++) sum += ntohs(p6[i]);
-	sum += (tcp_len >> 16);
-	sum += (tcp_len & 0xffff);
-	sum += IPPROTO_TCP;
+	sum += (len >> 16);
+	sum += (len & 0xffff);
+	sum += proto;
 
 	while (sum >> 16) {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	return (uint16_t)sum;
+}
+
+uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t tcp_len)
+{
+	return gso_calc_pseudo4(src4, dst4, IPPROTO_TCP, tcp_len);
+}
+
+uint16_t gso_calc_tcp_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint32_t tcp_len)
+{
+	return gso_calc_pseudo6(src6, dst6, IPPROTO_TCP, tcp_len);
+}
+
+uint16_t gso_calc_udp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t udp_len)
+{
+	return gso_calc_pseudo4(src4, dst4, IPPROTO_UDP, udp_len);
+}
+
+uint16_t gso_calc_udp_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint32_t udp_len)
+{
+	return gso_calc_pseudo6(src6, dst6, IPPROTO_UDP, udp_len);
 }
 
 /* Update TCP checksum for partially checksummed packet (CHECKSUM_PARTIAL / NEEDS_CSUM seed) */
@@ -142,7 +162,8 @@ int gso_validate_header(const struct pkt *p)
 	if (gso_type == VIRTIO_NET_HDR_GSO_NONE)
 		return 0;
 
-	if (gso_type != VIRTIO_NET_HDR_GSO_TCPV4 && gso_type != VIRTIO_NET_HDR_GSO_TCPV6) {
+	if (gso_type != VIRTIO_NET_HDR_GSO_TCPV4 && gso_type != VIRTIO_NET_HDR_GSO_TCPV6 &&
+	    gso_type != VIRTIO_NET_HDR_GSO_UDP_L4) {
 		stats_gso_invalid();
 		return -1;
 	}
@@ -161,6 +182,48 @@ int gso_validate_header(const struct pkt *p)
 	}
 
 	return 1;
+}
+
+static int gso_validate_ipv4_header(const struct pkt *p, uint8_t proto, uint32_t *header_len)
+{
+	if (p->data_len < sizeof(struct ip4))
+		return -1;
+	const struct ip4 *ip4 = (const struct ip4 *)p->data;
+	if ((ip4->ver_ihl >> 4) != 4 || ip4->proto != proto ||
+	    ip4->length != htons((uint16_t)p->data_len) ||
+	    (ntohs(ip4->flags_offset) & (IP4_F_MASK | IP4_F_MF)))
+		return -1;
+	uint32_t ihl = (ip4->ver_ihl & 0x0f) * 4;
+	if (ihl < sizeof(struct ip4) || ihl > p->data_len || ip_checksum((void *)ip4, ihl) != 0)
+		return -1;
+	for (uint32_t off = sizeof(struct ip4); off < ihl;) {
+		uint8_t kind = p->data[off];
+		if (kind == 0)
+			break;
+		if (kind == 1) {
+			off++;
+			continue;
+		}
+		if (off + 2 > ihl)
+			return -1;
+		uint8_t len = p->data[off + 1];
+		if (len < 2 || off + len > ihl)
+			return -1;
+		if ((kind == 131 || kind == 137) && (len < 3 || p->data[off + 2] <= len))
+			return -1;
+		off += len;
+	}
+	*header_len = ihl;
+	return 0;
+}
+
+static int gso_validate_transport_vnet(const struct pkt *p, uint32_t l3_len,
+				       uint32_t transport_len, uint32_t csum_offset)
+{
+	return (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+	       p->vhdr.csum_start == l3_len && p->vhdr.csum_offset == csum_offset &&
+	       p->vhdr.hdr_len >= l3_len + transport_len &&
+	       p->vhdr.hdr_len <= p->data_len ? 0 : -1;
 }
 
 void gso_dump_stats(void)
@@ -194,12 +257,15 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		return -1;
 
 	struct ip6 *ip6 = (struct ip6 *)p->data;
-	if (ip6->next_header != IPPROTO_TCP)
+	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_TCP ||
+	    ntohs(ip6->payload_length) != p->data_len - sizeof(struct ip6))
 		return -1;
 
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip6));
 	uint32_t tcp_hdr_len = (tcp->doff_res >> 4) * 4;
 	if (tcp_hdr_len < sizeof(struct tcp_hdr) || sizeof(struct ip6) + tcp_hdr_len > p->data_len)
+		return -1;
+	if (gso_validate_transport_vnet(p, sizeof(struct ip6), tcp_hdr_len, 16) < 0)
 		return -1;
 
 	uint32_t payload_len = p->data_len - sizeof(struct ip6) - tcp_hdr_len;
@@ -271,13 +337,17 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		head_ip4->dest = dst4;
 		head_ip4->cksum = ip4_header_checksum(head_ip4);
 
+		size_t head_out_len = sizeof(struct ip4) + head_tcp_len;
 		struct virtio_net_hdr_raw out_vhdr = p->vhdr;
 		out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV4 | (p->vhdr.gso_type & VIRTIO_NET_HDR_GSO_ECN);
 		out_vhdr.hdr_len -= (sizeof(struct ip6) - sizeof(struct ip4));
+		/* hdr_len is a linearization hint. The split head can be shorter than
+		 * the original linear region, so keep the hint within this packet. */
+		if (out_vhdr.hdr_len > head_out_len)
+			out_vhdr.hdr_len = (uint16_t)head_out_len;
 		out_vhdr.csum_start -= (sizeof(struct ip6) - sizeof(struct ip4));
 		out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-		size_t head_out_len = sizeof(struct ip4) + head_tcp_len;
 		ssize_t ret_head = tun_write_vnet(p->tun_fd, &out_vhdr, head_ip4, head_out_len);
 		if (ret_head > 0) {
 			stats_gso_tx(head_out_len);
@@ -379,16 +449,17 @@ int gso_translate_tcp_4to6(struct pkt *p)
 		return -1;
 
 	struct ip4 *ip4 = (struct ip4 *)p->data;
-	if (ip4->proto != IPPROTO_TCP)
+	uint32_t ip4_hdr_len;
+	if (gso_validate_ipv4_header(p, IPPROTO_TCP, &ip4_hdr_len) < 0)
 		return -1;
-
-	uint32_t ip4_hdr_len = (ip4->ver_ihl & 0x0f) * 4;
-	if (ip4_hdr_len < sizeof(struct ip4) || ip4_hdr_len > p->data_len)
+	if (!(p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM))
 		return -1;
 
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(p->data + ip4_hdr_len);
 	uint32_t tcp_hdr_len = (tcp->doff_res >> 4) * 4;
 	if (tcp_hdr_len < sizeof(struct tcp_hdr) || ip4_hdr_len + tcp_hdr_len > p->data_len)
+		return -1;
+	if (gso_validate_transport_vnet(p, ip4_hdr_len, tcp_hdr_len, 16) < 0)
 		return -1;
 
 	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
@@ -405,30 +476,40 @@ int gso_translate_tcp_4to6(struct pkt *p)
 		return 0;
 	}
 
-	/* Map addresses */
+	/* Save fields before removing the IPv4 options area in place. RFC 7915
+	 * ignores IPv4 options during translation; the transport header must
+	 * immediately follow the synthesized 40-byte IPv6 header. */
+	uint8_t tos = ip4->tos;
+	uint8_t ttl = ip4->ttl;
+	struct in_addr src4 = ip4->src, dst4 = ip4->dest;
 	struct in6_addr src6, dst6;
-	if (map_ip4_to_ip6(&src6, &ip4->src) < 0 || map_ip4_to_ip6(&dst6, &ip4->dest) < 0)
+	if (map_ip4_to_ip6(&src6, &src4) < 0 || map_ip4_to_ip6(&dst6, &dst4) < 0)
 		return -1;
 
 	/* Update TCP checksum seed for IPv6 pseudo-header */
 	uint32_t tcp_len = tcp_hdr_len + payload_len;
-	gso_update_csum_seed_4to6(tcp, &ip4->src, &ip4->dest, &src6, &dst6, tcp_len);
+	gso_update_csum_seed_4to6(tcp, &src4, &dst4, &src6, &dst6, tcp_len);
+	if (ip4_hdr_len > sizeof(struct ip4)) {
+		memmove(p->data + sizeof(struct ip4), tcp, tcp_len);
+		tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip4));
+	}
 
 	/* Use headroom before p->data to prepend 20 bytes for IPv6 header */
 	uint8_t *out = p->data - (sizeof(struct ip6) - sizeof(struct ip4));
 	struct ip6 *ip6 = (struct ip6 *)out;
-	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)ip4->tos << 20));
+	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
 	ip6->payload_length = htons((uint16_t)tcp_len);
 	ip6->next_header = IPPROTO_TCP;
-	ip6->hop_limit = ip4->ttl - 1;
+	ip6->hop_limit = ttl - 1;
 	ip6->src = src6;
 	ip6->dest = dst6;
 
 	/* Update VirtIO Net Header for IPv6 TCP GSO */
 	struct virtio_net_hdr_raw out_vhdr = p->vhdr;
 	out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV6 | (p->vhdr.gso_type & VIRTIO_NET_HDR_GSO_ECN);
-	out_vhdr.hdr_len += (sizeof(struct ip6) - sizeof(struct ip4));
-	out_vhdr.csum_start += (sizeof(struct ip6) - sizeof(struct ip4));
+	int header_delta = (int)sizeof(struct ip6) - (int)ip4_hdr_len;
+	out_vhdr.hdr_len = (uint16_t)((int)out_vhdr.hdr_len + header_delta);
+	out_vhdr.csum_start = (uint16_t)((int)out_vhdr.csum_start + header_delta);
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
 	size_t out_len = sizeof(struct ip6) + tcp_len;
@@ -475,7 +556,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
 
 	/* Buffer for individual segment */
-	uint8_t seg_buf[HEADROOM + 2048];
+	uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];
 	uint8_t *seg_ip = seg_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
@@ -485,7 +566,8 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 		uint32_t seg_tcp_total_len = tcp_hdr_len + seg_data_len;
 		uint32_t ip4_total = sizeof(struct ip4) + seg_tcp_total_len;
-		if (ip4_total > sizeof(seg_buf) - HEADROOM) {
+		if (ip4_total > sizeof(struct ip4) + UINT16_MAX ||
+		    ip4_total > sizeof(seg_buf) - HEADROOM) {
 			stats_gso_invalid();
 			return -1;
 		}
@@ -544,6 +626,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 			stats_gso_sw_seg_out(1);
 		} else {
 			stats_gso_tun_write_error();
+			return -1;
 		}
 
 		offset += seg_data_len;
@@ -646,5 +729,390 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 			break;
 	}
 
+	return 0;
+}
+
+int gso_software_segment_and_send_udp_6to4(struct pkt *p)
+{
+	stats_gso_fallback();
+	stats_gso_sw_seg();
+
+	if (p->data_len < sizeof(struct ip6) + sizeof(struct udp_hdr) ||
+	    gso_validate_header(p) <= 0 ||
+	    gso_validate_transport_vnet(p, sizeof(struct ip6), sizeof(struct udp_hdr), 6) < 0)
+		return -1;
+	struct ip6 *ip6 = (struct ip6 *)p->data;
+	uint32_t udp_len = p->data_len - sizeof(struct ip6);
+	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_UDP ||
+	    ntohs(ip6->payload_length) != udp_len ||
+	    udp_len < sizeof(struct udp_hdr))
+		return -1;
+	struct udp_hdr *orig_udp = (struct udp_hdr *)(p->data + sizeof(struct ip6));
+	if (ntohs(orig_udp->length) != udp_len)
+		return -1;
+
+	if (unlikely(ip6->hop_limit <= 1)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_UDP;
+		log_pkt6(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp6_error(3, 0, 0, p);
+		return 0;
+	}
+
+	uint8_t *payload = p->data + sizeof(struct ip6) + sizeof(struct udp_hdr);
+	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0 || gso_size > UINT16_MAX - sizeof(struct udp_hdr))
+		return -1;
+
+	struct in_addr src4, dst4;
+	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0)
+		return -1;
+
+	uint32_t offset = 0;
+	uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];
+	uint8_t *seg_ip = seg_buf + HEADROOM;
+
+	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
+		uint32_t seg_data_len = payload_len - offset;
+		if (seg_data_len > gso_size)
+			seg_data_len = gso_size;
+
+		uint32_t seg_udp_total = sizeof(struct udp_hdr) + seg_data_len;
+		uint32_t ip4_total = sizeof(struct ip4) + seg_udp_total;
+		if (seg_udp_total > UINT16_MAX || ip4_total > sizeof(seg_buf) - HEADROOM) {
+			stats_gso_invalid();
+			return -1;
+		}
+
+		struct ip4 *ip4 = (struct ip4 *)seg_ip;
+		struct udp_hdr *seg_udp = (struct udp_hdr *)(seg_ip + sizeof(struct ip4));
+
+		seg_udp->src_port = orig_udp->src_port;
+		seg_udp->dst_port = orig_udp->dst_port;
+		seg_udp->length = htons((uint16_t)seg_udp_total);
+		seg_udp->cksum = 0;
+
+		if (seg_data_len > 0) {
+			memcpy((uint8_t *)seg_udp + sizeof(struct udp_hdr), payload + offset, seg_data_len);
+		}
+
+		ip4->ver_ihl = 0x45;
+		ip4->tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
+		ip4->length = htons((uint16_t)ip4_total);
+
+		if (ip4_total <= 1260) {
+			ip4->flags_offset = 0;
+			ip4->ident = next_ip4_ident();
+		} else {
+			ip4->flags_offset = htons(IP4_F_DF);
+			ip4->ident = 0;
+		}
+
+		ip4->ttl = ip6->hop_limit - 1;
+		ip4->proto = IPPROTO_UDP;
+		ip4->src = src4;
+		ip4->dest = dst4;
+		ip4->cksum = 0;
+		ip4->cksum = ip4_header_checksum(ip4);
+
+		seg_udp->cksum = ones_add(ip_checksum(seg_udp, seg_udp_total),
+		                          ip4_checksum(ip4, seg_udp_total, IPPROTO_UDP));
+		if (seg_udp->cksum == 0)
+			seg_udp->cksum = 0xffff;
+
+		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip4_total);
+		if (ret > 0) {
+			stats_gso_sw_seg_out(1);
+		} else {
+			stats_gso_tun_write_error();
+			return -1;
+		}
+
+		offset += seg_data_len;
+		if (offset >= payload_len)
+			break;
+	}
+
+	return 0;
+}
+
+int gso_software_segment_and_send_udp_4to6(struct pkt *p)
+{
+	stats_gso_fallback();
+	stats_gso_sw_seg();
+
+	struct ip4 *ip4 = (struct ip4 *)p->data;
+	uint32_t ip4_hdr_len;
+	if (gso_validate_ipv4_header(p, IPPROTO_UDP, &ip4_hdr_len) < 0 ||
+	    p->data_len < ip4_hdr_len + sizeof(struct udp_hdr) ||
+	    gso_validate_transport_vnet(p, ip4_hdr_len, sizeof(struct udp_hdr), 6) < 0)
+		return -1;
+
+	if (unlikely(ip4->ttl <= 1)) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_UDP;
+		log_pkt4(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp4_error(11, 0, 0, p);
+		return 0;
+	}
+
+	uint8_t tos = ip4->tos, ttl = ip4->ttl;
+	struct in_addr src4 = ip4->src, dst4 = ip4->dest;
+	struct udp_hdr *orig_udp = (struct udp_hdr *)(p->data + ip4_hdr_len);
+	uint8_t *payload = (uint8_t *)orig_udp + sizeof(struct udp_hdr);
+	uint32_t udp_len = p->data_len - ip4_hdr_len;
+	if (ntohs(orig_udp->length) != udp_len)
+		return -1;
+	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0 || gso_size > UINT16_MAX - sizeof(struct udp_hdr))
+		return -1;
+
+	struct in6_addr src6, dst6;
+	if (map_ip4_to_ip6(&src6, &src4) < 0 || map_ip4_to_ip6(&dst6, &dst4) < 0)
+		return -1;
+
+	uint32_t offset = 0;
+	uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];
+	uint8_t *seg_ip = seg_buf + HEADROOM;
+
+	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
+		uint32_t seg_data_len = payload_len - offset;
+		if (seg_data_len > gso_size)
+			seg_data_len = gso_size;
+
+		uint32_t seg_udp_total = sizeof(struct udp_hdr) + seg_data_len;
+		uint32_t ip6_total = sizeof(struct ip6) + seg_udp_total;
+		if (ip6_total > sizeof(struct ip6) + UINT16_MAX ||
+		    ip6_total > sizeof(seg_buf) - HEADROOM) {
+			stats_gso_invalid();
+			return -1;
+		}
+
+		struct ip6 *ip6 = (struct ip6 *)seg_ip;
+		struct udp_hdr *seg_udp = (struct udp_hdr *)(seg_ip + sizeof(struct ip6));
+
+		seg_udp->src_port = orig_udp->src_port;
+		seg_udp->dst_port = orig_udp->dst_port;
+		seg_udp->length = htons((uint16_t)seg_udp_total);
+		seg_udp->cksum = 0;
+
+		if (seg_data_len > 0) {
+			memcpy((uint8_t *)seg_udp + sizeof(struct udp_hdr), payload + offset, seg_data_len);
+		}
+
+		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
+		ip6->payload_length = htons((uint16_t)seg_udp_total);
+		ip6->next_header = IPPROTO_UDP;
+		ip6->hop_limit = ttl - 1;
+		ip6->src = src6;
+		ip6->dest = dst6;
+
+		seg_udp->cksum = ones_add(ip_checksum(seg_udp, seg_udp_total),
+		                          ip6_checksum(ip6, seg_udp_total, IPPROTO_UDP));
+		if (seg_udp->cksum == 0)
+			seg_udp->cksum = 0xffff;
+
+		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip6_total);
+		if (ret > 0) {
+			stats_gso_sw_seg_out(1);
+		} else {
+			stats_gso_tun_write_error();
+			return -1;
+		}
+
+		offset += seg_data_len;
+		if (offset >= payload_len)
+			break;
+	}
+
+	return 0;
+}
+
+int gso_translate_udp_6to4(struct pkt *p)
+{
+	if (!p->has_vhdr)
+		return -1;
+	uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+	if (gtype != VIRTIO_NET_HDR_GSO_UDP_L4)
+		return -1;
+
+	stats_gso_rx(p->data_len);
+
+	if (gso_validate_header(p) <= 0)
+		return -1;
+
+	if (p->data_len < sizeof(struct ip6) + sizeof(struct udp_hdr))
+		return -1;
+
+	struct ip6 *ip6 = (struct ip6 *)p->data;
+	uint32_t udp_len = p->data_len - sizeof(struct ip6);
+	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_UDP ||
+	    ntohs(ip6->payload_length) != udp_len || udp_len < sizeof(struct udp_hdr) ||
+	    gso_validate_transport_vnet(p, sizeof(struct ip6), sizeof(struct udp_hdr), 6) < 0)
+		return -1;
+	struct udp_hdr *udp = (struct udp_hdr *)(p->data + sizeof(struct ip6));
+	if (ntohs(udp->length) != udp_len)
+		return -1;
+
+	if (unlikely(ip6->hop_limit <= 1)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_UDP;
+		log_pkt6(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp6_error(3, 0, 0, p);
+		return 0;
+	}
+
+	uint32_t out_ip4_len = sizeof(struct ip4) + udp_len;
+	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
+	uint32_t full_segments = payload_len / p->vhdr.gso_size;
+	uint32_t tail_len = payload_len % p->vhdr.gso_size;
+	uint32_t max_segment_len = sizeof(struct ip4) + sizeof(struct udp_hdr) +
+		(full_segments ? p->vhdr.gso_size : payload_len);
+	uint32_t tail_segment_len = sizeof(struct ip4) + sizeof(struct udp_hdr) + tail_len;
+	int mixed_df = full_segments && tail_len &&
+		((max_segment_len <= 1260) != (tail_segment_len <= 1260));
+
+	if (!gcfg.tun_has_uso || out_ip4_len > 65535 || mixed_df || max_segment_len <= 1260) {
+		return gso_software_segment_and_send_udp_6to4(p);
+	}
+
+	struct in_addr src4, dst4;
+	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0)
+		return -1;
+
+	uint8_t tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
+	uint8_t ttl = ip6->hop_limit - 1;
+
+	uint16_t seed = gso_calc_udp_pseudo4(&src4, &dst4, udp_len);
+	if (seed == 0)
+		seed = 0xffff;
+	udp->cksum = htons(seed);
+
+	/* Zero-copy IPv4 header placement in IPv6 space (40 - 20 = 20) */
+	struct ip4 *ip4 = (struct ip4 *)(p->data + (sizeof(struct ip6) - sizeof(struct ip4)));
+	ip4->ver_ihl = 0x45;
+	ip4->tos = tos;
+	ip4->length = htons((uint16_t)out_ip4_len);
+	if (max_segment_len <= 1260) {
+		ip4->ident = next_ip4_ident();
+		ip4->flags_offset = 0;
+	} else {
+		ip4->ident = 0;
+		ip4->flags_offset = htons(IP4_F_DF);
+	}
+	ip4->ttl = ttl;
+	ip4->proto = IPPROTO_UDP;
+	ip4->src = src4;
+	ip4->dest = dst4;
+	ip4->cksum = 0;
+	ip4->cksum = ip4_header_checksum(ip4);
+
+	struct virtio_net_hdr_raw out_vhdr = p->vhdr;
+	out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4 | (p->vhdr.gso_type & VIRTIO_NET_HDR_GSO_ECN);
+	out_vhdr.hdr_len = sizeof(struct ip4) + sizeof(struct udp_hdr);
+	out_vhdr.csum_start = sizeof(struct ip4);
+	out_vhdr.csum_offset = 6;
+	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+
+	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip4, out_ip4_len);
+	if (ret > 0) {
+		stats_gso_tx(out_ip4_len);
+		return 0;
+	}
+
+	stats_gso_tun_write_error();
+	return 0;
+}
+
+int gso_translate_udp_4to6(struct pkt *p)
+{
+	if (!p->has_vhdr)
+		return -1;
+	uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+	if (gtype != VIRTIO_NET_HDR_GSO_UDP_L4)
+		return -1;
+
+	stats_gso_rx(p->data_len);
+
+	if (gso_validate_header(p) <= 0)
+		return -1;
+
+	if (p->data_len < sizeof(struct ip4) + sizeof(struct udp_hdr))
+		return -1;
+
+	struct ip4 *ip4 = (struct ip4 *)p->data;
+	uint32_t ip4_hdr_len;
+	if (gso_validate_ipv4_header(p, IPPROTO_UDP, &ip4_hdr_len) < 0 ||
+	    p->data_len < ip4_hdr_len + sizeof(struct udp_hdr) ||
+	    gso_validate_transport_vnet(p, ip4_hdr_len, sizeof(struct udp_hdr), 6) < 0)
+		return -1;
+
+	if (unlikely(ip4->ttl <= 1)) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_UDP;
+		log_pkt4(LOG_OPT_ICMP, p, "Time Exceeded");
+		host_send_icmp4_error(11, 0, 0, p);
+		return 0;
+	}
+
+	struct udp_hdr *udp = (struct udp_hdr *)(p->data + ip4_hdr_len);
+	uint32_t udp_len = p->data_len - ip4_hdr_len;
+	if (udp_len > UINT16_MAX || ntohs(udp->length) != udp_len)
+		return -1;
+	/* IPv4 options are discarded during IPv4-to-IPv6 translation. */
+	if (!gcfg.tun_has_uso || ip4_hdr_len != sizeof(struct ip4)) {
+		return gso_software_segment_and_send_udp_4to6(p);
+	}
+
+	struct in6_addr src6, dst6;
+	if (map_ip4_to_ip6(&src6, &ip4->src) < 0 || map_ip4_to_ip6(&dst6, &ip4->dest) < 0)
+		return -1;
+
+	uint8_t tos = ip4->tos;
+	uint8_t hop_limit = ip4->ttl - 1;
+
+	uint16_t seed = gso_calc_udp_pseudo6(&src6, &dst6, udp_len);
+	if (seed == 0)
+		seed = 0xffff;
+	udp->cksum = htons(seed);
+
+	/* Zero-copy IPv6 header placement in headroom (20 bytes before p->data) */
+	struct ip6 *ip6 = (struct ip6 *)(p->data - (sizeof(struct ip6) - sizeof(struct ip4)));
+	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
+	ip6->payload_length = htons((uint16_t)(udp_len <= 65535 ? udp_len : 0));
+	ip6->next_header = IPPROTO_UDP;
+	ip6->hop_limit = hop_limit;
+	ip6->src = src6;
+	ip6->dest = dst6;
+
+	struct virtio_net_hdr_raw out_vhdr = p->vhdr;
+	out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4 | (p->vhdr.gso_type & VIRTIO_NET_HDR_GSO_ECN);
+	out_vhdr.hdr_len = sizeof(struct ip6) + sizeof(struct udp_hdr);
+	out_vhdr.csum_start = sizeof(struct ip6);
+	out_vhdr.csum_offset = 6;
+	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+
+	size_t out_len = sizeof(struct ip6) + udp_len;
+	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip6, out_len);
+	if (ret > 0) {
+		stats_gso_tx(out_len);
+		return 0;
+	}
+
+	stats_gso_tun_write_error();
 	return 0;
 }

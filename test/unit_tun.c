@@ -170,6 +170,15 @@ int main(void)
 	assert(errno == EINTR);
 	printf("PASS: tun_writev exits after strictly 5 EINTR attempts with errno == EINTR\n");
 
+	/* TUN read failures are distinguished from an empty nonblocking queue so
+	 * the daemon's main/worker loops can shut down instead of spinning. */
+	uint8_t tun_read_buf[RECV_BUF_SIZE];
+	gcfg.vnet_hdr_sz = 0;
+	errno = 0;
+	assert(tun_read_packet(tun_read_buf, -1) == TUN_READ_FATAL);
+	assert(errno == EBADF);
+	printf("PASS: tun_read_packet reports a fatal descriptor error\n");
+
 	/* Test 5: Short write returns -1, sets errno = EIO, and does not retry */
 	current_mock_mode = MOCK_SHORT_WRITE;
 	write_call_count = 0;

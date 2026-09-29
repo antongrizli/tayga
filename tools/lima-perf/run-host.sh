@@ -9,6 +9,8 @@ CPUS="${CPUS:-4}"
 MEMORY_GB="${MEMORY_GB:-4}"
 DISK_GB="${DISK_GB:-24}"
 VM_TYPE="${VM_TYPE:-vz}"
+SESSION_STAMP="${SESSION_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
+GIT_REVISION="${GIT_REVISION:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf unknown)}"
 
 if ! command -v limactl >/dev/null 2>&1; then
   echo "limactl is required (install Lima with Homebrew)." >&2
@@ -37,4 +39,20 @@ elif [ "$status" != "Running" ]; then
 fi
 
 echo "Running guest perf workflow"
-limactl shell "$INSTANCE" -- bash "$REPO/tools/lima-perf/run-guest.sh"
+limactl shell "$INSTANCE" -- env \
+  "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
+  "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
+  "CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}" "CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}" \
+  "PROTOCOL=${PROTOCOL:-tcp}" "RATE=${RATE:-0}" \
+  "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
+  "DIRECTIONS=${DIRECTIONS:-download}" "MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}" \
+  "MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}" "TUN_TXQLEN=${TUN_TXQLEN-1000}" \
+  "PERF_MODES=${PERF_MODES:-stat record}" \
+  "DATAGRAM_SIZE=${DATAGRAM_SIZE:-1200}" "BLOCK_SIZE=${BLOCK_SIZE-}" \
+  bash "$REPO/tools/lima-perf/run-guest.sh"
+
+SESSION_DIR="$REPO/perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
+if [ -d "$SESSION_DIR" ]; then
+  printf '%s\n' "$GIT_REVISION" > "$SESSION_DIR/git-revision.txt"
+  git -C "$REPO" diff --binary > "$SESSION_DIR/source.patch" || true
+fi

@@ -765,7 +765,7 @@ int config_init(void)
 	gcfg.wkpf_strict = 1;
 	gcfg.udp_cksum_mode = UDP_CKSUM_DROP;
 	gcfg.workers = -1;
-	gcfg.tun_offload = TUN_OFFLOAD_OFF;
+	gcfg.tun_offload = TUN_OFFLOAD_AUTO;
 	gcfg.vnet_hdr_sz = 0;
 	INIT_LIST_HEAD(&gcfg.tun_ip4_list);
 	INIT_LIST_HEAD(&gcfg.tun_ip6_list);

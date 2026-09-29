@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare benchmark session directories without hiding invalid runs."""
+"""Compare matching workload groups without pooling incompatible runs."""
 from __future__ import annotations
 
 import argparse
@@ -8,44 +8,167 @@ import math
 import statistics
 from pathlib import Path
 
+IDENTITY_KEYS = ("direction", "clients", "expected_clients", "workload_protocol",
+                 "flows_per_client", "rate_per_flow", "duration_seconds",
+                 "warmup_seconds", "datagram_size", "block_size", "offlink_mtu",
+                 "git_revision", "source_tree_sha256", "clat_start_sha256", "kernel",
+                 "tayga_sha256", "perf_mode")
+TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen")
+METRICS = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
+           "system_busy_cores", "system_softirq_cores", "tun_drops",
+           "tun_tx_drop_percent", "udp_loss_percent", "ping_loss_percent",
+           "retransmits", "retransmits_per_gbyte", "ping_avg_ms",
+           "ping_p95_ms", "ping_p99_ms", "elapsed_s")
+OPTIONAL_IDENTITY_KEYS = {"datagram_size", "block_size"}
+
 
 def results(root: Path):
     out = []
-    paths = list(root.glob("download/result.json")) + list(root.glob("*/download/result.json"))
-    for path in sorted(set(paths)):
+    for path in sorted(set(root.rglob("result.json"))):
         try:
             doc = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             out.append({"path": str(path), "valid": False, "error": str(exc)})
             continue
         doc["path"] = str(path)
-        doc["valid"] = True
+        doc["valid"] = bool(doc.get("capture_valid", False) and doc.get("workload_valid", False))
+        if not doc["valid"]:
+            doc["invalid_reason"] = "; ".join(doc.get("degraded_reasons", [])) or "capture/workload validity flag is false or missing"
         out.append(doc)
     return out
 
 
-def median(values):
-    return statistics.median(values) if values else None
+def signature(item):
+    return tuple(item.get(key) for key in IDENTITY_KEYS)
 
 
-def summary(items):
-    numeric = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
-               "tun_drops", "retransmits", "elapsed_s")
-    return {key: {"n": len(values), "median": median(values),
-                  "min": min(values), "max": max(values)}
-            for key in numeric
-            if (values := [float(x[key]) for x in items if x.get("valid") and key in x])}
+def treatment(item):
+    return tuple(item.get(key) for key in TREATMENT_KEYS)
 
 
-def workload_signature(item):
-    return (item.get("direction"), item.get("clients"), item.get("expected_clients"),
-            item.get("workload_protocol"))
+def display(values, keys):
+    return dict(zip(keys, values))
 
 
-def pct_change(old, new):
+def summarize(items):
+    result = {}
+    for key in METRICS:
+        values = []
+        for item in items:
+            value = item.get(key)
+            if not item.get("valid") or value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                values.append(numeric)
+        if values:
+            result[key] = {"n": len(values), "median": statistics.median(values),
+                           "min": min(values), "max": max(values)}
+    return result
+
+
+def percent_change(old, new):
     if old in (None, 0) or new is None:
         return None
     return (new - old) / old * 100.0
+
+
+def compare(base, candidate):
+    base_valid = [item for item in base if item.get("valid")]
+    candidate_valid = [item for item in candidate if item.get("valid")]
+    warnings = []
+    if not base_valid or not candidate_valid:
+        warnings.append("one side has no valid result.json")
+
+    comparable = {}
+    for label, items in (("baseline", base_valid), ("candidate", candidate_valid)):
+        missing = set()
+        comparable_items = []
+        for item in items:
+            problems = []
+            for key in IDENTITY_KEYS:
+                value = item.get(key)
+                if ((value is None and key not in OPTIONAL_IDENTITY_KEYS) or
+                    (isinstance(value, str) and value.strip().lower() in ("", "unknown", "n/a"))):
+                    problems.append(key + (" (unknown)" if value is not None else ""))
+            if item.get("workload_protocol") == "udp" and item.get("datagram_size") is None:
+                problems.append("datagram_size")
+            if problems:
+                missing.update(problems)
+            else:
+                comparable_items.append(item)
+        comparable[label] = comparable_items
+        missing = sorted(missing)
+        if missing:
+            warnings.append(f"{label} has results with incomplete identity; groups skipped: {', '.join(missing)}")
+
+    base_groups = {}
+    candidate_groups = {}
+    for item in comparable["baseline"]:
+        base_groups.setdefault(signature(item), []).append(item)
+    for item in comparable["candidate"]:
+        candidate_groups.setdefault(signature(item), []).append(item)
+
+    comparisons = []
+    for key in sorted(set(base_groups) | set(candidate_groups), key=repr):
+        bitems = base_groups.get(key, [])
+        citems = candidate_groups.get(key, [])
+        label = display(key, IDENTITY_KEYS)
+        if not bitems or not citems:
+            missing_side = "baseline" if not bitems else "candidate"
+            warnings.append(f"workload has no matching {missing_side} group: {label}")
+            continue
+
+        btreatments = {treatment(item) for item in bitems}
+        ctreatments = {treatment(item) for item in citems}
+        missing_treatment = any(
+            any(item.get(field) is None or
+                (isinstance(item.get(field), str) and
+                 item[field].strip().lower() in ("", "unknown", "n/a"))
+                for field in TREATMENT_KEYS)
+            for item in bitems + citems)
+        if missing_treatment:
+            warnings.append(f"workload lacks complete treatment identity; group skipped: {label}")
+            continue
+        if len(btreatments) != 1 or len(ctreatments) != 1:
+            warnings.append(f"workload has mixed treatment settings; group skipped: {label}")
+            continue
+
+        bsummary = summarize(bitems)
+        csummary = summarize(citems)
+        changes = {}
+        for metric in sorted(set(bsummary) & set(csummary)):
+            changes[metric + "_percent"] = percent_change(
+                bsummary[metric]["median"], csummary[metric]["median"])
+        comparisons.append({
+            "workload": label,
+            "baseline_treatment": display(next(iter(btreatments)), TREATMENT_KEYS),
+            "candidate_treatment": display(next(iter(ctreatments)), TREATMENT_KEYS),
+            "baseline_summary": bsummary,
+            "candidate_summary": csummary,
+            "changes_percent": changes,
+        })
+
+    if not comparisons and base_valid and candidate_valid:
+        warnings.append("no matching, comparable workload groups")
+    report = {
+        "baseline": None,
+        "candidate": None,
+        "comparisons": comparisons,
+        # Keep the former top-level fields for a single comparable workload.
+        "baseline_summary": comparisons[0]["baseline_summary"] if len(comparisons) == 1 else None,
+        "candidate_summary": comparisons[0]["candidate_summary"] if len(comparisons) == 1 else None,
+        "changes_percent": comparisons[0]["changes_percent"] if len(comparisons) == 1 else None,
+        "baseline_treatment": comparisons[0]["baseline_treatment"] if len(comparisons) == 1 else None,
+        "candidate_treatment": comparisons[0]["candidate_treatment"] if len(comparisons) == 1 else None,
+        "warnings": warnings,
+        "baseline_invalid": [item for item in base if not item.get("valid")],
+        "candidate_invalid": [item for item in candidate if not item.get("valid")],
+    }
+    return report
 
 
 def main():
@@ -55,45 +178,33 @@ def main():
     parser.add_argument("--json", type=Path, help="write machine-readable comparison")
     parser.add_argument("--markdown", type=Path, help="write Markdown comparison")
     args = parser.parse_args()
-
-    base = results(args.baseline)
-    cand = results(args.candidate)
-    base_valid = [x for x in base if x.get("valid")]
-    cand_valid = [x for x in cand if x.get("valid")]
-    warnings = []
-    if not base_valid or not cand_valid:
-        warnings.append("one side has no readable result.json")
-    signatures = {workload_signature(x) for x in base_valid + cand_valid}
-    if len(signatures) > 1:
-        warnings.append("baseline and candidate workloads are not identical")
-    base_summary = summary(base)
-    cand_summary = summary(cand)
-    changes = {}
-    for key in sorted(set(base_summary) & set(cand_summary)):
-        changes[key + "_percent"] = pct_change(base_summary[key]["median"], cand_summary[key]["median"])
-    report = {
-        "baseline": str(args.baseline), "candidate": str(args.candidate),
-        "baseline_summary": base_summary, "candidate_summary": cand_summary,
-        "changes_percent": changes, "warnings": warnings,
-        "baseline_invalid": [x for x in base if not x.get("valid")],
-        "candidate_invalid": [x for x in cand if not x.get("valid")],
-    }
+    report = compare(results(args.baseline), results(args.candidate))
+    report["baseline"] = str(args.baseline)
+    report["candidate"] = str(args.candidate)
     payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.json:
         args.json.write_text(payload)
-    rows = ["| Metric | Baseline median | Candidate median | Change |"]
-    rows.append("|---|---:|---:|---:|")
-    for key in sorted(set(base_summary) & set(cand_summary)):
-        b = base_summary[key]["median"]
-        c = cand_summary[key]["median"]
-        change = changes.get(key + "_percent")
-        rendered_change = "n/a" if change is None or not math.isfinite(change) else f"{change:.3f}%"
-        rows.append(f"| {key} | {b:.6g} | {c:.6g} | {rendered_change} |")
-    markdown = "\n".join(["# Perf session comparison", "", *rows, "", "Warnings: " + ("; ".join(warnings) if warnings else "none"), ""])
+
+    rows = ["# Perf session comparison", ""]
+    for index, group in enumerate(report["comparisons"], start=1):
+        rows.extend([f"## Workload {index}", "", "```json",
+                     json.dumps(group["workload"], indent=2, sort_keys=True), "```", "",
+                     "| Metric | Baseline median | Candidate median | Change |",
+                     "|---|---:|---:|---:|"])
+        for metric in sorted(set(group["baseline_summary"]) & set(group["candidate_summary"])):
+            b = group["baseline_summary"][metric]["median"]
+            c = group["candidate_summary"][metric]["median"]
+            change = group["changes_percent"].get(metric + "_percent")
+            rendered = "n/a" if change is None or not math.isfinite(change) else f"{change:.3f}%"
+            rows.append(f"| {metric} | {b:.6g} | {c:.6g} | {rendered} |")
+        rows.extend(["", f"Baseline treatment: `{group['baseline_treatment']}`  ",
+                     f"Candidate treatment: `{group['candidate_treatment']}`", ""])
+    rows.append("Warnings: " + ("; ".join(report["warnings"]) if report["warnings"] else "none"))
+    markdown = "\n".join(rows) + "\n"
     if args.markdown:
         args.markdown.write_text(markdown)
     print(payload, end="")
-    return 2 if warnings else 0
+    return 2 if report["warnings"] else 0
 
 
 if __name__ == "__main__":

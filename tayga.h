@@ -423,6 +423,7 @@ struct config {
 	//Offload parameters
 	enum tun_offload_mode tun_offload;
 	int vnet_hdr_sz;
+	int tun_has_uso;
 };
 
 /// Logging flags
@@ -507,6 +508,8 @@ void dynamic_get_stats(const struct dynamic_pool *pool, uint32_t *mapped, uint32
 /* nat64.c */
 void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
+int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em);
+int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em);
 void log_pkt4(int err, struct pkt *p, const char *msg);
 void log_pkt6(int err, struct pkt *p, const char *msg);
 void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
@@ -530,11 +533,19 @@ int journal_printv_with_location(
         int priority, const char *file, const char *line, const char *func,
         const char *format, va_list ap);
 
+#define TUN_READ_CONSUMED    0
+#define TUN_READ_WOULDBLOCK  1
+#define TUN_READ_INTR        2
+#define TUN_READ_FATAL      -1
+
+#define WORKER_BURST_BUDGET 32
+
 /* tun.c */
 int tun_setup(int do_mktun, int do_rmtun);
 int tun_check_offload_support(void);
 int set_nonblock(int fd);
-void tun_read(uint8_t * recv_buf,int tun_fd);
+int tun_read_packet(uint8_t * recv_buf, int tun_fd);
+void tun_read(uint8_t * recv_buf, int tun_fd);
 ssize_t tun_write(int tun_fd, const void *buf, size_t len);
 ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const void *buf, size_t len);
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);

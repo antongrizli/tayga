@@ -24,6 +24,7 @@ unit_tun
 unit_gso
 unit_pref64
 unit_stats
+unit_udp_checksum
 pref64-discover
 tayga.map
 perf-sessions

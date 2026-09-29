@@ -20,6 +20,7 @@
 #if defined(__linux__)
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+static unsigned int active_tun_offload_flags = 0;
 #endif
 
 
@@ -318,6 +319,21 @@ int netlink_route_dev_modify(int ifidx,
 	return netlink_wait_for_ack(fd);
 }
 
+/* TUNSETOFFLOAD is device-wide. Keep the negotiated packet framing when
+ * falling back, including on an existing persistent interface. */
+static int tun_disable_offload(void)
+{
+	if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, 0) < 0) {
+		slog(LOG_CRIT, "Unable to disable TUN offload safely: %s\n", strerror(errno));
+		return ERROR_REJECT;
+	}
+	gcfg.tun_offload = TUN_OFFLOAD_OFF;
+	gcfg.tun_has_uso = 0;
+	active_tun_offload_flags = 0;
+	slog(LOG_WARNING, "TUN fallback to offload=off (retaining negotiated vnet framing)\n");
+	return 0;
+}
+
 int tun_setup(int do_mktun, int do_rmtun)
 {
 	struct ifreq ifr;
@@ -338,7 +354,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	strcpy(ifr.ifr_name, gcfg.tundev);
 	if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 		if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
-			slog(LOG_WARNING, "Unable to attach tun with IFF_VNET_HDR (%s), falling back to offload=off\n",
+			slog(LOG_WARNING, "Unable to attach tun with IFF_VNET_HDR (%s), fallback to offload=off\n",
 				strerror(errno));
 			gcfg.tun_offload = TUN_OFFLOAD_OFF;
 			gcfg.vnet_hdr_sz = 0;
@@ -363,34 +379,28 @@ int tun_setup(int do_mktun, int do_rmtun)
 		}
 		gcfg.vnet_hdr_sz = sz;
 
+		if (sz != offsetof(struct virtio_net_hdr_raw, num_buffers) &&
+		    sz != sizeof(struct virtio_net_hdr_raw)) {
+			slog(LOG_CRIT, "Unsupported TUN vnet header size %d (expected 10 or 12)\n", sz);
+			return ERROR_REJECT;
+		}
+		/* UDP USO remains disabled until real TUN/kernel tests cover segment metadata. */
 		unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-		if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, offload_flags) < 0) {
-			if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
-				slog(LOG_WARNING, "TUNSETOFFLOAD failed (%s), re-opening clean tun without offload\n", strerror(errno));
-				close(gcfg.tun_fd);
-				gcfg.tun_fd = open("/dev/net/tun", O_RDWR);
-				if (gcfg.tun_fd < 0) {
-					slog(LOG_CRIT, "Unable to re-open /dev/net/tun: %s\n", strerror(errno));
-					return ERROR_REJECT;
-				}
-				memset(&ifr, 0, sizeof(ifr));
-				ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
-				strcpy(ifr.ifr_name, gcfg.tundev);
-				if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
-					slog(LOG_CRIT, "Unable to re-attach tun without offload: %s\n", strerror(errno));
-					return ERROR_REJECT;
-				}
-				gcfg.tun_offload = TUN_OFFLOAD_OFF;
-				gcfg.vnet_hdr_sz = 0;
-			} else {
-				slog(LOG_CRIT, "TUNSETOFFLOAD failed: %s, aborting\n", strerror(errno));
+		if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, offload_flags) == 0) {
+			gcfg.tun_has_uso = 0;
+			active_tun_offload_flags = offload_flags;
+		} else if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
+			slog(LOG_WARNING, "TUNSETOFFLOAD unavailable: %s\n", strerror(errno));
+			if (tun_disable_offload() < 0)
 				return ERROR_REJECT;
-			}
 		} else {
-			slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM\n", gcfg.vnet_hdr_sz);
+			slog(LOG_CRIT, "TUNSETOFFLOAD failed: %s, aborting\n", strerror(errno));
+			return ERROR_REJECT;
 		}
 	} else {
 		gcfg.vnet_hdr_sz = 0;
+		gcfg.tun_has_uso = 0;
+		active_tun_offload_flags = 0;
 	}
 
 	if (do_mktun) {
@@ -530,22 +540,33 @@ int tun_setup(int do_mktun, int do_rmtun)
 					"%s\n", gcfg.tundev, strerror(errno));
 			exit(1);
 		}
-		if (gcfg.vnet_hdr_sz > 0) {
-			unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-			ioctl(gcfg.tun_fd_addl[i], TUNSETOFFLOAD, offload_flags);
+		if (gcfg.vnet_hdr_sz > 0 && active_tun_offload_flags > 0) {
+			if (ioctl(gcfg.tun_fd_addl[i], TUNSETOFFLOAD, active_tun_offload_flags) < 0) {
+				slog(LOG_WARNING, "TUNSETOFFLOAD failed on worker queue %d: %s\n",
+					i, strerror(errno));
+				if (gcfg.tun_offload != TUN_OFFLOAD_AUTO || tun_disable_offload() < 0)
+					return ERROR_REJECT;
+			}
 		}
-		set_nonblock(gcfg.tun_fd_addl[i]);
+		if (set_nonblock(gcfg.tun_fd_addl[i]) < 0) {
+			slog(LOG_CRIT, "Unable to make worker TUN queue %d nonblocking\n", i);
+			return ERROR_REJECT;
+		}
 	}
 
 	/* Disable queue of main tun if we have >0 workers */
 	if(gcfg.workers > 0) {
 		memset(&ifr, 0, sizeof(ifr));
 		ifr.ifr_flags = IFF_DETACH_QUEUE;
-		if(ioctl(gcfg.tun_fd, TUNSETQUEUE, (void *)&ifr)) slog(LOG_CRIT,"Unable to detach main queue\n");
+		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, (void *)&ifr) < 0) {
+			slog(LOG_CRIT, "Unable to detach main TUN queue: %s\n", strerror(errno));
+			return ERROR_REJECT;
+		}
 	}
 
-	//No error on setup
-    return 0;
+	if (active_tun_offload_flags)
+		slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM (UDP USO disabled)\n", gcfg.vnet_hdr_sz);
+	return 0;
 }
 #endif /* ifdef __linux__ */
 
@@ -555,6 +576,13 @@ int tun_setup(int do_mktun, int do_rmtun)
 	struct ifreq ifr;
 	int fd, do_rename = 0, multi_af;
 	char devname[64];
+
+	if (gcfg.tun_offload == TUN_OFFLOAD_TCP) {
+		slog(LOG_CRIT, "TCP TUN offload requires Linux\n");
+		return ERROR_REJECT;
+	}
+	gcfg.tun_offload = TUN_OFFLOAD_OFF;
+	gcfg.vnet_hdr_sz = 0;
 
 	if (strncmp(gcfg.tundev, "tun", 3))
 		do_rename = 1;
@@ -800,7 +828,7 @@ ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const
 }
 
 
-void tun_read(uint8_t * recv_buf,int tun_fd)
+int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 {
 	int ret;
 	struct pkt pbuf, *p = &pbuf;
@@ -814,13 +842,15 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 
 	ret = read(tun_fd, read_ptr, read_len);
 	if (unlikely(ret < 0)) {
-		if (errno == EAGAIN)
-			return;
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return TUN_READ_WOULDBLOCK;
+		if (errno == EINTR)
+			return TUN_READ_INTR;
 		stats_error();
 		stats_packet_done();
 		slog(LOG_ERR, "received error when reading from tun "
 				"device: %s\n", strerror(errno));
-		return;
+		return TUN_READ_FATAL;
 	}
 
 	if (gcfg.vnet_hdr_sz > 0) {
@@ -828,7 +858,7 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			stats_packet_done();
 			slog(LOG_WARNING, "short read with vnet header (%d bytes)\n", ret);
-			return;
+			return TUN_READ_CONSUMED;
 		}
 		*p = (struct pkt){
 			.tun_fd = tun_fd,
@@ -848,13 +878,13 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			stats_packet_done();
 			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
-			return;
+			return TUN_READ_CONSUMED;
 		}
 		if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
 			stats_drop((uint32_t)ret);
 			stats_packet_done();
 			slog(LOG_WARNING, "dropping oversized packet\n");
-			return;
+			return TUN_READ_CONSUMED;
 		}
 		*p = (struct pkt){
 			.tun_fd = tun_fd,
@@ -891,7 +921,7 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 		if ((size_t)ret < sizeof(struct tun_pi)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
-			return;
+			return TUN_READ_CONSUMED;
 		}
 		p->data = recv_buf + HEADROOM + sizeof(struct tun_pi);
 		p->data_len = ret - sizeof(struct tun_pi);
@@ -913,4 +943,10 @@ void tun_read(uint8_t * recv_buf,int tun_fd)
 	}
 #endif
 	stats_packet_done();
+	return TUN_READ_CONSUMED;
+}
+
+void tun_read(uint8_t * recv_buf, int tun_fd)
+{
+	(void)tun_read_packet(recv_buf, tun_fd);
 }

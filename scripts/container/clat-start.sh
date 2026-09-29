@@ -159,20 +159,9 @@ echo " TAYGA Addresses   : v4=$V4_TAYGA, v6=$V6_TAYGA"
 echo " Host Addresses    : v4=$V4_HOST, v6=$V6_HOST"
 echo "============================================================"
 
-# Proactively probe kernel TUN offload and GSO capability before launch
-if [ "$TAYGA_OFFLOAD_VAL" != "off" ]; then
-  echo "==> Probing kernel TUN offload / GSO support..."
-  if /usr/sbin/tayga --check-offload; then
-    echo "==> Kernel TUN offload check: PASSED (IFF_VNET_HDR + TSO + CSUM supported)"
-  else
-    if [ "$TAYGA_OFFLOAD_VAL" = "auto" ]; then
-      echo "WARNING: Kernel TUN offload probe failed; auto-fallback to offload=off" >&2
-      TAYGA_OFFLOAD_VAL="off"
-    else
-      echo "WARNING: Kernel TUN offload probe failed; proceeding with requested offload=$TAYGA_OFFLOAD_VAL" >&2
-    fi
-  fi
-fi
+# Preserve the requested mode. TAYGA negotiates capabilities on the actual
+# device and all worker queues; a separate probe cannot decide that outcome.
+echo "==> TAYGA will negotiate TUN offload at startup (requested: $TAYGA_OFFLOAD_VAL)"
 
 # Configure GRO on uplink interface if requested and ethtool is present
 if [ "$TAYGA_OFFLOAD_VAL" != "off" ] && command -v ethtool >/dev/null 2>&1; then

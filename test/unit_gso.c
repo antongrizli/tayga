@@ -79,8 +79,8 @@ static void test_gso_validate(void)
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
 	assert(gso_validate_header(&p) == 0);
 
-	/* Case 3: Unsupported GSO type (e.g. UDP) */
-	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP;
+	/* Case 3: Unsupported GSO type */
+	p.vhdr.gso_type = 0x7f;
 	p.vhdr.gso_size = 1400;
 	p.vhdr.hdr_len = 54;
 	p.data_len = 2000;
@@ -109,10 +109,21 @@ static void test_gso_validate(void)
 	p.vhdr.csum_offset = 16;
 	assert(gso_validate_header(&p) == 1);
 
+	/* UFO is IP fragmentation, not UDP_L4 datagram segmentation. */
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP;
+	assert(gso_validate_header(&p) == -1);
+
 	/* Case 8: Valid TCPv6 GSO with ECN */
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV6 | VIRTIO_NET_HDR_GSO_ECN;
 	p.vhdr.csum_start = 40;
 	p.vhdr.csum_offset = 16;
+	assert(gso_validate_header(&p) == 1);
+
+	/* Case 9: Valid UDP USO GSO */
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4;
+	p.vhdr.hdr_len = 48;
+	p.vhdr.csum_start = 40;
+	p.vhdr.csum_offset = 6;
 	assert(gso_validate_header(&p) == 1);
 
 	printf("PASS: gso_validate_header()\n");
@@ -290,7 +301,9 @@ static void test_gso_translate_and_split(void)
 	p.has_vhdr = 1;
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV6;
 	p.vhdr.gso_size = 1400;
-	p.vhdr.hdr_len = sizeof(struct ip6) + sizeof(struct tcp_hdr);
+	/* Linux hdr_len may cover the entire original linear aggregate. The short
+	 * tail split must clamp the outgoing head hint to the shorter head packet. */
+	p.vhdr.hdr_len = p.data_len;
 	p.vhdr.csum_start = sizeof(struct ip6);
 	p.vhdr.csum_offset = 16;
 	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
@@ -312,7 +325,8 @@ static void test_gso_translate_and_split(void)
 	struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf;
 	assert(v1->gso_type == VIRTIO_NET_HDR_GSO_TCPV4);
 	assert(v1->gso_size == 1400);
-	assert(v1->hdr_len == sizeof(struct ip4) + sizeof(struct tcp_hdr));
+	assert(v1->hdr_len == sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
+	assert(v1->hdr_len <= n1 - 10);
 	assert(v1->csum_start == sizeof(struct ip4));
 	assert(v1->csum_offset == 16);
 	assert(v1->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM);
@@ -565,6 +579,89 @@ static void test_gso_tcp_options(void)
 	close(sv[0]);
 	close(sv[1]);
 	printf("PASS: TCP options preservation\n");
+}
+
+static void test_gso_ipv4_options(void)
+{
+	printf("Testing IPv4 options are stripped before TCP GSO translation...\n");
+	setup_test_mapping();
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	uint8_t pkt_buf[HEADROOM + 24 + sizeof(struct tcp_hdr) + 64] = {0};
+	uint8_t *raw = pkt_buf + HEADROOM;
+	struct ip4 *ip4 = (struct ip4 *)raw;
+	struct tcp_hdr *tcp = (struct tcp_hdr *)(raw + 24);
+	ip4->ver_ihl = 0x46;
+	ip4->length = htons(24 + sizeof(*tcp) + 64);
+	ip4->ttl = 64;
+	ip4->proto = IPPROTO_TCP;
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "198.51.100.2", &ip4->dest);
+	memset(raw + 20, 1, 4); /* Four NOP options; RFC 7915 ignores them. */
+	tcp->src_port = htons(12345);
+	tcp->dst_port = htons(443);
+	tcp->seq = htonl(1234);
+	tcp->doff_res = 5 << 4;
+	tcp->flags = TCP_FLAG_ACK;
+	memset((uint8_t *)tcp + sizeof(*tcp), 0x5a, 64);
+	uint8_t expected_payload[64];
+	memcpy(expected_payload, (uint8_t *)tcp + sizeof(*tcp), sizeof(expected_payload));
+	ip4->cksum = ip_checksum(ip4, 24);
+	struct pkt p = {.tun_fd = sv[0], .data = raw,
+		.data_len = 24 + sizeof(*tcp) + 64, .has_vhdr = 1};
+	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+	p.vhdr.gso_size = 1000;
+	p.vhdr.hdr_len = 24 + sizeof(*tcp) + 16;
+	p.vhdr.csum_start = 24;
+	p.vhdr.csum_offset = 16;
+	assert(gso_translate_tcp_4to6(&p) == 0);
+	uint8_t rx[256];
+	ssize_t n = recv(sv[1], rx, sizeof(rx), 0);
+	assert(n == 10 + sizeof(struct ip6) + sizeof(*tcp) + 64);
+	struct virtio_net_hdr_raw *vh = (void *)rx;
+	assert(vh->hdr_len == sizeof(struct ip6) + sizeof(*tcp) + 16);
+	assert(vh->csum_start == sizeof(struct ip6));
+	struct ip6 *ip6 = (void *)(rx + 10);
+	assert(ip6->next_header == IPPROTO_TCP);
+	struct tcp_hdr *out_tcp = (void *)((uint8_t *)ip6 + sizeof(*ip6));
+	assert(out_tcp->src_port == htons(12345));
+	assert(out_tcp->dst_port == htons(443));
+	assert(ntohs(out_tcp->cksum) == gso_calc_tcp_pseudo6(
+		&ip6->src, &ip6->dest, sizeof(*tcp) + 64));
+	assert(memcmp((uint8_t *)out_tcp + sizeof(*tcp), expected_payload, sizeof(expected_payload)) == 0);
+
+	/* An unexpired LSRR option must not be translated. */
+	uint8_t source_route_buf[HEADROOM + 28 + sizeof(*tcp) + 8] = {0};
+	raw = source_route_buf + HEADROOM;
+	ip4 = (struct ip4 *)raw;
+	tcp = (struct tcp_hdr *)(raw + 28);
+	ip4->ver_ihl = 0x47;
+	ip4->length = htons(28 + sizeof(*tcp) + 8);
+	ip4->ttl = 64;
+	ip4->proto = IPPROTO_TCP;
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "198.51.100.2", &ip4->dest);
+	raw[20] = 131; raw[21] = 7; raw[22] = 4;
+	ip4->cksum = ip_checksum(ip4, 28);
+	p = (struct pkt){.tun_fd = sv[0], .data = raw,
+		.data_len = 28 + sizeof(*tcp) + 8, .has_vhdr = 1};
+	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+	p.vhdr.gso_size = 1000;
+	p.vhdr.hdr_len = 28 + sizeof(*tcp);
+	p.vhdr.csum_start = 28;
+	p.vhdr.csum_offset = 16;
+	assert(gso_translate_tcp_4to6(&p) < 0);
+	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	/* Reject an IHL larger than the packet before reading its checksum. */
+	ip4->ver_ihl = 0x4f;
+	p.data_len = sizeof(struct ip4) + sizeof(*tcp);
+	ip4->length = htons((uint16_t)p.data_len);
+	assert(gso_translate_tcp_4to6(&p) < 0);
+	close(sv[0]);
+	close(sv[1]);
+	printf("PASS: IPv4 option compaction and source-route rejection\n");
 }
 
 static void test_gso_ecn_cwr(void)
@@ -1126,6 +1223,354 @@ static void test_gso_mock_write_error(void)
 	printf("PASS: mock write failure error handling and double-parse prevention\n");
 }
 
+static void test_gso_udp_uso(void)
+{
+	printf("Testing UDP Generic Segmentation Offload (USO) and fallback...\n");
+	setup_test_mapping();
+
+	/* 1. Fast-path 6to4 USO translation */
+	{
+		int sv[2];
+		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		gcfg.tun_has_uso = 1;
+
+		uint8_t pkt_buf[HEADROOM + 8192];
+		uint8_t *pkt_data = pkt_buf + HEADROOM;
+		struct ip6 *ip6 = (struct ip6 *)pkt_data;
+		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip6));
+		uint8_t *payload = pkt_data + sizeof(struct ip6) + sizeof(struct udp_hdr);
+		uint32_t payload_len = 4400;
+
+		memset(ip6, 0, sizeof(*ip6));
+		ip6->ver_tc_fl = htonl(0x60000000);
+		ip6->payload_length = htons(sizeof(struct udp_hdr) + payload_len);
+		ip6->next_header = IPPROTO_UDP;
+		ip6->hop_limit = 64;
+		inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->src);
+		inet_pton(AF_INET6, "64:ff9b::192.0.2.1", &ip6->dest);
+
+		udp->src_port = htons(12345);
+		udp->dst_port = htons(8080);
+		udp->length = htons(sizeof(struct udp_hdr) + payload_len);
+		udp->cksum = 0;
+		for (uint32_t i = 0; i < payload_len; i++) payload[i] = (uint8_t)(i & 0xff);
+
+		struct pkt p = {
+			.tun_fd = sv[0],
+			.data = pkt_data,
+			.data_len = sizeof(struct ip6) + sizeof(struct udp_hdr) + payload_len,
+			.header_len = 0,
+			.has_vhdr = 1,
+			.vhdr = {
+				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4,
+				.hdr_len = sizeof(struct ip6) + sizeof(struct udp_hdr),
+				.gso_size = 2200,
+				.csum_start = sizeof(struct ip6),
+				.csum_offset = 6,
+			},
+		};
+
+		assert(gso_translate_udp_6to4(&p) == 0);
+
+		uint8_t rx_buf[HEADROOM + 8192];
+		ssize_t nr = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len));
+
+		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
+		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4);
+		assert(vh->gso_size == 2200);
+		assert(vh->csum_start == sizeof(struct ip4));
+		assert(vh->csum_offset == 6);
+
+		struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + gcfg.vnet_hdr_sz);
+		assert(rx_ip4->proto == IPPROTO_UDP);
+		assert(rx_ip4->ttl == 63);
+		assert(ntohs(rx_ip4->length) == sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len);
+
+		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf + gcfg.vnet_hdr_sz + sizeof(struct ip4));
+		assert(rx_udp->src_port == htons(12345));
+		assert(rx_udp->dst_port == htons(8080));
+
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	/* 2. Fast-path 4to6 USO translation */
+	{
+		int sv[2];
+		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		gcfg.tun_has_uso = 1;
+
+		uint8_t pkt_buf[HEADROOM + 8192];
+		uint8_t *pkt_data = pkt_buf + HEADROOM;
+		struct ip4 *ip4 = (struct ip4 *)pkt_data;
+		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip4));
+		uint8_t *payload = pkt_data + sizeof(struct ip4) + sizeof(struct udp_hdr);
+		uint32_t payload_len = 2400;
+
+		memset(ip4, 0, sizeof(*ip4));
+		ip4->ver_ihl = 0x45;
+		ip4->length = htons(sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len);
+		ip4->ttl = 64;
+		ip4->proto = IPPROTO_UDP;
+		inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+		inet_pton(AF_INET, "192.0.2.1", &ip4->dest);
+		ip4->cksum = ip4_header_checksum(ip4);
+
+		udp->src_port = htons(12345);
+		udp->dst_port = htons(8080);
+		udp->length = htons(sizeof(struct udp_hdr) + payload_len);
+		udp->cksum = 0;
+		for (uint32_t i = 0; i < payload_len; i++) payload[i] = (uint8_t)(i & 0xff);
+
+		struct pkt p = {
+			.tun_fd = sv[0],
+			.data = pkt_data,
+			.data_len = sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len,
+			.header_len = 0,
+			.has_vhdr = 1,
+			.vhdr = {
+				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4,
+				.hdr_len = sizeof(struct ip4) + sizeof(struct udp_hdr),
+				.gso_size = 1200,
+				.csum_start = sizeof(struct ip4),
+				.csum_offset = 6,
+			},
+		};
+
+		assert(gso_translate_udp_4to6(&p) == 0);
+
+		uint8_t rx_buf[HEADROOM + 8192];
+		ssize_t nr = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + sizeof(struct udp_hdr) + payload_len));
+
+		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
+		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4);
+		assert(vh->gso_size == 1200);
+		assert(vh->csum_start == sizeof(struct ip6));
+		assert(vh->csum_offset == 6);
+
+		struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + gcfg.vnet_hdr_sz);
+		assert(rx_ip6->next_header == IPPROTO_UDP);
+		assert(rx_ip6->hop_limit == 63);
+
+		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf + gcfg.vnet_hdr_sz + sizeof(struct ip6));
+		assert(rx_udp->src_port == htons(12345));
+		assert(rx_udp->dst_port == htons(8080));
+
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	/* 3. Fallback software segmentation 6to4 (tun_has_uso = 0) */
+	{
+		int sv[2];
+		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		gcfg.tun_has_uso = 0;
+
+		uint8_t pkt_buf[HEADROOM + 8192];
+		uint8_t *pkt_data = pkt_buf + HEADROOM;
+		struct ip6 *ip6 = (struct ip6 *)pkt_data;
+		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip6));
+		uint8_t *payload = pkt_data + sizeof(struct ip6) + sizeof(struct udp_hdr);
+		uint32_t payload_len = 6100; // exercise segments larger than the former 2048-byte buffer
+
+		memset(ip6, 0, sizeof(*ip6));
+		ip6->ver_tc_fl = htonl(0x60000000);
+		ip6->payload_length = htons(sizeof(struct udp_hdr) + payload_len);
+		ip6->next_header = IPPROTO_UDP;
+		ip6->hop_limit = 64;
+		inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->src);
+		inet_pton(AF_INET6, "64:ff9b::192.0.2.1", &ip6->dest);
+
+		udp->src_port = htons(12345);
+		udp->dst_port = htons(8080);
+		udp->length = htons(sizeof(struct udp_hdr) + payload_len);
+		udp->cksum = 0;
+		for (uint32_t i = 0; i < payload_len; i++) payload[i] = (uint8_t)(i & 0xff);
+
+		struct pkt p = {
+			.tun_fd = sv[0],
+			.data = pkt_data,
+			.data_len = sizeof(struct ip6) + sizeof(struct udp_hdr) + payload_len,
+			.header_len = 0,
+			.has_vhdr = 1,
+			.vhdr = {
+				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4,
+				.hdr_len = sizeof(struct ip6) + sizeof(struct udp_hdr),
+				.gso_size = 3000,
+				.csum_start = sizeof(struct ip6),
+				.csum_offset = 6,
+			},
+		};
+
+		assert(gso_translate_udp_6to4(&p) == 0);
+
+		/* Segment 1: 3000 payload */
+		uint8_t rx1[4096];
+		ssize_t n1 = recv(sv[1], rx1, sizeof(rx1), 0);
+		assert(n1 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
+		uint8_t *seg1 = rx1 + gcfg.vnet_hdr_sz;
+		struct ip4 *ip4_1 = (struct ip4 *)seg1;
+		struct udp_hdr *udp_1 = (struct udp_hdr *)(seg1 + sizeof(struct ip4));
+		assert(ntohs(udp_1->length) == sizeof(struct udp_hdr) + 3000);
+		assert(ones_add(ip_checksum(udp_1, ntohs(udp_1->length)),
+		                ip4_checksum(ip4_1, ntohs(udp_1->length), IPPROTO_UDP)) == 0);
+
+		/* Segment 2: 3000 payload */
+		uint8_t rx2[4096];
+		ssize_t n2 = recv(sv[1], rx2, sizeof(rx2), 0);
+		assert(n2 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
+		uint8_t *seg2 = rx2 + gcfg.vnet_hdr_sz;
+		struct ip4 *ip4_2 = (struct ip4 *)seg2;
+		struct udp_hdr *udp_2 = (struct udp_hdr *)(seg2 + sizeof(struct ip4));
+		assert(ntohs(udp_2->length) == sizeof(struct udp_hdr) + 3000);
+		assert(ones_add(ip_checksum(udp_2, ntohs(udp_2->length)),
+		                ip4_checksum(ip4_2, ntohs(udp_2->length), IPPROTO_UDP)) == 0);
+
+		/* Segment 3: 100 payload */
+		uint8_t rx3[4096];
+		ssize_t n3 = recv(sv[1], rx3, sizeof(rx3), 0);
+		assert(n3 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 100));
+		uint8_t *seg3 = rx3 + gcfg.vnet_hdr_sz;
+		struct ip4 *ip4_3 = (struct ip4 *)seg3;
+		struct udp_hdr *udp_3 = (struct udp_hdr *)(seg3 + sizeof(struct ip4));
+		assert(ntohs(udp_3->length) == sizeof(struct udp_hdr) + 100);
+		assert(ones_add(ip_checksum(udp_3, ntohs(udp_3->length)),
+		                ip4_checksum(ip4_3, ntohs(udp_3->length), IPPROTO_UDP)) == 0);
+
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	/* 4. Fallback software segmentation 4to6 with segments larger than 2048 */
+	{
+		int sv[2];
+		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		gcfg.tun_has_uso = 0;
+
+		uint8_t pkt_buf[HEADROOM + 8192];
+		uint8_t *pkt_data = pkt_buf + HEADROOM;
+		struct ip4 *ip4 = (struct ip4 *)pkt_data;
+		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip4));
+		uint8_t *payload = (uint8_t *)udp + sizeof(struct udp_hdr);
+		uint32_t payload_len = 6100;
+
+		memset(ip4, 0, sizeof(*ip4));
+		ip4->ver_ihl = 0x45;
+		ip4->length = htons(sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len);
+		ip4->ttl = 64;
+		ip4->proto = IPPROTO_UDP;
+		inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+		inet_pton(AF_INET, "192.0.2.1", &ip4->dest);
+		ip4->cksum = ip4_header_checksum(ip4);
+		udp->src_port = htons(12345);
+		udp->dst_port = htons(8080);
+		udp->length = htons(sizeof(struct udp_hdr) + payload_len);
+		for (uint32_t i = 0; i < payload_len; i++) payload[i] = (uint8_t)(i & 0xff);
+
+		struct pkt p = {
+			.tun_fd = sv[0], .data = pkt_data,
+			.data_len = sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len,
+			.has_vhdr = 1,
+			.vhdr = {
+				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4,
+				.hdr_len = sizeof(struct ip4) + sizeof(struct udp_hdr),
+				.gso_size = 3000,
+				.csum_start = sizeof(struct ip4), .csum_offset = 6,
+			},
+		};
+		assert(gso_translate_udp_4to6(&p) == 0);
+
+		const uint32_t segment_sizes[] = {3000, 3000, 100};
+		for (size_t i = 0; i < sizeof(segment_sizes) / sizeof(segment_sizes[0]); i++) {
+			uint8_t rx[4096];
+			ssize_t nr = recv(sv[1], rx, sizeof(rx), 0);
+			uint32_t udp_segment_len = sizeof(struct udp_hdr) + segment_sizes[i];
+			assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + udp_segment_len));
+			struct ip6 *ip6 = (struct ip6 *)(rx + gcfg.vnet_hdr_sz);
+			struct udp_hdr *rx_udp = (struct udp_hdr *)((uint8_t *)ip6 + sizeof(struct ip6));
+			assert(ip6->next_header == IPPROTO_UDP);
+			assert(ntohs(ip6->payload_length) == udp_segment_len);
+			assert(ntohs(rx_udp->length) == udp_segment_len);
+			assert(ones_add(ip_checksum(rx_udp, udp_segment_len),
+			                ip6_checksum(ip6, udp_segment_len, IPPROTO_UDP)) == 0);
+		}
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	printf("PASS: UDP Generic Segmentation Offload (USO) and fallback\n");
+}
+
+/* Exercise the real packet handler, including partial checksum completion
+ * before IPv6 fragmentation. Reassemble the fragments and check the checksum. */
+static void test_partial_udp_fragmentation(void)
+{
+	setup_test_mapping();
+	gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+	gcfg.mtu = 1280;
+	gcfg.ipv6_offlink_mtu = 1280;
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	uint8_t buf[HEADROOM + 20 + 1508] = {0};
+	struct ip4 *ip4 = (struct ip4 *)(buf + HEADROOM);
+	ip4->ver_ihl = 0x45;
+	ip4->length = htons(20 + 1508);
+	ip4->ttl = 64;
+	ip4->proto = IPPROTO_UDP;
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "11.0.0.2", &ip4->dest);
+	ip4->cksum = ip_checksum(ip4, 20);
+	struct udp_hdr *udp = (struct udp_hdr *)(ip4 + 1);
+	udp->src_port = htons(1234);
+	udp->dst_port = htons(5678);
+	udp->length = htons(1508);
+	memset(udp + 1, 0xa5, 1500);
+	udp->cksum = htons(gso_calc_udp_pseudo4(&ip4->src, &ip4->dest, 1508));
+	struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip4,
+		.data_len = 1528, .has_vhdr = 1};
+	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	p.vhdr.csum_start = 20;
+	p.vhdr.csum_offset = 6;
+	handle_ip4(&p);
+	uint8_t assembled[1508], rx[2048];
+	struct ip6 translated;
+	size_t total = 0;
+	for (int i = 0; i < 2; i++) {
+		ssize_t n = recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT);
+		assert(n > gcfg.vnet_hdr_sz + 48);
+		struct virtio_net_hdr_raw *vh = (void *)rx;
+		assert(!(vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM));
+		struct ip6 *ip6 = (void *)(rx + gcfg.vnet_hdr_sz);
+		translated = *ip6;
+		assert(ip6->next_header == 44);
+		struct ip6_frag *frag = (void *)(ip6 + 1);
+		size_t off = ntohs(frag->offset_flags) & IP6_F_MASK;
+		size_t len = ntohs(ip6->payload_length) - sizeof(*frag);
+		assert(off == total && off + len <= sizeof(assembled));
+		memcpy(assembled + off, frag + 1, len);
+		total += len;
+	}
+	assert(total == sizeof(assembled));
+	assert(ones_add(ip_checksum(assembled, total),
+		ip6_checksum(&translated, total, IPPROTO_UDP)) == 0);
+	/* Invalid segmentation metadata must not fall through to plain translation. */
+	p = (struct pkt){.tun_fd = sv[0], .data = (uint8_t *)ip4,
+		.data_len = 1528, .has_vhdr = 1};
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4;
+	p.vhdr.gso_size = 0;
+	handle_ip4(&p);
+	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	close(sv[0]);
+	close(sv[1]);
+	printf("PASS: Partial UDP fragmentation checksum and invalid GSO rejection\n");
+}
+
 int main(void)
 {
 	printf("=== Running unit_gso test suite ===\n");
@@ -1136,9 +1581,12 @@ int main(void)
 	test_gso_translate_and_split();
 	test_gso_boundary_1260_1261();
 	test_gso_tcp_options();
+	test_gso_ipv4_options();
 	test_gso_ecn_cwr();
 	test_gso_ttl_hop_limit();
 	test_gso_mock_write_error();
+	test_gso_udp_uso();
+	test_partial_udp_fragmentation();
 	gso_dump_stats();
 	printf("All unit_gso tests passed successfully!\n");
 	return 0;

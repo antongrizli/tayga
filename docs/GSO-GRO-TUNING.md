@@ -28,9 +28,9 @@ With **GSO/GRO Offload**, TAYGA interacts with the Linux kernel TUN driver using
 ```conf
 # tun-offload: Controls hardware/kernel offload support
 # Options:
-#   off  - Standard packet-by-packet operation (safe default, legacy compatible)
+#   off  - Standard packet-by-packet operation (explicit legacy baseline)
 #   tcp  - Enforce TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
-#   auto - Probe kernel capabilities at startup; enable if supported, fallback to off
+#   auto - Default; probe kernel capabilities at startup; enable if supported, fallback to off
 tun-offload auto
 ```
 
@@ -80,8 +80,8 @@ OFFLOAD_CHECK: FAIL (IFF_VNET_HDR ioctl failed: Invalid argument)
 When configured with `tun-offload auto`:
 1. `tayga` requests `IFF_VNET_HDR` and queries the header size (`TUNGETVNETHDRSZ`).
 2. `tayga` attempts to enable `TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6` via `TUNSETOFFLOAD`.
-3. If any ioctl fails, `tayga` logs a warning and automatically re-opens a clean TUN device in standard `offload=off` mode.
-4. Traffic is processed without interruptions or packet corruption regardless of host capabilities.
+3. If the initial header negotiation fails, `tayga` retries without offload. If checksum/TSO negotiation fails on the device or a worker queue, it disables offload while preserving the negotiated header framing and existing interface routes.
+4. Startup logs report active offload only after queue setup succeeds. An inability to establish a consistent configuration fails startup. UDP segmentation stays disabled until its packet semantics and kernel integration are validated.
 
 ---
 

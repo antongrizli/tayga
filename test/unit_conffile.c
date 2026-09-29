@@ -261,7 +261,7 @@ void test_config_init(void) {
     tcfg.cache_size = 1<<13;
     tcfg.wkpf_strict = 1;
     tcfg.workers = -1;
-    tcfg.tun_offload = TUN_OFFLOAD_OFF;
+    tcfg.tun_offload = TUN_OFFLOAD_AUTO;
     tcfg.tun_up = 0;
 
     /* Make sure config is the size we expect

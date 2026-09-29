@@ -3,7 +3,7 @@
 set -u
 
 CLIENTS=${CLIENTS:-10}
-RATE=${RATE:-10M}
+RATE=${RATE:-0}
 DURATION=${DURATION:-10}
 WARMUP=${WARMUP:-2}
 PROTOCOL=${PROTOCOL:-udp}
@@ -39,7 +39,7 @@ for workers in $WORKERS_LIST; do
       result=$(python3 - "$result_file" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
-fields = ("tayga_cpu_cores", "router_rclat_packets_per_second", "received_mbps",
+fields = ("tayga_cpu_cores", "received_udp_packets_per_second", "received_mbps",
           "udp_loss_percent", "tun_drops")
 print(" ".join(f"{key}={doc[key]}" for key in fields if key in doc))
 PY

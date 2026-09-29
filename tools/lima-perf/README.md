@@ -20,19 +20,24 @@ The default VM is named `tayga-perf`, uses 4 vCPUs, 4 GiB RAM, 24 GiB disk, and
 the Apple Virtualization driver. Override these with `INSTANCE`, `CPUS`,
 `MEMORY_GB`, `DISK_GB`, or `VM_TYPE=qemu`.
 
-The default workload is 20 TCP clients, one flow each, 15 MiB/s per client,
+The default workload is 20 TCP clients, one flow each, unlimited offered rate (`RATE=0`),
 60 seconds after a 10 second warmup. Override `CLIENTS`, `FLOWS`, `RATE`,
-`DURATION`, `WARMUP`, `PROTOCOL`, `DIRECTIONS`, and `WORKERS` when invoking the
-host script. The target aggregate is intentionally close to 300 Mbps. The
-Set `PERF_MODES=none` for CPU baseline without perf sampling; the default is
+`DURATION`, `WARMUP`, `PROTOCOL`, `DIRECTIONS`, `WORKERS`, `CLAT_OFFLOAD`,
+`CLAT_OFFLINK_MTU`, `TUN_TXQLEN`, and `PERF_MODES` when invoking the host
+script. Use an explicit rate for controlled load comparisons. The default
+offload mode is `auto`: TAYGA negotiates kernel support and logs its decision.
+Set `CLAT_OFFLOAD=tcp` for a strict offload run or `off` for a baseline.
+Unpaced UDP may overload the test generator or control connections; use the
+staged UDP matrix to characterize that saturation and retain incomplete runs as invalid. Set `PERF_MODES=none` for CPU baseline
+without perf sampling; the default is
 `PERF_MODES="stat record"`.
 
-`TUN_TXQLEN` is an optional lab-only queue-size experiment. It is unset by
-default, preserving the kernel default. Test one value at a time and record
+`TUN_TXQLEN` defaults to 1000. Set it to an empty value to preserve the kernel
+default, or use it for a lab-only queue-size experiment. Test one value at a time and record
 TUN drops and latency; do not transfer a winning VM value to RouterOS without
 checking the container/veth implementation there.
 
-default is strict (`MAX_TUN_DROPS=0`); for a deliberate saturation profile set
+The drop threshold is strict (`MAX_TUN_DROPS=0`); for a deliberate saturation profile set
 an explicit threshold such as `MAX_TUN_DROPS=100000`. The benchmark output
 reports the exact drop and retransmit counts and marks such a run degraded.
 

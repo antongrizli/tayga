@@ -81,6 +81,21 @@ struct tcp_hdr {
 #define TCP_FLAG_ECE 0x40
 #define TCP_FLAG_CWR 0x80
 
+#ifndef TUN_F_USO4
+#define TUN_F_USO4 0x20
+#endif
+#ifndef TUN_F_USO6
+#define TUN_F_USO6 0x40
+#endif
+
+/* UDP Header definition for USO inspection and translation */
+struct udp_hdr {
+	uint16_t src_port;
+	uint16_t dst_port;
+	uint16_t length;
+	uint16_t cksum;
+} __attribute__((packed));
+
 /* Validation: verifies that vhdr fields are within bounds of packet payload */
 int gso_validate_header(const struct pkt *p);
 
@@ -90,12 +105,24 @@ int gso_translate_tcp_6to4(struct pkt *p);
 /* Fast-path translation: converts GSO TCPv4 to GSO TCPv6 in-place or returns < 0 for fallback */
 int gso_translate_tcp_4to6(struct pkt *p);
 
+/* Fast-path translation: converts GSO UDP (USO) v6 to v4 in-place or returns < 0 for fallback */
+int gso_translate_udp_6to4(struct pkt *p);
+
+/* Fast-path translation: converts GSO UDP (USO) v4 to v6 in-place or returns < 0 for fallback */
+int gso_translate_udp_4to6(struct pkt *p);
+
 /* Fallback software segmentation: segments aggregate into MSS-sized chunks and sends individually */
 int gso_software_segment_and_send_6to4(struct pkt *p);
 int gso_software_segment_and_send_4to6(struct pkt *p);
+int gso_software_segment_and_send_udp_6to4(struct pkt *p);
+int gso_software_segment_and_send_udp_4to6(struct pkt *p);
 
+uint16_t gso_calc_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint8_t proto, uint32_t len);
+uint16_t gso_calc_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint8_t proto, uint32_t len);
 uint16_t gso_calc_tcp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t tcp_len);
 uint16_t gso_calc_tcp_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint32_t tcp_len);
+uint16_t gso_calc_udp_pseudo4(const struct in_addr *src4, const struct in_addr *dst4, uint32_t udp_len);
+uint16_t gso_calc_udp_pseudo6(const struct in6_addr *src6, const struct in6_addr *dst6, uint32_t udp_len);
 
 void gso_update_csum_seed_6to4(struct tcp_hdr *tcp, const struct in6_addr *src6,
                               const struct in6_addr *dst6, const struct in_addr *src4,
