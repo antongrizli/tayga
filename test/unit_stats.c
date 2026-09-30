@@ -123,6 +123,14 @@ int main(void)
 	stats_drop(64);
 	stats_get_snapshot(&s);
 	assert(s.dropped_pkts == 1);
+	stats_udp_gso_rx(2048);
+	stats_udp_gso_tx(1536);
+	stats_udp_gso_sw_fallback();
+	stats_udp_gso_sw_segment();
+	stats_get_snapshot(&s);
+	assert(s.udp_gso_rx_aggregates == 1 && s.udp_gso_rx_bytes == 2048);
+	assert(s.udp_gso_tx_aggregates == 1 && s.udp_gso_tx_bytes == 1536);
+	assert(s.udp_gso_sw_fallbacks == 1 && s.udp_gso_sw_segments == 1);
 	assert(s.dropped_bytes == 64);
 
 	stats_error();

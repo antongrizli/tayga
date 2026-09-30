@@ -66,6 +66,8 @@ void stats_write_json(const char *path, const char *state)
 		offload_str = "tcp";
 	else if (gcfg.tun_offload == TUN_OFFLOAD_AUTO)
 		offload_str = "auto";
+	else if (gcfg.tun_offload == TUN_OFFLOAD_UDP)
+		offload_str = "udp";
 
 	time_t now = time(NULL);
 
@@ -146,7 +148,13 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "    \"sw_seg_out_packets\": %llu,\n", (unsigned long long)s.gso_sw_seg_out_pkts);
 	fprintf(f, "    \"fallback_packets\": %llu,\n", (unsigned long long)s.gso_fallback_pkts);
 	fprintf(f, "    \"invalid_packets\": %llu,\n", (unsigned long long)s.gso_invalid_pkts);
-	fprintf(f, "    \"tun_write_errors\": %llu\n", (unsigned long long)s.gso_tun_write_errors);
+	fprintf(f, "    \"tun_write_errors\": %llu,\n", (unsigned long long)s.gso_tun_write_errors);
+	fprintf(f, "    \"udp_rx_aggregates\": %llu,\n", (unsigned long long)s.udp_gso_rx_aggregates);
+	fprintf(f, "    \"udp_rx_bytes\": %llu,\n", (unsigned long long)s.udp_gso_rx_bytes);
+	fprintf(f, "    \"udp_tx_aggregates\": %llu,\n", (unsigned long long)s.udp_gso_tx_aggregates);
+	fprintf(f, "    \"udp_tx_bytes\": %llu,\n", (unsigned long long)s.udp_gso_tx_bytes);
+	fprintf(f, "    \"udp_sw_fallbacks\": %llu,\n", (unsigned long long)s.udp_gso_sw_fallbacks);
+	fprintf(f, "    \"udp_sw_segments\": %llu\n", (unsigned long long)s.udp_gso_sw_segments);
 	fprintf(f, "  },\n");
 	fprintf(f, "  \"dynamic_pool\": {\n");
 	fprintf(f, "    \"active_mappings\": %u,\n", active_map);

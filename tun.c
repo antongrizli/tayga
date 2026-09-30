@@ -384,10 +384,11 @@ int tun_setup(int do_mktun, int do_rmtun)
 			slog(LOG_CRIT, "Unsupported TUN vnet header size %d (expected 10 or 12)\n", sz);
 			return ERROR_REJECT;
 		}
-		/* UDP USO remains disabled until real TUN/kernel tests cover segment metadata. */
 		unsigned int offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+		if (gcfg.tun_offload == TUN_OFFLOAD_UDP)
+			offload_flags |= TUN_F_USO4 | TUN_F_USO6;
 		if (ioctl(gcfg.tun_fd, TUNSETOFFLOAD, offload_flags) == 0) {
-			gcfg.tun_has_uso = 0;
+			gcfg.tun_has_uso = (gcfg.tun_offload == TUN_OFFLOAD_UDP);
 			active_tun_offload_flags = offload_flags;
 		} else if (gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
 			slog(LOG_WARNING, "TUNSETOFFLOAD unavailable: %s\n", strerror(errno));
@@ -564,8 +565,12 @@ int tun_setup(int do_mktun, int do_rmtun)
 		}
 	}
 
-	if (active_tun_offload_flags)
-		slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM (UDP USO disabled)\n", gcfg.vnet_hdr_sz);
+	if (active_tun_offload_flags) {
+		if (gcfg.tun_has_uso)
+			slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM|USO4|USO6 (experimental UDP USO)\n", gcfg.vnet_hdr_sz);
+		else
+			slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM (UDP USO disabled)\n", gcfg.vnet_hdr_sz);
+	}
 	return 0;
 }
 #endif /* ifdef __linux__ */
@@ -577,8 +582,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 	int fd, do_rename = 0, multi_af;
 	char devname[64];
 
-	if (gcfg.tun_offload == TUN_OFFLOAD_TCP) {
-		slog(LOG_CRIT, "TCP TUN offload requires Linux\n");
+	if (gcfg.tun_offload == TUN_OFFLOAD_TCP || gcfg.tun_offload == TUN_OFFLOAD_UDP) {
+		slog(LOG_CRIT, "TCP/UDP TUN offload requires Linux\n");
 		return ERROR_REJECT;
 	}
 	gcfg.tun_offload = TUN_OFFLOAD_OFF;
@@ -852,6 +857,15 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 				"device: %s\n", strerror(errno));
 		return TUN_READ_FATAL;
 	}
+	/* A full read buffer may have truncated a larger TUN frame. The allocation
+	 * includes one byte beyond the largest supported ordinary IPv6 frame, so
+	 * equality is an unambiguous overflow signal in both vnet and plain mode. */
+	if (unlikely((size_t)ret == read_len)) {
+		stats_drop((uint32_t)ret);
+		stats_packet_done();
+		slog(LOG_WARNING, "dropping oversized or truncated packet (%d bytes)\n", ret);
+		return TUN_READ_CONSUMED;
+	}
 
 	if (gcfg.vnet_hdr_sz > 0) {
 		if (unlikely(ret <= gcfg.vnet_hdr_sz)) {
@@ -878,12 +892,6 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			stats_packet_done();
 			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
-			return TUN_READ_CONSUMED;
-		}
-		if (unlikely((uint32_t)ret == (RECV_BUF_SIZE - HEADROOM))) {
-			stats_drop((uint32_t)ret);
-			stats_packet_done();
-			slog(LOG_WARNING, "dropping oversized packet\n");
 			return TUN_READ_CONSUMED;
 		}
 		*p = (struct pkt){

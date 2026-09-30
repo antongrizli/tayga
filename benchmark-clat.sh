@@ -17,17 +17,28 @@ ARTIFACT_DIR=${ARTIFACT_DIR:-/tmp/tayga-clat-results}
 PERF_MODE=${PERF_MODE:-none}
 MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}
 MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}
+MAX_PING_LOSS_PERCENT=${MAX_PING_LOSS_PERCENT:-0}
 TUN_TXQLEN=${TUN_TXQLEN:-1000}
 CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}
 CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}
+FORWARDING_GRO=${FORWARDING_GRO:-off}
+export FORWARDING_GRO
 GIT_REVISION=${GIT_REVISION:-unknown}
 SOURCE_TREE_SHA256=${SOURCE_TREE_SHA256:-unknown}
 
 case "$PROTOCOL" in tcp|udp) ;; *) echo 'PROTOCOL must be tcp or udp' >&2; exit 64;; esac
-case "$CLAT_OFFLOAD" in off|tcp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, tcp or auto' >&2; exit 64;; esac
+case "$CLAT_OFFLOAD" in off|tcp|udp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, tcp, udp or auto' >&2; exit 64;; esac
 case "$PERF_MODE" in none|stat|record) ;; *) echo 'PERF_MODE must be none, stat or record' >&2; exit 64;; esac
+case "$FORWARDING_GRO" in off|on) ;; *) echo 'FORWARDING_GRO must be off or on' >&2; exit 64;; esac
 case "$DURATION:$WARMUP" in *[!0-9:]*|:) echo 'DURATION and WARMUP must be integers' >&2; exit 64;; esac
 case "$MAX_TUN_DROPS" in ''|*[!0-9]*) echo 'MAX_TUN_DROPS must be a non-negative integer' >&2; exit 64;; esac
+case "$MAX_UDP_LOSS_PERCENT:$MAX_PING_LOSS_PERCENT" in
+  *[!0-9.:]*|:*|*:) echo 'loss thresholds must be non-negative numbers' >&2; exit 64;;
+esac
+awk -v x="$MAX_UDP_LOSS_PERCENT" -v y="$MAX_PING_LOSS_PERCENT" \
+  'BEGIN { exit !((x ~ /^[0-9]+([.][0-9]+)?$/) && (y ~ /^[0-9]+([.][0-9]+)?$/) && x >= 0 && y >= 0) }' || {
+  echo 'loss thresholds must be finite non-negative numbers' >&2; exit 64;
+}
 case "$TUN_TXQLEN" in
   '') ;;
   *[!0-9]*) echo 'TUN_TXQLEN must be a non-negative integer' >&2; exit 64;;
@@ -123,6 +134,24 @@ ip -n clatns -6 addr add fd9b:64:1:fe::2/64 dev veth-nat64
 ip -n clatns -6 route add default via fd9b:64:1:fe::1
 ip netns exec clatns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec clatns sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+if [ "$FORWARDING_GRO" = on ]; then
+  # Only disposable benchmark ingress links are changed. Namespace cleanup
+  # removes them; no host or physical-interface features are modified.
+  for ingress in router:rlan router:rwan router:rclat clatns:veth-nat64; do
+    ingress_ns=${ingress%:*}
+    ingress_dev=${ingress#*:}
+    ip netns exec "$ingress_ns" ethtool -k "$ingress_dev" \
+      > "$ARTIFACT_DIR/gro-$ingress_ns-$ingress_dev.before.txt"
+    ip netns exec "$ingress_ns" ethtool -K "$ingress_dev" gro on \
+      rx-udp-gro-forwarding on rx-gro-list off
+    ip netns exec "$ingress_ns" ethtool -k "$ingress_dev" \
+      > "$ARTIFACT_DIR/gro-$ingress_ns-$ingress_dev.after.txt"
+    feature_file="$ARTIFACT_DIR/gro-$ingress_ns-$ingress_dev.after.txt"
+    grep -q '^generic-receive-offload: on' "$feature_file"
+    grep -q '^[[:space:]]*rx-udp-gro-forwarding: on' "$feature_file"
+    grep -q '^[[:space:]]*rx-gro-list: off' "$feature_file"
+  done
+fi
 ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 \
   CLAT_WORKERS="$WORKERS" CLAT_OFFLOAD="$CLAT_OFFLOAD" \
   CLAT_OFFLINK_MTU="$CLAT_OFFLINK_MTU" /usr/local/sbin/clat-start.sh \
@@ -184,8 +213,13 @@ offload_active=no
 if grep -q 'TUN offload active:' "$ARTIFACT_DIR/clat.log"; then
   offload_active=yes
 fi
-if test "$CLAT_OFFLOAD" = tcp && test "$offload_active" != yes; then
+if { test "$CLAT_OFFLOAD" = tcp || test "$CLAT_OFFLOAD" = udp; } && test "$offload_active" != yes; then
   echo "requested CLAT_OFFLOAD=tcp but TUN offload was not confirmed" >&2
+  cat "$ARTIFACT_DIR/clat.log" >&2
+  exit 1
+fi
+if test "$CLAT_OFFLOAD" = udp && ! grep -q 'experimental UDP USO' "$ARTIFACT_DIR/clat.log"; then
+  echo "requested CLAT_OFFLOAD=udp but UDP USO was not confirmed" >&2
   cat "$ARTIFACT_DIR/clat.log" >&2
   exit 1
 fi
@@ -413,11 +447,26 @@ run_iperf() {
   cat /proc/net/softnet_stat > "$run_dir/softnet.after"
   cat /proc/stat > "$run_dir/proc_stat.after"
   printf '%s\n' "$status" > "$run_dir/exit-status"
-  python3 - "$run_dir" "$direction" "$ticks_before" "$ticks_after" "$uptime_before" "$uptime_after" "$monotonic_before" "$monotonic_after" "$PROTOCOL" "$MAX_UDP_LOSS_PERCENT" "$MAX_TUN_DROPS" "$CLAT_OFFLOAD" "$offload_active" "$TUN_TXQLEN" "$GIT_REVISION" "$SOURCE_TREE_SHA256" "$WORKERS" "$FLOWS" "$RATE" "$DURATION" "$WARMUP" "$DATAGRAM_SIZE" "$BLOCK_SIZE" "$CLAT_OFFLINK_MTU" <<'PY'
+  python3 - "$run_dir" "$direction" "$ticks_before" "$ticks_after" "$uptime_before" "$uptime_after" "$monotonic_before" "$monotonic_after" "$PROTOCOL" "$MAX_UDP_LOSS_PERCENT" "$MAX_TUN_DROPS" "$MAX_PING_LOSS_PERCENT" "$CLAT_OFFLOAD" "$offload_active" "$TUN_TXQLEN" "$GIT_REVISION" "$SOURCE_TREE_SHA256" "$WORKERS" "$FLOWS" "$RATE" "$DURATION" "$WARMUP" "$DATAGRAM_SIZE" "$BLOCK_SIZE" "$CLAT_OFFLINK_MTU" <<'PY'
 import glob, json, os, re, sys
-run_dir, direction, before, after, up_before, up_after, mono_before, mono_after, protocol, max_udp_loss, max_tun_drops, offload_requested, offload_active, txqlen, revision, source_tree_sha256, workers, flows, rate, duration, warmup, datagram_size, block_size, offlink_mtu = sys.argv[1:]
+run_dir, direction, before, after, up_before, up_after, mono_before, mono_after, protocol, max_udp_loss, max_tun_drops, max_ping_loss, offload_requested, offload_active, txqlen, revision, source_tree_sha256, workers, flows, rate, duration, warmup, datagram_size, block_size, offlink_mtu = sys.argv[1:]
 reports = []
 capture_errors = []
+workload_errors = []
+def udp_packet_accounting(sent, received, payload_size):
+    """iperf3 packets is the receiver's expected sequence count, not receipts."""
+    expected = received["packets"]
+    lost = received["lost_packets"]
+    byte_count = received["bytes"]
+    size = int(payload_size)
+    if any(not isinstance(v, int) or isinstance(v, bool) or v < 0
+           for v in (expected, lost, byte_count)) or lost > expected or size <= 0:
+        raise ValueError("invalid UDP packet/byte counters")
+    if byte_count % size:
+        raise ValueError("UDP received bytes do not contain whole fixed-size datagrams")
+    return dict(packets=byte_count // size, receiver_expected_packets=expected,
+                lost_packets=lost, sent_packets=sent.get("packets"))
+
 for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
     try:
         with open(path) as f:
@@ -429,22 +478,33 @@ for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
             raise ValueError("missing 'end' section in iperf report")
         sent = end.get("sum_sent", {})
         received = end.get("sum_received", {})
-        report = dict(sent_bps=sent.get("bits_per_second", 0), received_bps=received.get("bits_per_second", 0),
-                      sent_bytes=sent.get("bytes", 0), received_bytes=received.get("bytes", 0),
-                      retransmits=sent.get("retransmits", 0), seconds=received.get("seconds", 0))
+        required = ("bits_per_second", "bytes", "seconds")
+        if any(key not in received for key in required):
+            raise ValueError("receiver summary is missing throughput/byte/duration fields")
+        report = dict(sent_bps=sent.get("bits_per_second"), received_bps=received["bits_per_second"],
+                      sent_bytes=sent.get("bytes"), received_bytes=received["bytes"],
+                      sent_packets=sent.get("packets"), retransmits=sent.get("retransmits", 0),
+                      seconds=received["seconds"])
         if protocol == "udp":
-            report.update(lost_packets=received.get("lost_packets", 0),
-                          packets=received.get("packets", 0),
-                          lost_percent=received.get("lost_percent", 0),
-                          jitter_ms=received.get("jitter_ms", 0),
-                          out_of_order=received.get("out_of_order", 0))
+            if "packets" not in received or "lost_packets" not in received:
+                raise ValueError("UDP receiver summary is missing packet/loss counters")
+            report.update(udp_packet_accounting(sent, received, datagram_size))
+            stream_ooo = [s.get("udp", {}).get("out_of_order") for s in end.get("streams", [])]
+            report.update(
+                          lost_percent=received.get("lost_percent"),
+                          jitter_ms=received.get("jitter_ms"),
+                          out_of_order=(sum(stream_ooo) if stream_ooo and all(v is not None for v in stream_ooo) else None))
         reports.append(report)
     except Exception as exc:
         print(f"ERROR direction={direction} file={os.path.basename(path)} reason={exc}", file=sys.stderr)
-        capture_errors.append(f"client report {os.path.basename(path)} error: {exc}")
+        workload_errors.append(f"client report {os.path.basename(path)} error: {exc}")
 
 if not reports:
-    capture_errors.append("no valid iperf client reports found")
+    workload_errors.append("no valid iperf client reports found")
+if str(revision).strip().lower() in ("", "unknown", "n/a"):
+    capture_errors.append("source Git revision is unknown")
+if str(source_tree_sha256).strip().lower() in ("", "unknown", "n/a"):
+    capture_errors.append("source snapshot hash is unknown")
 
 elapsed = (int(mono_after) - int(mono_before)) / 1_000_000_000
 if elapsed <= 0:
@@ -459,34 +519,46 @@ received_bytes = sum(x["received_bytes"] for x in reports) if reports else 0
 
 def counters(path, ifname):
     if not os.path.exists(path):
-        return {side: {field: 0 for field in ("bytes", "packets", "errors", "dropped")} for side in ("rx", "tx")}
+        return None
     try:
         with open(path) as f:
             links = json.load(f)
         for link in links:
             if link.get("ifname") == ifname:
                 stats = link.get("stats64", link.get("stats", {}))
-                return {side: {field: int(stats.get(side, {}).get(field, 0))
+                return {side: {field: (int(stats[side][field]) if field in stats.get(side, {}) else None)
                                for field in ("bytes", "packets", "errors", "dropped")}
                         for side in ("rx", "tx")}
     except Exception as exc:
         capture_errors.append(f"failed reading {ifname} stats from {os.path.basename(path)}: {exc}")
-    return {side: {field: 0 for field in ("bytes", "packets", "errors", "dropped")} for side in ("rx", "tx")}
+    return None
 
 def delta(before_path, after_path, ifname):
     before_stats, after_stats = counters(before_path, ifname), counters(after_path, ifname)
-    return {side: {field: max(0, after_stats[side][field] - before_stats[side][field])
+    if before_stats is None or after_stats is None:
+        capture_errors.append(f"missing {ifname} interface counters in benchmark window")
+        return None
+    if any(before_stats[side][field] is None or after_stats[side][field] is None
+           for side in before_stats for field in before_stats[side]):
+        capture_errors.append(f"incomplete {ifname} interface counters in benchmark window")
+        return None
+    result = {side: {field: after_stats[side][field] - before_stats[side][field]
                    for field in before_stats[side]}
             for side in before_stats}
+    if any(value < 0 for side in result.values() for value in side.values()):
+        capture_errors.append(f"{ifname} interface counters decreased or reset during measurement")
+        return None
+    return result
 
 router_delta = delta(os.path.join(run_dir, "router.links.before.json"),
                      os.path.join(run_dir, "router.links.after.json"), "rclat")
 clat_delta = delta(os.path.join(run_dir, "clat.links.before.json"),
                    os.path.join(run_dir, "clat.links.after.json"), "clat")
-router_packets = router_delta["rx"]["packets"] + router_delta["tx"]["packets"]
-tun_drops = clat_delta["rx"]["dropped"] + clat_delta["tx"]["dropped"]
-tun_total_tx = clat_delta["tx"]["packets"] + clat_delta["tx"]["dropped"]
-tun_tx_drop_pct = (100.0 * clat_delta["tx"]["dropped"] / max(tun_total_tx, 1)) if tun_total_tx > 0 else 0.0
+router_packets = (router_delta["rx"]["packets"] + router_delta["tx"]["packets"]) if router_delta else None
+tun_drops = (clat_delta["rx"]["dropped"] + clat_delta["tx"]["dropped"]) if clat_delta else None
+tun_total_tx = (clat_delta["tx"]["packets"] + clat_delta["tx"]["dropped"]) if clat_delta else None
+tun_tx_drop_pct = (100.0 * clat_delta["tx"]["dropped"] / tun_total_tx
+                   if clat_delta and tun_total_tx else None)
 
 sys_busy_cores = None
 sys_softirq_cores = None
@@ -530,20 +602,28 @@ if os.path.exists(perf_csv_path):
 
 expected_clients = int(os.environ.get("CLIENTS", len(reports) or 1))
 if len(reports) != expected_clients:
-    capture_errors.append(f"received {len(reports)} client reports; expected {expected_clients}")
+    workload_errors.append(f"received {len(reports)} client reports; expected {expected_clients}")
 client_status_path = os.path.join(run_dir, "exit-status")
 client_status = open(client_status_path).read().strip() if os.path.exists(client_status_path) else "missing"
 if client_status != "0":
-    capture_errors.append(f"client workload exit status is {client_status}")
+    workload_errors.append(f"client workload exit status is {client_status}")
+if os.path.exists(os.path.join(run_dir, "warmup-failed.marker")):
+    workload_errors.append("warmup failed")
+if os.path.exists(os.path.join(run_dir, "timeout.marker")):
+    workload_errors.append("one or more clients timed out")
 perf_mode = os.environ.get("PERF_MODE", "none")
 perf_status_path = os.path.join(run_dir, "perf-exit-status")
 perf_status = open(perf_status_path).read().strip() if os.path.exists(perf_status_path) else "missing"
 if perf_mode != "none" and perf_status != "0":
     capture_errors.append(f"perf {perf_mode} exit status is {perf_status}")
+if perf_mode != "none" and not os.path.exists(os.path.join(run_dir, "perf-stat.csv" if perf_mode == "stat" else "perf.data")):
+    capture_errors.append(f"perf {perf_mode} output is missing")
 offload_log_path = os.path.join(os.path.dirname(run_dir), "clat.log")
 offload_log = open(offload_log_path).read().lower() if os.path.exists(offload_log_path) else ""
 offload_fell_back = any(marker in offload_log for marker in ("fallback", "without offload"))
-effective_offload = "tcp" if offload_active == "yes" else ("off" if offload_requested == "off" or offload_fell_back else "unknown")
+effective_offload = ("udp" if offload_requested == "udp" and "experimental udp uso" in offload_log else
+                     "tcp" if offload_active == "yes" else
+                     "off" if offload_requested == "off" or offload_fell_back else "unknown")
 if effective_offload == "unknown":
     capture_errors.append("effective TUN offload mode could not be determined")
 
@@ -561,9 +641,12 @@ gso_delta = ({key: gso_after[key] - gso_before.get(key, 0) for key in gso_after}
 if (effective_offload == "tcp" and protocol == "tcp" and
         (not gso_delta or gso_delta.get("rx_pkts", 0) + gso_delta.get("tx_pkts", 0) <= 0)):
     capture_errors.append("TUN offload active but no GSO packets were observed")
+udp_aggregate_count = ((gso_delta or {}).get("udp_rx_aggregates", 0) +
+                       (gso_delta or {}).get("udp_tx_aggregates", 0))
 
 result = dict(direction=direction, clients=len(reports), expected_clients=expected_clients,
               capture_valid=not capture_errors, workload_valid=True, acceptance_pass=True,
+              schema_version=3,
               degraded_reasons=list(capture_errors),
               perf_mode=perf_mode,
               git_revision=revision,
@@ -577,12 +660,21 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               offload_requested=offload_requested,
               offload_effective=effective_offload,
               gso_stats_before=gso_before, gso_stats_after=gso_after, gso_stats_delta=gso_delta,
+              udp_gso_input_aggregates=(gso_delta or {}).get("udp_rx_aggregates") if gso_delta else None,
+              udp_gso_output_aggregates=(gso_delta or {}).get("udp_tx_aggregates") if gso_delta else None,
+              udp_gso_software_fallbacks=(gso_delta or {}).get("udp_sw_fallbacks") if gso_delta else None,
+              udp_gso_software_segments=(gso_delta or {}).get("udp_sw_segments") if gso_delta else None,
+              udp_gso_aggregate_path_observed=(udp_aggregate_count > 0),
               workers=int(workers), flows_per_client=int(flows), tun_txqlen=(int(txqlen) if txqlen else None),
               offlink_mtu=int(offlink_mtu),
+              forwarding_gro=os.environ.get("FORWARDING_GRO", "off"),
               rate_per_flow=(rate or "unlimited"), duration_seconds=int(duration), warmup_seconds=int(warmup),
               datagram_size=int(datagram_size) if protocol == "udp" else None,
               block_size=(block_size or None),
               sent_mbps=sent, received_mbps=received,
+              client_duration_seconds_min=(min(x["seconds"] for x in reports) if reports else None),
+              client_duration_seconds_max=(max(x["seconds"] for x in reports) if reports else None),
+              client_duration_seconds_median=(sorted(x["seconds"] for x in reports)[len(reports)//2] if reports else None),
               retransmits=retransmits, tayga_cpu_cores=cores,
               tayga_core_per_gbps=cores / (received / 1000) if received else None,
               system_busy_cores=sys_busy_cores,
@@ -590,34 +682,45 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               perf_stat_metrics=perf_stat_metrics,
               received_application_MBps=received_bytes / elapsed / 1_000_000,
               received_udp_packets_per_second=None,
-              router_interface_packets_per_second=router_packets / elapsed,
+              router_interface_packets_per_second=(router_packets / elapsed if router_packets is not None else None),
               router_rclat_delta=router_delta, clat_tun_delta=clat_delta, tun_drops=tun_drops,
               tun_tx_drop_percent=tun_tx_drop_pct,
               retransmits_per_gbyte=(retransmits / (received_bytes / 1_000_000_000) if received_bytes else None),
-              elapsed_s=elapsed, workload_protocol=protocol)
+              elapsed_s=elapsed, workload_protocol=protocol,
+              measurement_window=dict(monotonic_start_ns=int(mono_before), monotonic_end_ns=int(mono_after),
+                                     elapsed_seconds=elapsed, intended_duration_seconds=int(duration)))
 
 if protocol == "udp":
     packets = sum(x.get("packets", 0) for x in reports)
     lost = sum(x.get("lost_packets", 0) for x in reports)
-    # Receiver packets is the total expected datagram count; loss is a subset.
-    total_sent = packets
-    loss_pct = (100.0 * lost / total_sent) if total_sent > 0 else 0.0
-    jitter_max = max((x.get("jitter_ms", 0) for x in reports), default=0.0)
-    ooo = sum(x.get("out_of_order", 0) for x in reports)
-    result.update(udp_received_packets=max(packets - lost, 0), udp_lost_packets=lost,
+    receiver_expected = sum(x["receiver_expected_packets"] for x in reports)
+    sender_packets = [x.get("sent_packets") for x in reports]
+    total_sent = sum(sender_packets) if sender_packets and all(p is not None for p in sender_packets) else None
+    loss_pct = (100.0 * lost / receiver_expected) if receiver_expected > 0 else None
+    if receiver_expected <= 0:
+        workload_errors.append("UDP receiver reported no datagrams; loss rate is undefined")
+    jitter_samples = [x["jitter_ms"] for x in reports if x.get("jitter_ms") is not None]
+    jitter_max = max(jitter_samples, default=None)
+    ooo_counts = [x.get("out_of_order") for x in reports]
+    ooo = sum(ooo_counts) if ooo_counts and all(v is not None for v in ooo_counts) else None
+    result.update(udp_received_packets=packets, udp_lost_packets=lost,
+                  udp_accounting_version=2,
+                  udp_counter_definitions=dict(received="receiver bytes divided by configured fixed datagram size",
+                                               receiver_expected="iperf receiver highest-sequence packet count; includes lost packets",
+                                               sent="iperf sender packet count, independently reported"),
                   udp_sent_packets=total_sent,
-                  received_udp_packets_per_second=sum(max(x.get("packets", 0) - x.get("lost_packets", 0), 0) / max(x.get("seconds", 0), 0.001) for x in reports),
+                  udp_receiver_expected_packets=receiver_expected,
+                  received_udp_packets_per_second=sum(x.get("packets", 0) / max(x.get("seconds", 0), 0.001) for x in reports),
                   udp_loss_percent=loss_pct,
                   udp_jitter_ms_max=jitter_max,
                   udp_out_of_order=ooo)
-    if loss_pct > 0:
-        result["acceptance_pass"] = False
-        result["degraded_reasons"].append(f"UDP loss observed: {loss_pct:.3f}%")
-    if loss_pct > float(max_udp_loss):
+    if loss_pct is not None and loss_pct > float(max_udp_loss):
         result["acceptance_pass"] = False
         result["degraded_reasons"].append(f"UDP loss {loss_pct:.3f}% exceeds {max_udp_loss}% threshold")
 
 ping_file = os.path.join(run_dir, "ping.txt")
+if not os.path.exists(ping_file):
+    capture_errors.append("ping output is missing")
 if os.path.exists(ping_file):
     try:
         ping_rtts = []
@@ -645,9 +748,9 @@ if os.path.exists(ping_file):
             result.update(ping_transmitted=ping_transmitted,
                           ping_received=ping_received,
                           ping_loss_percent=ping_loss_percent)
-            if ping_loss_percent > 0:
+            if ping_loss_percent > float(max_ping_loss):
                 result["acceptance_pass"] = False
-                result["degraded_reasons"].append(f"ping packet loss observed: {ping_loss_percent:.1f}%")
+                result["degraded_reasons"].append(f"ping loss {ping_loss_percent:.1f}% exceeds {max_ping_loss}% threshold")
         if ping_rtts:
             ping_rtts.sort()
             def percentile(values, p):
@@ -659,17 +762,19 @@ if os.path.exists(ping_file):
     except Exception as exc:
         capture_errors.append(f"failed parsing ping.txt: {exc}")
 
-if tun_drops > int(max_tun_drops):
+if tun_drops is not None and tun_drops > int(max_tun_drops):
     result["acceptance_pass"] = False
     result["degraded_reasons"].append(f"TUN drops {tun_drops} exceeds {max_tun_drops} threshold")
-if tun_drops > 0 and f"TUN drops observed: {tun_drops}" not in result["degraded_reasons"]:
-    result["acceptance_pass"] = False
-    result["degraded_reasons"].append(f"TUN drops observed: {tun_drops}")
 if capture_errors:
     result["capture_valid"] = False
-    result["workload_valid"] = False
     result["acceptance_pass"] = False
     for err in capture_errors:
+        if err not in result["degraded_reasons"]:
+            result["degraded_reasons"].append(err)
+if workload_errors:
+    result["workload_valid"] = False
+    result["acceptance_pass"] = False
+    for err in workload_errors:
         if err not in result["degraded_reasons"]:
             result["degraded_reasons"].append(err)
 with open(os.path.join(run_dir, "result.json"), "w") as out:

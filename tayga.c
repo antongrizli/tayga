@@ -63,7 +63,7 @@ void usage(int code) {
 			"--pidfile FILE     : Write process ID of daemon to FILE\n"
 			"--mktun            : Create the persistent TUN interface\n"
 			"--rmtun            : Remove the persistent TUN interface\n"
-			"--tun-offload MODE : Offload mode: off, tcp, or auto (default: auto)\n"
+			"--tun-offload MODE : Offload mode: off, tcp, udp (experimental), or auto (default: auto)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
@@ -375,8 +375,10 @@ int main(int argc, char **argv)
 				gcfg.tun_offload = TUN_OFFLOAD_TCP;
 			} else if (strcasecmp(optarg, "auto") == 0) {
 				gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+			} else if (strcasecmp(optarg, "udp") == 0) {
+				gcfg.tun_offload = TUN_OFFLOAD_UDP;
 			} else {
-				die("Error: invalid value for --tun-offload (must be off, tcp, or auto)");
+				die("Error: invalid value for --tun-offload (must be off, tcp, udp, or auto)");
 			}
 			break;
 		case 0:

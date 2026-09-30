@@ -61,6 +61,12 @@ void stats_flush_worker(void)
 	atomic_store_explicit(&p->gso_fallback_pkts, g_tls_priv.gso_fallback_pkts, memory_order_relaxed);
 	atomic_store_explicit(&p->gso_invalid_pkts, g_tls_priv.gso_invalid_pkts, memory_order_relaxed);
 	atomic_store_explicit(&p->gso_tun_write_errors, g_tls_priv.gso_tun_write_errors, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_rx_aggregates, g_tls_priv.udp_gso_rx_aggregates, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_rx_bytes, g_tls_priv.udp_gso_rx_bytes, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_tx_aggregates, g_tls_priv.udp_gso_tx_aggregates, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_tx_bytes, g_tls_priv.udp_gso_tx_bytes, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_sw_fallbacks, g_tls_priv.udp_gso_sw_fallbacks, memory_order_relaxed);
+	atomic_store_explicit(&p->udp_gso_sw_segments, g_tls_priv.udp_gso_sw_segments, memory_order_relaxed);
 
 	g_tls_priv.batch_count = 0;
 }
@@ -99,6 +105,12 @@ void stats_get_snapshot(struct tayga_stats *out)
 		out->gso_fallback_pkts += atomic_load_explicit(&p->gso_fallback_pkts, memory_order_relaxed);
 		out->gso_invalid_pkts += atomic_load_explicit(&p->gso_invalid_pkts, memory_order_relaxed);
 		out->gso_tun_write_errors += atomic_load_explicit(&p->gso_tun_write_errors, memory_order_relaxed);
+		out->udp_gso_rx_aggregates += atomic_load_explicit(&p->udp_gso_rx_aggregates, memory_order_relaxed);
+		out->udp_gso_rx_bytes += atomic_load_explicit(&p->udp_gso_rx_bytes, memory_order_relaxed);
+		out->udp_gso_tx_aggregates += atomic_load_explicit(&p->udp_gso_tx_aggregates, memory_order_relaxed);
+		out->udp_gso_tx_bytes += atomic_load_explicit(&p->udp_gso_tx_bytes, memory_order_relaxed);
+		out->udp_gso_sw_fallbacks += atomic_load_explicit(&p->udp_gso_sw_fallbacks, memory_order_relaxed);
+		out->udp_gso_sw_segments += atomic_load_explicit(&p->udp_gso_sw_segments, memory_order_relaxed);
 	}
 }
 

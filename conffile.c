@@ -713,8 +713,10 @@ static int config_tun_offload(int ln, int arg_count, char **args)
 		gcfg.tun_offload = TUN_OFFLOAD_TCP;
 	} else if (strcasecmp(args[0], "auto") == 0) {
 		gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+	} else if (strcasecmp(args[0], "udp") == 0) {
+		gcfg.tun_offload = TUN_OFFLOAD_UDP;
 	} else {
-		slog(LOG_CRIT, "Error: invalid value for tun-offload on line %d (must be off, tcp, or auto)\n", ln);
+		slog(LOG_CRIT, "Error: invalid value for tun-offload on line %d (must be off, tcp, udp, or auto)\n", ln);
 		return ERROR_REJECT;
 	}
 	return 0;

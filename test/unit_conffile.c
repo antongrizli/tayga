@@ -818,6 +818,19 @@ void test_config_read(void) {
     expect(!config_read(conffile),"Passed");
     expectl(gcfg.tun_offload, TUN_OFFLOAD_TCP, "tun_offload");
 
+    /* Test Case - experimental UDP segmentation offload */
+    if(!print_fail_only) printf("TEST CASE: tun-offload udp\n");
+    fd = fopen(conffile,"w");
+    expect((long)fd,"fopen");
+    if(!fd) return;
+    testcase = "tun-offload udp\n";
+    fwrite(testcase,strlen(testcase),1,fd);
+    fclose(fd);
+
+    config_init();
+    expect(!config_read(conffile),"Passed");
+    expectl(gcfg.tun_offload, TUN_OFFLOAD_UDP, "tun_offload");
+
     /* Test Case - tun-up invalid  */
     if(!print_fail_only) printf("TEST CASE: tun-up invalid\n");
     fd = fopen(conffile,"w");

@@ -66,9 +66,9 @@ if [ "$TAYGA_OFFLINK_MTU_VAL" -lt 1280 ] || [ "$TAYGA_OFFLINK_MTU_VAL" -gt 1500 
 fi
 
 case "$TAYGA_OFFLOAD_VAL" in
-  off|tcp|auto) ;;
+  off|tcp|udp|auto) ;;
   *)
-    echo "ERROR: TAYGA_OFFLOAD must be 'off', 'tcp', or 'auto' (got '$TAYGA_OFFLOAD_VAL')" >&2
+    echo "ERROR: TAYGA_OFFLOAD must be 'off', 'tcp', 'udp', or 'auto' (got '$TAYGA_OFFLOAD_VAL')" >&2
     exit 64
     ;;
 esac

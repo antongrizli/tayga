@@ -988,7 +988,9 @@ static void host_handle_icmp6(struct pkt *p)
  *
  * In a stateless translator without per-flow state tables, uniqueness across all
  * concurrent flows is maintained by advancing a global monotonic 16-bit sequence.
- * We use an atomic fetch-and-add of 1 (`atomic_fetch_add_explicit(&..., 1, ...)`).
+ * We atomically reserve one ID for scalar packets or a consecutive range for an
+ * immediately emitted UDP aggregate. The finite 16-bit space still wraps;
+ * this allocator does not guarantee uniqueness over an unbounded MDL.
  * This eliminates thread-local block leases, preventing slow threads from holding
  * stale ID blocks that could collide when fast threads cycle through 65,536 values.
  * Every generated ID within any rolling window of 65,536 allocations is strictly
@@ -1003,7 +1005,12 @@ void set_ip4_ident_counter(uint16_t val)
 
 uint16_t next_ip4_ident(void)
 {
-	return atomic_fetch_add_explicit(&global_ip4_ident, 1, memory_order_relaxed);
+	return reserve_ip4_ident(1);
+}
+
+uint16_t reserve_ip4_ident(uint16_t count)
+{
+	return atomic_fetch_add_explicit(&global_ip4_ident, count, memory_order_relaxed);
 }
 
 static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,

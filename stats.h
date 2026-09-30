@@ -47,6 +47,12 @@ struct worker_pub_stats {
 	_Atomic uint64_t gso_fallback_pkts;
 	_Atomic uint64_t gso_invalid_pkts;
 	_Atomic uint64_t gso_tun_write_errors;
+	_Atomic uint64_t udp_gso_rx_aggregates;
+	_Atomic uint64_t udp_gso_rx_bytes;
+	_Atomic uint64_t udp_gso_tx_aggregates;
+	_Atomic uint64_t udp_gso_tx_bytes;
+	_Atomic uint64_t udp_gso_sw_fallbacks;
+	_Atomic uint64_t udp_gso_sw_segments;
 } __attribute__((aligned(128)));
 
 /*
@@ -78,6 +84,12 @@ struct worker_priv_stats {
 	uint64_t gso_fallback_pkts;
 	uint64_t gso_invalid_pkts;
 	uint64_t gso_tun_write_errors;
+	uint64_t udp_gso_rx_aggregates;
+	uint64_t udp_gso_rx_bytes;
+	uint64_t udp_gso_tx_aggregates;
+	uint64_t udp_gso_tx_bytes;
+	uint64_t udp_gso_sw_fallbacks;
+	uint64_t udp_gso_sw_segments;
 
 	uint32_t batch_count;
 	int slot_idx;
@@ -109,6 +121,12 @@ struct tayga_stats {
 	uint64_t gso_fallback_pkts;
 	uint64_t gso_invalid_pkts;
 	uint64_t gso_tun_write_errors;
+	uint64_t udp_gso_rx_aggregates;
+	uint64_t udp_gso_rx_bytes;
+	uint64_t udp_gso_tx_aggregates;
+	uint64_t udp_gso_tx_bytes;
+	uint64_t udp_gso_sw_fallbacks;
+	uint64_t udp_gso_sw_segments;
 
 	time_t start_time;
 };
@@ -141,6 +159,10 @@ static inline void stats_gso_sw_seg_out(uint32_t count) { (void)count; }
 static inline void stats_gso_fallback(void) {}
 static inline void stats_gso_invalid(void) {}
 static inline void stats_gso_tun_write_error(void) {}
+static inline void stats_udp_gso_rx(uint32_t bytes) { (void)bytes; }
+static inline void stats_udp_gso_tx(uint32_t bytes) { (void)bytes; }
+static inline void stats_udp_gso_sw_fallback(void) {}
+static inline void stats_udp_gso_sw_segment(void) {}
 #else
 /* Per-packet accounting: called exactly once per TUN read datagram */
 static inline void stats_packet_done(void) {
@@ -217,6 +239,24 @@ static inline void stats_gso_invalid(void) {
 
 static inline void stats_gso_tun_write_error(void) {
 	g_tls_priv.gso_tun_write_errors++;
+}
+
+static inline void stats_udp_gso_rx(uint32_t bytes) {
+	g_tls_priv.udp_gso_rx_aggregates++;
+	g_tls_priv.udp_gso_rx_bytes += bytes;
+}
+
+static inline void stats_udp_gso_tx(uint32_t bytes) {
+	g_tls_priv.udp_gso_tx_aggregates++;
+	g_tls_priv.udp_gso_tx_bytes += bytes;
+}
+
+static inline void stats_udp_gso_sw_fallback(void) {
+	g_tls_priv.udp_gso_sw_fallbacks++;
+}
+
+static inline void stats_udp_gso_sw_segment(void) {
+	g_tls_priv.udp_gso_sw_segments++;
 }
 #endif
 

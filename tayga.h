@@ -134,7 +134,9 @@ struct tun_pi {
 #define HEADROOM 64
 
 /* Size of receive buffer(s) */
-#define RECV_BUF_SIZE (HEADROOM + 65536)
+/* IPv6's largest non-jumbo packet is 40 + 65535 bytes. Reserve the maximum
+ * vnet header too; the extra byte lets tun_read_packet detect a full buffer. */
+#define RECV_BUF_SIZE (HEADROOM + 40 + 65535 + 12 + 1)
 /* Protocol structures */
 
 struct ip4 {
@@ -515,6 +517,8 @@ void log_pkt6(int err, struct pkt *p, const char *msg);
 void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
 void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
 uint16_t next_ip4_ident(void);
+/* Reserve count consecutive host-order IDs for one immediately emitted aggregate. */
+uint16_t reserve_ip4_ident(uint16_t count);
 void set_ip4_ident_counter(uint16_t val);
 uint16_t ip_checksum(void *d, uint32_t c);
 uint16_t ones_add(uint16_t a, uint16_t b);

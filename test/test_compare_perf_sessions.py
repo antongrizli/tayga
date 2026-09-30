@@ -41,8 +41,8 @@ class ComparePerfSessionsTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
 
-    def run_tool(self):
-        return subprocess.run(["python3", str(TOOL), str(self.base), str(self.candidate)],
+    def run_tool(self, *args):
+        return subprocess.run(["python3", str(TOOL), *args, str(self.base), str(self.candidate)],
                               capture_output=True, text=True)
 
     def test_groups_directions_separately(self):
@@ -117,6 +117,70 @@ class ComparePerfSessionsTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertFalse(report["comparisons"])
         self.assertTrue(any("no matching" in warning for warning in report["warnings"]))
+
+    def test_build_mode_matches_distinct_known_builds(self):
+        base = result("upload", "0", "off", 100)
+        candidate = result("upload", "0", "tcp", 120)
+        candidate["git_revision"] = "def"
+        candidate["source_tree_sha256"] = "tree-new"
+        candidate["tayga_sha256"] = "binary-new"
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool("--mode", "build")
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(report["comparisons"]), 1)
+        self.assertEqual(report["comparisons"][0]["baseline_build"]["git_revision"], "abc")
+        self.assertEqual(report["comparisons"][0]["candidate_build"]["git_revision"], "def")
+
+    def test_forwarding_gro_is_a_distinct_treatment(self):
+        base = result("upload", "0", "udp", 100)
+        candidate = dict(base, forwarding_gro="on", received_mbps=120)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(report["comparisons"][0]["baseline_treatment"]["forwarding_gro"], "off")
+        self.assertEqual(report["comparisons"][0]["candidate_treatment"]["forwarding_gro"], "on")
+
+    def test_mixed_forwarding_gro_is_not_pooled(self):
+        base = result("upload", "0", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "off", base)
+        self.write(self.candidate, "on", dict(base, forwarding_gro="on"))
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 2)
+        self.assertTrue(any("mixed treatment" in warning for warning in report["warnings"]))
+
+    def test_legacy_udp_loss_is_excluded(self):
+        base = dict(result("upload", "0", "udp", 100), workload_protocol="udp",
+                    datagram_size=1200, udp_loss_percent=10)
+        candidate = dict(base, udp_accounting_version=2, udp_loss_percent=12)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 2, run.stderr)  # legacy accounting warning
+        comparison = report["comparisons"][0]
+        self.assertNotIn("udp_loss_percent", comparison["baseline_summary"])
+        self.assertNotIn("udp_loss_percent_percent", comparison["changes_percent"])
+        self.assertTrue(any("Legacy UDP loss" in warning for warning in report["warnings"]))
+
+    def test_build_mode_rejects_mixed_builds_within_arm(self):
+        base_a = result("upload", "0", "off", 100)
+        base_b = result("upload", "0", "off", 110)
+        base_b["tayga_sha256"] = "binary-other"
+        candidate = result("upload", "0", "tcp", 120)
+        self.write(self.base, "upload-a", base_a)
+        self.write(self.base, "upload-b", base_b)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool("--mode", "build")
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 2)
+        self.assertFalse(report["comparisons"])
+        self.assertTrue(any("mixed build identities" in warning for warning in report["warnings"]))
 
     def test_missing_metrics_are_ignored(self):
         base = result("upload", "0", "off", 100)

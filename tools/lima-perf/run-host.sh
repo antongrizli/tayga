@@ -43,16 +43,24 @@ limactl shell "$INSTANCE" -- env \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
   "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
   "CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}" "CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}" \
+  "FORWARDING_GRO=${FORWARDING_GRO:-off}" \
   "PROTOCOL=${PROTOCOL:-tcp}" "RATE=${RATE:-0}" \
   "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
   "DIRECTIONS=${DIRECTIONS:-download}" "MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}" \
   "MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}" "TUN_TXQLEN=${TUN_TXQLEN-1000}" \
+  "MAX_PING_LOSS_PERCENT=${MAX_PING_LOSS_PERCENT:-0}" \
   "PERF_MODES=${PERF_MODES:-stat record}" \
   "DATAGRAM_SIZE=${DATAGRAM_SIZE:-1200}" "BLOCK_SIZE=${BLOCK_SIZE-}" \
-  bash "$REPO/tools/lima-perf/run-guest.sh"
+  bash -c '
+    task_runner=$(mktemp /tmp/tayga-perf-runner.XXXXXX)
+    cp "$1" "$task_runner" || exit
+    bash "$task_runner"
+    task_status=$?
+    rm -f "$task_runner"
+    exit "$task_status"
+  ' bash "$REPO/tools/lima-perf/run-guest.sh"
 
 SESSION_DIR="$REPO/perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
 if [ -d "$SESSION_DIR" ]; then
-  printf '%s\n' "$GIT_REVISION" > "$SESSION_DIR/git-revision.txt"
-  git -C "$REPO" diff --binary > "$SESSION_DIR/source.patch" || true
+  printf 'requested_revision=%s\n' "$GIT_REVISION" > "$SESSION_DIR/host-request.txt"
 fi

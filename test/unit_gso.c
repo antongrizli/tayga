@@ -112,6 +112,8 @@ static void test_gso_validate(void)
 	/* UFO is IP fragmentation, not UDP_L4 datagram segmentation. */
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP;
 	assert(gso_validate_header(&p) == -1);
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4 | VIRTIO_NET_HDR_GSO_ECN;
+	assert(gso_validate_header(&p) == -1); /* ECN GSO flag is TCP-only */
 
 	/* Case 8: Valid TCPv6 GSO with ECN */
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV6 | VIRTIO_NET_HDR_GSO_ECN;
@@ -1228,8 +1230,8 @@ static void test_gso_udp_uso(void)
 	printf("Testing UDP Generic Segmentation Offload (USO) and fallback...\n");
 	setup_test_mapping();
 
-	/* 1. Fast-path 6to4 USO translation */
-	{
+	/* 1. Fast-path 6to4 USO translation, including DF=0 range reservation. */
+	for (int small = 0; small < 2; small++) {
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		gcfg.tun_has_uso = 1;
@@ -1239,7 +1241,9 @@ static void test_gso_udp_uso(void)
 		struct ip6 *ip6 = (struct ip6 *)pkt_data;
 		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip6));
 		uint8_t *payload = pkt_data + sizeof(struct ip6) + sizeof(struct udp_hdr);
-		uint32_t payload_len = 4400;
+		uint32_t payload_len = small ? 3600 : 4400;
+		uint16_t segment_size = small ? 1200 : 2200;
+		set_ip4_ident_counter(65534);
 
 		memset(ip6, 0, sizeof(*ip6));
 		ip6->ver_tc_fl = htonl(0x60000000);
@@ -1265,7 +1269,7 @@ static void test_gso_udp_uso(void)
 				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
 				.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4,
 				.hdr_len = sizeof(struct ip6) + sizeof(struct udp_hdr),
-				.gso_size = 2200,
+				.gso_size = segment_size,
 				.csum_start = sizeof(struct ip6),
 				.csum_offset = 6,
 			},
@@ -1279,7 +1283,7 @@ static void test_gso_udp_uso(void)
 
 		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4);
-		assert(vh->gso_size == 2200);
+		assert(vh->gso_size == segment_size);
 		assert(vh->csum_start == sizeof(struct ip4));
 		assert(vh->csum_offset == 6);
 
@@ -1287,6 +1291,9 @@ static void test_gso_udp_uso(void)
 		assert(rx_ip4->proto == IPPROTO_UDP);
 		assert(rx_ip4->ttl == 63);
 		assert(ntohs(rx_ip4->length) == sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len);
+		assert(ntohs(rx_ip4->flags_offset) == (small ? 0 : IP4_F_DF));
+		assert(ntohs(rx_ip4->ident) == (small ? 65534 : 0));
+		assert(next_ip4_ident() == (small ? 1 : 65534));
 
 		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf + gcfg.vnet_hdr_sz + sizeof(struct ip4));
 		assert(rx_udp->src_port == htons(12345));
@@ -1564,6 +1571,15 @@ static void test_partial_udp_fragmentation(void)
 		.data_len = 1528, .has_vhdr = 1};
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4;
 	p.vhdr.gso_size = 0;
+	handle_ip4(&p);
+	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	/* More than 128 logical datagrams in one aggregate is rejected before any
+	 * output, bounding software work and matching the UDP_SEGMENT API limit. */
+	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	p.vhdr.gso_size = 10;
+	p.vhdr.hdr_len = sizeof(struct ip4) + sizeof(struct udp_hdr);
+	p.vhdr.csum_start = sizeof(struct ip4);
+	p.vhdr.csum_offset = 6;
 	handle_ip4(&p);
 	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
 	close(sv[0]);

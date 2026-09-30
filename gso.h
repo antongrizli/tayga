@@ -40,6 +40,7 @@ enum tun_offload_mode {
 	TUN_OFFLOAD_OFF = 0,
 	TUN_OFFLOAD_TCP = 1,
 	TUN_OFFLOAD_AUTO = 2,
+	TUN_OFFLOAD_UDP = 3,
 };
 
 struct gso_worker_stats {

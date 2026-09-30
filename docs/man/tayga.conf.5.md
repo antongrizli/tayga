@@ -31,12 +31,16 @@ tayga.conf.
 
     This configuration directive is mandatory.
 
-**tun-offload** *off|tcp|auto*
+**tun-offload** *off|tcp|udp|auto*
 :   Defaults to **auto**. On Linux, negotiate checksum and TCP segmentation
     offload on the TUN device and worker queues. Fall back to packet processing
     when unsupported, logging the effective mode. **tcp** requires support and
     fails startup when it cannot be enabled; **off** disables offload explicitly.
-    UDP segmentation is currently disabled pending integration validation.
+    **udp** explicitly requests checksum, TCP segmentation, and UDP segmentation
+    offload and fails startup when the complete feature set is unavailable. UDP
+    mode is experimental; packet-level fallback remains active for cases the
+    translator cannot safely segment in the kernel. **auto** currently selects
+    the proven TCP feature set and does not enable UDP segmentation.
     On FreeBSD, **auto** uses the ordinary TUN path.
 
 **ipv4-addr** *ipv4_address*

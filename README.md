@@ -60,13 +60,14 @@ tayga -d
 
 ## Hardware Offload & Performance (GSO / GRO)
 
-TAYGA supports high-performance kernel offloads (**GSO**, **GRO**, and **Checksum Offload**) via VirtIO network headers (`IFF_VNET_HDR`), achieving a **95.5% reduction in system calls** (from 62k to 2.8k/sec) and up to **4× lower CPU usage** at 300 Mbps:
+On Linux, TAYGA can use TUN virtio headers for TCP segmentation and checksum offload. `auto` is the default and currently selects the validated TCP feature set when available. UDP segmentation is experimental and must be requested explicitly with `udp`; it is not enabled by `auto` until its packet behavior passes target-kernel validation.
 
 ```conf
 # In tayga.conf:
 # off  - Standard packet-by-packet operation (explicit baseline)
-# tcp  - Enable TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
-# auto - Default; probe kernel at startup; enable if supported, fallback to off
+# tcp  - Require TCP GSO/checksum offload support
+# udp  - Experimental: require TCP and UDP segmentation/checksum support
+# auto - Default; use the validated TCP feature set when supported
 tun-offload auto
 ```
 
@@ -74,6 +75,9 @@ Or via command-line flags:
 ```sh
 # Start with auto-detected offloads
 tayga --tun-offload auto
+
+# Explicit lab-only UDP segmentation experiment
+tayga --tun-offload udp
 
 # Test host kernel & TUN offload capabilities before launch
 tayga --check-offload
@@ -84,7 +88,7 @@ For container and script deployments:
 export CLAT_OFFLOAD=auto
 ```
 
-See [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) and [**Verification Report**](perf-sessions/GSO-FINAL-REPORT.md) for architecture, benchmarks, and MikroTik RouterOS deployment details.
+See the [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) for configuration and the [**2026-09-29 session investigation**](docs/PERFORMANCE-SESSION-INVESTIGATION-2026-09-29.md) for current synthetic Linux measurements and their limits.
 
 ## CLAT performance harness
 
@@ -105,9 +109,10 @@ docker run --privileged --device /dev/net/tun --rm \
   tayga-clat:bench
 ```
 
-The example aims for approximately 300 Mbit/s because `RATE` is applied to
-each of 20 one-flow clients. `WARMUP` is a separate unmeasured run; the actual
-run has no iperf `-O`, so its traffic, CPU and counter windows coincide.
+The example's `RATE` is applied to each client; it is a sample workload, not a
+capacity limit. Use the adaptive UDP capacity search to increase offered load
+until a boundary is bracketed and then probe for a delivered-throughput
+plateau. There is no fixed 300 Mbit/s ceiling. `WARMUP` is a separate run.
 Always use measured `received_mbps`, not the requested rate. `DIRECTIONS` also
 accepts `bidir`; `PROTOCOL=udp` and `DATAGRAM_SIZE=1200` select UDP, while
 `BLOCK_SIZE` supplies iperf3 `-l` for a packet-size experiment.
@@ -116,10 +121,44 @@ Every run saves a monotonic window, per-thread state, TUN/router link counter
 deltas, softirq/softnet snapshots, JSON/stderr and process CPU. TCP reports
 retransmits; UDP reports loss, jitter, packet count and out-of-order packets.
 By default `MAX_TUN_DROPS=0` and `MAX_UDP_LOSS_PERCENT=0`: a run crossing either
-limit is retained as an artifact but exits non-zero and is not valid for A/B.
+limit is retained as an artifact and fails acceptance. Workload validity and
+capture validity are reported separately. Schema 3 fixes UDP accounting:
+receiver sequence counts include losses, while actual datagram receipts come
+from received bytes and the configured datagram size. Legacy UDP loss metrics
+must be reprocessed from raw reports before comparison.
 Results are written under `ARTIFACT_DIR` (default `/tmp/tayga-clat-results`).
 
-To compare worker counts and UDP payload sizes, use the matrix runner:
+To measure a sustainable UDP rate and probe maximum delivered throughput in
+both directions without a fixed rate ceiling, use the adaptive search:
+
+```sh
+sudo tools/run-udp-matrix.sh
+```
+
+The runner starts at `INITIAL_TOTAL_RATE_MBIT`, increases offered load, refines
+the acceptance boundary, and retains invalid or overload runs. `MAX_SEARCH_RUNS`
+and `MAX_OVERLOAD_RUNS` bound experiment time; reaching those limits is reported
+as an unresolved bound, not a maximum. Use `MAX_TOTAL_RATE_MBIT` only when an
+explicit operational cap is desired.
+
+For an explicit lab experiment with ordinary UDP forwarding aggregation, set
+`FORWARDING_GRO=on` and `CLAT_OFFLOAD=udp`. The harness changes and records features
+only on disposable namespace interfaces. Check nonzero UDP aggregate counters;
+accepted ethtool settings alone do not prove aggregation or a throughput gain.
+The default is `FORWARDING_GRO=off` and `CLAT_OFFLOAD=auto`.
+
+For real Linux TUN packet validation against a selected executable:
+
+```sh
+sudo python3 test/test_udp_gso_kernel.py --binary ./tayga --output /tmp/tayga-udp-kernel-results
+```
+
+This saves independent post-segmentation captures and checks both directions,
+worker modes, MTUs, payloads, checksums, tails and IPv4 IDs. It does not measure
+throughput; broader malformed-input and PMTU tests remain necessary.
+
+To compare worker counts and UDP payload sizes, set `SIZES` and other workload
+variables on that runner:
 
 ```sh
 docker run --privileged --device /dev/net/tun --rm \

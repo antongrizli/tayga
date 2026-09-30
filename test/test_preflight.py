@@ -92,7 +92,7 @@ def wait_for_clat(timeout_sec=5):
 
 def test_cli_check_offload():
     print("\n--- 1. CLI `tayga --check-offload` Test ---")
-    out, err, rc = sh("/usr/local/sbin/tayga --check-offload")
+    out, err, rc = sh("/usr/sbin/tayga --check-offload")
     print(f"Output: {out.strip()}")
     assert rc == 0, f"tayga --check-offload failed with rc={rc}: {err}"
     assert "OFFLOAD_CHECK: OK" in out, f"Unexpected output: {out}"
@@ -123,6 +123,29 @@ def test_mode_startup(mode, expect_offload_active):
     else:
         assert "TUN offload active" not in log_content, f"Expected no offload in log, got:\n{log_content}"
         print(f"[PASS] Mode {mode} disabled offload verified (clean standard tun)")
+
+def test_udp_mode_negotiation():
+    print("\n--- Experimental UDP USO negotiation ---")
+    setup_topology()
+    log_file = "/tmp/tayga_test_udp.log"
+    tayga = subprocess.Popen(
+        f"ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 "
+        f"CLAT_WORKERS=1 CLAT_OFFLOAD=udp /usr/local/sbin/clat-start.sh > {log_file} 2>&1",
+        shell=True)
+    ready = wait_for_clat(timeout_sec=6)
+    with open(log_file, "r") as f:
+        log_content = f.read()
+    tayga.terminate()
+    try: tayga.wait(timeout=2)
+    except subprocess.TimeoutExpired: sh("killall -9 tayga 2>/dev/null || true")
+    teardown()
+    if ready:
+        assert "experimental UDP USO" in log_content, log_content
+        print("[PASS] Explicit UDP mode negotiated USO")
+    else:
+        assert "TUNSETOFFLOAD failed" in log_content, log_content
+        assert "fallback to offload=off" not in log_content, log_content
+        print("[PASS] Explicit UDP mode rejected unavailable USO without silently falling back")
 
 def test_auto_data_transfer():
     print("\n--- 3. End-to-End Data Transfer with CLAT_OFFLOAD=auto ---")
@@ -172,6 +195,7 @@ def main():
     test_mode_startup("auto", expect_offload_active=True)
     test_mode_startup("tcp", expect_offload_active=True)
     test_mode_startup("off", expect_offload_active=False)
+    test_udp_mode_negotiation()
     test_auto_data_transfer()
     print("\nALL PREFLIGHT & AUTO-DETECTION TESTS PASSED!")
 

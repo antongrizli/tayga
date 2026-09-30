@@ -17,6 +17,22 @@ time_t now;
 static uint16_t thread_ids[NUM_THREADS][IDS_PER_THREAD];
 static pthread_barrier_t barrier_start;
 
+static void *range_worker(void *arg)
+{
+	int tid = *(int *)arg;
+	const uint16_t sizes[] = {1, 3, 16, 128};
+	pthread_barrier_wait(&barrier_start);
+	for (int i = 0; i < IDS_PER_THREAD;) {
+		uint16_t count = sizes[tid];
+		if (count > IDS_PER_THREAD - i)
+			count = IDS_PER_THREAD - i;
+		uint16_t first = reserve_ip4_ident(count);
+		for (uint16_t j = 0; j < count; j++)
+			thread_ids[tid][i++] = (uint16_t)(first + j);
+	}
+	return NULL;
+}
+
 static void *worker_fn(void *arg)
 {
 	int tid = *(int *)arg;
@@ -136,6 +152,24 @@ int main(void)
 	assert(skew_unique == 65536);
 	printf("PASS: Skewed thread scenario: 65,536 IDs partitioned between slow/fast threads have 0 collisions.\n");
 
+	set_ip4_ident_counter(65530);
+	assert(reserve_ip4_ident(10) == 65530);
+	assert(next_ip4_ident() == 4);
+	set_ip4_ident_counter(0);
+	pthread_barrier_init(&barrier_start, NULL, NUM_THREADS);
+	for (int t = 0; t < NUM_THREADS; t++)
+		pthread_create(&th[t], NULL, range_worker, &tids[t]);
+	for (int t = 0; t < NUM_THREADS; t++)
+		pthread_join(th[t], NULL);
+	pthread_barrier_destroy(&barrier_start);
+	memset(seen, 0, sizeof(seen));
+	for (int t = 0; t < NUM_THREADS; t++) {
+		for (int i = 0; i < IDS_PER_THREAD; i++) {
+			assert(!seen[thread_ids[t][i]]);
+			seen[thread_ids[t][i]] = 1;
+		}
+	}
+	printf("PASS: Mixed scalar/range reservations are unique across four threads and wrap correctly.\n");
 	printf("PASS: All unit_ip4_id tests passed.\n");
 	return 0;
 }
