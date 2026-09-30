@@ -11,13 +11,14 @@ from pathlib import Path
 WORKLOAD_KEYS = ("direction", "clients", "expected_clients", "workload_protocol",
                  "flows_per_client", "rate_per_flow", "duration_seconds",
                  "warmup_seconds", "datagram_size", "block_size", "offlink_mtu",
-                 "kernel", "perf_mode")
+                 "kernel", "perf_mode", "perf_scope", "socket_sample_interval")
 BUILD_KEYS = ("git_revision", "source_tree_sha256", "clat_start_sha256", "tayga_sha256")
 IDENTITY_KEYS = WORKLOAD_KEYS + BUILD_KEYS
-TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen", "forwarding_gro")
+TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen", "forwarding_gro",
+                  "pacing_timer_us", "fq_rate", "socket_buffer_bytes", "sender_fq", "sender_fq_flow_limit")
 METRICS = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
            "system_busy_cores", "system_softirq_cores", "tun_drops",
-           "tun_tx_drop_percent", "udp_loss_percent", "ping_loss_percent",
+           "tun_tx_drop_percent", "udp_loss_percent", "udp_sender_receiver_gap_percent", "ping_loss_percent",
            "retransmits", "retransmits_per_gbyte", "ping_avg_ms",
            "ping_p95_ms", "ping_p99_ms", "elapsed_s")
 OPTIONAL_IDENTITY_KEYS = {"datagram_size", "block_size"}
@@ -34,7 +35,12 @@ def results(root: Path):
         doc["path"] = str(path)
         # Earlier harness versions had no forwarding GRO treatment and never
         # enabled it. Preserve comparisons with those saved results.
+        doc.setdefault("perf_scope", "process")
         doc.setdefault("forwarding_gro", "off")
+        for key, default in (("pacing_timer_us", 1000), ("fq_rate", "0"),
+                             ("socket_buffer_bytes", 0), ("sender_fq", "off"), ("sender_fq_flow_limit", 100),
+                             ("socket_sample_interval", 0)):
+            doc.setdefault(key, default)
         doc["valid"] = bool(doc.get("capture_valid", False) and doc.get("workload_valid", False))
         if not doc["valid"]:
             doc["invalid_reason"] = "; ".join(doc.get("degraded_reasons", [])) or "capture/workload validity flag is false or missing"

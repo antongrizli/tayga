@@ -144,6 +144,35 @@ class ComparePerfSessionsTests(unittest.TestCase):
         self.assertEqual(report["comparisons"][0]["baseline_treatment"]["forwarding_gro"], "off")
         self.assertEqual(report["comparisons"][0]["candidate_treatment"]["forwarding_gro"], "on")
 
+    def test_pacing_buffer_and_fq_limits_are_distinct_treatments(self):
+        base = result("upload", "750M", "udp", 100)
+        candidate = dict(base, pacing_timer_us=250, socket_buffer_bytes=2097152,
+                         sender_fq="on", fq_rate="800M", sender_fq_flow_limit=1000)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        comparison = report["comparisons"][0]
+        self.assertEqual(comparison["baseline_treatment"]["sender_fq_flow_limit"], 100)
+        self.assertEqual(comparison["candidate_treatment"]["sender_fq_flow_limit"], 1000)
+
+    def test_system_profiles_are_not_pooled_with_process_profiles(self):
+        base = result("upload", "750M", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", dict(base, perf_scope="system"))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 2)
+        self.assertFalse(json.loads(run.stdout)["comparisons"])
+
+    def test_socket_sampling_changes_workload_identity(self):
+        base = result("upload", "750M", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", dict(base, socket_sample_interval=1))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 2)
+        self.assertFalse(json.loads(run.stdout)["comparisons"])
+
     def test_mixed_forwarding_gro_is_not_pooled(self):
         base = result("upload", "0", "udp", 100)
         self.write(self.base, "upload", base)

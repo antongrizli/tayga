@@ -15,6 +15,8 @@ DATAGRAM_SIZE=${DATAGRAM_SIZE:-1200}
 BLOCK_SIZE=${BLOCK_SIZE:-}
 ARTIFACT_DIR=${ARTIFACT_DIR:-/tmp/tayga-clat-results}
 PERF_MODE=${PERF_MODE:-none}
+PERF_SCOPE=${PERF_SCOPE:-process}
+export PERF_SCOPE
 MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}
 MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}
 MAX_PING_LOSS_PERCENT=${MAX_PING_LOSS_PERCENT:-0}
@@ -22,14 +24,32 @@ TUN_TXQLEN=${TUN_TXQLEN:-1000}
 CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}
 CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}
 FORWARDING_GRO=${FORWARDING_GRO:-off}
-export FORWARDING_GRO
+PACING_TIMER_US=${PACING_TIMER_US:-1000}
+FQ_RATE=${FQ_RATE:-0}
+SOCKET_BUFFER_BYTES=${SOCKET_BUFFER_BYTES:-0}
+SENDER_FQ=${SENDER_FQ:-off}
+SENDER_FQ_FLOW_LIMIT=${SENDER_FQ_FLOW_LIMIT:-100}
+SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}
+export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SOCKET_SAMPLE_INTERVAL
 GIT_REVISION=${GIT_REVISION:-unknown}
 SOURCE_TREE_SHA256=${SOURCE_TREE_SHA256:-unknown}
 
 case "$PROTOCOL" in tcp|udp) ;; *) echo 'PROTOCOL must be tcp or udp' >&2; exit 64;; esac
 case "$CLAT_OFFLOAD" in off|tcp|udp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, tcp, udp or auto' >&2; exit 64;; esac
+case "$PERF_SCOPE" in process|system) ;; *) echo 'PERF_SCOPE must be process or system' >&2; exit 64;; esac
 case "$PERF_MODE" in none|stat|record) ;; *) echo 'PERF_MODE must be none, stat or record' >&2; exit 64;; esac
 case "$FORWARDING_GRO" in off|on) ;; *) echo 'FORWARDING_GRO must be off or on' >&2; exit 64;; esac
+case "$SENDER_FQ" in off|on) ;; *) echo 'SENDER_FQ must be off or on' >&2; exit 64;; esac
+for numeric in "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT"; do
+  case "$numeric" in ''|*[!0-9]*) echo 'pacing/buffer/sampling values must be non-negative integers' >&2; exit 64;; esac
+done
+[ "$SENDER_FQ_FLOW_LIMIT" -gt 0 ] && [ "$SENDER_FQ_FLOW_LIMIT" -le 10000 ] || { echo 'SENDER_FQ_FLOW_LIMIT must be between 1 and 10000' >&2; exit 64; }
+[ "$PACING_TIMER_US" -gt 0 ] || { echo 'PACING_TIMER_US must be positive' >&2; exit 64; }
+awk -v rate="$FQ_RATE" 'BEGIN { exit !(rate ~ /^[0-9]+([.][0-9]+)?[KMGTkmgt]?$/) }' || { echo 'invalid FQ_RATE' >&2; exit 64; }
+if [ "$PROTOCOL" = udp ] && [ -n "$BLOCK_SIZE" ] && [ "$BLOCK_SIZE" != "$DATAGRAM_SIZE" ]; then
+  echo 'UDP BLOCK_SIZE must equal DATAGRAM_SIZE for packet accounting' >&2; exit 64
+fi
+[ "$FQ_RATE" = 0 ] || [ "$SENDER_FQ" = on ] || { echo 'FQ_RATE requires SENDER_FQ=on' >&2; exit 64; }
 case "$DURATION:$WARMUP" in *[!0-9:]*|:) echo 'DURATION and WARMUP must be integers' >&2; exit 64;; esac
 case "$MAX_TUN_DROPS" in ''|*[!0-9]*) echo 'MAX_TUN_DROPS must be a non-negative integer' >&2; exit 64;; esac
 case "$MAX_UDP_LOSS_PERCENT:$MAX_PING_LOSS_PERCENT" in
@@ -55,17 +75,26 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 owned_namespaces=
 cleanup() {
+  test -n "$socket_sampler_pid" && kill "$socket_sampler_pid" 2>/dev/null || true
   test -n "$clat_pid" && kill "$clat_pid" 2>/dev/null || true
   for iperf_pid in $iperf_pids; do kill "$iperf_pid" 2>/dev/null || true; done
   for client_pid in $client_pids; do kill "$client_pid" 2>/dev/null || true; done
   for release_pid in $release_pids; do kill "$release_pid" 2>/dev/null || true; done
   for owned_ns in $owned_namespaces; do ip netns del "$owned_ns" 2>/dev/null || true; done
+  if test -n "$saved_rmem_max"; then
+    sysctl -qw "net.core.rmem_max=$saved_rmem_max" "net.core.wmem_max=$saved_wmem_max" || {
+      echo 'ERROR: could not restore socket buffer limits' >&2; return 1;
+    }
+  fi
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 clat_pid=
 iperf_pids=
 client_pids=
 release_pids=
+socket_sampler_pid=
+saved_rmem_max=
+saved_wmem_max=
 for ns in client router clatns server; do
   if ip netns list | awk '{print $1}' | grep -Fxq "$ns"; then
     echo "network namespace '$ns' already exists; refusing to alter it" >&2
@@ -86,6 +115,21 @@ for ns in client router clatns server; do
     exit 1
   fi
 done
+
+# Linux 6.12 exposes these limits read-only in child network namespaces.
+# Raise the initial-namespace limits only for this serialized experiment and
+# restore them on every exit; socket defaults remain unchanged.
+if [ "$SOCKET_BUFFER_BYTES" -gt 0 ]; then
+  saved_rmem_max=$(sysctl -n net.core.rmem_max) || exit 1
+  saved_wmem_max=$(sysctl -n net.core.wmem_max) || exit 1
+  printf '%s\n%s\n' "$saved_rmem_max" "$saved_wmem_max" > "$ARTIFACT_DIR/buffer-limits.original"
+  for setting in rmem_max wmem_max; do
+    current_limit=$(sysctl -n "net.core.$setting") || exit 1
+    if [ "$SOCKET_BUFFER_BYTES" -gt "$current_limit" ]; then
+      sysctl -qw "net.core.$setting=$SOCKET_BUFFER_BYTES" || exit 1
+    fi
+  done
+fi
 
 ip link add lan0 type veth peer name rlan
 ip link set lan0 netns client
@@ -163,6 +207,64 @@ ip -n server link set server0 up
 ip -n server -6 addr add 2600:464::2/64 dev server0
 ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo
 ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0
+if [ "$SENDER_FQ" = on ]; then
+  ip netns exec client tc qdisc replace dev lan0 root fq limit 10000 flow_limit "$SENDER_FQ_FLOW_LIMIT" || exit 1
+  ip netns exec server tc qdisc replace dev server0 root fq limit 10000 flow_limit "$SENDER_FQ_FLOW_LIMIT" || exit 1
+fi
+
+
+snapshot_thread_counters() {
+  python3 - "$clat_pid" "$1" <<'PY_THREADS'
+import json, os, pathlib, re, sys, time
+pid, target = int(sys.argv[1]), pathlib.Path(sys.argv[2])
+rows = []
+for task in sorted(pathlib.Path(f"/proc/{pid}/task").iterdir()):
+    stat = (task / "stat").read_text().rsplit(")", 1)[1].split()
+    status = dict(line.split(":", 1) for line in (task / "status").read_text().splitlines() if ":" in line)
+    def optional(path):
+        try:
+            return path.read_text()
+        except OSError:
+            return None
+    sched, schedstat = optional(task / "sched"), optional(task / "schedstat")
+    migration = re.search(r"se.nr_migrations\s*:\s*(\d+)", sched or "")
+    times = [int(value) for value in schedstat.split()] if schedstat else None
+    rows.append(dict(tid=int(task.name), start_ticks=int(stat[19]), comm=(task / "comm").read_text().strip(),
+                     cpu_ticks=int(stat[11]) + int(stat[12]),
+                     voluntary_context_switches=int(status["voluntary_ctxt_switches"]),
+                     involuntary_context_switches=int(status["nonvoluntary_ctxt_switches"]),
+                     migrations=int(migration.group(1)) if migration else None,
+                     scheduler_running_ns=times[0] if times else None,
+                     runqueue_wait_ns=times[1] if times else None))
+target.write_text(json.dumps(dict(pid=pid, monotonic_ns=time.monotonic_ns(),
+                                 clock_ticks=os.sysconf("SC_CLK_TCK"), threads=rows), indent=2) + "\n")
+PY_THREADS
+}
+
+collect_network_counters() {
+  local counter_dir=$1 counter_phase=$2 counter_ns
+  uptime_seconds > "$counter_dir/network-counters.$counter_phase.uptime"
+  sysctl -n net.core.rmem_max net.core.wmem_max > "$counter_dir/buffer-limits.$counter_phase"
+  for counter_ns in client router clatns server; do
+    ip netns exec "$counter_ns" cat /proc/net/snmp > "$counter_dir/$counter_ns.snmp.$counter_phase"
+    ip netns exec "$counter_ns" cat /proc/net/snmp6 > "$counter_dir/$counter_ns.snmp6.$counter_phase"
+    ip -n "$counter_ns" -j -s link show > "$counter_dir/$counter_ns.links.$counter_phase.json"
+    ip netns exec "$counter_ns" tc -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase"
+    ip netns exec "$counter_ns" tc -j -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase.json"
+    ip netns exec "$counter_ns" sysctl -n net.core.rmem_max net.core.wmem_max > "$counter_dir/$counter_ns.buffer-limits.$counter_phase"
+  done
+}
+
+sample_udp_sockets() {
+  local sample_dir=$1 sample_ns
+  while :; do
+    for sample_ns in client server; do
+      printf 'uptime=%s namespace=%s\n' "$(uptime_seconds)" "$sample_ns" >> "$sample_dir/socket-samples.txt"
+      ip netns exec "$sample_ns" ss -u -a -n -m -i >> "$sample_dir/socket-samples.txt" 2>> "$sample_dir/socket-samples.stderr"
+    done
+    sleep "$SOCKET_SAMPLE_INTERVAL"
+  done
+}
 cleanup_iperf_servers() {
   for old_iperf_pid in $iperf_pids; do
     kill "$old_iperf_pid" 2>/dev/null || true
@@ -277,6 +379,9 @@ start_clients() {
     test "$direction" = download && set -- "$@" -R
     test "$direction" = bidir && set -- "$@" --bidir
     test "$PROTOCOL" = udp && set -- "$@" -u -l "$DATAGRAM_SIZE"
+    test "$PROTOCOL" = udp && set -- "$@" --pacing-timer "$PACING_TIMER_US"
+    set -- "$@" --fq-rate "$FQ_RATE"
+    test "$SOCKET_BUFFER_BYTES" -gt 0 && set -- "$@" -w "$SOCKET_BUFFER_BYTES"
     test -n "$BLOCK_SIZE" && set -- "$@" -l "$BLOCK_SIZE"
     test -n "$RATE" && set -- "$@" -b "$RATE"
     if test "$gated" = yes; then
@@ -391,17 +496,25 @@ run_iperf() {
   cat /proc/softirqs > "$run_dir/softirqs.before"
   cat /proc/net/softnet_stat > "$run_dir/softnet.before"
   cat /proc/stat > "$run_dir/proc_stat.before"
+  snapshot_thread_counters "$run_dir/thread-counters.before.json"
+  collect_network_counters "$run_dir" before
+  if [ "$PROTOCOL" = udp ] && [ "$SOCKET_SAMPLE_INTERVAL" -gt 0 ]; then
+    sample_udp_sockets "$run_dir" &
+    socket_sampler_pid=$!
+  fi
   local perf_pid=
   local perf_status=0
   if test "$PERF_MODE" != none && command -v perf >/dev/null 2>&1; then
     perf --version > "$run_dir/perf-version.txt" 2>&1 || true
+    set -- -p "$clat_pid"
+    test "$PERF_SCOPE" = system && set -- -a
     if test "$PERF_MODE" = stat; then
       perf stat -x ';' -o "$run_dir/perf-stat.csv" \
         -e task-clock,context-switches,cpu-migrations,page-faults,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_writev \
-        -p "$clat_pid" -- sleep "$DURATION" \
+        "$@" -- sleep "$DURATION" \
         >"$run_dir/perf-stat.stdout" 2>"$run_dir/perf-stat.stderr" &
     else
-      perf record -o "$run_dir/perf.data" -e cpu-clock -F 99 --call-graph fp -p "$clat_pid" -- sleep "$DURATION" \
+      perf record -o "$run_dir/perf.data" -e cpu-clock -F 99 --call-graph fp "$@" -- sleep "$DURATION" \
         >"$run_dir/perf-record.stdout" 2>"$run_dir/perf-record.stderr" &
     fi
     perf_pid=$!
@@ -417,6 +530,12 @@ run_iperf() {
   release_pids=
   if wait_clients "$run_dir"; then status=0; else status=$?; fi
   client_pids=
+  if test -n "$socket_sampler_pid"; then
+    kill "$socket_sampler_pid" 2>/dev/null || true
+    wait "$socket_sampler_pid" 2>/dev/null || true
+    socket_sampler_pid=
+  fi
+  collect_network_counters "$run_dir" after
   cleanup_iperf_servers
   if test -n "$ping_pid"; then
     wait "$ping_pid" || true
@@ -432,6 +551,7 @@ run_iperf() {
   uptime_after=$(uptime_seconds)
   monotonic_after=$(monotonic_ns)
   printf '%s\n%s\n' "$monotonic_before" "$monotonic_after" > "$run_dir/measurement.monotonic-ns"
+  snapshot_thread_counters "$run_dir/thread-counters.after.json"
   ps -L -p "$clat_pid" -o pid,tid,psr,pcpu,stat,comm > "$run_dir/tayga.threads.after"
   cat "/proc/$clat_pid/status" > "$run_dir/tayga.status.after"
   if test "$offload_active" = yes; then
@@ -467,6 +587,93 @@ def udp_packet_accounting(sent, received, payload_size):
     return dict(packets=byte_count // size, receiver_expected_packets=expected,
                 lost_packets=lost, sent_packets=sent.get("packets"))
 
+
+def parse_udp_snmp(text, ipv6=False):
+    """Return available UDP counters; missing fields never become zero."""
+    if ipv6:
+        return {key: int(value) for key, value in (line.split() for line in text.splitlines())
+                if key.startswith("Udp6")}
+    lines = text.splitlines()
+    for pos, line in enumerate(lines[:-1]):
+        if line.startswith("Udp:"):
+            keys, values = line.split()[1:], lines[pos + 1].split()[1:]
+            if not lines[pos + 1].startswith("Udp:") or len(keys) != len(values):
+                raise ValueError("malformed UDP SNMP header/value pair")
+            return {"Udp" + key: int(value) for key, value in zip(keys, values)}
+    return {}
+
+
+def udp_snmp_delta(before, after):
+    if not before or before.keys() != after.keys():
+        raise ValueError("UDP SNMP fields missing or changed")
+    delta = {key: after[key] - before[key] for key in before}
+    if any(value < 0 for value in delta.values()):
+        raise ValueError("UDP SNMP counter reset")
+    return delta
+
+
+def qdisc_counter_delta(before, after):
+    """Keep each qdisc separate: parent and child counters can overlap."""
+    def indexed(rows):
+        return {(row["dev"], row["handle"], row.get("parent"), row.get("root", False)): row for row in rows}
+    old, new = indexed(before), indexed(after)
+    if old.keys() != new.keys():
+        raise ValueError("qdisc topology changed during measurement")
+    result = []
+    for key, row in new.items():
+        if old[key]["kind"] != row["kind"] or old[key].get("options") != row.get("options"):
+            raise ValueError("qdisc settings changed during measurement")
+        counters = {name: row[name] - old[key][name] for name in ("bytes", "packets", "drops", "overlimits", "requeues")}
+        if any(value < 0 for value in counters.values()):
+            raise ValueError("qdisc counter reset")
+        result.append(dict(dev=row["dev"], handle=row["handle"], kind=row["kind"],
+                           parent=row.get("parent"), root=row.get("root", False),
+                           options=row.get("options"), counters=counters,
+                           backlog_before=old[key].get("backlog"), backlog_after=row.get("backlog"),
+                           qlen_before=old[key].get("qlen"), qlen_after=row.get("qlen")))
+    return result
+
+
+def udp_delivery_reconciliation(reports):
+    """Sequence-gap loss misses trailing packets; reconcile each client too."""
+    counts = [row.get("sent_packets") for row in reports]
+    if not counts or any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts):
+        return dict(udp_delivery_accounting_match=False, udp_sender_receiver_packet_gap=None,
+                    udp_sender_receiver_gap_percent=None, udp_sender_unobserved_tail_packets=None,
+                    udp_client_packet_gaps=None)
+    gaps = [row["sent_packets"] - row["packets"] for row in reports]
+    tails = [max(row["sent_packets"] - row["receiver_expected_packets"], 0) for row in reports]
+    sent = sum(counts)
+    return dict(udp_delivery_accounting_match=all(gap == 0 for gap in gaps),
+                udp_sender_receiver_packet_gap=sum(gaps),
+                udp_sender_receiver_gap_percent=100.0 * sum(abs(gap) for gap in gaps) / sent if sent else None,
+                udp_sender_unobserved_tail_packets=sum(tails), udp_client_packet_gaps=gaps)
+
+
+def thread_counter_deltas(before, after):
+    elapsed = (after["monotonic_ns"] - before["monotonic_ns"]) / 1_000_000_000
+    if elapsed <= 0 or before["pid"] != after["pid"] or before["clock_ticks"] != after["clock_ticks"]:
+        raise ValueError("thread process/clock identity changed")
+    old = {row["tid"]: row for row in before["threads"]}
+    new = {row["tid"]: row for row in after["threads"]}
+    if old.keys() != new.keys():
+        raise ValueError("thread set changed during capture")
+    result = []
+    for tid, row in new.items():
+        if old[tid]["start_ticks"] != row["start_ticks"]:
+            raise ValueError("thread identity reused during capture")
+        counters = {}
+        for name in ("cpu_ticks", "voluntary_context_switches", "involuntary_context_switches",
+                     "migrations", "scheduler_running_ns", "runqueue_wait_ns"):
+            counters[name] = row[name] - old[tid][name] if row.get(name) is not None and old[tid].get(name) is not None else None
+            if counters[name] is not None and counters[name] < 0:
+                raise ValueError("thread counter reset")
+        if counters["cpu_ticks"] is None:
+            raise ValueError("thread CPU counters unavailable")
+        result.append(dict(tid=tid, comm=row["comm"], main_thread=tid == before["pid"],
+                           cpu_cores=counters["cpu_ticks"] / before["clock_ticks"] / elapsed, **counters))
+    return dict(elapsed_seconds=elapsed, threads=result)
+
 for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
     try:
         with open(path) as f:
@@ -494,6 +701,8 @@ for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
                           lost_percent=received.get("lost_percent"),
                           jitter_ms=received.get("jitter_ms"),
                           out_of_order=(sum(stream_ooo) if stream_ooo and all(v is not None for v in stream_ooo) else None))
+        report["socket_buffers"] = {key: doc.get("start", {}).get(key) for key in
+                                    ("sock_bufsize", "sndbuf_actual", "rcvbuf_actual")}
         reports.append(report)
     except Exception as exc:
         print(f"ERROR direction={direction} file={os.path.basename(path)} reason={exc}", file=sys.stderr)
@@ -644,11 +853,47 @@ if (effective_offload == "tcp" and protocol == "tcp" and
 udp_aggregate_count = ((gso_delta or {}).get("udp_rx_aggregates", 0) +
                        (gso_delta or {}).get("udp_tx_aggregates", 0))
 
+
+network_udp_counters = {}
+network_counter_errors = []
+for counter_ns in ("client", "router", "clatns", "server"):
+    network_udp_counters[counter_ns] = {}
+    for suffix, ipv6 in (("snmp", False), ("snmp6", True)):
+        try:
+            snapshots = [parse_udp_snmp(open(os.path.join(run_dir, f"{counter_ns}.{suffix}.{phase}")).read(), ipv6)
+                         for phase in ("before", "after")]
+            network_udp_counters[counter_ns][suffix] = udp_snmp_delta(*snapshots)
+        except (OSError, ValueError) as exc:
+            network_udp_counters[counter_ns][suffix] = None
+            network_counter_errors.append(f"{counter_ns}/{suffix}: {exc}")
+qdisc_deltas = {}
+for counter_ns in ("client", "router", "clatns", "server"):
+    try:
+        snapshots = [json.load(open(os.path.join(run_dir, f"{counter_ns}.qdisc.{phase}.json")))
+                     for phase in ("before", "after")]
+        qdisc_deltas[counter_ns] = qdisc_counter_delta(*snapshots)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        qdisc_deltas[counter_ns] = None
+        network_counter_errors.append(f"{counter_ns}/qdisc: {exc}")
+# InErrors already includes RcvbufErrors. Preserve both, never sum them.
+if protocol == "udp" and network_counter_errors:
+    capture_errors.extend(network_counter_errors)
+
+
+thread_metrics, thread_counter_error = None, None
+try:
+    thread_metrics = thread_counter_deltas(*[json.load(open(os.path.join(run_dir, f"thread-counters.{phase}.json")))
+                                            for phase in ("before", "after")])
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    thread_counter_error = str(exc)
+    capture_errors.append(f"thread CPU counter capture: {exc}")
+
 result = dict(direction=direction, clients=len(reports), expected_clients=expected_clients,
               capture_valid=not capture_errors, workload_valid=True, acceptance_pass=True,
-              schema_version=3,
+              schema_version=4,
               degraded_reasons=list(capture_errors),
-              perf_mode=perf_mode,
+              perf_mode=perf_mode, perf_scope=os.environ["PERF_SCOPE"],
+              thread_metrics=thread_metrics, thread_counter_error=thread_counter_error,
               git_revision=revision,
               source_tree_sha256=source_tree_sha256,
               tayga_sha256=open(os.path.join(os.path.dirname(run_dir), "tayga.sha256")).read().split()[0]
@@ -668,6 +913,12 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               workers=int(workers), flows_per_client=int(flows), tun_txqlen=(int(txqlen) if txqlen else None),
               offlink_mtu=int(offlink_mtu),
               forwarding_gro=os.environ.get("FORWARDING_GRO", "off"),
+              pacing_timer_us=int(os.environ["PACING_TIMER_US"]), fq_rate=os.environ["FQ_RATE"],
+              socket_buffer_bytes=int(os.environ["SOCKET_BUFFER_BYTES"]), sender_fq=os.environ["SENDER_FQ"],
+              sender_fq_flow_limit=int(os.environ["SENDER_FQ_FLOW_LIMIT"]), qdisc_deltas=qdisc_deltas,
+              socket_sample_interval=int(os.environ["SOCKET_SAMPLE_INTERVAL"]) if protocol == "udp" else 0,
+              network_udp_counters=network_udp_counters, network_counter_errors=network_counter_errors,
+              iperf_socket_buffers=[x["socket_buffers"] for x in reports],
               rate_per_flow=(rate or "unlimited"), duration_seconds=int(duration), warmup_seconds=int(warmup),
               datagram_size=int(datagram_size) if protocol == "udp" else None,
               block_size=(block_size or None),
@@ -691,6 +942,17 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
                                      elapsed_seconds=elapsed, intended_duration_seconds=int(duration)))
 
 if protocol == "udp":
+    for counter_ns, rows in qdisc_deltas.items():
+        for row in rows or []:
+            if row["counters"]["drops"] > 0:
+                result["acceptance_pass"] = False
+                result["degraded_reasons"].append(f"{counter_ns}/{row['dev']}/{row['kind']} qdisc drops increased by {row['counters']['drops']}")
+    for counter_ns, families in network_udp_counters.items():
+        for family, counters in families.items():
+            for key, value in (counters or {}).items():
+                if value > 0 and key.endswith(("InErrors", "SndbufErrors", "NoPorts", "MemErrors")):
+                    result["acceptance_pass"] = False
+                    result["degraded_reasons"].append(f"{counter_ns} {key} increased by {value}")
     packets = sum(x.get("packets", 0) for x in reports)
     lost = sum(x.get("lost_packets", 0) for x in reports)
     receiver_expected = sum(x["receiver_expected_packets"] for x in reports)
@@ -714,6 +976,12 @@ if protocol == "udp":
                   udp_loss_percent=loss_pct,
                   udp_jitter_ms_max=jitter_max,
                   udp_out_of_order=ooo)
+    reconciliation = udp_delivery_reconciliation(reports)
+    result.update(reconciliation)
+    gap_percent = reconciliation["udp_sender_receiver_gap_percent"]
+    if gap_percent is None or gap_percent > float(max_udp_loss):
+        result["acceptance_pass"] = False
+        result["degraded_reasons"].append("UDP sender/receiver packet counts do not reconcile within the loss threshold")
     if loss_pct is not None and loss_pct > float(max_udp_loss):
         result["acceptance_pass"] = False
         result["degraded_reasons"].append(f"UDP loss {loss_pct:.3f}% exceeds {max_udp_loss}% threshold")

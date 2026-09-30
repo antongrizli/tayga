@@ -6,18 +6,14 @@ This document describes the high-performance GSO (Generic Segmentation Offload) 
 
 ## 1. Overview and Architecture
 
-Traditional userspace NAT64 translators process network traffic packet-by-packet (MTU 1500 or 1280 bytes). For a 300 Mbps TCP stream, this requires approximately **62,000 system calls per second** (`read` + `write`), consuming significant CPU both in userspace and in kernel softirq processing.
+Without aggregation, TAYGA handles each packet through userspace and the TUN/kernel path. The resulting CPU and syscall cost depends on packet size, traffic direction, kernel, and workload; do not treat one fixed-rate result as a general capacity limit.
 
 With **GSO/GRO Offload**, TAYGA interacts with the Linux kernel TUN driver using VirtIO network headers (`IFF_VNET_HDR`):
 - **GSO (Transmit / Forwarding)**: The kernel delivers aggregated TCP super-packets (up to 64 KB) to TAYGA in a single `read()`. TAYGA translates the headers in-place (updating TCP/IP pseudo-checksum seeds) and forwards them back into the TUN device via a single vectored `writev()` system call with `VIRTIO_NET_HDR_GSO_TCPV4` or `VIRTIO_NET_HDR_GSO_TCPV6`.
 - **GRO (Receive-Side)**: When enabled on ingress interfaces (`ethtool -K <iface> gro on`), the kernel coalesces incoming TCP packets of the same flow before delivering them to TUN.
-- **RFC 7915 Safety Fallback**: For segments requiring unique IPv4 Identification (e.g. tail fragments ≤ 1260 bytes with DF=0), TAYGA automatically performs software segmentation with unique atomic IDs.
+- **RFC 7915 packet policy**: Experimental UDP USO reserves consecutive IPv4 IDs for aggregates whose output packets all have DF=0. Linux completes their checksums and increments IDs during segmentation. Aggregates crossing the 1,260-byte IPv4 length boundary use software segmentation because their packets require different DF policies. This path has been checked on Debian Linux 6.12 ARM64; validation on other target kernels remains required.
 
-### Measured Performance Gains (Lima VM ARM64, 300 Mbps fixed load)
-- **System Calls**: Reduced from 62,000/s to 2,800/s (**−95.5% reduction**).
-- **TAYGA CPU**: Reduced from 0.27–0.31 cores to 0.06–0.07 cores (**4.1× reduction**).
-- **Kernel Softirq**: Reduced by **67–68%**.
-- **TUN Drops**: Completely eliminated (0 drops across all tested workloads).
+TCP and UDP results are workload-specific. The current TCP measurements used aggregates averaging tens of kilobytes and reached high synthetic Lima throughput. UDP USO was disabled in those measurements, and UDP losses occurred at higher offered rates. See the [session investigation](PERFORMANCE-SESSION-INVESTIGATION-2026-09-29.md) for measured directions, rates, drops, perf scope, and limitations. No hardware capacity claim follows from those VM results.
 
 ---
 
@@ -30,7 +26,8 @@ With **GSO/GRO Offload**, TAYGA interacts with the Linux kernel TUN driver using
 # Options:
 #   off  - Standard packet-by-packet operation (explicit legacy baseline)
 #   tcp  - Enforce TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
-#   auto - Default; probe kernel capabilities at startup; enable if supported, fallback to off
+#   udp  - Experimental TCP/UDP segmentation and checksum offload; requires kernel validation
+#   auto - Default; use the validated TCP feature set when supported
 tun-offload auto
 ```
 
@@ -50,6 +47,7 @@ tayga --check-offload
 # Set CLAT_OFFLOAD environment variable before starting clat-start.sh:
 export CLAT_OFFLOAD=auto   # Recommended for automatic safe offload
 # export CLAT_OFFLOAD=tcp  # Enforce offload
+# export CLAT_OFFLOAD=udp  # Experimental UDP segmentation test only
 # export CLAT_OFFLOAD=off  # Explicitly disable offload
 ```
 
@@ -81,7 +79,7 @@ When configured with `tun-offload auto`:
 1. `tayga` requests `IFF_VNET_HDR` and queries the header size (`TUNGETVNETHDRSZ`).
 2. `tayga` attempts to enable `TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6` via `TUNSETOFFLOAD`.
 3. If the initial header negotiation fails, `tayga` retries without offload. If checksum/TSO negotiation fails on the device or a worker queue, it disables offload while preserving the negotiated header framing and existing interface routes.
-4. Startup logs report active offload only after queue setup succeeds. An inability to establish a consistent configuration fails startup. UDP segmentation stays disabled until its packet semantics and kernel integration are validated.
+4. Startup logs report active offload only after queue setup succeeds. An inability to establish a consistent configuration fails startup. `auto` keeps UDP segmentation disabled; `udp` requests USO explicitly and fails if either required feature is unavailable. A kernel accepting USO is only a capability check, not proof that segmentation preserves translator packet semantics.
 
 ---
 
