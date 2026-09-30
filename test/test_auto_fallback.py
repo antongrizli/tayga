@@ -20,12 +20,13 @@ def main():
         original = os.environ.copy()
         try:
             os.environ["LD_PRELOAD"] = shim
-            for fault in ("vnet", "primary", "worker"):
+            for fault, effective in (("vnet", "off"), ("primary", "off"), ("worker", "tcp"),
+                                     ("uso", "tcp"), ("uso-worker", "tcp")):
                 os.environ["TAYGA_TEST_OFFLOAD_FAIL"] = fault
                 preflight.test_auto_data_transfer()
                 log = Path("/tmp/tayga_auto_transfer.log").read_text()
-                assert "fallback to offload=off" in log, log
-                assert "TUN offload active:" not in log, log
+                assert f"requested=auto effective={effective}" in log, log
+                assert ("USO4|USO6" in log) == (effective == "udp"), log
                 assert "tun-offload auto" in Path("/run/clat.conf").read_text()
                 print(f"PASS: auto fallback after {fault} failure, SHA-256 verified")
 

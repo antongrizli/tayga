@@ -16,12 +16,33 @@ exec(compile(ast.parse(script[start:end]), "benchmark UDP accounting", "exec"), 
 account = namespace["udp_packet_accounting"]
 
 
+class SnapshotIdentityTests(unittest.TestCase):
+    def test_previous_process_sequence_is_not_reused(self):
+        # Execute the deployed baseline-sequence snippet with a supplied JSON file.
+        import re
+        snippet = re.search(r"cur_seq=\$\(python3 -c '([^']+)'", script).group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "status.json"
+            snapshot.write_text(json.dumps({"pid": 111, "snapshot_sequence": 99}))
+            snippet = snippet.replace("/run/tayga-status.json", str(snapshot))
+            for pid, expected in ((111, "99"), (222, "0")):
+                actual = subprocess.check_output(["python3", "-c", snippet, str(pid)], text=True)
+                self.assertEqual(actual.strip(), expected)
+
 class UdpAccountingTests(unittest.TestCase):
     def test_loss_is_already_in_expected_count(self):
         result = account({"packets": 1000}, {"packets": 990, "lost_packets": 90, "bytes": 900 * 1200}, 1200)
         self.assertEqual(result, dict(packets=900, receiver_expected_packets=990,
                                       lost_packets=90, sent_packets=1000))
         self.assertAlmostEqual(100 * result["lost_packets"] / result["receiver_expected_packets"], 9.090909, places=5)
+
+    def test_unsent_pending_sequence_is_not_counted_as_sent(self):
+        actual = account({"packets": 101, "bytes": 100 * 1200},
+                         {"packets": 100, "lost_packets": 0, "bytes": 100 * 1200}, 1200)
+        self.assertEqual(actual["sent_packets"], 100)
+        for sent_bytes in (1199, -1, True):
+            with self.assertRaises(ValueError):
+                account({"bytes": sent_bytes}, {"packets": 0, "lost_packets": 0, "bytes": 0}, 1200)
 
     def test_actual_receipts_come_from_bytes_even_with_duplicates(self):
         result = account({}, {"packets": 100, "lost_packets": 0, "bytes": 101 * 64}, 64)
@@ -292,6 +313,130 @@ class ThreadCounterTests(unittest.TestCase):
         after["threads"][0]["start_ticks"] = 2
         with self.assertRaises(ValueError):
             namespace["thread_counter_deltas"](before, after)
+
+
+class WorkerCounterTests(unittest.TestCase):
+    def make_snapshot(self, pid=1234, seq=1, workers=None):
+        if workers is None:
+            workers = [
+                dict(slot=0, worker_id=0, rx_packets_v4=100, tx_packets_v4=50, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0),
+                dict(slot=1, worker_id=1, rx_packets_v4=200, tx_packets_v4=150, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0),
+            ]
+        return dict(pid=pid, snapshot_sequence=seq, workers_synced=True, workers=workers)
+
+    def test_missing_or_nonboolean_sync_confirmation_is_rejected(self):
+        for value in (None, False, 1, "true"):
+            before, after = self.make_snapshot(seq=1), self.make_snapshot(seq=2)
+            after["workers_synced"] = value
+            with self.assertRaises(ValueError):
+                namespace["worker_counter_deltas"](before, after)
+
+    def test_worker_counter_deltas(self):
+        worker_deltas = namespace["worker_counter_deltas"]
+        before = self.make_snapshot(pid=1234, seq=1)
+        after = self.make_snapshot(pid=1234, seq=2, workers=[
+            dict(slot=0, worker_id=0, rx_packets_v4=300, tx_packets_v4=200, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=1, error_packets=0),
+            dict(slot=1, worker_id=1, rx_packets_v4=500, tx_packets_v4=400, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0),
+        ])
+        res = worker_deltas(before, after)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["rx_packets_v4"], 200)
+        self.assertEqual(res[0]["tx_packets_v4"], 150)
+        self.assertEqual(res[0]["dropped_packets"], 1)
+        self.assertEqual(res[1]["rx_packets_v4"], 300)
+        self.assertEqual(res[1]["tx_packets_v4"], 250)
+
+    def test_worker_counter_identity_and_freshness_checks(self):
+        worker_deltas = namespace["worker_counter_deltas"]
+        base = self.make_snapshot(pid=1234, seq=1)
+
+        # PID changed
+        with self.assertRaises(ValueError):
+            worker_deltas(base, self.make_snapshot(pid=5678, seq=2))
+
+        # Snapshot sequence not increasing
+        with self.assertRaises(ValueError):
+            worker_deltas(base, self.make_snapshot(pid=1234, seq=1))
+        with self.assertRaises(ValueError):
+            worker_deltas(base, self.make_snapshot(pid=1234, seq=0))
+
+        # Missing PID or sequence
+        bad_before = dict(snapshot_sequence=1, workers=[])
+        bad_after = dict(pid=1234, snapshot_sequence=2, workers=[])
+        with self.assertRaises(ValueError):
+            worker_deltas(bad_before, bad_after)
+
+        # Worker slot set changed
+        changed_workers = self.make_snapshot(pid=1234, seq=2, workers=[
+            dict(slot=0, worker_id=0, rx_packets_v4=200, tx_packets_v4=100, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0)
+        ])
+        with self.assertRaises(ValueError):
+            worker_deltas(base, changed_workers)
+
+        # Counter reset
+        reset_counters = self.make_snapshot(pid=1234, seq=2, workers=[
+            dict(slot=0, worker_id=0, rx_packets_v4=50, tx_packets_v4=200, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0),
+            dict(slot=1, worker_id=1, rx_packets_v4=500, tx_packets_v4=400, rx_packets_v6=0, tx_packets_v6=0, dropped_packets=0, error_packets=0),
+        ])
+        with self.assertRaises(ValueError):
+            worker_deltas(base, reset_counters)
+
+        # Worker synchronization timeout
+        unsynced_after = self.make_snapshot(pid=1234, seq=2)
+        unsynced_after["workers_synced"] = False
+        with self.assertRaises(ValueError):
+            worker_deltas(base, unsynced_after)
+
+        # Unacknowledged worker slots
+        unacked_after = self.make_snapshot(pid=1234, seq=2)
+        unacked_after["unacknowledged_worker_slots"] = [1]
+        with self.assertRaises(ValueError):
+            worker_deltas(base, unacked_after)
+
+    def test_sequence_ledger_accounting(self):
+        reconcile = namespace["udp_delivery_reconciliation"]
+        reports = [
+            dict(sent_packets=1000, packets=990, receiver_expected_packets=990, lost_packets=0, out_of_order=0, jitter_ms=0.1),
+            dict(sent_packets=1000, packets=1000, receiver_expected_packets=1000, lost_packets=0, out_of_order=0, jitter_ms=0.2),
+            dict(sent_packets=1000, packets=995, receiver_expected_packets=990, lost_packets=5, out_of_order=1, jitter_ms=0.15),
+        ]
+        res = reconcile(reports)
+        ledger = res["udp_sequence_ledger"]
+        self.assertEqual(len(ledger), 3)
+
+        # Client 1: 10 trailing lost packets
+        self.assertEqual(ledger[0]["terminal_tail_gap"], 10)
+        self.assertEqual(ledger[0]["interior_lost_packets"], 0)
+        self.assertEqual(ledger[0]["unique_received_packets"], 990)
+        self.assertEqual(ledger[0]["estimated_unique_packets"], 990)
+        self.assertEqual(ledger[0]["duplicate_packets"], 0)
+        self.assertEqual(ledger[0]["estimated_duplicate_packets"], 0)
+        self.assertEqual(ledger[0]["total_lost_packets"], 10)
+
+        # Client 2: perfect delivery
+        self.assertEqual(ledger[1]["terminal_tail_gap"], 0)
+        self.assertEqual(ledger[1]["interior_lost_packets"], 0)
+        self.assertEqual(ledger[1]["unique_received_packets"], 1000)
+        self.assertEqual(ledger[1]["estimated_unique_packets"], 1000)
+        self.assertEqual(ledger[1]["duplicate_packets"], 0)
+        self.assertEqual(ledger[1]["estimated_duplicate_packets"], 0)
+        self.assertEqual(ledger[1]["total_lost_packets"], 0)
+
+        # Client 3: 5 interior lost, 10 trailing lost, 10 duplicates (expected 990, unique 985, receipts 995 -> 10 duplicates)
+        self.assertEqual(ledger[2]["terminal_tail_gap"], 10)
+        self.assertEqual(ledger[2]["interior_lost_packets"], 5)
+        self.assertEqual(ledger[2]["unique_received_packets"], 985)
+        self.assertEqual(ledger[2]["estimated_unique_packets"], 985)
+        self.assertEqual(ledger[2]["duplicate_packets"], 10)
+        self.assertEqual(ledger[2]["estimated_duplicate_packets"], 10)
+        self.assertEqual(ledger[2]["total_lost_packets"], 15)
+
+    def test_invalid_receiver_drain_fails_before_topology_setup(self):
+        harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+        for bad_val in ("-1", "abc", "1.2.3"):
+            env = dict(os.environ, PROTOCOL="udp", RECEIVER_DRAIN_SECONDS=bad_val)
+            run = subprocess.run(["sh", str(harness)], env=env, capture_output=True)
+            self.assertEqual(run.returncode, 64, run.stderr.decode())
 
 
 if __name__ == "__main__":

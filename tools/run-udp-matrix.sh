@@ -26,6 +26,7 @@ FORWARDING_GRO="${FORWARDING_GRO:-off}"
 export FORWARDING_GRO
 SIZES="${SIZES:-1200}"
 DIRECTIONS="${DIRECTIONS:-upload download}"
+RECEIVER_DRAIN_SECONDS="${RECEIVER_DRAIN_SECONDS:-0.5}"
 case "$CLAT_OFFLOAD" in auto|tcp|udp|off) ;; *) echo "invalid CLAT_OFFLOAD: $CLAT_OFFLOAD" >&2; exit 64;; esac
 case "$FORWARDING_GRO" in on|off) ;; *) echo "invalid FORWARDING_GRO: $FORWARDING_GRO" >&2; exit 64;; esac
 for direction in $DIRECTIONS; do
@@ -44,6 +45,10 @@ mkdir -p "$OUT_DIR"
 # The guest runner freezes and hashes the exact snapshot used to compile the
 # benchmarked daemon. Keep the environment stable across all search points.
 make -B VERSION="${TAYGA_VERSION:-0.9.12}"
+make udp-drain-tools CC=gcc
+sudo install -Dm0755 tools/udp-drain-control /usr/local/libexec/tayga-perf/udp-drain-control
+sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drain-guard.so
+sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
 sudo install -D -m 0755 tayga /usr/sbin/tayga
 sudo install -D -m 0755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
 GIT_REVISION="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
@@ -97,6 +102,7 @@ for size in $SIZES; do
         CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
         SERVER_CPUSET="${SERVER_CPUSET:-all}" \
         SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
+        RECEIVER_DRAIN_SECONDS="$RECEIVER_DRAIN_SECONDS" \
         PROTOCOL=udp RATE="${rate_per_client}M" DURATION="$DURATION" WARMUP="$WARMUP" \
         DIRECTIONS="$direction" MAX_TUN_DROPS="$MAX_TUN_DROPS" \
         MAX_UDP_LOSS_PERCENT="$MAX_UDP_LOSS_PERCENT" TUN_TXQLEN="${TUN_TXQLEN:-1000}" \
@@ -178,6 +184,7 @@ PY
         CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
         SERVER_CPUSET="${SERVER_CPUSET:-all}" \
         SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
+        RECEIVER_DRAIN_SECONDS="$RECEIVER_DRAIN_SECONDS" \
             PROTOCOL=udp RATE="${rate_per_client}M" DURATION="$DURATION" WARMUP="$WARMUP" \
             DIRECTIONS="$direction" MAX_TUN_DROPS="$MAX_TUN_DROPS" \
             MAX_UDP_LOSS_PERCENT="$MAX_UDP_LOSS_PERCENT" TUN_TXQLEN="${TUN_TXQLEN:-1000}" \
@@ -250,6 +257,7 @@ PY
         CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
         SERVER_CPUSET="${SERVER_CPUSET:-all}" \
         SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
+        RECEIVER_DRAIN_SECONDS="$RECEIVER_DRAIN_SECONDS" \
         PROTOCOL=udp RATE="${rate_per_client}M" DURATION="$DURATION" WARMUP="$WARMUP" \
         DIRECTIONS="$direction" MAX_TUN_DROPS="$MAX_TUN_DROPS" \
         MAX_UDP_LOSS_PERCENT="$MAX_UDP_LOSS_PERCENT" TUN_TXQLEN="${TUN_TXQLEN:-1000}" \
@@ -313,6 +321,7 @@ PY
         CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
         SERVER_CPUSET="${SERVER_CPUSET:-all}" \
         SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
+        RECEIVER_DRAIN_SECONDS="$RECEIVER_DRAIN_SECONDS" \
           PROTOCOL=udp RATE="${rate_per_client}M" DURATION="$DURATION" WARMUP="$WARMUP" \
           DIRECTIONS="$direction" MAX_TUN_DROPS="$MAX_TUN_DROPS" \
           MAX_UDP_LOSS_PERCENT="$MAX_UDP_LOSS_PERCENT" TUN_TXQLEN="${TUN_TXQLEN:-1000}" \

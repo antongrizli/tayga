@@ -14,6 +14,10 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/virtio_net.h>
+#ifndef TUN_F_USO4
+#define TUN_F_USO4 0x20
+#define TUN_F_USO6 0x40
+#endif
 
 int main(int argc, char **argv)
 {
@@ -77,10 +81,18 @@ int main(int argc, char **argv)
 		}
 	}
 
+    int uso_ok = 0, uso_errno = 0;
+    if (attach_ok && get_vnet_hdr_sz_ok && (vnet_hdr_sz == 10 || vnet_hdr_sz == 12)) {
+        unsigned int flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6;
+        uso_ok = ioctl(fd, TUNSETOFFLOAD, flags) == 0;
+        if (!uso_ok) uso_errno = errno;
+    }
 	close(fd);
 
 	if (as_json) {
 		printf("{\n");
+        printf("  \"udp_offload_available\": %s,\n", uso_ok ? "true" : "false");
+        printf("  \"udp_offload_errno\": %d,\n", uso_errno);
 		printf("  \"tun_features\": {\n");
 		printf("    \"raw\": %u,\n", features);
 		printf("    \"IFF_VNET_HDR\": %s,\n", feat_vnet_hdr ? "true" : "false");
@@ -107,6 +119,7 @@ int main(int argc, char **argv)
 		printf("}\n");
 	} else {
 		printf("=== Linux TUN Offload Probe ===\n");
+        printf("UDP USO4|USO6: %s (errno=%d)\n", uso_ok ? "OK" : "UNAVAILABLE", uso_errno);
 		printf("TUNGETFEATURES: 0x%x (IFF_VNET_HDR=%d, IFF_MULTI_QUEUE=%d, IFF_NO_PI=%d)\n",
 			features, feat_vnet_hdr, feat_multi_queue, feat_no_pi);
 		printf("Attach with IFF_VNET_HDR: %s (dev=%s, errno=%d %s)\n",

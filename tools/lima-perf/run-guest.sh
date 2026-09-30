@@ -56,7 +56,7 @@ tar -C "$REPO" \
   --exclude='./.codex' --exclude='./.agents' --exclude='./tayga' \
   --exclude='./unit_conffile' --exclude='./unit_checksum' --exclude='./unit_udp_checksum' \
   --exclude='./unit_ip4_id' --exclude='./unit_tun' --exclude='./unit_gso' \
-  --exclude='./unit_pref64' --exclude='./unit_stats' --exclude='./tools/probe-tun-offload' \
+  --exclude='./tools/udp-drain-guard.so' --exclude='./tools/udp-drain-control' --exclude='./unit_pref64' --exclude='./unit_stats' --exclude='./tools/probe-tun-offload' \
   -cf - . | tar -C "$BUILD_ROOT" -xf -
 cd "$BUILD_ROOT"
 GIT_REVISION="${GIT_REVISION:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf unknown)}"
@@ -86,6 +86,9 @@ BUILD_CFLAGS="-O3 -flto -g -fno-omit-frame-pointer -ffile-prefix-map=$BUILD_ROOT
 BUILD_LDFLAGS='-flto -Wl,--build-id'
 BUILD_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || printf detached)"
 make -B CC=gcc VERSION="${TAYGA_VERSION:-0.9.12}" COMMIT="$GIT_REVISION" BRANCH="$BUILD_BRANCH" CFLAGS="$BUILD_CFLAGS" LDFLAGS="$BUILD_LDFLAGS"
+make udp-drain-tools CC=gcc
+sudo install -Dm0755 tools/udp-drain-control /usr/local/libexec/tayga-perf/udp-drain-control
+sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drain-guard.so
 sudo install -Dm0755 tayga /usr/sbin/tayga
 sudo install -Dm0755 "$BUILD_ROOT/scripts/container/clat-start.sh" /usr/local/sbin/clat-start.sh
 sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
@@ -123,6 +126,7 @@ run_case() {
     CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
     SERVER_CPUSET="${SERVER_CPUSET:-all}" \
     SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
+    RECEIVER_DRAIN_SECONDS="${RECEIVER_DRAIN_SECONDS:-0.5}" \
     GIT_REVISION="$GIT_REVISION" SOURCE_TREE_SHA256="$SOURCE_TREE_SHA256" \
     PROTOCOL="${PROTOCOL:-tcp}" RATE="${RATE:-0}" \
     DURATION="${DURATION:-60}" WARMUP="${WARMUP:-10}" \

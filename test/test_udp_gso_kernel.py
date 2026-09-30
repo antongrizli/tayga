@@ -258,7 +258,7 @@ def run_group(args, mode, workers, mtu, direction, root):
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     after = gso_stats(log)
-                    aggregate_expected = mode == "udp" and segmented and len(lengths) > 1
+                    aggregate_expected = mode in ("udp", "auto") and segmented and len(lengths) > 1
                     if after and (after.get("udp_rx_aggregates", 0) > before.get("udp_rx_aggregates", 0)
                                   if aggregate_expected else True):
                         break
@@ -270,7 +270,7 @@ def run_group(args, mode, workers, mtu, direction, root):
                 before = after
             else:
                 delta = {}
-            aggregate_expected = mode == "udp" and segmented and len(lengths) > 1
+            aggregate_expected = mode in ("udp", "auto") and segmented and len(lengths) > 1
             if aggregate_expected:
                 assert delta.get("udp_rx_aggregates", 0) > 0, ("UDP_SEGMENT never reached TAYGA", name, delta, log.read_text())
                 mixed_df = any(n + 28 <= 1260 for n in lengths) and any(n + 28 > 1260 for n in lengths)

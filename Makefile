@@ -192,7 +192,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install
@@ -272,3 +272,9 @@ endif
 update-scripts-version:
 	@if [ -z "$(VERSION)" ]; then echo "Usage: make update-scripts-version VERSION=<tag> [REPO=antongrizli/tayga]" >&2; exit 1; fi
 	./scripts/update-image-tags.sh "$(VERSION)" "$(or $(REPO),antongrizli/tayga)" scripts/mikrotik
+.PHONY: udp-drain-tools
+udp-drain-tools: tools/udp-drain-guard.so tools/udp-drain-control
+tools/udp-drain-guard.so: tools/udp-drain-guard.c
+	$(CC) -O2 -Wall -Wextra -fPIC -shared -o $@ $< -ldl
+tools/udp-drain-control: tools/udp-drain-guard.c
+	$(CC) -O2 -Wall -Wextra -DUDP_DRAIN_CONTROLLER -o $@ $<

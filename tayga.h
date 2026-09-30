@@ -423,7 +423,13 @@ struct config {
 	int tun_fd_addl[MAX_WORKERS];
 
 	//Offload parameters
-	enum tun_offload_mode tun_offload;
+	enum tun_offload_mode tun_offload; /* requested policy */
+	enum tun_offload_mode tun_offload_effective;
+	unsigned int tun_offload_flags;
+	int tun_offload_complete;
+	int tun_offload_errno;
+	int tun_offload_queue;
+	const char *tun_offload_reason;
 	int vnet_hdr_sz;
 	int tun_has_uso;
 };
@@ -560,5 +566,6 @@ ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const
 void telemetry_start(const char *status_path, int interval_sec);
 void telemetry_stop(void);
 void telemetry_trigger(void);
+void telemetry_write_status(const char *state);
 
 #endif /* #ifndef __TAYGA_H__ */

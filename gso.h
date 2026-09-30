@@ -43,6 +43,16 @@ enum tun_offload_mode {
 	TUN_OFFLOAD_UDP = 3,
 };
 
+static inline const char *tun_offload_name(enum tun_offload_mode mode)
+{
+    switch (mode) {
+    case TUN_OFFLOAD_AUTO: return "auto";
+    case TUN_OFFLOAD_TCP: return "tcp";
+    case TUN_OFFLOAD_UDP: return "udp";
+    default: return "off";
+    }
+}
+
 struct gso_worker_stats {
 	_Atomic uint64_t gso_pkts_rx;
 	_Atomic uint64_t gso_pkts_tx;

@@ -32,16 +32,19 @@ tayga.conf.
     This configuration directive is mandatory.
 
 **tun-offload** *off|tcp|udp|auto*
-:   Defaults to **auto**. On Linux, negotiate checksum and TCP segmentation
-    offload on the TUN device and worker queues. Fall back to packet processing
-    when unsupported, logging the effective mode. **tcp** requires support and
-    fails startup when it cannot be enabled; **off** disables offload explicitly.
-    **udp** explicitly requests checksum, TCP segmentation, and UDP segmentation
-    offload and fails startup when the complete feature set is unavailable. UDP
-    mode is experimental; packet-level fallback remains active for cases the
-    translator cannot safely segment in the kernel. **auto** currently selects
-    the proven TCP feature set and does not enable UDP segmentation.
-    On FreeBSD, **auto** uses the ordinary TUN path.
+:   Defaults to **auto**. On Linux, check TUN capabilities during initialization
+    and enable checksum, TCP and UDP segmentation offload when supported.
+    If UDP is unavailable, retain TCP; if TCP is unavailable, use ordinary
+    packets. All worker queues use the same negotiated capabilities and verified
+    virtual header framing. Startup fails if a safe state cannot be established.
+    **tcp** requires checksum and TCP segmentation. **udp** requires checksum,
+    TCP and UDP segmentation. Explicit modes fail when unavailable; **off**
+    disables offload. Packet-level software fallback remains active.
+    Initialization verifies kernel support; aggregation, throughput and packet
+    loss depend on the traffic and network. The service holds its owned TUN
+    down during negotiation and restores its previous UP state. A namespace/device
+    ownership lock prevents concurrent TAYGA processes; other software must not
+    share the device. On FreeBSD, **auto** uses the ordinary TUN path.
 
 **ipv4-addr** *ipv4_address*
 :   IPv4 address that **tayga** will use as the source address for

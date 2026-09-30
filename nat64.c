@@ -844,7 +844,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 void handle_ip4(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
-		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV4) {
 				if (gso_translate_tcp_4to6(p) == 0)
@@ -1529,7 +1529,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 void handle_ip6(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
-		if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV6) {
 				if (gso_translate_tcp_6to4(p) == 0)

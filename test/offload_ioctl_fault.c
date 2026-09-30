@@ -14,6 +14,7 @@
 
 static int tun_fds[128];
 static int tun_fd_count;
+static int test_tun_io_ready;
 
 static int is_test_tun_fd(int fd)
 {
@@ -27,6 +28,7 @@ int ioctl(int fd, unsigned long request, ...)
 {
 	static int (*real_ioctl)(int, unsigned long, ...);
 	static unsigned int enables;
+	static unsigned int interruptions;
 	va_list ap;
 	va_start(ap, request);
 	unsigned long arg = va_arg(ap, unsigned long);
@@ -34,11 +36,39 @@ int ioctl(int fd, unsigned long request, ...)
 	if (!real_ioctl)
 		real_ioctl = dlsym(RTLD_NEXT, "ioctl");
 	const char *fault = getenv("TAYGA_TEST_OFFLOAD_FAIL");
+	if (fault && request == TUNSETIFF && !strcmp(fault, "attach-worker") && tun_fd_count) {
+		errno = EIO;
+		return -1;
+	}
+	if (fault && request == TUNSETOFFLOAD &&
+	    ((!strcmp(fault, "eintr-once") && interruptions++ == 0) ||
+	     !strcmp(fault, "eintr-always"))) {
+		errno = EINTR;
+		return -1;
+	}
 	if (fault && request == TUNSETIFF && !strcmp(fault, "vnet") &&
 	    (((struct ifreq *)arg)->ifr_flags & IFF_VNET_HDR)) {
 		errno = EINVAL;
 		return -1;
 	}
+    if (fault && request == TUNGETVNETHDRSZ) {
+        if (!strcmp(fault, "header") || (!strcmp(fault, "header-worker") && tun_fd_count > 1)) { errno = EIO; return -1; }
+        if (!strcmp(fault, "header-size")) { *(int *)arg = 14; return 0; }
+    }
+    if (fault && request == TUNSETOFFLOAD) {
+        int uso = !!(arg & (0x20 | 0x40));
+        if ((!strcmp(fault, "uso") && uso) ||
+            (!strcmp(fault, "uso-worker") && uso && enables == 1) ||
+            (!strcmp(fault, "zero") && !arg) ||
+            (!strcmp(fault, "all") && arg) ||
+            (!strcmp(fault, "all-worker") && arg && tun_fd_count > 1 && fd != tun_fds[0]) ||
+            !strcmp(fault, "disabled") ||
+            (!strcmp(fault, "broken") && arg)) {
+            if (arg) enables++;
+            errno = !strcmp(fault, "broken") ? EBADF : EINVAL;
+            return -1;
+        }
+    }
 	if (fault && request == TUNSETOFFLOAD && arg) {
 		enables++;
 		if (!strcmp(fault, "primary") ||
@@ -58,7 +88,7 @@ ssize_t read(int fd, void *buffer, size_t size)
 	static ssize_t (*real_read)(int, void *, size_t);
 	if (!real_read)
 		real_read = dlsym(RTLD_NEXT, "read");
-	if (getenv("TAYGA_TEST_TUN_READ_FAIL") && is_test_tun_fd(fd)) {
+	if (test_tun_io_ready && getenv("TAYGA_TEST_TUN_READ_FAIL") && is_test_tun_fd(fd)) {
 		errno = EIO;
 		return -1;
 	}
@@ -73,6 +103,7 @@ int poll(struct pollfd *fds, nfds_t count, int timeout)
 	if (getenv("TAYGA_TEST_TUN_READ_FAIL")) {
 		for (nfds_t i = 0; i < count; i++) {
 			if (is_test_tun_fd(fds[i].fd)) {
+				test_tun_io_ready = 1;
 				fds[i].revents = POLLIN;
 				return 1;
 			}

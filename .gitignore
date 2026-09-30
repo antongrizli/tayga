@@ -29,3 +29,5 @@ pref64-discover
 tayga.map
 perf-sessions
 dist/
+/tools/udp-drain-guard.so
+/tools/udp-drain-control

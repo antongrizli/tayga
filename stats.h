@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <time.h>
 #include <string.h>
 
@@ -129,15 +130,25 @@ struct tayga_stats {
 	uint64_t udp_gso_sw_segments;
 
 	time_t start_time;
+	bool workers_synced;
+	uint64_t unacked_mask;
 };
 
 extern struct worker_pub_stats g_worker_pub[STATS_MAX_SLOTS];
 extern __thread struct worker_priv_stats g_tls_priv;
 extern time_t g_stats_start_time;
+extern atomic_uint_fast64_t g_stats_sync_req;
+extern atomic_uint_fast64_t g_stats_sync_ack[STATS_MAX_SLOTS];
+extern atomic_uint_fast64_t g_stats_snapshot_seq;
+extern atomic_int g_workers_running;
+extern atomic_bool g_worker_slot_active[STATS_MAX_SLOTS];
 
 void stats_init(void);
 void stats_thread_init(int worker_idx);
+void stats_thread_exit(void);
 void stats_flush_worker(void);
+int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out);
+void stats_check_sync_request(void);
 void stats_get_snapshot(struct tayga_stats *out);
 void stats_dump(void);
 void stats_write_json(const char *path, const char *state);

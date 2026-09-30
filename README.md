@@ -60,14 +60,14 @@ tayga -d
 
 ## Hardware Offload & Performance (GSO / GRO)
 
-On Linux, TAYGA can use TUN virtio headers for TCP segmentation and checksum offload. `auto` is the default and currently selects the validated TCP feature set when available. UDP segmentation is experimental and must be requested explicitly with `udp`; it is not enabled by `auto` until its packet behavior passes target-kernel validation.
+On Linux, TAYGA uses TUN virtio headers for TCP/UDP segmentation and checksum offload. The default `auto` checks capabilities during initialization and selects UDP plus TCP when supported, falling back to TCP and then ordinary packets. Explicit `tcp` and `udp` require their complete feature set. Capability negotiation does not guarantee aggregation or loss-free throughput; ordinary UDP and packet-level software fallback remain supported.
 
 ```conf
 # In tayga.conf:
 # off  - Standard packet-by-packet operation (explicit baseline)
 # tcp  - Require TCP GSO/checksum offload support
 # udp  - Experimental: require TCP and UDP segmentation/checksum support
-# auto - Default; use the validated TCP feature set when supported
+# auto - Default; negotiate UDP + TCP, then TCP, then off during initialization
 tun-offload auto
 ```
 

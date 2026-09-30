@@ -24,18 +24,21 @@ static _Atomic bool g_telemetry_running = false;
 static bool g_telemetry_triggered = false;
 static pthread_mutex_t g_telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_telemetry_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t s_stats_export_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_telemetry_path[256] = "/run/tayga-status.json";
 static int g_telemetry_interval = 5;
 
 void stats_write_json(const char *path, const char *state)
 {
+	pthread_mutex_lock(&s_stats_export_mutex);
 	char tmp_path[512];
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%lu", path, (unsigned long)pthread_self());
 
 	FILE *f = fopen(tmp_path, "w");
 	if (!f) {
 		slog(LOG_WARNING, "Unable to open %s for writing stats JSON: %s\n",
 			tmp_path, strerror(errno));
+		pthread_mutex_unlock(&s_stats_export_mutex);
 		return;
 	}
 
@@ -61,13 +64,7 @@ void stats_write_json(const char *path, const char *state)
 		}
 	}
 
-	const char *offload_str = "off";
-	if (gcfg.tun_offload == TUN_OFFLOAD_TCP)
-		offload_str = "tcp";
-	else if (gcfg.tun_offload == TUN_OFFLOAD_AUTO)
-		offload_str = "auto";
-	else if (gcfg.tun_offload == TUN_OFFLOAD_UDP)
-		offload_str = "udp";
+	const char *offload_str = tun_offload_name(gcfg.tun_offload);
 
 	time_t now = time(NULL);
 
@@ -112,11 +109,25 @@ void stats_write_json(const char *path, const char *state)
 	gmtime_r(&now, &tm_info);
 	strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
 
-	const char *status_state = state ? state : "running";
+	atomic_fetch_add_explicit(&g_stats_snapshot_seq, 1, memory_order_relaxed);
+	uint64_t snap_seq = atomic_load_explicit(&g_stats_snapshot_seq, memory_order_relaxed);
 
+	const char *status_state = state ? state : "running";
 	fprintf(f, "{\n");
 	fprintf(f, "  \"version\": \"%s\",\n", TAYGA_VERSION);
 	fprintf(f, "  \"pid\": %ld,\n", (long)getpid());
+	fprintf(f, "  \"snapshot_sequence\": %llu,\n", (unsigned long long)snap_seq);
+	fprintf(f, "  \"workers_synced\": %s,\n", s.workers_synced ? "true" : "false");
+	fprintf(f, "  \"unacknowledged_worker_slots\": [");
+	bool first_unacked = true;
+	for (int i = 0; i < 64; i++) {
+		if (s.unacked_mask & (1ULL << i)) {
+			int slot = i + 1;
+			fprintf(f, "%s%d", first_unacked ? "" : ", ", slot);
+			first_unacked = false;
+		}
+	}
+	fprintf(f, "],\n");
 	fprintf(f, "  \"state\": \"%s\",\n", status_state);
 	fprintf(f, "  \"generated_at\": \"%s\",\n", ts_buf);
 	fprintf(f, "  \"uptime_sec\": %ld,\n", uptime);
@@ -125,6 +136,14 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "  \"pref64\": \"%s\",\n", prefix_buf);
 	fprintf(f, "  \"pref64_source\": \"%s\",\n", pref64_source);
 	fprintf(f, "  \"offload_mode\": \"%s\",\n", offload_str);
+	fprintf(f, "  \"offload_effective\": \"%s\",\n", tun_offload_name(gcfg.tun_offload_effective));
+	fprintf(f, "  \"offload_flags\": %u,\n", gcfg.tun_offload_flags);
+	fprintf(f, "  \"udp_offload_available\": %s,\n", gcfg.tun_has_uso ? "true" : "false");
+	fprintf(f, "  \"vnet_hdr_sz\": %d,\n", gcfg.vnet_hdr_sz);
+	fprintf(f, "  \"offload_negotiation_complete\": %s,\n", gcfg.tun_offload_complete ? "true" : "false");
+	fprintf(f, "  \"offload_fallback_reason\": \"%s\",\n", gcfg.tun_offload_reason ? gcfg.tun_offload_reason : "none");
+	fprintf(f, "  \"offload_fallback_errno\": %d,\n", gcfg.tun_offload_errno);
+	fprintf(f, "  \"offload_fallback_queue\": %d,\n", gcfg.tun_offload_queue);
 	fprintf(f, "  \"traffic\": {\n");
 	fprintf(f, "    \"rx_packets_v4\": %llu,\n", (unsigned long long)s.rx_pkts_v4);
 	fprintf(f, "    \"rx_bytes_v4\": %llu,\n", (unsigned long long)s.rx_bytes_v4);
@@ -160,11 +179,28 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "    \"active_mappings\": %u,\n", active_map);
 	fprintf(f, "    \"dormant_mappings\": %u,\n", dormant_map);
 	fprintf(f, "    \"free_addresses\": %u\n", free_addr);
-	fprintf(f, "  }\n");
+	fprintf(f, "  },\n");
+	fprintf(f, "  \"workers\": [\n");
+	int num_workers = gcfg.workers;
+	for (int i = 0; i <= num_workers && i < STATS_MAX_SLOTS; i++) {
+		struct worker_pub_stats *p = &g_worker_pub[i];
+		fprintf(f, "    {\n");
+		fprintf(f, "      \"slot\": %d,\n", i);
+		fprintf(f, "      \"worker_id\": %d,\n", i == 0 ? 0 : i - 1);
+		fprintf(f, "      \"rx_packets_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_pkts_v4, memory_order_relaxed));
+		fprintf(f, "      \"tx_packets_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_pkts_v4, memory_order_relaxed));
+		fprintf(f, "      \"rx_packets_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_pkts_v6, memory_order_relaxed));
+		fprintf(f, "      \"tx_packets_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_pkts_v6, memory_order_relaxed));
+		fprintf(f, "      \"dropped_packets\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->dropped_pkts, memory_order_relaxed));
+		fprintf(f, "      \"error_packets\": %llu\n", (unsigned long long)atomic_load_explicit(&p->error_pkts, memory_order_relaxed));
+		fprintf(f, "    }%s\n", (i == num_workers || i == STATS_MAX_SLOTS - 1) ? "" : ",");
+	}
+	fprintf(f, "  ]\n");
 	fprintf(f, "}\n");
 
 	fclose(f);
 	rename(tmp_path, path);
+	pthread_mutex_unlock(&s_stats_export_mutex);
 }
 
 static void *telemetry_worker_loop(void *arg)
@@ -247,5 +283,14 @@ void telemetry_stop(void)
 	pthread_join(g_telemetry_thread, NULL);
 	/* Final snapshot with stopped status */
 	stats_write_json(g_telemetry_path, "stopped");
+#endif
+}
+
+void telemetry_write_status(const char *state)
+{
+#ifndef STATS_DISABLED
+	stats_write_json(g_telemetry_path, state ? state : "running");
+#else
+	(void)state;
 #endif
 }

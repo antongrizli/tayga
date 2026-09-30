@@ -41,6 +41,7 @@ fi
 echo "Running guest perf workflow"
 # This workflow is noninteractive. Preserve stdin for any calling matrix script.
 limactl shell "$INSTANCE" -- env \
+  "REPO=$REPO" "PROJECT=$PROJECT" \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
   "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
   "CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}" "CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}" \
@@ -58,6 +59,7 @@ limactl shell "$INSTANCE" -- env \
   "CLIENT_CPUSET=${CLIENT_CPUSET:-all}" \
   "SERVER_CPUSET=${SERVER_CPUSET:-all}" \
   "SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}" \
+  "RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}" \
   "PROTOCOL=${PROTOCOL:-tcp}" "RATE=${RATE:-0}" \
   "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
   "DIRECTIONS=${DIRECTIONS:-download}" "MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}" \

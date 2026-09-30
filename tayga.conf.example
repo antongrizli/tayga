@@ -220,3 +220,7 @@ dynamic-pool 192.168.255.0/24
 #
 #tun-route 192.168.255.0/24
 #tun-route 64:ff9b::/96
+
+# Linux: initialize UDP + TCP offload, fall back to TCP, then off.
+# Explicit tcp disables UDP USO; explicit udp requires full support.
+tun-offload auto

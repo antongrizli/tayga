@@ -45,6 +45,38 @@ class ComparePerfSessionsTests(unittest.TestCase):
         return subprocess.run(["python3", str(TOOL), *args, str(self.base), str(self.candidate)],
                               capture_output=True, text=True)
 
+    def test_accounting_v3_udp_loss_is_supported(self):
+        doc = result("upload", "0", "off", 100)
+        doc.update(workload_protocol="udp", datagram_size=1200,
+                   udp_accounting_version=3, udp_loss_percent=.1)
+        self.write(self.base, "run", doc)
+        self.write(self.candidate, "run", doc)
+        report = json.loads(self.run_tool().stdout)
+        self.assertEqual(report["comparisons"][0]["baseline_summary"]["udp_loss_percent"]["median"], .1)
+        self.assertFalse(any("Legacy UDP" in w for w in report["warnings"]))
+
+    def test_guard_capture_without_guard_binary_identity_is_invalid(self):
+        doc = result("upload", "0", "off", 100)
+        doc.update(receiver_drain_seconds=.5, receiver_drain_method="udp-write-eagain-v1")
+        self.write(self.base, "run", doc)
+        self.write(self.candidate, "run", doc)
+        report = json.loads(self.run_tool().stdout)
+        self.assertIn("guard binary identity", report["baseline_invalid"][0]["invalid_reason"])
+        self.assertEqual(report["comparisons"], [])
+
+    def test_drain_methods_and_guard_binaries_are_not_pooled(self):
+        for change in ({"receiver_drain_method": "legacy"},
+                       {"receiver_drain_guard_sha256": "other-guard"}):
+            with self.subTest(change=change):
+                baseline = result("upload", "0", "off", 100)
+                baseline.update(receiver_drain_seconds=.5, receiver_drain_method="udp-write-eagain-v1",
+                                receiver_drain_guard_sha256="guard")
+                candidate = dict(baseline, **change)
+                self.write(self.base, "run", baseline)
+                self.write(self.candidate, "run", candidate)
+                report = json.loads(self.run_tool().stdout)
+                self.assertEqual(report["comparisons"], [])
+
     def test_groups_directions_separately(self):
         for direction, b, c in (("upload", 100, 120), ("download", 200, 180)):
             self.write(self.base, direction + "-a", result(direction, "0", "off", b - 2))
@@ -269,8 +301,33 @@ class ComparePerfSessionsTests(unittest.TestCase):
         report = json.loads(run.stdout)
         self.assertEqual(run.returncode, 2)
         self.assertFalse(report["comparisons"])
-        self.assertTrue(any("complete treatment" in warning
-                            for warning in report["warnings"]))
+        self.assertTrue(any("complete treatment" in warning for warning in report["warnings"]))
+
+    def test_different_receiver_drain_not_pooled(self):
+        base = result("upload", "0", "off", 100)
+        candidate = result("upload", "0", "tcp", 120)
+        base["receiver_drain_seconds"] = 0.5
+        candidate["receiver_drain_seconds"] = 1.0
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 2)
+        self.assertFalse(report["comparisons"])
+        self.assertTrue(any("no matching" in warning for warning in report["warnings"]))
+
+    def test_legacy_capture_without_receiver_drain_defaults_to_zero(self):
+        base = result("upload", "0", "off", 100)
+        candidate = result("upload", "0", "off", 100)
+        # candidate explicitly has receiver_drain_seconds = 0.0, base omits it (legacy)
+        candidate["receiver_drain_seconds"] = 0.0
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", candidate)
+        run = self.run_tool()
+        report = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(report["comparisons"]), 1)
+        self.assertEqual(report["comparisons"][0]["workload"]["receiver_drain_seconds"], 0.0)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
+#include <poll.h>
 #include "tayga.h"
 #include "stats.h"
 #include "gso.h"
@@ -74,6 +76,51 @@ static void *stress_writer(void *arg) {
 	}
 	stats_flush_worker();
 	return NULL;
+}
+
+static atomic_bool idle_ready, idle_stop, idle_ack;
+static void urgent_handler(int sig) { (void)sig; }
+static void *idle_worker(void *arg) {
+    int idx = *(int *)arg;
+    stats_thread_init(idx);
+    atomic_store(&idle_ready, true);
+    while (!atomic_load(&idle_stop)) {
+        poll(NULL, 0, 500);
+        if (atomic_load(&idle_ack)) stats_check_sync_request();
+    }
+    stats_flush_worker();
+    stats_thread_exit();
+    return NULL;
+}
+static void test_idle_sync(void) {
+    struct sigaction sa = {.sa_handler = urgent_handler};
+    sigemptyset(&sa.sa_mask);
+    assert(sigaction(SIGURG, &sa, NULL) == 0);
+    stats_init(); stats_thread_init(-1);
+    gcfg.workers = 64;
+    int idx = 63; /* Sparse slot and the highest mask bit. */
+    atomic_store(&idle_ready, false); atomic_store(&idle_stop, false); atomic_store(&idle_ack, true);
+    assert(pthread_create(&gcfg.threads[idx], NULL, idle_worker, &idx) == 0);
+    while (!atomic_load(&idle_ready)) usleep(1000);
+    for (int i = 0; i < 100; i++) {
+        usleep(2000);
+        bool synced = false; uint64_t missing = UINT64_MAX;
+        assert(stats_sync_workers(&synced, &missing) == 0);
+        assert(synced && missing == 0);
+    }
+    atomic_store(&idle_ack, false);
+    usleep(20000);
+    bool synced = true; uint64_t missing = 0;
+    assert(stats_sync_workers(&synced, &missing) == -1);
+    assert(!synced && missing == (UINT64_C(1) << 63));
+    atomic_store(&idle_ack, true);
+    assert(stats_sync_workers(&synced, &missing) == 0);
+    assert(synced && missing == 0);
+    atomic_store(&idle_stop, true);
+    pthread_kill(gcfg.threads[idx], SIGURG);
+    pthread_join(gcfg.threads[idx], NULL);
+    gcfg.workers = 0;
+    puts("PASS: idle sparse highest-slot worker synchronization (100 requests)");
 }
 
 int main(void)
@@ -339,6 +386,7 @@ int main(void)
 	assert(atomic_load_explicit(&g_worker_pub[3].rx_pkts_v4, memory_order_relaxed) == 15);
 	printf("PASS: low-rate continuous streaming interval flush publishes within 1 second\n");
 
+	test_idle_sync();
 	printf("All stats unit tests PASSED.\n");
 	return 0;
 }

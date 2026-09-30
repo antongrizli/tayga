@@ -63,7 +63,7 @@ void usage(int code) {
 			"--pidfile FILE     : Write process ID of daemon to FILE\n"
 			"--mktun            : Create the persistent TUN interface\n"
 			"--rmtun            : Remove the persistent TUN interface\n"
-			"--tun-offload MODE : Offload mode: off, tcp, udp (experimental), or auto (default: auto)\n"
+			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
@@ -85,6 +85,11 @@ static void signal_handler(int signal)
 	(void)!write(signalfds[1], &signal, sizeof(signal));
 }
 
+static void noop_signal_handler(int signal)
+{
+	(void)signal;
+}
+
 static void signal_setup(void)
 {
 	struct sigaction act;
@@ -104,6 +109,8 @@ static void signal_setup(void)
 	sigaction(SIGUSR2, &act, NULL);
 	sigaction(SIGQUIT, &act, NULL);
 	sigaction(SIGTERM, &act, NULL);
+	act.sa_handler = noop_signal_handler;
+	sigaction(SIGURG, &act, NULL);
 }
 
 
@@ -138,11 +145,12 @@ static void signal_read(void)
 		/* If we got SIGUSR2, dump statistics without exiting */
 		if(sig == SIGUSR2) {
 			slog(LOG_NOTICE, "Received SIGUSR2, reporting statistics\n");
+			stats_sync_workers(NULL, NULL);
 			stats_dump();
-			if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+			if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 				gso_dump_stats();
 			}
-			telemetry_trigger();
+			telemetry_write_status("running");
 			continue;
 		}
 		/* For any other signal prepare to exit cleanly */
@@ -262,6 +270,7 @@ static void * worker(void * arg)
 
 	/* Enter worker loop */
 	stats_thread_init(idx);
+	atomic_fetch_add_explicit(&g_workers_running, 1, memory_order_release);
 	slog(LOG_DEBUG,"Starting worker thread %d\n",idx);
 
 	struct pollfd pfd;
@@ -273,6 +282,7 @@ static void * worker(void * arg)
 	clock_gettime(CLOCK_MONOTONIC, &last_flush);
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
 		int pret = poll(&pfd, 1, 500);
+		stats_check_sync_request();
 		if (pret > 0) {
 			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
 				tun_io_fail("worker TUN poll reported a failed descriptor", EIO);
@@ -312,6 +322,8 @@ static void * worker(void * arg)
 		}
 	}
 	stats_flush_worker();
+	stats_thread_exit();
+	atomic_fetch_sub_explicit(&g_workers_running, 1, memory_order_release);
 	free(recv_buf);
 	return NULL;
 }
@@ -671,8 +683,6 @@ int main(int argc, char **argv)
 	if (gcfg.cache_size)
 		create_cache();
 
-	telemetry_start("/run/tayga-status.json", 5);
-
 	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
 	if (!recv_buf) {
 		slog(LOG_CRIT, "Error: unable to allocate %d bytes for "
@@ -709,6 +719,7 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	telemetry_start("/run/tayga-status.json", 5);
 
 	struct timespec last_main_flush, main_mono_now;
 	clock_gettime(CLOCK_MONOTONIC, &last_main_flush);
@@ -717,6 +728,7 @@ int main(int argc, char **argv)
 	/* Main loop */
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
 		ret = poll(pollfds, 2, 500);
+		stats_check_sync_request();
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
@@ -788,7 +800,7 @@ int main(int argc, char **argv)
 #endif
 	stats_flush_worker();
 	stats_dump();
-	if (gcfg.tun_offload != TUN_OFFLOAD_OFF) {
+	if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 		gso_dump_stats();
 	}
 	telemetry_stop();

@@ -1,6 +1,6 @@
 # TAYGA CLAT Hardware Offloads: GSO & GRO Tuning Guide
 
-This document describes the high-performance GSO (Generic Segmentation Offload) and GRO (Generic Receive Offload) architecture implemented in TAYGA, configuration options, runtime preflight detection, and tuning guidelines.
+This document describes the high-performance GSO (Generic Segmentation Offload) and GRO (Generic Receive Offload) architecture implemented in TAYGA, configuration options, initialization capability detection, and tuning guidelines.
 
 ---
 
@@ -27,7 +27,7 @@ TCP and UDP results are workload-specific. The current TCP measurements used agg
 #   off  - Standard packet-by-packet operation (explicit legacy baseline)
 #   tcp  - Enforce TCP GSO/CSUM offloads (requires IFF_VNET_HDR support)
 #   udp  - Experimental TCP/UDP segmentation and checksum offload; requires kernel validation
-#   auto - Default; use the validated TCP feature set when supported
+#   auto - Default; negotiate UDP + TCP, then TCP, then off at initialization
 tun-offload auto
 ```
 
@@ -40,6 +40,8 @@ tayga --tun-offload auto -c /etc/tayga.conf
 # Check kernel and TUN driver offload capabilities without starting daemon
 tayga --check-offload
 ```
+
+When the configuration file contains `tun-offload`, that directive takes precedence over the CLI mode. Set the directive in the configuration file for an explicit rollback.
 
 ### 2.3. Environment Variables (Container & CLAT startup scripts)
 
@@ -73,13 +75,22 @@ Output on unsupported systems:
 OFFLOAD_CHECK: FAIL (IFF_VNET_HDR ioctl failed: Invalid argument)
 ```
 
-### 3.2. Automatic Runtime Fallback (`tun-offload auto`)
+### 3.2. Automatic Initialization Fallback (`tun-offload auto`)
 
-When configured with `tun-offload auto`:
-1. `tayga` requests `IFF_VNET_HDR` and queries the header size (`TUNGETVNETHDRSZ`).
-2. `tayga` attempts to enable `TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6` via `TUNSETOFFLOAD`.
-3. If the initial header negotiation fails, `tayga` retries without offload. If checksum/TSO negotiation fails on the device or a worker queue, it disables offload while preserving the negotiated header framing and existing interface routes.
-4. Startup logs report active offload only after queue setup succeeds. An inability to establish a consistent configuration fails startup. `auto` keeps UDP segmentation disabled; `udp` requests USO explicitly and fails if either required feature is unavailable. A kernel accepting USO is only a capability check, not proof that segmentation preserves translator packet semantics.
+When configured with `tun-offload auto`, TAYGA checks virtual header framing and
+attaches its worker queues before starting packet processing. It requests
+`CSUM | TSO4 | TSO6 | USO4 | USO6`; if unavailable, it retries `CSUM | TSO4 | TSO6`,
+then verified offload disabled. A worker failure restarts the candidate across
+all descriptors. Invalid framing or inability to establish the disabled state
+fails startup. Requested policy and effective capabilities appear separately in
+telemetry. Explicit `tcp` and `udp` remain strict operational overrides.
+
+Initialization establishes kernel capability, while packet-level fallback
+handles valid aggregates outside the fast path. Forwarding GRO must be available
+on the ingress path to aggregate ordinary UDP senders; TAYGA does not modify
+physical NIC settings. The owned TUN is held down during negotiation and its
+previous UP state is restored. Only one TAYGA may own a device in a network
+namespace. Other programs must not share that interface.
 
 ---
 
@@ -105,6 +116,8 @@ The repository provides automated validation scripts in the `test/` directory:
 
 | Test Script | Scope |
 |---|---|
+| `test/test_auto_negotiation.py` | Default UDP selection, fallback failures and capability telemetry |
+| `test/test_auto_persistent.py` | Persistent addresses/routes, restart, exclusive ownership and removal |
 | [`test/test_correctness.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_correctness.py) | ICMP ping, 20 MB TCP upload/download SHA-256 integrity, UDP datagrams |
 | [`test/test_pmtud.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_pmtud.py) | End-to-end PMTUD & ICMPv6 Packet Too Big (1280 → 1260) translation |
 | [`test/test_preflight.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_preflight.py) | CLI `--check-offload`, mode startups (`auto`, `tcp`, `off`), and data path |
@@ -115,3 +128,54 @@ sudo python3 test/test_correctness.py
 sudo python3 test/test_pmtud.py
 sudo python3 test/test_preflight.py
 ```
+
+## 6. Bounded UDP sender buffering in the benchmark
+
+On the tested Linux 6.12.107 veth path, a queued sender can retain packets
+while the peer receive ring is temporarily full. The benchmark exposes this
+treatment independently of socket rate limiting:
+
+```sh
+SENDER_FQ=on SENDER_FQ_LIMIT=4096 SENDER_FQ_FLOW_LIMIT=1024 \
+VETH_QUEUES=4 SENDER_FQ_TOPOLOGY=auto FQ_RATE=0 \
+PROTOCOL=udp RATE=0 DIRECTIONS="upload download" \
+tools/lima-perf/run-host.sh
+```
+
+`RATE=0` leaves offered load unrestricted. `FQ_RATE=0` adds no socket pacing
+rate cap. Offload defaults to `auto`, which now negotiates UDP USO when supported. Explicit
+`CLAT_OFFLOAD=udp` requires full support. Other socket, TUN and application pacing controls
+remain explicit treatments.
+
+`SENDER_FQ_TOPOLOGY=auto` uses one fq scheduler for one active TX channel and
+an `mq` root with a separate fq scheduler per TX channel otherwise. `single`
+and `mq` select a topology explicitly. `SENDER_FQ_LIMIT` is the total packet
+budget per sender interface: multiqueue partitions it across the leaf
+schedulers without multiplying the budget. Each leaf's effective flow limit
+is the smaller of its packet budget and `SENDER_FQ_FLOW_LIMIT`. Actual qdisc
+settings, counters and channel settings are saved with each session.
+
+`VETH_QUEUES=0` preserves existing channel counts. A positive value configures
+both ends of all disposable benchmark pairs and fails setup if unsupported.
+The control changes queue capacity, not a guarantee of balanced flow mapping.
+Per-leaf packet counters expose the resulting distribution.
+
+Optional `TAYGA_CPUSET`, `CLIENT_CPUSET` and `SERVER_CPUSET` accept `all` (the
+default) or CPU lists such as `2,3`. They constrain child processes only and
+are recorded as distinct treatments. They do not isolate CPUs from unrelated
+guest tasks. Unsupported CPU lists fail before topology setup.
+
+Interface drops/errors now affect UDP acceptance independently of qdisc and
+socket counters. TUN transmit drops continue to use `MAX_TUN_DROPS`. Parent
+and leaf qdisc counts can overlap and must not be added together. Queues are
+removed with the disposable namespaces; production interfaces are unaffected.
+
+This treatment does not guarantee lossless overload or resolve all TUN
+pressure. See [the buffer investigation](UDP-BUFFER-PRESSURE-INVESTIGATION-0.9.12.md)
+for the evidence and validation criteria.
+
+### Benchmark-only UDP draining and accounting
+
+The runners build `make udp-drain-tools` and install a native iperf3 drain guard. With `RECEIVER_DRAIN_SECONDS>0`, UDP sending stops at the active-window boundary while TCP control and receiver threads remain live. The stop flag remains set through normal endpoint termination. No process pause/resume or fake successful writes are used. iperf3 3.18 is the tested writer; other generators or write APIs require separate validation. Direct harness users must install `tools/udp-drain-guard.so` at `/usr/local/lib/tayga-perf/udp-drain-guard.so` and `tools/udp-drain-control` at `/usr/local/libexec/tayga-perf/udp-drain-control`, or explicitly set drain seconds to zero and identify that as a different workload.
+
+Schema 6 records drain method/hash and guard counters. UDP accounting v3 derives sent and received datagram counts from their successful byte totals and retains the raw sender sequence count separately. iperf can sample its incremented sequence during a pending soft-error write, so the sequence count alone may include an unsent attempt. Sequence gaps, reordering, and estimated duplicates remain separate diagnostics; byte totals do not prove exact unique delivery when duplicates are possible. Original iperf throughput averages over its extended timer; `received_active_window_mbps` uses the recorded active traffic window. A drain fixes end-of-test accounting, not loss from sustained overload.

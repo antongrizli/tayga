@@ -1520,6 +1520,7 @@ static void test_partial_udp_fragmentation(void)
 {
 	setup_test_mapping();
 	gcfg.tun_offload = TUN_OFFLOAD_AUTO;
+    gcfg.tun_offload_effective = TUN_OFFLOAD_TCP;
 	gcfg.mtu = 1280;
 	gcfg.ipv6_offlink_mtu = 1280;
 	int sv[2];

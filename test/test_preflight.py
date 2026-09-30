@@ -16,10 +16,22 @@ import time
 import hashlib
 import os
 import sys
+import signal
 
 def sh(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return r.stdout, r.stderr, r.returncode
+
+def stop_tayga(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=3)
 
 def setup_topology():
     for ns in ["client", "router", "clatns", "server"]:
@@ -105,15 +117,13 @@ def test_mode_startup(mode, expect_offload_active):
     tayga = subprocess.Popen(
         f"ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 "
         f"CLAT_WORKERS=1 CLAT_OFFLOAD={mode} /usr/local/sbin/clat-start.sh > {log_file} 2>&1",
-        shell=True)
+        shell=True, start_new_session=True)
 
     ready = wait_for_clat(timeout_sec=6)
     with open(log_file, "r") as f:
         log_content = f.read()
 
-    tayga.terminate()
-    try: tayga.wait(timeout=2)
-    except: sh("killall -9 tayga 2>/dev/null || true")
+    stop_tayga(tayga)
     teardown()
 
     assert ready, f"Ping readiness timed out in mode {mode}. Log:\n{log_content}"
@@ -131,13 +141,11 @@ def test_udp_mode_negotiation():
     tayga = subprocess.Popen(
         f"ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 "
         f"CLAT_WORKERS=1 CLAT_OFFLOAD=udp /usr/local/sbin/clat-start.sh > {log_file} 2>&1",
-        shell=True)
+        shell=True, start_new_session=True)
     ready = wait_for_clat(timeout_sec=6)
     with open(log_file, "r") as f:
         log_content = f.read()
-    tayga.terminate()
-    try: tayga.wait(timeout=2)
-    except subprocess.TimeoutExpired: sh("killall -9 tayga 2>/dev/null || true")
+    stop_tayga(tayga)
     teardown()
     if ready:
         assert "experimental UDP USO" in log_content, log_content
@@ -162,7 +170,7 @@ def test_auto_data_transfer():
     tayga = subprocess.Popen(
         f"ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 "
         f"CLAT_WORKERS=2 CLAT_OFFLOAD=auto /usr/local/sbin/clat-start.sh > {log_file} 2>&1",
-        shell=True)
+        shell=True, start_new_session=True)
 
     ready = wait_for_clat(timeout_sec=6)
     assert ready, "CLAT failed to become ready under auto mode"
@@ -181,9 +189,7 @@ def test_auto_data_transfer():
     with open(dl_file, "rb") as f:
         got_hash = hashlib.sha256(f.read()).hexdigest()
 
-    tayga.terminate()
-    try: tayga.wait(timeout=2)
-    except: sh("killall -9 tayga 2>/dev/null || true")
+    stop_tayga(tayga)
     teardown()
 
     assert got_hash == expected_hash, f"Hash mismatch: expected {expected_hash}, got {got_hash}"
@@ -193,6 +199,9 @@ def main():
     print("=== TAYGA CLAT Preflight & Auto-detection Test Suite ===")
     test_cli_check_offload()
     test_mode_startup("auto", expect_offload_active=True)
+    check, _, _ = sh("/usr/sbin/tayga --check-offload")
+    if "udp_available=yes" in check:
+        assert "requested=auto effective=udp" in open("/tmp/tayga_test_auto.log").read()
     test_mode_startup("tcp", expect_offload_active=True)
     test_mode_startup("off", expect_offload_active=False)
     test_udp_mode_negotiation()

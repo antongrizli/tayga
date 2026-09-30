@@ -11,7 +11,8 @@ from pathlib import Path
 WORKLOAD_KEYS = ("direction", "clients", "expected_clients", "workload_protocol",
                  "flows_per_client", "rate_per_flow", "duration_seconds",
                  "warmup_seconds", "datagram_size", "block_size", "offlink_mtu",
-                 "kernel", "guest_cpu_count", "perf_mode", "perf_scope", "socket_sample_interval")
+                 "kernel", "guest_cpu_count", "perf_mode", "perf_scope", "socket_sample_interval",
+                 "receiver_drain_seconds", "receiver_drain_method", "receiver_drain_guard_sha256")
 BUILD_KEYS = ("git_revision", "source_tree_sha256", "clat_start_sha256", "tayga_sha256")
 IDENTITY_KEYS = WORKLOAD_KEYS + BUILD_KEYS
 TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen", "forwarding_gro",
@@ -22,7 +23,7 @@ METRICS = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
            "tun_tx_drop_percent", "udp_loss_percent", "udp_sender_receiver_gap_percent", "ping_loss_percent",
            "retransmits", "retransmits_per_gbyte", "ping_avg_ms",
            "ping_p95_ms", "ping_p99_ms", "elapsed_s")
-OPTIONAL_IDENTITY_KEYS = {"datagram_size", "block_size"}
+OPTIONAL_IDENTITY_KEYS = {"datagram_size", "block_size", "receiver_drain_guard_sha256"}
 
 
 def results(root: Path):
@@ -51,9 +52,14 @@ def results(root: Path):
         for key, default in (("pacing_timer_us", 1000), ("fq_rate", "0"),
                              ("socket_buffer_bytes", 0), ("sender_fq", "off"), ("sender_fq_flow_limit", 100),
                              ("sender_fq_limit", 10000), ("veth_queues", 0), ("sender_fq_topology", "single"),
-                             ("tayga_cpuset", "all"), ("client_cpuset", "all"), ("server_cpuset", "all"), ("socket_sample_interval", 0)):
+                             ("tayga_cpuset", "all"), ("client_cpuset", "all"), ("server_cpuset", "all"),
+                             ("socket_sample_interval", 0), ("receiver_drain_seconds", 0.0)):
             doc.setdefault(key, default)
+        doc.setdefault("receiver_drain_method", "legacy" if doc["receiver_drain_seconds"] else "none")
         doc["valid"] = bool(doc.get("capture_valid", False) and doc.get("workload_valid", False))
+        if doc["receiver_drain_method"] == "udp-write-eagain-v1" and not doc.get("receiver_drain_guard_sha256"):
+            doc["valid"] = False
+            doc["degraded_reasons"] = list(doc.get("degraded_reasons", [])) + ["UDP drain guard binary identity is missing"]
         if not doc["valid"]:
             doc["invalid_reason"] = "; ".join(doc.get("degraded_reasons", [])) or "capture/workload validity flag is false or missing"
         out.append(doc)
@@ -77,7 +83,7 @@ def summarize(items):
     for key in METRICS:
         values = []
         for item in items:
-            if key == "udp_loss_percent" and item.get("workload_protocol") == "udp" and item.get("udp_accounting_version") != 2:
+            if key == "udp_loss_percent" and item.get("workload_protocol") == "udp" and item.get("udp_accounting_version") not in (2, 3):
                 continue
             value = item.get(key)
             if not item.get("valid") or value is None:
@@ -106,7 +112,7 @@ def compare(base, candidate, mode="configuration"):
     base_valid = [item for item in base if item.get("valid")]
     candidate_valid = [item for item in candidate if item.get("valid")]
     warnings = []
-    if any(item.get("workload_protocol") == "udp" and item.get("udp_accounting_version") != 2
+    if any(item.get("workload_protocol") == "udp" and item.get("udp_accounting_version") not in (2, 3)
            for item in base_valid + candidate_valid):
         warnings.append("Legacy UDP loss accounting is unsupported; UDP loss metrics are excluded. Reprocess raw iperf reports or rerun with schema 3.")
     if not base_valid or not candidate_valid:

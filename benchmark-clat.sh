@@ -36,7 +36,8 @@ TAYGA_CPUSET=${TAYGA_CPUSET:-all}
 CLIENT_CPUSET=${CLIENT_CPUSET:-all}
 SERVER_CPUSET=${SERVER_CPUSET:-all}
 SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}
-export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SENDER_FQ_LIMIT VETH_QUEUES SENDER_FQ_TOPOLOGY TAYGA_CPUSET CLIENT_CPUSET SERVER_CPUSET SOCKET_SAMPLE_INTERVAL
+RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}
+export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SENDER_FQ_LIMIT VETH_QUEUES SENDER_FQ_TOPOLOGY TAYGA_CPUSET CLIENT_CPUSET SERVER_CPUSET SOCKET_SAMPLE_INTERVAL RECEIVER_DRAIN_SECONDS
 GIT_REVISION=${GIT_REVISION:-unknown}
 SOURCE_TREE_SHA256=${SOURCE_TREE_SHA256:-unknown}
 
@@ -70,6 +71,9 @@ done
 [ "$SENDER_FQ_FLOW_LIMIT" -le "$SENDER_FQ_LIMIT" ] || { echo 'SENDER_FQ_FLOW_LIMIT cannot exceed SENDER_FQ_LIMIT' >&2; exit 64; }
 [ "$VETH_QUEUES" -le 64 ] || { echo 'VETH_QUEUES must be between 0 (unchanged) and 64' >&2; exit 64; }
 [ "$PACING_TIMER_US" -gt 0 ] || { echo 'PACING_TIMER_US must be positive' >&2; exit 64; }
+awk -v d="$RECEIVER_DRAIN_SECONDS" 'BEGIN { exit !(d ~ /^[0-9]+([.][0-9]+)?$/ && d >= 0) }' || {
+  echo 'RECEIVER_DRAIN_SECONDS must be a finite non-negative number' >&2; exit 64;
+}
 awk -v rate="$FQ_RATE" 'BEGIN { exit !(rate ~ /^[0-9]+([.][0-9]+)?[KMGTkmgt]?$/) }' || { echo 'invalid FQ_RATE' >&2; exit 64; }
 if [ "$PROTOCOL" = udp ] && [ -n "$BLOCK_SIZE" ] && [ "$BLOCK_SIZE" != "$DATAGRAM_SIZE" ]; then
   echo 'UDP BLOCK_SIZE must equal DATAGRAM_SIZE for packet accounting' >&2; exit 64
@@ -348,6 +352,45 @@ sample_udp_sockets() {
     sleep "$SOCKET_SAMPLE_INTERVAL"
   done
 }
+tayga_snapshot() {
+  local target_path=$1
+  local cur_seq=0
+  if [ -s /run/tayga-status.json ]; then
+    cur_seq=$(python3 -c 'import json, sys; d=json.load(open("/run/tayga-status.json")); print(d.get("snapshot_sequence", 0) if d.get("pid") == int(sys.argv[1]) else 0)' "$clat_pid" 2>/dev/null || echo 0)
+  fi
+  kill -USR2 "$clat_pid" 2>/dev/null || true
+  local fresh=0
+  for _ in $(seq 1 50); do
+    test "$(( _ % 10 ))" -ne 0 || kill -USR2 "$clat_pid" 2>/dev/null || true
+    sleep 0.02
+    if [ -s /run/tayga-status.json ]; then
+      fresh=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open("/run/tayga-status.json"))
+    pid = int(sys.argv[1])
+    cur_seq = int(sys.argv[2])
+    if (d.get("pid") == pid and
+        d.get("snapshot_sequence", 0) > cur_seq and
+        d.get("workers_synced") is True and
+        not d.get("unacknowledged_worker_slots")):
+        with open(sys.argv[3], "w") as output:
+            json.dump(d, output)
+        print(1)
+    else:
+        print(0)
+except Exception:
+    print(0)
+' "$clat_pid" "$cur_seq" "$target_path" 2>/dev/null || echo 0)
+      if [ "$fresh" = 1 ]; then
+        return 0
+      fi
+    fi
+  done
+  echo "Failed to obtain fresh TAYGA status snapshot for PID $clat_pid (old seq $cur_seq)" >&2
+  return 1
+}
+
 cleanup_iperf_servers() {
   for old_iperf_pid in $iperf_pids; do
     kill "$old_iperf_pid" 2>/dev/null || true
@@ -361,7 +404,7 @@ cleanup_iperf_servers() {
 start_iperf_servers() {
   cleanup_iperf_servers
   for client_no in $(seq 1 "$CLIENTS"); do
-    exec_with_affinity "$SERVER_CPUSET" ip netns exec server iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
+    exec_with_affinity "$SERVER_CPUSET" ip netns exec server env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
       >"$ARTIFACT_DIR/iperf-server-$client_no.log" 2>&1 &
     iperf_pids="$iperf_pids $!"
   done
@@ -472,10 +515,10 @@ start_clients() {
       rm -f "$gate"
       mkfifo "$gate"
       printf '%s\n' "$gate" >> "$run_dir/gates"
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" iperf3 "$@" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" \
         >"$run_dir/client-$client_no.json" 2>"$run_dir/client-$client_no.stderr" &
     else
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client iperf3 "$@" >"$run_dir/client-$client_no.json" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" >"$run_dir/client-$client_no.json" \
         2>"$run_dir/client-$client_no.stderr" &
     fi
     printf '%s\n' "$!" >> "$run_dir/pids"
@@ -558,8 +601,23 @@ run_iperf() {
     echo "Warmup failed for $direction; marking run as degraded" >&2
     printf '%s\n' "warmup_failed" > "$run_dir/warmup-failed.marker"
   fi
+  drain_s=${RECEIVER_DRAIN_SECONDS:-0.5}
+  drain_int=0
+  if [ "$PROTOCOL" = udp ] && [ "$(awk -v d="$drain_s" 'BEGIN { print (d > 0) }')" = 1 ]; then
+    drain_int=$(awk -v d="$drain_s" 'BEGIN { print int(d + 0.999) }')
+  fi
+  udp_drain_control=
+  udp_drain_guard=
+  if test "$drain_int" -gt 0; then
+    test -r /usr/local/lib/tayga-perf/udp-drain-guard.so || return 1
+    udp_drain_control="$run_dir/udp-drain.control"
+    /usr/local/libexec/tayga-perf/udp-drain-control init "$udp_drain_control" || return 1
+    udp_drain_guard=/usr/local/lib/tayga-perf/udp-drain-guard.so
+    sha256sum /usr/local/lib/tayga-perf/udp-drain-guard.so > "$run_dir/udp-drain-guard.sha256"
+  fi
   start_iperf_servers || return 1
-  start_clients "$run_dir" "$direction" "$DURATION" yes
+  client_duration=$(( DURATION + drain_int ))
+  start_clients "$run_dir" "$direction" "$client_duration" yes
   # Give every wrapper time to block on its FIFO before a common release.
   sleep 1
   : > "$run_dir/endpoint-affinity.before"
@@ -572,11 +630,14 @@ run_iperf() {
   monotonic_before=$(monotonic_ns)
   ps -L -p "$clat_pid" -o pid,tid,psr,pcpu,stat,comm > "$run_dir/tayga.threads.before"
   cat "/proc/$clat_pid/status" > "$run_dir/tayga.status.before"
+  tayga_snapshot "$run_dir/tayga-status.before.json" || {
+    echo "failed to capture valid synchronized before status snapshot" >&2
+    printf 'failed to capture valid synchronized before status snapshot\n' >> "$run_dir/capture_errors.txt"
+  }
   if test "$offload_active" = yes; then
-    kill -USR2 "$clat_pid"
-    sleep 0.1
     grep 'GSO Stats:' "$ARTIFACT_DIR/clat.log" | tail -n 1 > "$run_dir/gso-stats.before" || true
   fi
+  grep 'Stats: Worker' "$ARTIFACT_DIR/clat.log" | tail -n "$((WORKERS + 1))" > "$run_dir/worker-stats.before.txt" 2>/dev/null || true
   ip -n clatns -s link show > "$run_dir/clat.links.before"
   ip -n clatns -j -s link show > "$run_dir/clat.links.before.json"
   ip netns exec clatns tc -s qdisc show dev clat > "$run_dir/clat.qdisc.before" 2>&1 || true
@@ -612,19 +673,39 @@ run_iperf() {
   local ping_pid=
   ip netns exec client ping -c "$((DURATION * 5))" -i 0.2 -W 1 11.0.0.2 > "$run_dir/ping.txt" 2>&1 &
   ping_pid=$!
+  monotonic_traffic_start=$(monotonic_ns)
   release_pids=
   while read -r gate; do printf 'go\n' > "$gate" & release_pids="$release_pids $!"; done < "$run_dir/gates"
   for release_pid in $release_pids; do wait "$release_pid" || true; done
   release_pids=
-  if wait_clients "$run_dir"; then status=0; else status=$?; fi
+  if [ "$drain_int" -gt 0 ]; then
+    sleep "$DURATION"
+    if ! /usr/local/libexec/tayga-perf/udp-drain-control stop "$udp_drain_control" > "$run_dir/udp-drain.stop.json"; then
+      echo "failed to suppress UDP sender during drain" >&2
+      printf 'failed to suppress UDP sender during drain\n' >> "$run_dir/capture_errors.txt"
+    fi
+    monotonic_traffic_end=$(monotonic_ns)
+    sleep "$drain_s"
+    if wait_clients "$run_dir"; then status=0; else status=$?; fi
+    monotonic_drain_end=$(monotonic_ns)
+  else
+    if wait_clients "$run_dir"; then status=0; else status=$?; fi
+    monotonic_traffic_end=$(monotonic_ns)
+    monotonic_drain_end=$monotonic_traffic_end
+  fi
   client_pids=
   if test -n "$socket_sampler_pid"; then
     kill "$socket_sampler_pid" 2>/dev/null || true
     wait "$socket_sampler_pid" 2>/dev/null || true
     socket_sampler_pid=
   fi
+  if test -n "$udp_drain_control"; then
+    /usr/local/libexec/tayga-perf/udp-drain-control status "$udp_drain_control" > "$run_dir/udp-drain.status.json" || printf "drain status failed\n" >> "$run_dir/capture_errors.txt"
+  fi
   collect_network_counters "$run_dir" after
   cleanup_iperf_servers
+  udp_drain_control=
+  udp_drain_guard=
   if test -n "$ping_pid"; then
     wait "$ping_pid" || true
   fi
@@ -642,11 +723,14 @@ run_iperf() {
   snapshot_thread_counters "$run_dir/thread-counters.after.json"
   ps -L -p "$clat_pid" -o pid,tid,psr,pcpu,stat,comm > "$run_dir/tayga.threads.after"
   cat "/proc/$clat_pid/status" > "$run_dir/tayga.status.after"
+  tayga_snapshot "$run_dir/tayga-status.after.json" || {
+    echo "failed to capture valid synchronized after status snapshot" >&2
+    printf 'failed to capture valid synchronized after status snapshot\n' >> "$run_dir/capture_errors.txt"
+  }
   if test "$offload_active" = yes; then
-    kill -USR2 "$clat_pid"
-    sleep 0.1
     grep 'GSO Stats:' "$ARTIFACT_DIR/clat.log" | tail -n 1 > "$run_dir/gso-stats.after" || true
   fi
+  grep 'Stats: Worker' "$ARTIFACT_DIR/clat.log" | tail -n "$((WORKERS + 1))" > "$run_dir/worker-stats.after.txt" 2>/dev/null || true
   ip -n clatns -s link show > "$run_dir/clat.links.after"
   ip -n clatns -j -s link show > "$run_dir/clat.links.after.json"
   ip netns exec clatns tc -s qdisc show dev clat > "$run_dir/clat.qdisc.after" 2>&1 || true
@@ -655,9 +739,9 @@ run_iperf() {
   cat /proc/net/softnet_stat > "$run_dir/softnet.after"
   cat /proc/stat > "$run_dir/proc_stat.after"
   printf '%s\n' "$status" > "$run_dir/exit-status"
-  python3 - "$run_dir" "$direction" "$ticks_before" "$ticks_after" "$uptime_before" "$uptime_after" "$monotonic_before" "$monotonic_after" "$PROTOCOL" "$MAX_UDP_LOSS_PERCENT" "$MAX_TUN_DROPS" "$MAX_PING_LOSS_PERCENT" "$CLAT_OFFLOAD" "$offload_active" "$TUN_TXQLEN" "$GIT_REVISION" "$SOURCE_TREE_SHA256" "$WORKERS" "$FLOWS" "$RATE" "$DURATION" "$WARMUP" "$DATAGRAM_SIZE" "$BLOCK_SIZE" "$CLAT_OFFLINK_MTU" <<'PY'
+  python3 - "$run_dir" "$direction" "$ticks_before" "$ticks_after" "$uptime_before" "$uptime_after" "$monotonic_before" "$monotonic_after" "$PROTOCOL" "$MAX_UDP_LOSS_PERCENT" "$MAX_TUN_DROPS" "$MAX_PING_LOSS_PERCENT" "$CLAT_OFFLOAD" "$offload_active" "$TUN_TXQLEN" "$GIT_REVISION" "$SOURCE_TREE_SHA256" "$WORKERS" "$FLOWS" "$RATE" "$DURATION" "$WARMUP" "$DATAGRAM_SIZE" "$BLOCK_SIZE" "$CLAT_OFFLINK_MTU" "$monotonic_traffic_end" "$monotonic_drain_end" "$monotonic_traffic_start" <<'PY'
 import glob, json, os, re, sys
-run_dir, direction, before, after, up_before, up_after, mono_before, mono_after, protocol, max_udp_loss, max_tun_drops, max_ping_loss, offload_requested, offload_active, txqlen, revision, source_tree_sha256, workers, flows, rate, duration, warmup, datagram_size, block_size, offlink_mtu = sys.argv[1:]
+run_dir, direction, before, after, up_before, up_after, mono_before, mono_after, protocol, max_udp_loss, max_tun_drops, max_ping_loss, offload_requested, offload_active, txqlen, revision, source_tree_sha256, workers, flows, rate, duration, warmup, datagram_size, block_size, offlink_mtu, mono_traffic_end, mono_drain_end, mono_traffic_start = sys.argv[1:]
 reports = []
 capture_errors = []
 workload_errors = []
@@ -672,8 +756,16 @@ def udp_packet_accounting(sent, received, payload_size):
         raise ValueError("invalid UDP packet/byte counters")
     if byte_count % size:
         raise ValueError("UDP received bytes do not contain whole fixed-size datagrams")
+    sent_packets = sent.get("packets")
+    if "bytes" in sent:
+        sent_bytes = sent["bytes"]
+        if not isinstance(sent_bytes, int) or isinstance(sent_bytes, bool) or sent_bytes < 0 or sent_bytes % size:
+            raise ValueError("UDP sent bytes do not contain whole fixed-size datagrams")
+        # iperf increments its sequence before Nwrite and rolls it back after
+        # EAGAIN; a concurrent final report can observe the unsent attempt.
+        sent_packets = sent_bytes // size
     return dict(packets=byte_count // size, receiver_expected_packets=expected,
-                lost_packets=lost, sent_packets=sent.get("packets"))
+                lost_packets=lost, sent_packets=sent_packets)
 
 
 def parse_udp_snmp(text, ipv6=False):
@@ -757,14 +849,81 @@ def udp_delivery_reconciliation(reports):
     if not counts or any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts):
         return dict(udp_delivery_accounting_match=False, udp_sender_receiver_packet_gap=None,
                     udp_sender_receiver_gap_percent=None, udp_sender_unobserved_tail_packets=None,
-                    udp_client_packet_gaps=None)
+                    udp_client_packet_gaps=None, udp_sequence_ledger=None)
     gaps = [row["sent_packets"] - row["packets"] for row in reports]
     tails = [max(row["sent_packets"] - row["receiver_expected_packets"], 0) for row in reports]
     sent = sum(counts)
+    ledger = []
+    for idx, row in enumerate(reports):
+        sp = row.get("sent_packets")
+        rp = row.get("packets")
+        exp = row.get("receiver_expected_packets")
+        lp = row.get("lost_packets")
+        tail = max(sp - exp, 0) if (sp is not None and exp is not None) else None
+        uniq = (exp - lp) if (exp is not None and lp is not None) else None
+        dup = max(0, rp - uniq) if (rp is not None and uniq is not None) else None
+        tot_lost = (lp + tail) if (lp is not None and tail is not None) else None
+        ledger.append(dict(client_index=idx + 1,
+                           sent_packets=sp,
+                           received_packets=rp,
+                           receiver_expected_packets=exp,
+                           interior_lost_packets=lp,
+                           terminal_tail_gap=tail,
+                           estimated_unique_packets=uniq,
+                           estimated_duplicate_packets=dup,
+                           unique_received_packets=uniq,
+                           duplicate_packets=dup,
+                           total_lost_packets=tot_lost,
+                           net_packet_gap=(sp - rp) if (sp is not None and rp is not None) else None,
+                           out_of_order=row.get("out_of_order"),
+                           jitter_ms=row.get("jitter_ms")))
     return dict(udp_delivery_accounting_match=all(gap == 0 for gap in gaps),
                 udp_sender_receiver_packet_gap=sum(gaps),
                 udp_sender_receiver_gap_percent=100.0 * sum(abs(gap) for gap in gaps) / sent if sent else None,
-                udp_sender_unobserved_tail_packets=sum(tails), udp_client_packet_gaps=gaps)
+                udp_sender_unobserved_tail_packets=sum(tails), udp_client_packet_gaps=gaps,
+                udp_sequence_ledger=ledger)
+
+
+def worker_counter_deltas(before, after):
+    if not before or not after:
+        raise ValueError("worker status snapshot missing")
+    if "pid" not in before or "pid" not in after:
+        raise ValueError("worker status missing process identity")
+    if before["pid"] != after["pid"]:
+        raise ValueError("worker process identity changed")
+    if "snapshot_sequence" not in before or "snapshot_sequence" not in after:
+        raise ValueError("worker status missing snapshot sequence")
+    if after["snapshot_sequence"] <= before["snapshot_sequence"]:
+        raise ValueError("worker snapshot sequence not strictly increasing")
+    if before.get("workers_synced") is not True or after.get("workers_synced") is not True:
+        raise ValueError("worker snapshot synchronization timed out")
+    if before.get("unacknowledged_worker_slots") or after.get("unacknowledged_worker_slots"):
+        raise ValueError(f"unacknowledged worker slots: before={before.get('unacknowledged_worker_slots')}, after={after.get('unacknowledged_worker_slots')}")
+    if "workers" not in before or "workers" not in after:
+        raise ValueError("worker list missing from status")
+    old = {w["slot"]: w for w in before["workers"]}
+    new = {w["slot"]: w for w in after["workers"]}
+    if old.keys() != new.keys():
+        raise ValueError("worker slot set changed during measurement")
+    deltas = []
+    fields = ("rx_packets_v4", "tx_packets_v4", "rx_packets_v6", "tx_packets_v6", "dropped_packets", "error_packets")
+    for slot in sorted(new.keys()):
+        b = old[slot]
+        a = new[slot]
+        d = dict(slot=slot, worker_id=a.get("worker_id", slot))
+        for field in fields:
+            if field not in b or field not in a:
+                raise ValueError(f"worker slot {slot} missing field {field}")
+            b_val, a_val = b[field], a[field]
+            if not isinstance(b_val, int) or isinstance(b_val, bool) or b_val < 0 or \
+               not isinstance(a_val, int) or isinstance(a_val, bool) or a_val < 0:
+                raise ValueError(f"worker slot {slot} field {field} invalid counter value")
+            diff = a_val - b_val
+            if diff < 0:
+                raise ValueError(f"worker slot {slot} field {field} counter reset")
+            d[field] = diff
+        deltas.append(d)
+    return deltas
 
 
 def thread_counter_deltas(before, after):
@@ -815,6 +974,7 @@ for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
             if "packets" not in received or "lost_packets" not in received:
                 raise ValueError("UDP receiver summary is missing packet/loss counters")
             report.update(udp_packet_accounting(sent, received, datagram_size))
+            report["iperf_reported_sender_sequence_packets"] = sent.get("packets")
             stream_ooo = [s.get("udp", {}).get("out_of_order") for s in end.get("streams", [])]
             report.update(
                           lost_percent=received.get("lost_percent"),
@@ -826,6 +986,21 @@ for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
     except Exception as exc:
         print(f"ERROR direction={direction} file={os.path.basename(path)} reason={exc}", file=sys.stderr)
         workload_errors.append(f"client report {os.path.basename(path)} error: {exc}")
+
+drain_status = None
+if protocol == "udp" and float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")) > 0:
+    try:
+        drain_status = json.load(open(os.path.join(run_dir, "udp-drain.status.json")))
+        if drain_status["stopped"] != 1 or drain_status["attached"] < 2 * int(os.environ["CLIENTS"]) or drain_status["blocked_writes"] <= 0:
+            raise ValueError("drain guard did not attach and suppress UDP writes")
+    except (OSError, ValueError, KeyError) as exc:
+        capture_errors.append(f"UDP drain validation failed: {exc}")
+if os.path.exists(os.path.join(run_dir, "capture_errors.txt")):
+    with open(os.path.join(run_dir, "capture_errors.txt")) as cef:
+        for line in cef:
+            line = line.strip()
+            if line:
+                capture_errors.append(line)
 
 if not reports:
     workload_errors.append("no valid iperf client reports found")
@@ -946,14 +1121,37 @@ if perf_mode != "none" and perf_status != "0":
     capture_errors.append(f"perf {perf_mode} exit status is {perf_status}")
 if perf_mode != "none" and not os.path.exists(os.path.join(run_dir, "perf-stat.csv" if perf_mode == "stat" else "perf.data")):
     capture_errors.append(f"perf {perf_mode} output is missing")
-offload_log_path = os.path.join(os.path.dirname(run_dir), "clat.log")
-offload_log = open(offload_log_path).read().lower() if os.path.exists(offload_log_path) else ""
-offload_fell_back = any(marker in offload_log for marker in ("fallback", "without offload"))
-effective_offload = ("udp" if offload_requested == "udp" and "experimental udp uso" in offload_log else
-                     "tcp" if offload_active == "yes" else
-                     "off" if offload_requested == "off" or offload_fell_back else "unknown")
-if effective_offload == "unknown":
-    capture_errors.append("effective TUN offload mode could not be determined")
+def negotiated_offload_mode(statuses, requested):
+    if len(statuses) != 2:
+        raise ValueError("before/after offload state is required")
+    modes = {status["offload_effective"] for status in statuses}
+    sizes = {status["vnet_hdr_sz"] for status in statuses}
+    if len(modes) != 1 or len(sizes) != 1:
+        raise ValueError("negotiated capabilities changed during capture")
+    mode, size = modes.pop(), sizes.pop()
+    flags = {"off": 0, "tcp": 7, "udp": 103}
+    if mode not in flags or requested not in ("auto", "off", "tcp", "udp"):
+        raise ValueError("unknown offload policy/capability")
+    if requested != "auto" and requested != mode:
+        raise ValueError("explicit offload mode was not established")
+    if size not in (0, 10, 12) or (mode != "off" and size == 0):
+        raise ValueError("unsupported negotiated framing")
+    for status in statuses:
+        if (status.get("offload_negotiation_complete") is not True or
+                status.get("offload_mode") != requested or
+                type(status.get("offload_flags")) is not int or
+                status["offload_flags"] != flags[mode] or
+                status.get("udp_offload_available") is not (mode == "udp")):
+            raise ValueError("negotiated capability fields disagree")
+    return mode
+
+effective_offload = "unknown"
+try:
+    negotiated = [json.load(open(os.path.join(run_dir, f"tayga-status.{phase}.json")))
+                  for phase in ("before", "after")]
+    effective_offload = negotiated_offload_mode(negotiated, offload_requested)
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    capture_errors.append(f"effective TUN offload state could not be verified: {exc}")
 
 def parse_gso_stats(name):
     path = os.path.join(run_dir, name)
@@ -966,7 +1164,7 @@ gso_before = parse_gso_stats("gso-stats.before")
 gso_after = parse_gso_stats("gso-stats.after")
 gso_delta = ({key: gso_after[key] - gso_before.get(key, 0) for key in gso_after}
              if gso_before is not None and gso_after is not None else None)
-if (effective_offload == "tcp" and protocol == "tcp" and
+if (effective_offload in ("tcp", "udp") and protocol == "tcp" and
         (not gso_delta or gso_delta.get("rx_pkts", 0) + gso_delta.get("tx_pkts", 0) <= 0)):
     capture_errors.append("TUN offload active but no GSO packets were observed")
 udp_aggregate_count = ((gso_delta or {}).get("udp_rx_aggregates", 0) +
@@ -1016,12 +1214,29 @@ except (OSError, ValueError, KeyError, TypeError) as exc:
     thread_counter_error = str(exc)
     capture_errors.append(f"thread CPU counter capture: {exc}")
 
+worker_metrics = None
+status_b_path = os.path.join(run_dir, "tayga-status.before.json")
+status_a_path = os.path.join(run_dir, "tayga-status.after.json")
+if os.path.exists(status_b_path) and os.path.exists(status_a_path):
+    try:
+        worker_metrics = worker_counter_deltas(json.load(open(status_b_path)),
+                                               json.load(open(status_a_path)))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        worker_metrics = None
+        capture_errors.append(f"worker counter capture: {exc}")
+else:
+    capture_errors.append("worker status snapshots missing")
+
 result = dict(direction=direction, clients=len(reports), expected_clients=expected_clients,
               capture_valid=not capture_errors, workload_valid=True, acceptance_pass=True,
-              schema_version=5, guest_cpu_count=os.cpu_count(),
+              schema_version=6, guest_cpu_count=os.cpu_count(),
               degraded_reasons=list(capture_errors),
               perf_mode=perf_mode, perf_scope=os.environ["PERF_SCOPE"],
               thread_metrics=thread_metrics, thread_counter_error=thread_counter_error,
+              worker_metrics=worker_metrics,
+              receiver_drain_guard_sha256=(open(os.path.join(run_dir, "udp-drain-guard.sha256")).read().split()[0] if drain_status else None),
+              receiver_drain_method="udp-write-eagain-v1" if os.path.exists(os.path.join(run_dir, "udp-drain.status.json")) else "none",
+              receiver_drain_seconds=float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")),
               git_revision=revision,
               source_tree_sha256=source_tree_sha256,
               tayga_sha256=open(os.path.join(os.path.dirname(run_dir), "tayga.sha256")).read().split()[0]
@@ -1056,6 +1271,9 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               datagram_size=int(datagram_size) if protocol == "udp" else None,
               block_size=(block_size or None),
               sent_mbps=sent, received_mbps=received,
+              udp_drain_status=drain_status,
+              iperf_reported_sender_sequence_packets=[x.get("iperf_reported_sender_sequence_packets") for x in reports] if protocol == "udp" else None,
+              received_active_window_mbps=(received_bytes * 8 / ((int(mono_traffic_end)-int(mono_traffic_start))/1e9) / 1e6 if protocol == "udp" and int(mono_traffic_end)>int(mono_traffic_start) else None),
               client_duration_seconds_min=(min(x["seconds"] for x in reports) if reports else None),
               client_duration_seconds_max=(max(x["seconds"] for x in reports) if reports else None),
               client_duration_seconds_median=(sorted(x["seconds"] for x in reports)[len(reports)//2] if reports else None),
@@ -1071,7 +1289,13 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               tun_tx_drop_percent=tun_tx_drop_pct,
               retransmits_per_gbyte=(retransmits / (received_bytes / 1_000_000_000) if received_bytes else None),
               elapsed_s=elapsed, workload_protocol=protocol,
-              measurement_window=dict(monotonic_start_ns=int(mono_before), monotonic_end_ns=int(mono_after),
+              measurement_window=dict(monotonic_start_ns=int(mono_before),
+                                     monotonic_traffic_start_ns=int(mono_traffic_start),
+                                     monotonic_traffic_end_ns=int(mono_traffic_end) if mono_traffic_end else None,
+                                     monotonic_drain_end_ns=int(mono_drain_end) if mono_drain_end else None,
+                                     monotonic_end_ns=int(mono_after),
+                                     traffic_duration_seconds=(int(mono_traffic_end) - int(mono_traffic_start)) / 1_000_000_000 if mono_traffic_end else None,
+                                     drain_duration_seconds=(int(mono_drain_end) - int(mono_traffic_end)) / 1_000_000_000 if (mono_traffic_end and mono_drain_end) else None,
                                      elapsed_seconds=elapsed, intended_duration_seconds=int(duration)))
 
 if protocol == "udp":
@@ -1109,10 +1333,10 @@ if protocol == "udp":
     ooo_counts = [x.get("out_of_order") for x in reports]
     ooo = sum(ooo_counts) if ooo_counts and all(v is not None for v in ooo_counts) else None
     result.update(udp_received_packets=packets, udp_lost_packets=lost,
-                  udp_accounting_version=2,
+                  udp_accounting_version=3,
                   udp_counter_definitions=dict(received="receiver bytes divided by configured fixed datagram size",
                                                receiver_expected="iperf receiver highest-sequence packet count; includes lost packets",
-                                               sent="iperf sender packet count, independently reported"),
+                                               sent="successful sender bytes divided by configured fixed datagram size"),
                   udp_sent_packets=total_sent,
                   udp_receiver_expected_packets=receiver_expected,
                   received_udp_packets_per_second=sum(x.get("packets", 0) / max(x.get("seconds", 0), 0.001) for x in reports),
@@ -1122,6 +1346,14 @@ if protocol == "udp":
     reconciliation = udp_delivery_reconciliation(reports)
     result.update(reconciliation)
     gap_percent = reconciliation["udp_sender_receiver_gap_percent"]
+
+    # Record receiver kernel SNMP datagram count for context; do not conflate socket reads with loss.
+    receiver_ns = "server" if direction == "upload" else "client"
+    receiver_family = "snmp6" if direction == "upload" else "snmp"
+    counter_key = "Udp6InDatagrams" if direction == "upload" else "UdpInDatagrams"
+    kernel_rx = (network_udp_counters.get(receiver_ns, {}).get(receiver_family, {}) or {}).get(counter_key)
+    result["receiver_kernel_udp_datagrams"] = kernel_rx
+
     if gap_percent is None or gap_percent > float(max_udp_loss):
         result["acceptance_pass"] = False
         result["degraded_reasons"].append("UDP sender/receiver packet counts do not reconcile within the loss threshold")
