@@ -36,7 +36,7 @@ if [ ! -d "$REPO" ]; then
   exit 1
 fi
 
-required_commands=(gcc make ip iperf3 nft python3 jq git sha256sum perf)
+required_commands=(gcc make ip iperf3 nft python3 jq git sha256sum perf ethtool tc ss sysctl taskset)
 missing_commands=()
 for command_name in "${required_commands[@]}"; do
   command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
@@ -116,6 +116,12 @@ run_case() {
     SOCKET_BUFFER_BYTES="${SOCKET_BUFFER_BYTES:-0}" \
     SENDER_FQ="${SENDER_FQ:-off}" \
     SENDER_FQ_FLOW_LIMIT="${SENDER_FQ_FLOW_LIMIT:-100}" \
+    SENDER_FQ_LIMIT="${SENDER_FQ_LIMIT:-10000}" \
+    VETH_QUEUES="${VETH_QUEUES:-0}" \
+    SENDER_FQ_TOPOLOGY="${SENDER_FQ_TOPOLOGY:-auto}" \
+    TAYGA_CPUSET="${TAYGA_CPUSET:-all}" \
+    CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
+    SERVER_CPUSET="${SERVER_CPUSET:-all}" \
     SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
     GIT_REVISION="$GIT_REVISION" SOURCE_TREE_SHA256="$SOURCE_TREE_SHA256" \
     PROTOCOL="${PROTOCOL:-tcp}" RATE="${RATE:-0}" \

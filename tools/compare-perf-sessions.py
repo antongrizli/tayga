@@ -11,11 +11,12 @@ from pathlib import Path
 WORKLOAD_KEYS = ("direction", "clients", "expected_clients", "workload_protocol",
                  "flows_per_client", "rate_per_flow", "duration_seconds",
                  "warmup_seconds", "datagram_size", "block_size", "offlink_mtu",
-                 "kernel", "perf_mode", "perf_scope", "socket_sample_interval")
+                 "kernel", "guest_cpu_count", "perf_mode", "perf_scope", "socket_sample_interval")
 BUILD_KEYS = ("git_revision", "source_tree_sha256", "clat_start_sha256", "tayga_sha256")
 IDENTITY_KEYS = WORKLOAD_KEYS + BUILD_KEYS
 TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen", "forwarding_gro",
-                  "pacing_timer_us", "fq_rate", "socket_buffer_bytes", "sender_fq", "sender_fq_flow_limit")
+                  "pacing_timer_us", "fq_rate", "socket_buffer_bytes", "sender_fq", "sender_fq_flow_limit", "sender_fq_limit", "veth_queues", "sender_fq_topology",
+                  "tayga_cpuset", "client_cpuset", "server_cpuset")
 METRICS = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
            "system_busy_cores", "system_softirq_cores", "tun_drops",
            "tun_tx_drop_percent", "udp_loss_percent", "udp_sender_receiver_gap_percent", "ping_loss_percent",
@@ -33,13 +34,24 @@ def results(root: Path):
             out.append({"path": str(path), "valid": False, "error": str(exc)})
             continue
         doc["path"] = str(path)
+        if "guest_cpu_count" not in doc:
+            # Earlier captures already saved the guest's /proc/cpuinfo beside
+            # the directional results. Do not assume a CPU count if absent.
+            try:
+                cpuinfo = (path.parent.parent / "cpuinfo.txt").read_text()
+                count = sum(line.split(":", 1)[0].strip() == "processor"
+                            for line in cpuinfo.splitlines() if ":" in line)
+                doc["guest_cpu_count"] = count if count else None
+            except OSError:
+                doc["guest_cpu_count"] = None
         # Earlier harness versions had no forwarding GRO treatment and never
         # enabled it. Preserve comparisons with those saved results.
         doc.setdefault("perf_scope", "process")
         doc.setdefault("forwarding_gro", "off")
         for key, default in (("pacing_timer_us", 1000), ("fq_rate", "0"),
                              ("socket_buffer_bytes", 0), ("sender_fq", "off"), ("sender_fq_flow_limit", 100),
-                             ("socket_sample_interval", 0)):
+                             ("sender_fq_limit", 10000), ("veth_queues", 0), ("sender_fq_topology", "single"),
+                             ("tayga_cpuset", "all"), ("client_cpuset", "all"), ("server_cpuset", "all"), ("socket_sample_interval", 0)):
             doc.setdefault(key, default)
         doc["valid"] = bool(doc.get("capture_valid", False) and doc.get("workload_valid", False))
         if not doc["valid"]:

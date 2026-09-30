@@ -17,7 +17,7 @@ def result(direction, rate, offload, received):
         "rate_per_flow": rate, "duration_seconds": 10, "warmup_seconds": 1,
         "datagram_size": None, "block_size": 131072, "offlink_mtu": 1280,
         "git_revision": "abc", "source_tree_sha256": "tree",
-        "clat_start_sha256": "starter", "kernel": "Linux test", "perf_mode": "stat",
+        "clat_start_sha256": "starter", "kernel": "Linux test", "guest_cpu_count": 4, "perf_mode": "stat",
         "tayga_sha256": "binary",
         "offload_requested": offload, "offload_effective": offload,
         "workers": 2, "tun_txqlen": 1000, "received_mbps": received,
@@ -164,6 +164,42 @@ class ComparePerfSessionsTests(unittest.TestCase):
         run = self.run_tool()
         self.assertEqual(run.returncode, 2)
         self.assertFalse(json.loads(run.stdout)["comparisons"])
+
+    def test_queue_count_and_total_limit_are_distinct_treatments(self):
+        base = result("upload", "750M", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", dict(base, sender_fq_limit=4096, veth_queues=4))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        comparison = json.loads(run.stdout)["comparisons"][0]
+        self.assertEqual(comparison["baseline_treatment"]["sender_fq_limit"], 10000)
+        self.assertEqual(comparison["candidate_treatment"]["veth_queues"], 4)
+
+    def test_affinity_changes_are_not_pooled_with_other_treatments(self):
+        base = result("upload", "750M", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "unpinned", base)
+        self.write(self.candidate, "pinned", dict(base, tayga_cpuset="2,3", client_cpuset="0", server_cpuset="1"))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 2)
+        self.assertTrue(any("mixed treatment" in warning for warning in json.loads(run.stdout)["warnings"]))
+
+    def test_cpu_resource_changes_are_not_pooled(self):
+        base = result("upload", "750M", "udp", 100)
+        self.write(self.base, "upload", base)
+        self.write(self.candidate, "upload", dict(base, guest_cpu_count=8))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 2)
+        self.assertFalse(json.loads(run.stdout)["comparisons"])
+
+    def test_legacy_cpu_count_uses_saved_cpuinfo(self):
+        base = result("upload", "750M", "udp", 100)
+        del base["guest_cpu_count"]
+        self.write(self.base, "upload", base)
+        (self.base / "cpuinfo.txt").write_text("processor : 0\nprocessor : 1\nprocessor : 2\nprocessor : 3\n")
+        self.write(self.candidate, "upload", dict(base, guest_cpu_count=4))
+        run = self.run_tool()
+        self.assertEqual(run.returncode, 0, run.stderr)
 
     def test_socket_sampling_changes_workload_identity(self):
         base = result("upload", "750M", "udp", 100)

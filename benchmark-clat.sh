@@ -29,8 +29,14 @@ FQ_RATE=${FQ_RATE:-0}
 SOCKET_BUFFER_BYTES=${SOCKET_BUFFER_BYTES:-0}
 SENDER_FQ=${SENDER_FQ:-off}
 SENDER_FQ_FLOW_LIMIT=${SENDER_FQ_FLOW_LIMIT:-100}
+SENDER_FQ_LIMIT=${SENDER_FQ_LIMIT:-10000}
+VETH_QUEUES=${VETH_QUEUES:-0}
+SENDER_FQ_TOPOLOGY=${SENDER_FQ_TOPOLOGY:-auto}
+TAYGA_CPUSET=${TAYGA_CPUSET:-all}
+CLIENT_CPUSET=${CLIENT_CPUSET:-all}
+SERVER_CPUSET=${SERVER_CPUSET:-all}
 SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}
-export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SOCKET_SAMPLE_INTERVAL
+export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SENDER_FQ_LIMIT VETH_QUEUES SENDER_FQ_TOPOLOGY TAYGA_CPUSET CLIENT_CPUSET SERVER_CPUSET SOCKET_SAMPLE_INTERVAL
 GIT_REVISION=${GIT_REVISION:-unknown}
 SOURCE_TREE_SHA256=${SOURCE_TREE_SHA256:-unknown}
 
@@ -39,11 +45,30 @@ case "$CLAT_OFFLOAD" in off|tcp|udp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, 
 case "$PERF_SCOPE" in process|system) ;; *) echo 'PERF_SCOPE must be process or system' >&2; exit 64;; esac
 case "$PERF_MODE" in none|stat|record) ;; *) echo 'PERF_MODE must be none, stat or record' >&2; exit 64;; esac
 case "$FORWARDING_GRO" in off|on) ;; *) echo 'FORWARDING_GRO must be off or on' >&2; exit 64;; esac
+case "$SENDER_FQ_TOPOLOGY" in auto|single|mq) ;; *) echo 'SENDER_FQ_TOPOLOGY must be auto, single or mq' >&2; exit 64;; esac
+for cpuset in "$TAYGA_CPUSET" "$CLIENT_CPUSET" "$SERVER_CPUSET"; do
+  [ "$cpuset" != all ] || continue
+  printf '%s\n' "$cpuset" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$' || {
+    echo 'CPU sets must be all or a CPU list such as 0,2-3' >&2; exit 64;
+  }
+  taskset -c "$cpuset" true || { echo "CPU set unavailable: $cpuset" >&2; exit 64; }
+done
+# Only used for background child launches; exec preserves PID ownership for
+# readiness, profiling and cleanup, including the gated client wrapper.
+exec_with_affinity() {
+  local child_cpuset=$1
+  shift
+  if [ "$child_cpuset" = all ]; then exec "$@"; else exec taskset -c "$child_cpuset" "$@"; fi
+}
+
 case "$SENDER_FQ" in off|on) ;; *) echo 'SENDER_FQ must be off or on' >&2; exit 64;; esac
-for numeric in "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT"; do
+for numeric in "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT" "$SENDER_FQ_LIMIT" "$VETH_QUEUES"; do
   case "$numeric" in ''|*[!0-9]*) echo 'pacing/buffer/sampling values must be non-negative integers' >&2; exit 64;; esac
 done
 [ "$SENDER_FQ_FLOW_LIMIT" -gt 0 ] && [ "$SENDER_FQ_FLOW_LIMIT" -le 10000 ] || { echo 'SENDER_FQ_FLOW_LIMIT must be between 1 and 10000' >&2; exit 64; }
+[ "$SENDER_FQ_LIMIT" -gt 0 ] && [ "$SENDER_FQ_LIMIT" -le 1000000 ] || { echo 'SENDER_FQ_LIMIT must be between 1 and 1000000' >&2; exit 64; }
+[ "$SENDER_FQ_FLOW_LIMIT" -le "$SENDER_FQ_LIMIT" ] || { echo 'SENDER_FQ_FLOW_LIMIT cannot exceed SENDER_FQ_LIMIT' >&2; exit 64; }
+[ "$VETH_QUEUES" -le 64 ] || { echo 'VETH_QUEUES must be between 0 (unchanged) and 64' >&2; exit 64; }
 [ "$PACING_TIMER_US" -gt 0 ] || { echo 'PACING_TIMER_US must be positive' >&2; exit 64; }
 awk -v rate="$FQ_RATE" 'BEGIN { exit !(rate ~ /^[0-9]+([.][0-9]+)?[KMGTkmgt]?$/) }' || { echo 'invalid FQ_RATE' >&2; exit 64; }
 if [ "$PROTOCOL" = udp ] && [ -n "$BLOCK_SIZE" ] && [ "$BLOCK_SIZE" != "$DATAGRAM_SIZE" ]; then
@@ -142,6 +167,28 @@ ip link add rwan type veth peer name server0
 ip link set rwan netns router
 ip link set server0 netns server
 
+# Change both sides of each disposable pair, before traffic starts. Unsupported
+# channel counts fail setup; never silently label a single-queue run multiqueue.
+for veth_endpoint in client:lan0 router:rlan router:rclat clatns:veth-nat64 router:rwan server:server0; do
+  veth_ns=${veth_endpoint%:*}
+  veth_dev=${veth_endpoint#*:}
+  ip netns exec "$veth_ns" ethtool -l "$veth_dev" > "$ARTIFACT_DIR/channels-$veth_ns-$veth_dev.before.txt"
+  if [ "$VETH_QUEUES" -gt 0 ]; then
+    ip netns exec "$veth_ns" ethtool -L "$veth_dev" rx "$VETH_QUEUES" tx "$VETH_QUEUES"
+  fi
+  ip netns exec "$veth_ns" ethtool -l "$veth_dev" > "$ARTIFACT_DIR/channels-$veth_ns-$veth_dev.after.txt"
+  if [ "$VETH_QUEUES" -gt 0 ]; then
+    awk -v expected="$VETH_QUEUES" '
+      /Current hardware settings:/ { current=1; next }
+      current && /^RX:/ { rx=$2 }
+      current && /^TX:/ { tx=$2 }
+      END { exit !(rx == expected && tx == expected) }
+    ' "$ARTIFACT_DIR/channels-$veth_ns-$veth_dev.after.txt" || {
+      echo "requested channels were not applied to $veth_ns/$veth_dev" >&2; exit 1;
+    }
+  fi
+done
+
 ip -n client link set lo up
 ip -n client link set lan0 up
 for client_no in $(seq 1 "$CLIENTS"); do
@@ -196,7 +243,7 @@ if [ "$FORWARDING_GRO" = on ]; then
     grep -q '^[[:space:]]*rx-gro-list: off' "$feature_file"
   done
 fi
-ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 \
+exec_with_affinity "$TAYGA_CPUSET" ip netns exec clatns env PREF64=64:ff9b::/96 ROUTER4=172.31.64.1 \
   CLAT_WORKERS="$WORKERS" CLAT_OFFLOAD="$CLAT_OFFLOAD" \
   CLAT_OFFLINK_MTU="$CLAT_OFFLINK_MTU" /usr/local/sbin/clat-start.sh \
   >"$ARTIFACT_DIR/clat.log" 2>&1 &
@@ -207,9 +254,35 @@ ip -n server link set server0 up
 ip -n server -6 addr add 2600:464::2/64 dev server0
 ip -n server -6 addr add 64:ff9b::b00:2/128 dev lo
 ip -n server -6 route add fd9b:64:1::/48 via 2600:464::1 dev server0
+configure_sender_fq() {
+  local sender_ns=$1 sender_dev=$2 tx_count topology queue_no queue_limit flow_limit
+  tx_count=$(awk '/Current hardware settings:/ { current=1; next } current && /^TX:/ { print $2; exit }'     "$ARTIFACT_DIR/channels-$sender_ns-$sender_dev.after.txt")
+  case "$tx_count" in ''|*[!0-9]*|0) echo 'could not determine active TX channels' >&2; exit 1;; esac
+  topology=$SENDER_FQ_TOPOLOGY
+  if [ "$topology" = auto ]; then
+    topology=single
+    [ "$tx_count" -le 1 ] || topology=mq
+  fi
+  printf '%s/%s topology=%s tx_channels=%s total_limit=%s flow_limit=%s fq_rate=%s\n'     "$sender_ns" "$sender_dev" "$topology" "$tx_count" "$SENDER_FQ_LIMIT" "$SENDER_FQ_FLOW_LIMIT" "$FQ_RATE"     >> "$ARTIFACT_DIR/sender-qdisc-settings.txt"
+  if [ "$topology" = single ]; then
+    ip netns exec "$sender_ns" tc qdisc replace dev "$sender_dev" root fq       limit "$SENDER_FQ_LIMIT" flow_limit "$SENDER_FQ_FLOW_LIMIT"
+  else
+    [ "$SENDER_FQ_LIMIT" -ge "$tx_count" ] || { echo 'total fq limit must cover all TX queues' >&2; exit 64; }
+    # Each hardware TX queue gets its own scheduler. Partition the total budget
+    # exactly; adding channels must not silently multiply buffered memory.
+    ip netns exec "$sender_ns" tc qdisc replace dev "$sender_dev" root handle 1: mq
+    for queue_no in $(seq 1 "$tx_count"); do
+      queue_limit=$((SENDER_FQ_LIMIT / tx_count))
+      if [ "$queue_no" -le "$((SENDER_FQ_LIMIT % tx_count))" ]; then queue_limit=$((queue_limit + 1)); fi
+      flow_limit=$SENDER_FQ_FLOW_LIMIT
+      [ "$flow_limit" -le "$queue_limit" ] || flow_limit=$queue_limit
+      ip netns exec "$sender_ns" tc qdisc replace dev "$sender_dev" parent "1:$queue_no" fq         limit "$queue_limit" flow_limit "$flow_limit"
+    done
+  fi
+}
 if [ "$SENDER_FQ" = on ]; then
-  ip netns exec client tc qdisc replace dev lan0 root fq limit 10000 flow_limit "$SENDER_FQ_FLOW_LIMIT" || exit 1
-  ip netns exec server tc qdisc replace dev server0 root fq limit 10000 flow_limit "$SENDER_FQ_FLOW_LIMIT" || exit 1
+  configure_sender_fq client lan0
+  configure_sender_fq server server0
 fi
 
 
@@ -231,6 +304,7 @@ for task in sorted(pathlib.Path(f"/proc/{pid}/task").iterdir()):
     times = [int(value) for value in schedstat.split()] if schedstat else None
     rows.append(dict(tid=int(task.name), start_ticks=int(stat[19]), comm=(task / "comm").read_text().strip(),
                      cpu_ticks=int(stat[11]) + int(stat[12]),
+                     cpus_allowed_list=status["Cpus_allowed_list"].strip(),
                      voluntary_context_switches=int(status["voluntary_ctxt_switches"]),
                      involuntary_context_switches=int(status["nonvoluntary_ctxt_switches"]),
                      migrations=int(migration.group(1)) if migration else None,
@@ -252,6 +326,15 @@ collect_network_counters() {
     ip netns exec "$counter_ns" tc -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase"
     ip netns exec "$counter_ns" tc -j -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase.json"
     ip netns exec "$counter_ns" sysctl -n net.core.rmem_max net.core.wmem_max > "$counter_dir/$counter_ns.buffer-limits.$counter_phase"
+    case "$counter_ns" in
+      client) counter_devs=lan0;;
+      router) counter_devs="rlan rclat rwan";;
+      clatns) counter_devs=veth-nat64;;
+      server) counter_devs=server0;;
+    esac
+    for counter_dev in $counter_devs; do
+      ip netns exec "$counter_ns" ethtool -S "$counter_dev" > "$counter_dir/$counter_ns.$counter_dev.driver.$counter_phase"
+    done
   done
 }
 
@@ -278,7 +361,7 @@ cleanup_iperf_servers() {
 start_iperf_servers() {
   cleanup_iperf_servers
   for client_no in $(seq 1 "$CLIENTS"); do
-    ip netns exec server iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
+    exec_with_affinity "$SERVER_CPUSET" ip netns exec server iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
       >"$ARTIFACT_DIR/iperf-server-$client_no.log" 2>&1 &
     iperf_pids="$iperf_pids $!"
   done
@@ -389,10 +472,10 @@ start_clients() {
       rm -f "$gate"
       mkfifo "$gate"
       printf '%s\n' "$gate" >> "$run_dir/gates"
-      ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" iperf3 "$@" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" iperf3 "$@" \
         >"$run_dir/client-$client_no.json" 2>"$run_dir/client-$client_no.stderr" &
     else
-      ip netns exec client iperf3 "$@" >"$run_dir/client-$client_no.json" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client iperf3 "$@" >"$run_dir/client-$client_no.json" \
         2>"$run_dir/client-$client_no.stderr" &
     fi
     printf '%s\n' "$!" >> "$run_dir/pids"
@@ -479,6 +562,11 @@ run_iperf() {
   start_clients "$run_dir" "$direction" "$DURATION" yes
   # Give every wrapper time to block on its FIFO before a common release.
   sleep 1
+  : > "$run_dir/endpoint-affinity.before"
+  for endpoint_pid in $client_pids $iperf_pids; do
+    printf 'pid=%s\n' "$endpoint_pid" >> "$run_dir/endpoint-affinity.before"
+    awk '/^(Name|Cpus_allowed_list):/' "/proc/$endpoint_pid/status" >> "$run_dir/endpoint-affinity.before"
+  done
   ticks_before=$(ticks)
   uptime_before=$(uptime_seconds)
   monotonic_before=$(monotonic_ns)
@@ -634,6 +722,35 @@ def qdisc_counter_delta(before, after):
     return result
 
 
+def interface_counter_delta(before, after):
+    """Interface counters are distinct from qdisc counters and datagram counts."""
+    def indexed(rows):
+        if not rows:
+            raise ValueError("interface counters unavailable")
+        out = {row["ifname"]: row for row in rows}
+        if len(out) != len(rows):
+            raise ValueError("duplicate interface identity")
+        return out
+    old, new = indexed(before), indexed(after)
+    if old.keys() != new.keys():
+        raise ValueError("interface topology changed during measurement")
+    result = {}
+    for name, row in new.items():
+        if old[name]["ifindex"] != row["ifindex"]:
+            raise ValueError("interface identity changed during measurement")
+        counters = {}
+        for direction in ("rx", "tx"):
+            counters[direction] = {}
+            for field in ("bytes", "packets", "dropped", "errors"):
+                previous, current = old[name]["stats64"][direction][field], row["stats64"][direction][field]
+                if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                       for value in (previous, current)) or current < previous:
+                    raise ValueError("invalid or reset interface counter")
+                counters[direction][field] = current - previous
+        result[name] = counters
+    return result
+
+
 def udp_delivery_reconciliation(reports):
     """Sequence-gap loss misses trailing packets; reconcile each client too."""
     counts = [row.get("sent_packets") for row in reports]
@@ -671,7 +788,9 @@ def thread_counter_deltas(before, after):
         if counters["cpu_ticks"] is None:
             raise ValueError("thread CPU counters unavailable")
         result.append(dict(tid=tid, comm=row["comm"], main_thread=tid == before["pid"],
-                           cpu_cores=counters["cpu_ticks"] / before["clock_ticks"] / elapsed, **counters))
+                           cpu_cores=counters["cpu_ticks"] / before["clock_ticks"] / elapsed,
+                           cpus_allowed_before=old[tid].get("cpus_allowed_list"),
+                           cpus_allowed_after=row.get("cpus_allowed_list"), **counters))
     return dict(elapsed_seconds=elapsed, threads=result)
 
 for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
@@ -875,6 +994,15 @@ for counter_ns in ("client", "router", "clatns", "server"):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         qdisc_deltas[counter_ns] = None
         network_counter_errors.append(f"{counter_ns}/qdisc: {exc}")
+interface_deltas = {}
+for counter_ns in ("client", "router", "clatns", "server"):
+    try:
+        snapshots = [json.load(open(os.path.join(run_dir, f"{counter_ns}.links.{phase}.json")))
+                     for phase in ("before", "after")]
+        interface_deltas[counter_ns] = interface_counter_delta(*snapshots)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        interface_deltas[counter_ns] = None
+        network_counter_errors.append(f"{counter_ns}/interfaces: {exc}")
 # InErrors already includes RcvbufErrors. Preserve both, never sum them.
 if protocol == "udp" and network_counter_errors:
     capture_errors.extend(network_counter_errors)
@@ -890,7 +1018,7 @@ except (OSError, ValueError, KeyError, TypeError) as exc:
 
 result = dict(direction=direction, clients=len(reports), expected_clients=expected_clients,
               capture_valid=not capture_errors, workload_valid=True, acceptance_pass=True,
-              schema_version=4,
+              schema_version=5, guest_cpu_count=os.cpu_count(),
               degraded_reasons=list(capture_errors),
               perf_mode=perf_mode, perf_scope=os.environ["PERF_SCOPE"],
               thread_metrics=thread_metrics, thread_counter_error=thread_counter_error,
@@ -915,7 +1043,12 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               forwarding_gro=os.environ.get("FORWARDING_GRO", "off"),
               pacing_timer_us=int(os.environ["PACING_TIMER_US"]), fq_rate=os.environ["FQ_RATE"],
               socket_buffer_bytes=int(os.environ["SOCKET_BUFFER_BYTES"]), sender_fq=os.environ["SENDER_FQ"],
-              sender_fq_flow_limit=int(os.environ["SENDER_FQ_FLOW_LIMIT"]), qdisc_deltas=qdisc_deltas,
+              sender_fq_flow_limit=int(os.environ["SENDER_FQ_FLOW_LIMIT"]),
+              sender_fq_limit=int(os.environ["SENDER_FQ_LIMIT"]), veth_queues=int(os.environ["VETH_QUEUES"]),
+              sender_fq_topology=os.environ["SENDER_FQ_TOPOLOGY"],
+              tayga_cpuset=os.environ["TAYGA_CPUSET"], client_cpuset=os.environ["CLIENT_CPUSET"],
+              server_cpuset=os.environ["SERVER_CPUSET"],
+              qdisc_deltas=qdisc_deltas, interface_deltas=interface_deltas,
               socket_sample_interval=int(os.environ["SOCKET_SAMPLE_INTERVAL"]) if protocol == "udp" else 0,
               network_udp_counters=network_udp_counters, network_counter_errors=network_counter_errors,
               iperf_socket_buffers=[x["socket_buffers"] for x in reports],
@@ -942,6 +1075,16 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
                                      elapsed_seconds=elapsed, intended_duration_seconds=int(duration)))
 
 if protocol == "udp":
+    for counter_ns, devices in interface_deltas.items():
+        for device, counters in (devices or {}).items():
+            for direction_name, fields in counters.items():
+                for field in ("dropped", "errors"):
+                    # TUN transmit drops already use the explicit MAX_TUN_DROPS gate.
+                    if counter_ns == "clatns" and device == "clat" and direction_name == "tx" and field == "dropped":
+                        continue
+                    if fields[field] > 0:
+                        result["acceptance_pass"] = False
+                        result["degraded_reasons"].append(f"{counter_ns}/{device} {direction_name} {field} increased by {fields[field]}")
     for counter_ns, rows in qdisc_deltas.items():
         for row in rows or []:
             if row["counters"]["drops"] > 0:

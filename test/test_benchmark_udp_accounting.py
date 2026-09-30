@@ -115,6 +115,116 @@ class UdpReconciliationTests(unittest.TestCase):
         self.assertTrue(reconcile([dict(sent_packets=100, packets=100, receiver_expected_packets=100)])["udp_delivery_accounting_match"])
 
 
+class InterfaceCounterTests(unittest.TestCase):
+    def row(self, drops=0):
+        return dict(ifname="lan0", ifindex=2, stats64={direction: dict(
+            bytes=12000, packets=10, dropped=drops, errors=0) for direction in ("rx", "tx")})
+
+    def test_driver_drops_remain_visible_without_qdisc_drops(self):
+        delta = namespace["interface_counter_delta"]([self.row()], [self.row(85767)])
+        self.assertEqual(delta["lan0"]["tx"]["dropped"], 85767)
+        self.assertEqual(delta["lan0"]["rx"]["packets"], 0)
+
+    def test_missing_reset_recreated_and_duplicate_interfaces_are_rejected(self):
+        recreated = self.row()
+        recreated["ifindex"] = 3
+        missing = self.row()
+        del missing["stats64"]["tx"]["dropped"]
+        for after in ([], [self.row(0)], [recreated], [missing], [self.row(5), self.row(5)]):
+            with self.assertRaises((ValueError, KeyError)):
+                namespace["interface_counter_delta"]([self.row(5)], after)
+
+
+class QueueValidationTests(unittest.TestCase):
+    def test_invalid_queue_settings_fail_before_topology_setup(self):
+        harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+        for updates in (dict(SENDER_FQ_LIMIT="0"), dict(VETH_QUEUES="65"),
+                        dict(SENDER_FQ_LIMIT="100", SENDER_FQ_FLOW_LIMIT="101")):
+            with self.subTest(updates=updates):
+                env = dict(os.environ, PROTOCOL="udp", SENDER_FQ="on", FQ_RATE="0",
+                           SENDER_FQ_LIMIT="4096", SENDER_FQ_FLOW_LIMIT="1024", VETH_QUEUES="1")
+                env.update(updates)
+                run = subprocess.run(["sh", str(harness)], env=env, capture_output=True)
+                self.assertEqual(run.returncode, 64, run.stderr.decode())
+
+
+class SenderQueueSetupTests(unittest.TestCase):
+    def configure(self, channels, total_limit):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "channels-client-lan0.after.txt").write_text(
+                f"Pre-set maximums:\nRX: 4\nTX: 4\nCurrent hardware settings:\nRX: {channels}\nTX: {channels}\n")
+            (root / "ip").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$QUEUE_LOG"\n')
+            (root / "ip").chmod(0o755)
+            setup = script[script.index("configure_sender_fq() {"):script.index('\nif [ "$SENDER_FQ" = on ]; then')]
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                       ARTIFACT_DIR=str(root), SENDER_FQ_TOPOLOGY="auto", SENDER_FQ_LIMIT=str(total_limit),
+                       SENDER_FQ_FLOW_LIMIT="2000", FQ_RATE="0", QUEUE_LOG=str(root / "commands"))
+            run = subprocess.run(["sh", "-c", "set -eu\n" + setup + "\nconfigure_sender_fq client lan0"],
+                                 env=env, capture_output=True)
+            commands = (root / "commands").read_text().splitlines() if (root / "commands").exists() else []
+            return run, commands
+
+    def test_multiqueue_preserves_total_budget_and_clamps_flow_limits(self):
+        run, commands = self.configure(4, 4097)
+        self.assertEqual(run.returncode, 0, run.stderr.decode())
+        self.assertIn("root handle 1: mq", commands[0])
+        limits = [int(command.split(" limit ")[1].split()[0]) for command in commands[1:]]
+        flows = [int(command.split(" flow_limit ")[1]) for command in commands[1:]]
+        self.assertEqual(limits, [1025, 1024, 1024, 1024])
+        self.assertEqual(sum(limits), 4097)
+        self.assertEqual(flows, limits)
+
+    def test_single_queue_uses_one_scheduler(self):
+        run, commands = self.configure(1, 4097)
+        self.assertEqual(run.returncode, 0, run.stderr.decode())
+        self.assertEqual(len(commands), 1)
+        self.assertIn("root fq limit 4097 flow_limit 2000", commands[0])
+
+    def test_budget_smaller_than_channel_count_fails_without_mutating_qdisc(self):
+        run, commands = self.configure(4, 3)
+        self.assertEqual(run.returncode, 64)
+        self.assertEqual(commands, [])
+
+
+class AffinityLaunchTests(unittest.TestCase):
+    def test_launch_keeps_pid_and_argument_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "taskset").write_text('#!/bin/sh\n[ "$1" = -c ] || exit 1\n[ "$2" = 2,3 ] || exit 1\nshift 2\nexec "$@"\n')
+            (root / "taskset").chmod(0o755)
+            start = script.index("exec_with_affinity() {")
+            setup = script[start:script.index('\ncase "$SENDER_FQ"', start)]
+            for cpuset in ("all", "2,3"):
+                command = setup + '\nexpected=$$\nexec_with_affinity "$TEST_CPUSET" sh -c \'[ "$$" = "$1" ] && [ "$2" = "argument with spaces" ]\' sh "$expected" "argument with spaces"'
+                run = subprocess.run(["sh", "-c", command], env=dict(os.environ,
+                                     PATH=str(root) + os.pathsep + os.environ['PATH'], TEST_CPUSET=cpuset),
+                                     capture_output=True)
+                self.assertEqual(run.returncode, 0, run.stderr.decode())
+
+
+class HostRunnerStdinTests(unittest.TestCase):
+    def test_noninteractive_lima_workflow_cannot_consume_parent_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "limactl").write_text('''#!/bin/sh
+case "$1" in
+  list) printf 'NAME STATUS\\ntayga-perf Running\\n';;
+  shell) cat > "$LIMA_STDIN";;
+  *) exit 1;;
+esac
+''')
+            (root / "limactl").chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                       REPO=str(root), ISO=str(root / "absent.iso"), INSTANCE="tayga-perf",
+                       SESSION_STAMP="stdin-test", LIMA_STDIN=str(root / "stdin"))
+            runner = Path(__file__).resolve().parents[1] / "tools/lima-perf/run-host.sh"
+            run = subprocess.run(["bash", str(runner)], env=env, input="remaining orchestration commands\n",
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual((root / "stdin").read_text(), "")
+
+
 class BufferCleanupTests(unittest.TestCase):
     def run_failure(self, fail_raise):
         with tempfile.TemporaryDirectory() as tmp:

@@ -39,6 +39,7 @@ elif [ "$status" != "Running" ]; then
 fi
 
 echo "Running guest perf workflow"
+# This workflow is noninteractive. Preserve stdin for any calling matrix script.
 limactl shell "$INSTANCE" -- env \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
   "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
@@ -50,6 +51,12 @@ limactl shell "$INSTANCE" -- env \
   "SOCKET_BUFFER_BYTES=${SOCKET_BUFFER_BYTES:-0}" \
   "SENDER_FQ=${SENDER_FQ:-off}" \
   "SENDER_FQ_FLOW_LIMIT=${SENDER_FQ_FLOW_LIMIT:-100}" \
+  "SENDER_FQ_LIMIT=${SENDER_FQ_LIMIT:-10000}" \
+  "VETH_QUEUES=${VETH_QUEUES:-0}" \
+  "SENDER_FQ_TOPOLOGY=${SENDER_FQ_TOPOLOGY:-auto}" \
+  "TAYGA_CPUSET=${TAYGA_CPUSET:-all}" \
+  "CLIENT_CPUSET=${CLIENT_CPUSET:-all}" \
+  "SERVER_CPUSET=${SERVER_CPUSET:-all}" \
   "SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}" \
   "PROTOCOL=${PROTOCOL:-tcp}" "RATE=${RATE:-0}" \
   "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
@@ -65,7 +72,7 @@ limactl shell "$INSTANCE" -- env \
     task_status=$?
     rm -f "$task_runner"
     exit "$task_status"
-  ' bash "$REPO/tools/lima-perf/run-guest.sh"
+  ' bash "$REPO/tools/lima-perf/run-guest.sh" < /dev/null
 
 SESSION_DIR="$REPO/perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
 if [ -d "$SESSION_DIR" ]; then
