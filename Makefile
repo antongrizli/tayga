@@ -5,7 +5,11 @@ CC ?= gcc
 CFLAGS ?= -Wall -O2
 LDFLAGS ?= -flto=auto
 LDLIBS := -lpthread
-SOURCES := nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c gso.c stats.c stats_exporter.c
+ifeq ($(WITH_URING),1)
+override CFLAGS += -DTAYGA_WITH_URING
+override LDFLAGS += -luring
+endif
+SOURCES := experimental_io.c nat64.c addrmap.c dynamic.c tayga.c conffile.c log.c tun.c gso.c stats.c stats_exporter.c
 
 #Default installation paths (may be overridden by environment variables)
 prefix ?= /usr/local
@@ -119,13 +123,15 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io
+test: unit_dispatch unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime
+	./unit_dispatch
 	./unit_conffile
 	./unit_checksum
 	./unit_udp_checksum
 	./unit_ip4_id
 	./unit_tun
 	./unit_packet_io
+	./unit_packet_io_lifetime
 	./unit_gso
 	./unit_pref64
 	./unit_stats
@@ -142,28 +148,37 @@ unit_conffile: $(TEST_FILES) test/unit_conffile.c conffile.c addrmap.c tayga.h l
 unit_checksum: test/unit_checksum.c tayga.h
 	$(CC) $(CFLAGS) -I. -o unit_checksum test/unit_checksum.c $(LDFLAGS)
 
-unit_udp_checksum: test/unit_udp_checksum.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c tayga.h gso.h stats.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_udp_checksum test/unit_udp_checksum.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c $(LDFLAGS) -lpthread
+unit_udp_checksum: test/unit_udp_checksum.c nat64.c addrmap.c dynamic.c gso.c tun.c experimental_io.c log.c stats.c tayga.h gso.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_udp_checksum test/unit_udp_checksum.c nat64.c addrmap.c dynamic.c gso.c tun.c experimental_io.c log.c stats.c $(LDFLAGS) -lpthread
 
-unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c tayga.h gso.h stats.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c stats.c $(LDFLAGS) -lpthread
+unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c experimental_io.c log.c stats.c tayga.h gso.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_ip4_id test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c experimental_io.c log.c stats.c $(LDFLAGS) -lpthread
 
-unit_tun: test/unit_tun.c tun.c log.c stats.c tayga.h stats.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_tun test/unit_tun.c tun.c log.c stats.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS) -lpthread
+unit_tun: test/unit_tun.c tun.c experimental_io.c log.c stats.c tayga.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_tun test/unit_tun.c tun.c experimental_io.c log.c stats.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS) -lpthread
+
+unit_dispatch: test/unit_dispatch.c experimental_io.c flow_dispatch.h experimental_io.h packet_io_lifetime.h
+	$(CC) $(CFLAGS) -I. -o $@ test/unit_dispatch.c experimental_io.c stats.c log.c $(LDFLAGS) -pthread -Wl,--wrap=clock_gettime
+
+unit_async_tun: test/unit_async_tun.c experimental_io.c experimental_io.h packet_io_lifetime.h
+	$(CC) $(CFLAGS) -I. -o $@ test/unit_async_tun.c experimental_io.c stats.c log.c $(LDFLAGS) -pthread
+
+unit_packet_io_lifetime: test/unit_packet_io_lifetime.c packet_io_lifetime.h
+	$(CC) $(CFLAGS) -I. -o $@ test/unit_packet_io_lifetime.c
 
 unit_packet_io: test/unit_packet_io.c packet_io.h
 	$(CC) $(CFLAGS) -I. -o $@ test/unit_packet_io.c
 
-tayga unit_tun unit_gso unit_ip4_id unit_udp_checksum: packet_io.h tun_steering.h
+tayga unit_tun unit_gso unit_ip4_id unit_udp_checksum: packet_io.h tun_steering.h experimental_io.h flow_dispatch.h packet_io_lifetime.h
 
-unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c tayga.h gso.h stats.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c $(LDFLAGS) -lpthread
+unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c experimental_io.c log.c stats.c tayga.h gso.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c experimental_io.c log.c stats.c $(LDFLAGS) -lpthread
 
 unit_pref64: test/unit_pref64.c src-helper/pref64-discover.c
 	$(CC) $(CFLAGS) -DPREF64_NO_MAIN -I. -o unit_pref64 test/unit_pref64.c src-helper/pref64-discover.c $(LDFLAGS)
 
-unit_stats: test/unit_stats.c stats.c stats_exporter.c log.c tayga.h stats.h
-	$(CC) $(CFLAGS) -I. -pthread -o unit_stats test/unit_stats.c stats.c stats_exporter.c log.c $(LDFLAGS) -lpthread
+unit_stats: test/unit_stats.c stats.c stats_exporter.c experimental_io.c log.c tayga.h stats.h
+	$(CC) $(CFLAGS) -I. -pthread -o unit_stats test/unit_stats.c stats.c stats_exporter.c experimental_io.c log.c $(LDFLAGS) -lpthread
 
 pref64-discover: src-helper/pref64-discover.c
 	$(CC) $(CFLAGS) -I. -o pref64-discover src-helper/pref64-discover.c $(LDFLAGS)
@@ -198,7 +213,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
+	$(RM) unit_dispatch unit_async_tun unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

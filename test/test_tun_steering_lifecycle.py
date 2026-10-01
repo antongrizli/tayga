@@ -13,6 +13,10 @@ import json
 
 def main():
     binary=Path(sys.argv[1]).resolve()
+    flags=sys.argv[2:] or ["--tun-steering=groups"]
+    groups=flags==["--tun-steering=groups"]
+    selected=dict(flag[2:].split("=",1) for flag in flags)
+    readiness="requested=groups effective=groups" if groups else "Packet I/O: dispatch="+selected.get("dispatch","kernel")+" transmit="+selected.get("packet-io","sync")
     lock=open('/tmp/tayga-perf-workflow.lock','a')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     ns='tayga-lifecycle-'+str(os.getpid())
@@ -26,10 +30,10 @@ def main():
             for ending in (signal.SIGTERM,signal.SIGKILL):
                 log=Path(folder)/str(ending)
                 with log.open('w') as output:
-                    child=subprocess.Popen(['ip','netns','exec',ns,str(binary),'-c',str(conf),'-d','--tun-steering=groups'],stdout=output,stderr=subprocess.STDOUT)
+                    child=subprocess.Popen(['ip','netns','exec',ns,str(binary),'-c',str(conf),'-d',*flags],stdout=output,stderr=subprocess.STDOUT)
                     try:
                         for _ in range(100):
-                            if 'requested=groups effective=groups' in log.read_text():break
+                            if readiness in log.read_text():break
                             assert child.poll() is None,log.read_text()
                             time.sleep(.05)
                         else: raise AssertionError(log.read_text())
@@ -65,13 +69,16 @@ def main():
                         if child.poll() is None:child.kill();child.wait()
                 assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
             assert run(str(binary),'-c',str(conf),'--mktun',stdout=subprocess.DEVNULL).returncode==0
-            rejected=run(str(binary),'-c',str(conf),'-d','--tun-steering=groups',capture_output=True,text=True,timeout=5)
+            rejected=run(str(binary),'-c',str(conf),'-d',*flags,capture_output=True,text=True,timeout=5)
             assert rejected.returncode!=0 and 'fresh disposable' in rejected.stdout+rejected.stderr
             assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL).returncode==0
             run(str(binary),'-c',str(conf),'--rmtun',check=True,stdout=subprocess.DEVNULL)
+            if not groups:
+                print("PASS: flow/uring reload, TERM/KILL cleanup, existing-device rejection")
+                return
             # Remove both privilege alternatives while retaining TUN capability.
             with (Path(folder)/'fallback').open('w') as output:
-                child=subprocess.Popen(['ip','netns','exec',ns,'setpriv','--bounding-set=-bpf,-sys_admin',str(binary),'-c',str(conf),'-d','--tun-steering=groups'],stdout=output,stderr=subprocess.STDOUT)
+                child=subprocess.Popen(['ip','netns','exec',ns,'setpriv','--bounding-set=-bpf,-sys_admin',str(binary),'-c',str(conf),'-d',*flags],stdout=output,stderr=subprocess.STDOUT)
                 try:
                     for _ in range(100):
                         if 'requested=groups effective=kernel' in (Path(folder)/'fallback').read_text():break

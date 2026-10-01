@@ -201,14 +201,15 @@ def run_group(args, mode, workers, mtu, direction, root):
         cfg.write_text(f"tun-device usotun\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8:64::1\n"
                        f"prefix 64:ff9b::/96\nwkpf-strict no\nmap {ADDR4} {ADDR6}\n"
                        f"workers {workers}\ntun-offload {mode}\nofflink-mtu {mtu}\n")
-        if args.steering == "groups":
+        if args.steering == "groups" or args.dispatch == "flows":
             # Fresh disposable TUN is mandatory for the experimental policy.
             # Configure the test MTU/routes after negotiation; offlink-mtu is
             # already fixed in the daemon configuration before startup.
-            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg), "--tun-steering=groups"],
+            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg), "--tun-steering="+args.steering,"--dispatch="+args.dispatch,"--packet-io="+args.packet_io],
                                       stdout=log_fd, stderr=log_fd)
             for _ in range(100):
-                if "requested=groups effective=groups" in log.read_text(): break
+                if ("Packet I/O: dispatch="+args.dispatch+" transmit="+args.packet_io in log.read_text()
+                        and (args.steering != "groups" or "TUN steering requested=groups effective=groups" in log.read_text())): break
                 assert daemon.poll() is None, log.read_text()
                 time.sleep(.05)
             else: raise AssertionError("experimental steering not activated")
@@ -230,7 +231,7 @@ def run_group(args, mode, workers, mtu, direction, root):
             command("ip", "-n", trans, "route", "add", ADDR4 + "/32", "via", "10.23.0.2", "dev", "out0")
             command("ip", "-n", recv, "addr", "add", ADDR4 + "/32", "dev", "lo")
         if daemon is None:
-            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg)],
+            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg),"--packet-io="+args.packet_io],
                                       stdout=log_fd, stderr=log_fd)
         time.sleep(0.15)
         assert daemon.poll() is None, log.read_text()
@@ -318,6 +319,8 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="/usr/sbin/tayga")
+    parser.add_argument("--dispatch",choices=("kernel","flows"),default="kernel")
+    parser.add_argument("--packet-io",choices=("sync","uring"),default="sync")
     parser.add_argument("--steering", choices=("kernel", "groups"), default="kernel")
     parser.add_argument("--output", required=True)
     parser.add_argument("--modes", nargs="+", choices=("off", "tcp", "auto", "udp"), default=["udp"])
@@ -345,7 +348,7 @@ def main():
     finally:
         # Include cases completed before a later case in the same group failed.
         results = [json.loads(p.read_text()) for p in sorted(root.glob("*/*/result.json"))]
-        (root / "summary.json").write_text(json.dumps({"binary": args.binary, "binary_sha256": binary_hash, "steering": args.steering,
+        (root / "summary.json").write_text(json.dumps({"binary": args.binary, "binary_sha256": binary_hash, "steering": args.steering,"dispatch":args.dispatch,"packet_io":args.packet_io,
                     "kernel": command("uname", "-a").stdout.strip(), "completed_cases": len(results),
                     "results": results}, indent=2) + "\n")
     print(f"All {len(results)} kernel UDP cases passed. Artifacts: {root}")

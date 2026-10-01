@@ -49,6 +49,38 @@ class EndpointTests(unittest.TestCase):
             got=json.loads((folder/'receiver.json').read_text());self.assertEqual(got['packets'],35);self.assertEqual(got['bytes'],40864);self.assertEqual(got['short_tails'],1)
             if batch==32 and gro: self.assertGreater(got['aggregates'],0)
 
+    def test_paced_payload_accounting(self):
+        proc,folder=self.receiver(1,'paced')
+        subprocess.run([str(self.binary),'send','4','127.0.0.1','127.0.0.1','1','32','123',str(folder/'sender.json'),'0','1200','100'],check=True)
+        time.sleep(.1);status,err=self.finish(proc);self.assertEqual(status,0,err)
+        sent=json.loads((folder/'sender.json').read_text());got=json.loads((folder/'receiver.json').read_text())
+        self.assertEqual(sent['rate_mbps'],100)
+        self.assertEqual(sent['packets'],got['packets'])
+        self.assertEqual(sent['bytes'],got['bytes'])
+        self.assertGreater(sent['elapsed_seconds'],.95)
+        actual=sent['bytes']*8/sent['elapsed_seconds']/1e6
+        self.assertLess(abs(actual-100),5)
+
+    def test_explicit_receive_buffer(self):
+        proc,folder=self.receiver(0,'receive-buffer',dict(os.environ,UDP_ENDPOINT_RCVBUF='1048576'))
+        subprocess.run([str(self.binary),'send','4','127.0.0.1','127.0.0.1','1','1','123',str(folder/'sender.json'),'35','64'],check=True)
+        time.sleep(.1);status,err=self.finish(proc);self.assertEqual(status,0,err)
+        got=json.loads((folder/'receiver.json').read_text())
+        self.assertEqual(got['requested_rcvbuf'],1048576)
+        self.assertEqual(got['force_rcvbuf'],0)
+        self.assertGreater(got['actual_rcvbuf'],0)
+        self.assertEqual(got['packets'],35)
+
+    def test_invalid_force_buffer(self):
+        output=self.root/'invalid-force.json'
+        result=subprocess.run([str(self.binary),'send','4','127.0.0.1','127.0.0.1','1','32','123',str(output),'0','1200','0'],env=dict(os.environ,UDP_ENDPOINT_RCVBUF_FORCE='4294967296'))
+        self.assertEqual(result.returncode,2);self.assertFalse(output.exists())
+
+    def test_invalid_rate(self):
+        output=self.root/'invalid-rate.json'
+        result=subprocess.run([str(self.binary),'send','4','127.0.0.1','127.0.0.1','1','32','123',str(output),'0','1200','1000001'])
+        self.assertEqual(result.returncode,2);self.assertFalse(output.exists())
+
     def test_auto_unsupported_fallback(self):
         env=dict(os.environ,LD_PRELOAD=str(self.fault),UDP_ENDPOINT_FAULT='92',UDP_ENDPOINT_OFFLOAD='auto')
         proc,folder=self.receiver(1,'fallback',env)

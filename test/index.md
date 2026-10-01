@@ -238,3 +238,32 @@ validation tests.
 In the prepared guest, `sudo python3 tools/run-tun-steering-study.py --candidate /path/to/frozen/tayga --revision BUILD_REVISION --source-sha SOURCE_SNAPSHOT_SHA --output /tmp/new-steering-study` captures unrestricted alternating capacity and separate perf sessions, restoring installed files on exit. `--reference-only` selects sixteen-stream TCP pairs; `--verification-only` selects final-image kernel/groups TCP/UDP checks; `--profiles-only --kernel-only` selects final production-policy profiles. Use immutable sources and new output directories. Resume only with matching frozen identities/settings. UDP zero-loss rejection is preserved. Run `python3 tools/summarize-tun-steering-study.py /tmp/new-steering-study` to validate and summarize.
 
 `sudo python3 tools/run-steering-integrity.py --binary /path/to/frozen/tayga --output /tmp/new-steering-integrity` temporarily installs the selected image for TCP/UDP integrity and PMTU checks, then restores the original files. `python3 test/test_tun_steering_study.py` validates the measurement tooling. These experiments require serialized use of the prepared Linux guest.
+
+### UDP operating-envelope and frame-lifetime gates
+
+`make test` now also includes `unit_packet_io_lifetime`. The experimental helper models fixed frame storage, generation/pool identity, ownership transitions, completion and shutdown; it is not an asynchronous backend. See [next-stage design](../docs/FLOW-STEERING-AND-ASYNC-OWNERSHIP-NEXT-STAGE-2026-10-01.md).
+
+Compile the diagnostic endpoint with `cc -O3 -Wall -Wextra -Werror tools/udp-batch-endpoint.c -o /tmp/udp-envelope-endpoint`. In an otherwise idle Linux guest, run `sudo python3 tools/run-udp-envelope-study.py --binary /path/to/frozen/tayga --endpoint /tmp/udp-envelope-endpoint --output /tmp/new-envelope`. The default rates include unrestricted maximum load (`0`). Paced cases are separate operating points; a requested rate must be reached within 5% and every full packet/byte count and pressure gate must pass. The topology excludes NAT44 and ordinary iperf; do not pool these results with those studies. `--duration 30 --pairs 1 --rates 100 500 0` selects a longer conservative observation. `--receive-buffer 4194304` explicitly requests a larger receiver socket buffer and records the actual kernel value; `0` retains the kernel default. This is diagnostic endpoint configuration, not a TAYGA setting.
+
+Run `python3 test/test_udp_envelope_study.py` for summary checks and, on Linux, `python3 test/test_udp_batch_endpoint.py` for endpoint fallback, integrity, pacing and receive-buffer checks. All studies reserve the workflow lock and retain rejected/under-offered runs. Native endpoint pacing sleeps to absolute deadlines and limits catch-up bursts; at high rates the scheduler can prevent achieving the requested rate. Such a run cannot establish capacity at that rate.
+
+For matched socket-buffer A/B, use `--receive-buffers 0 4194304 --rates 1000 0 --pairs 3`. The guest may clamp SO_RCVBUF to rmem_max, so inspect `receiver.json`'s actual value. Add `--force-receive-buffer` only for an explicit privileged diagnostic; it uses SO_RCVBUFFORCE without changing global sysctls. `--profiles-only --receive-buffers 0 4194304 --force-receive-buffer` records separate unrestricted process/system profiles with raw data, self/caller reports and zero-lost-sample validation. Profile results are excluded from operating-point summaries.
+
+Results and limitations: [UDP envelope/ownership follow-up](../docs/UDP-ENVELOPE-AND-OWNERSHIP-FOLLOWUP-2026-10-01.md).
+
+
+### Experimental flow dispatch and asynchronous TUN TX
+
+Build using `make WITH_URING=1 VERSION=0.9.12` with liburing development headers. Default builds do not require liburing. Runtime defaults remain kernel multiqueue and synchronous writes. Experimental selections are `--dispatch=flows --packet-io=uring`; flow dispatch requires static inline maps and a fresh disposable Linux TUN.
+
+```sh
+make WITH_URING=1 test unit_async_tun
+./unit_async_tun
+sudo python3 test/test_dispatch_fragments.py ./tayga /tmp/dispatch-fragments-new
+sudo python3 test/test_tun_steering_lifecycle.py ./tayga --dispatch=flows --packet-io=uring
+sudo python3 test/test_udp_gso_kernel.py --binary ./tayga --dispatch flows --packet-io uring --output /tmp/dispatch-wire-new --modes auto off --workers 3 --mtus 1280 1500
+```
+
+`unit_dispatch` is included in `make test`. The async unit requires `WITH_URING=1`; it tests owned gather-copy lifetime, completion ordering, failed writes and stopping. The lifecycle test retains its original group-steering behavior when no extra flags are supplied.
+
+`tools/run-dispatch-study.py` runs reversible max-rate policy or previous-binary campaigns and separate process/system perf sessions. Supply verified `GIT_REVISION` and `SOURCE_TREE_SHA256` environment metadata for the frozen candidate. Output directories must be new. Failed UDP zero-loss gates are overload evidence, not a sustainable capacity result. See [measured results and restrictions](../docs/DISPATCH-URING-IMPLEMENTATION-2026-10-01.md). These prototypes failed the performance gate and must remain opt-in.

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import select
@@ -87,13 +88,29 @@ def run_case(args, root, direction, batch, gro, label, finite=False, profile=Fal
         receiver=subprocess.Popen(['ip','netns','exec',recv,args.endpoint,'receive',str(af_out),target,str(gro),cookie,str(folder/'receiver.json')], stdout=subprocess.PIPE,stderr=receive_log,text=True)
         ready,_,_=select.select([receiver.stdout],[],[],3)
         assert ready and receiver.stdout.readline().strip()=='READY', 'receiver readiness failed'
+        def counters(stage):
+            result={}
+            for tag,name in (('translator',trans),('receiver',recv)):
+                raw=ns(name,'nstat','-az').stdout
+                (folder/f'{tag}-nstat.{stage}').write_text(raw)
+                result[tag]={parts[0]:int(parts[1]) for line in raw.splitlines() if len(parts:=line.split())>=2 and parts[1].isdigit()}
+                links=ns(name,'ip','-s','-j','link').stdout
+                (folder/f'{tag}-links.{stage}.json').write_text(links)
+                for link in json.loads(links):
+                    for way,stats in link.get('stats64',link.get('stats',{})).items():
+                        if isinstance(stats,dict):
+                            for key in ('errors','dropped'):
+                                result[tag][f'{link["ifname"]}.{way}.{key}']=stats.get(key,0)
+            return result
+        before=counters('before')
         ticks_before=Path(f'/proc/{daemon.pid}/stat').read_text().split(') ',1)[1].split()
         if profile:
-            recorder=subprocess.Popen(['perf','record','-e','cpu-clock','-F','99','-g','--call-graph','fp','-p',str(daemon.pid),'-o',str(folder/'perf.data'),'--','sleep',str(args.duration+2)], stdout=perf_log,stderr=perf_log)
+            recorder=subprocess.Popen(['perf','record','-e','cpu-clock','-F','99','-g','--call-graph','fp',*(['-a'] if getattr(args,'profile_scope','process')=='system' else ['-p',str(daemon.pid)]),'-o',str(folder/'perf.data'),'--','sleep',str(args.duration+2)], stdout=perf_log,stderr=perf_log)
             time.sleep(.3)
             assert recorder.poll() is None, 'perf attachment failed'
         sender=['ip','netns','exec',trans,args.endpoint,'send',str(af_in),source,dest,str(args.duration),str(batch),cookie,str(folder/'sender.json')]
         if finite: sender += ['35','64']
+        elif getattr(args,'rate_mbps',0): sender += ['0','1200',str(args.rate_mbps)]
         result=command(*sender,check=False)
         (folder/'sender.log').write_text(result.stdout+result.stderr)
         result.check_returncode()
@@ -106,8 +123,10 @@ def run_case(args, root, direction, batch, gro, label, finite=False, profile=Fal
         if recorder:
             recorder.wait(timeout=10)
             assert recorder.returncode==0, 'perf recording failed'
-            export=command('perf','report','--stdio','--no-children','--percent-limit','0.5','--sort','symbol,dso','-i',folder/'perf.data')
+            export=command('perf','report','--stdio','--no-children','--call-graph','none','--percent-limit','0','--sort','symbol,dso','-i',folder/'perf.data')
             (folder/'perf-report.txt').write_text(export.stdout+export.stderr)
+        after=counters('after')
+        pressure={f'{tag}.{key}':value-before[tag].get(key,0) for tag,values in after.items() for key,value in values.items() if ('Errors' in key or 'Discards' in key or key.endswith(('.errors','.dropped'))) and value!=before[tag].get(key,0)}
         sent=json.loads((folder/'sender.json').read_text()); got=json.loads((folder/'receiver.json').read_text())
         assert sent['packets']>0 and got['packets']<=sent['packets'] and got['invalid']==0 and got['duplicates']==0
         assert got['highest_sequence']<sent['packets'], 'sequence outside sender ledger'
@@ -118,14 +137,15 @@ def run_case(args, root, direction, batch, gro, label, finite=False, profile=Fal
         useful=got['bytes']*8/sent['elapsed_seconds']/1e6
         lost=sent['packets']-got['packets']
         cpu_ticks=sum(int(ticks_after[i])-int(ticks_before[i]) for i in (11,12))
-        row=dict(case=label,direction=direction,batch=batch,gro=gro,finite=finite,profile=profile,
+        row=dict(case=label,direction=direction,batch=batch,gro=gro,finite=finite,profile=profile,profile_scope=getattr(args,'profile_scope','process') if profile else None,
                  sender=sent,receiver=got,received_mbps=useful,loss_percent=100*lost/sent['packets'],
                  tayga_cpu_cores=cpu_ticks/os.sysconf('SC_CLK_TCK')/sent['elapsed_seconds'],
                  tayga_cpu_seconds=cpu_ticks/os.sysconf('SC_CLK_TCK'),
                  tayga_cpu_seconds_per_received_gib=(cpu_ticks/os.sysconf('SC_CLK_TCK'))/(got['bytes']/(1024**3)) if got['bytes'] else None,
                  offered_mbps=sent['bytes']*8/sent['elapsed_seconds']/1e6,
-                 acceptance_pass=lost==0,capture_valid=True,workload_valid=True,
-                 rate='unrestricted',topology='local sender -> TUN translator -> veth receiver; no NAT44',
+                 pressure_deltas=pressure,requested_rate_mbps=0 if finite else getattr(args,'rate_mbps',0),
+                 acceptance_pass=lost==0 and not pressure,capture_valid=True,workload_valid=True,
+                 rate='paced' if not finite and getattr(args,'rate_mbps',0) else 'unrestricted',topology='local sender -> TUN translator -> veth receiver; no NAT44',
                  binary_sha256=args.binary_hash,endpoint_sha256=args.endpoint_hash)
         (folder/'result.json').write_text(json.dumps(row,indent=2)+'\n')
         print(f'{label}: rx={useful:.1f} Mbit/s loss={row["loss_percent"]:.2f}% GRO buffers={got["aggregates"]}',flush=True)

@@ -34,3 +34,8 @@ dist/
 /tools/udp-drain-control
 /tools/iperf-start-gate.so
 /tools/iperf-start-control
+
+unit_packet_io_lifetime
+
+unit_dispatch
+unit_async_tun

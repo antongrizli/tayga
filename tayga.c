@@ -19,6 +19,7 @@
 #include "tayga.h"
 #include "stats.h"
 #include "gso.h"
+#include "experimental_io.h"
 
 #include <stdarg.h>
 #include <signal.h>
@@ -66,6 +67,8 @@ void usage(int code) {
 			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--tun-steering MODE: kernel (default) or experimental groups (fresh disposable Linux TUN only)\n"
+			"--dispatch MODE   : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
+			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
 	exit(code);
@@ -269,6 +272,7 @@ static void * worker(void * arg)
 		exit(1);
 	}
 
+	if(gcfg.async_tun)async_tun_select(idx);
 	/* Enter worker loop */
 	stats_thread_init(idx);
 	atomic_fetch_add_explicit(&g_workers_running, 1, memory_order_release);
@@ -283,12 +287,22 @@ static void * worker(void * arg)
 	clock_gettime(CLOCK_MONOTONIC, &last_flush);
 	unsigned direct_burst = 0;
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		if(gcfg.async_tun && async_tun_service()<0) {tun_io_fail("async completion failed",EIO);break;}
+		if(gcfg.dispatch_mode) {
+			uint8_t *frame;int length;int slot=dispatch_take(idx,&frame,&length);
+			if(slot>=0) {tun_process_frame(frame,length,gcfg.tun_fd);dispatch_release(slot);}
+			else {dispatch_wait(idx,gcfg.async_tun?1:100);stats_flush_idle();}
+			stats_check_sync_request();
+			clock_gettime(CLOCK_MONOTONIC,&mono_now);
+			if(mono_now.tv_sec!=last_flush.tv_sec){stats_flush_worker();last_flush=mono_now;}
+			continue;
+		}
 		int pret;
 		if (direct_burst) {
 			pfd.revents = POLLIN;
 			pret = 1;
 		} else {
-			pret = poll(&pfd, 1, 500);
+			pret = poll(&pfd, 1, gcfg.async_tun ? 1 : 500);
 		}
 		stats_check_sync_request();
 		if (pret > 0) {
@@ -332,6 +346,7 @@ static void * worker(void * arg)
 			break;
 		}
 	}
+	if(gcfg.async_tun && async_tun_finish()<0)tun_io_fail("async drain failed",EIO);
 	stats_flush_worker();
 	stats_thread_exit();
 	atomic_fetch_sub_explicit(&g_workers_running, 1, memory_order_release);
@@ -380,6 +395,8 @@ int main(int argc, char **argv)
 		{ "tun-offload", 1, 0, 1001 },
 		{ "check-offload", 0, 0, 1002 },
 		{ "tun-steering", 1, 0, 1003 },
+		{ "dispatch", 1, 0, 1004 },
+		{ "packet-io", 1, 0, 1005 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -390,6 +407,22 @@ int main(int argc, char **argv)
 		if (c == -1)
 			break;
 		switch (c) {
+		case 1004:
+			if(!strcmp(optarg,"kernel"))gcfg.dispatch_mode=0;
+			else if(!strcmp(optarg,"flows"))gcfg.dispatch_mode=1;
+			else die("Invalid --dispatch: use kernel or flows");
+#ifndef __linux__
+			if(gcfg.dispatch_mode)die("Experimental dispatch requires Linux");
+#endif
+			break;
+		case 1005:
+			if(!strcmp(optarg,"sync"))gcfg.async_tun=0;
+			else if(!strcmp(optarg,"uring"))gcfg.async_tun=1;
+			else die("Invalid --packet-io: use sync or uring");
+#ifndef TAYGA_WITH_URING
+			if(gcfg.async_tun)die("io_uring requires build WITH_URING=1");
+#endif
+			break;
 		case 1003:
 #ifndef __linux__
 			if (strcmp(optarg, "kernel")) die("Experimental steering requires Linux");
@@ -647,7 +680,14 @@ int main(int argc, char **argv)
 		gcfg.workers = cpu_cores;
 	}
 
+	if(gcfg.dispatch_mode && (gcfg.workers<1 || gcfg.workers>8 || gcfg.tun_steering_groups || gcfg.dynamic_pool || gcfg.map_file[0]))
+		die("Experimental dispatch requires 1..8 workers, static inline mappings and kernel steering");
+	if(gcfg.async_tun && gcfg.workers>8)die("Experimental io_uring supports at most 8 workers");
 	if(tun_setup(0, 0)) exit(1);
+	if(gcfg.dispatch_mode && dispatch_init(gcfg.workers))die("Dispatcher initialization failed: %s",strerror(errno));
+	if(gcfg.async_tun && async_tun_init())die("io_uring initialization failed: %s",strerror(errno));
+	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
+	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 
 	if (do_chroot) {
 		if (chroot(gcfg.data_dir) < 0) {
@@ -747,7 +787,9 @@ int main(int argc, char **argv)
 
 	/* Main loop */
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
-		ret = poll(pollfds, 2, 500);
+		if(gcfg.dispatch_mode)dispatch_expire();
+		if(gcfg.async_tun && !gcfg.workers && async_tun_service()<0){tun_io_fail("main async completion failed",EIO);break;}
+		ret = poll(pollfds, 2, gcfg.async_tun && !gcfg.workers ? 1 : 500);
 		stats_check_sync_request();
 		if (ret < 0) {
 			if (errno == EINTR)
@@ -811,6 +853,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Graceful shutdown */
+	if(gcfg.dispatch_mode)dispatch_stop();
 #ifdef __linux__
 	for (int i = 0; i < gcfg.workers; i++) {
 		pthread_join(gcfg.threads[i], NULL);
@@ -818,6 +861,9 @@ int main(int argc, char **argv)
 	if (atomic_load_explicit(&g_tun_io_failure, memory_order_relaxed))
 		exit_code = 1;
 #endif
+	if(gcfg.async_tun && !gcfg.workers && async_tun_finish()<0)exit_code=1;
+	if(gcfg.dispatch_mode)dispatch_destroy();
+	if(gcfg.async_tun)async_tun_destroy();
 	stats_flush_worker();
 	stats_dump();
 	if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {

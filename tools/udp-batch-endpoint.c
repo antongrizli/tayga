@@ -22,7 +22,7 @@ static void fail(const char *s) { perror(s); exit(1); }
 static unsigned long long number(const char *s) { char *end; errno=0; unsigned long long n=strtoull(s,&end,10); if(errno || *end || !*s || *s=='-') { fprintf(stderr,"invalid number\n"); exit(2); } return n; }
 static int unsupported(int error) { return error==ENOPROTOOPT || error==EOPNOTSUPP || error==EINVAL; }
 int main(int argc, char **argv) {
-    if(argc < 7) { fprintf(stderr,"send AF source destination seconds batch cookie output [count [tail]] OR receive AF address gro cookie output\n"); return 2; }
+    if(argc < 7) { fprintf(stderr,"send AF source destination seconds batch cookie output [count [tail [rate_mbps]]] OR receive AF address gro cookie output\n"); return 2; }
     unsigned af=number(argv[2]); if(af!=4 && af!=6) return 2;
     int sending=!strcmp(argv[1],"send"), family=af==4?AF_INET:AF_INET6;
     const char *policy=getenv("UDP_ENDPOINT_OFFLOAD");
@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     const char *output=argv[sending?8:6];
     uint64_t limit=sending && argc>9?number(argv[9]):0;
     unsigned tail=sending && argc>10?number(argv[10]):SIZE;
+    uint64_t rate=sending && argc>11?number(argv[11]):0;
+    if(rate>1000000 || argc>(sending?12:7)) return 2;
     if(batch<1 || batch>32 || gro>1 || (sending && (!seconds || seconds>300)) || tail<16 || tail>SIZE || limit>=MAXSEQ) return 2;
     int fd=socket(family,SOCK_DGRAM|SOCK_CLOEXEC,0); if(fd<0) fail("socket");
     struct sockaddr_storage src={0}, dst={0}; socklen_t addrlen;
@@ -50,6 +52,20 @@ int main(int argc, char **argv) {
         d->sin6_port=htons(49153); if(!sending) s->sin6_port=d->sin6_port;
     }
     if(bind(fd,(void*)&src,addrlen)) fail("bind");
+    const char *buffer_env=getenv("UDP_ENDPOINT_RCVBUF");
+    uint64_t requested_rcvbuf=buffer_env?number(buffer_env):0;
+    const char *force_env=getenv("UDP_ENDPOINT_RCVBUF_FORCE");
+    uint64_t force_requested=force_env?number(force_env):0;
+    if(force_requested>1) return 2;
+    int force_rcvbuf=(int)force_requested;
+    if(force_rcvbuf>1) return 2;
+    if(requested_rcvbuf>1073741824) return 2;
+    if(!sending && requested_rcvbuf) {
+        int value=(int)requested_rcvbuf;
+        if(setsockopt(fd,SOL_SOCKET,force_rcvbuf?SO_RCVBUFFORCE:SO_RCVBUF,&value,sizeof(value))) fail("SO_RCVBUF");
+    }
+    int actual_rcvbuf=0; socklen_t buffer_len=sizeof(actual_rcvbuf);
+    if(getsockopt(fd,SOL_SOCKET,SO_RCVBUF,&actual_rcvbuf,&buffer_len)) fail("get SO_RCVBUF");
     unsigned requested_batch=batch, requested_gro=gro;
     int fallback_errno=0;
     if(gro && setsockopt(fd,IPPROTO_UDP,UDP_GRO,&gro,sizeof(gro))) {
@@ -65,11 +81,26 @@ int main(int argc, char **argv) {
     unsigned char data[65536], expected[SIZE]; memset(expected,0xa5,sizeof(expected));
     unsigned char *seen=sending?NULL:calloc(MAXSEQ/8,1); if(!sending && !seen) fail("calloc");
     uint64_t packets=0,bytes=0,calls=0,aggregates=0,duplicates=0,invalid=0,reordered=0,highest=0,shorts=0;
-    double started=now(),ended=started;
+    double started=now(),measured_start=started,ended=started,deadline=started+seconds;
     if(!sending) { puts("READY"); fflush(stdout); }
     while(!stop) {
         if(sending) {
-            if((limit && packets>=limit) || now()-started>=seconds) break;
+            if((limit && packets>=limit) || now()>=deadline) break;
+            /* Absolute schedule from successful payload bytes. Do not catch up
+             * after scheduler delay: at most one batch may burst per wakeup. */
+            if(rate && bytes) {
+                double target=started+(double)bytes*8/(rate*1e6);
+                double current=now();
+                if(target>current) {
+                    struct timespec wake={.tv_sec=(time_t)target,.tv_nsec=(long)((target-(time_t)target)*1e9)};
+                    int status;
+                    do { status=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&wake,NULL); } while(status==EINTR && !stop);
+                    if(status && status!=EINTR) { errno=status; fail("pacing"); }
+                } else if(current-target>(double)(batch*SIZE)*8/(rate*1e6)) {
+                    started=current-(double)bytes*8/(rate*1e6);
+                }
+                if(stop || now()>=deadline) break;
+            }
             unsigned n=batch; if(limit && n>limit-packets) n=limit-packets;
             size_t length=0;
             for(unsigned i=0;i<n;i++) {
@@ -118,7 +149,10 @@ int main(int argc, char **argv) {
     }
     FILE *f=fopen(output,"wx"); if(!f) fail("output");
     fprintf(f,"{\"offload_policy\":\"%s\",\"requested_batch\":%u,\"requested_gro\":%u,\"fallback_errno\":%d,",automatic?"auto":"strict",requested_batch,requested_gro,fallback_errno);
-    fprintf(f,"\"packets\":%"PRIu64",\"bytes\":%"PRIu64",\"calls\":%"PRIu64",\"aggregates\":%"PRIu64",\"duplicates\":%"PRIu64",\"invalid\":%"PRIu64",\"reordered\":%"PRIu64",\"short_tails\":%"PRIu64",\"highest_sequence\":%"PRIu64",\"elapsed_seconds\":%.9f,\"batch\":%u,\"gro\":%u,\"segment_size\":%u}\n",packets,bytes,calls,aggregates,duplicates,invalid,reordered,shorts,highest,ended-started,batch,gro,segment);
+    fprintf(f,"\"force_rcvbuf\":%d,",force_rcvbuf);
+    fprintf(f,"\"requested_rcvbuf\":%"PRIu64",\"actual_rcvbuf\":%d,",requested_rcvbuf,actual_rcvbuf);
+    fprintf(f,"\"rate_mbps\":%"PRIu64",",rate);
+    fprintf(f,"\"packets\":%"PRIu64",\"bytes\":%"PRIu64",\"calls\":%"PRIu64",\"aggregates\":%"PRIu64",\"duplicates\":%"PRIu64",\"invalid\":%"PRIu64",\"reordered\":%"PRIu64",\"short_tails\":%"PRIu64",\"highest_sequence\":%"PRIu64",\"elapsed_seconds\":%.9f,\"batch\":%u,\"gro\":%u,\"segment_size\":%u}\n",packets,bytes,calls,aggregates,duplicates,invalid,reordered,shorts,highest,ended-measured_start,batch,gro,segment);
     if(fclose(f)) fail("fclose");
     free(seen);close(fd);return invalid?1:0;
 }

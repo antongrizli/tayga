@@ -18,6 +18,7 @@
 #include "tayga.h"
 #include "stats.h"
 #include "packet_io.h"
+#include "experimental_io.h"
 #if defined(__linux__)
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -557,8 +558,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 	int created_persistent = 0;
 	/* No existing interface/BPF attachment is replaced. On last close this
 	 * disposable device and its maps disappear, including after SIGKILL. */
-	if (gcfg.tun_steering_groups && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
-		slog(LOG_CRIT, "Experimental group steering requires a fresh disposable TUN device\n");
+	if ((gcfg.tun_steering_groups || gcfg.dispatch_mode) && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
+		slog(LOG_CRIT, "Experimental steering/dispatch requires a fresh disposable TUN device\n");
 		return ERROR_REJECT;
 	}
 	int want_vnet = !do_rmtun && gcfg.tun_offload != TUN_OFFLOAD_OFF;
@@ -590,7 +591,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 	/* Atomic creation guard: the name check above alone cannot exclude a
 	 * device created by another owner between the check and TUNSETIFF. */
-	if (gcfg.tun_steering_groups) ifr.ifr_flags |= IFF_TUN_EXCL;
+	if (gcfg.tun_steering_groups || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 	if (want_vnet) {
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	}
@@ -604,7 +605,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			want_vnet = 0;
 			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
-			if (gcfg.tun_steering_groups) ifr.ifr_flags |= IFF_TUN_EXCL;
+			if (gcfg.tun_steering_groups || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
@@ -745,7 +746,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	if (gcfg.vnet_hdr_sz > 0)
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	strcpy(ifr.ifr_name, gcfg.tundev);
-	for(int i = 0; i < gcfg.workers; i++) {
+	for(int i = 0; i < (gcfg.dispatch_mode ? 0 : gcfg.workers); i++) {
 		gcfg.tun_fd_addl[i] = open("/dev/net/tun", O_RDWR);
 		if (gcfg.tun_fd_addl[i] < 0) {
 			slog(LOG_CRIT, "Unable to open /dev/net/tun, aborting: %s\n",
@@ -796,7 +797,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 		slog(LOG_WARNING, "TUN fallback to offload=off (retaining negotiated framing)\n");
 	}
 	/* Finalize queue indices before publishing the interface to traffic. */
-	if (gcfg.workers > 0) {
+	if (gcfg.workers > 0 && !gcfg.dispatch_mode) {
 		memset(&ifr, 0, sizeof(ifr));
 		ifr.ifr_flags = IFF_DETACH_QUEUE;
 		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, &ifr) < 0) goto setup_fail;
@@ -1027,6 +1028,7 @@ ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 		return tun_write_vnet(tun_fd, &vhdr, buf, len);
 	}
 
+	if (gcfg.async_tun) {struct iovec iov={(void *)buf,len};return async_tun_submit(tun_fd,&iov,1);}
 	ssize_t ret;
 
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -1091,6 +1093,7 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 		return tun_writev_vnet(tun_fd, &vhdr, iov, iovcnt);
 	}
 
+	if (gcfg.async_tun) return async_tun_submit(tun_fd,iov,iovcnt);
 	size_t total_len = 0;
 	ssize_t ret;
 
@@ -1159,7 +1162,6 @@ ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const
 int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 {
 	int ret;
-	struct pkt pbuf, *p = &pbuf;
 	uint8_t *read_ptr = recv_buf + HEADROOM;
 	size_t read_len = RECV_BUF_SIZE - HEADROOM;
 
@@ -1193,6 +1195,17 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 		return TUN_READ_CONSUMED;
 	}
 
+	if (gcfg.dispatch_mode) {
+		dispatch_submit(recv_buf,ret);
+		return TUN_READ_CONSUMED;
+	}
+	return tun_process_frame(recv_buf,ret,tun_fd);
+}
+
+int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
+{
+	struct pkt pbuf,*p=&pbuf;
+	uint8_t *read_ptr=recv_buf+HEADROOM-gcfg.vnet_hdr_sz;
 	if (gcfg.vnet_hdr_sz > 0) {
 		if (unlikely(ret <= gcfg.vnet_hdr_sz)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
