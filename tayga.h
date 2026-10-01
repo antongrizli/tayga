@@ -549,6 +549,14 @@ int journal_printv_with_location(
 #define TUN_READ_FATAL      -1
 
 #define WORKER_BURST_BUDGET 32
+/* A full nonblocking burst already establishes that more input may be ready.
+ * Retain a periodic poll to observe descriptor failure flags, while checking
+ * shutdown and statistics synchronization after every ordinary burst. */
+#define WORKER_DIRECT_BURSTS 8
+static inline unsigned tun_next_direct_burst(unsigned previous, int exhausted)
+{
+	return exhausted && previous + 1 < WORKER_DIRECT_BURSTS ? previous + 1 : 0;
+}
 
 /* tun.c */
 int tun_setup(int do_mktun, int do_rmtun);

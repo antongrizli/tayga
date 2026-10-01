@@ -213,6 +213,16 @@ int main(void)
 
 	close(sv[0]);
 	close(sv[1]);
+	/* Readiness continuation is bounded and never survives a drained burst. */
+	unsigned direct = 0;
+	for (unsigned i = 1; i < WORKER_DIRECT_BURSTS; i++) {
+		direct = tun_next_direct_burst(direct, 1);
+		assert(direct == i);
+	}
+	assert(tun_next_direct_burst(direct, 1) == 0);
+	for (unsigned i = 0; i < WORKER_DIRECT_BURSTS; i++)
+		assert(tun_next_direct_burst(i, 0) == 0);
+	printf("PASS: full bursts skip redundant polls with bounded recheck; drained input resets readiness\n");
 
 	printf("PASS: All unit_tun tests passed.\n");
 	return 0;

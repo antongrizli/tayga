@@ -280,8 +280,15 @@ static void * worker(void * arg)
 
 	struct timespec last_flush, mono_now;
 	clock_gettime(CLOCK_MONOTONIC, &last_flush);
+	unsigned direct_burst = 0;
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
-		int pret = poll(&pfd, 1, 500);
+		int pret;
+		if (direct_burst) {
+			pfd.revents = POLLIN;
+			pret = 1;
+		} else {
+			pret = poll(&pfd, 1, 500);
+		}
 		stats_check_sync_request();
 		if (pret > 0) {
 			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -289,7 +296,8 @@ static void * worker(void * arg)
 				break;
 			}
 			if (pfd.revents & POLLIN) {
-				for (int reads = 0; reads < WORKER_BURST_BUDGET; reads++) {
+				int reads;
+				for (reads = 0; reads < WORKER_BURST_BUDGET; reads++) {
 					int res = tun_read_packet(recv_buf, gcfg.tun_fd_addl[idx]);
 					if (res == TUN_READ_CONSUMED) {
 						continue;
@@ -304,6 +312,8 @@ static void * worker(void * arg)
 						tun_io_fail("worker TUN read failed", errno);
 					break;
 				}
+				direct_burst = tun_next_direct_burst(direct_burst,
+											reads == WORKER_BURST_BUDGET);
 			}
 			clock_gettime(CLOCK_MONOTONIC, &mono_now);
 			if (mono_now.tv_sec - last_flush.tv_sec >= 1 && g_tls_priv.batch_count > 0) {

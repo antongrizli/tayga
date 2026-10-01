@@ -37,10 +37,13 @@ CLIENT_CPUSET=${CLIENT_CPUSET:-all}
 SERVER_CPUSET=${SERVER_CPUSET:-all}
 SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}
 RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}
+IPERF_START_GATE=${IPERF_START_GATE:-on}
+export IPERF_START_GATE
 export FORWARDING_GRO PACING_TIMER_US FQ_RATE SOCKET_BUFFER_BYTES SENDER_FQ SENDER_FQ_FLOW_LIMIT SENDER_FQ_LIMIT VETH_QUEUES SENDER_FQ_TOPOLOGY TAYGA_CPUSET CLIENT_CPUSET SERVER_CPUSET SOCKET_SAMPLE_INTERVAL RECEIVER_DRAIN_SECONDS
 GIT_REVISION=${GIT_REVISION:-unknown}
 SOURCE_TREE_SHA256=${SOURCE_TREE_SHA256:-unknown}
 
+case "$IPERF_START_GATE" in on|off) ;; *) echo 'IPERF_START_GATE must be on or off' >&2; exit 64;; esac
 case "$PROTOCOL" in tcp|udp) ;; *) echo 'PROTOCOL must be tcp or udp' >&2; exit 64;; esac
 case "$CLAT_OFFLOAD" in off|tcp|udp|auto) ;; *) echo 'CLAT_OFFLOAD must be off, tcp, udp or auto' >&2; exit 64;; esac
 case "$PERF_SCOPE" in process|system) ;; *) echo 'PERF_SCOPE must be process or system' >&2; exit 64;; esac
@@ -109,6 +112,37 @@ cleanup() {
   for iperf_pid in $iperf_pids; do kill "$iperf_pid" 2>/dev/null || true; done
   for client_pid in $client_pids; do kill "$client_pid" 2>/dev/null || true; done
   for release_pid in $release_pids; do kill "$release_pid" 2>/dev/null || true; done
+  # Reap owned children before releasing namespaces/locks or starting the next
+  # allocator/throughput arm. A slow shutdown must not overlap that next arm.
+  python3 - $clat_pid $iperf_pids $client_pids $release_pids $socket_sampler_pid <<'PY'
+import os, signal, sys, time
+from pathlib import Path
+parent = os.getppid()
+def identity(pid):
+    try:
+        fields = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+        return (int(fields[1]), int(fields[19]), fields[0])
+    except (OSError, ValueError, IndexError):
+        return None
+owned = {}
+for pid in map(int, sys.argv[1:]):
+    state = identity(pid)
+    if state and state[0] == parent:
+        owned[pid] = state[:2]
+deadline = time.monotonic() + 3
+while owned:
+    owned = {pid: start for pid, start in owned.items()
+             if (state := identity(pid)) and state[:2] == start and state[2] != 'Z'}
+    if time.monotonic() >= deadline:
+        for pid in owned:
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        break
+    if owned: time.sleep(.025)
+PY
+  for owned_pid in $clat_pid $iperf_pids $client_pids $release_pids $socket_sampler_pid; do
+    wait "$owned_pid" 2>/dev/null || true
+  done
   for owned_ns in $owned_namespaces; do ip netns del "$owned_ns" 2>/dev/null || true; done
   if test -n "$saved_rmem_max"; then
     sysctl -qw "net.core.rmem_max=$saved_rmem_max" "net.core.wmem_max=$saved_wmem_max" || {
@@ -404,7 +438,7 @@ cleanup_iperf_servers() {
 start_iperf_servers() {
   cleanup_iperf_servers
   for client_no in $(seq 1 "$CLIENTS"); do
-    exec_with_affinity "$SERVER_CPUSET" ip netns exec server env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
+    exec_with_affinity "$SERVER_CPUSET" ip netns exec server env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
       >"$ARTIFACT_DIR/iperf-server-$client_no.log" 2>&1 &
     iperf_pids="$iperf_pids $!"
   done
@@ -515,10 +549,10 @@ start_clients() {
       rm -f "$gate"
       mkfifo "$gate"
       printf '%s\n' "$gate" >> "$run_dir/gates"
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" \
         >"$run_dir/client-$client_no.json" 2>"$run_dir/client-$client_no.stderr" &
     else
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client env "LD_PRELOAD=${udp_drain_guard:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" >"$run_dir/client-$client_no.json" \
+      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" >"$run_dir/client-$client_no.json" \
         2>"$run_dir/client-$client_no.stderr" &
     fi
     printf '%s\n' "$!" >> "$run_dir/pids"
@@ -574,17 +608,40 @@ wait_clients() {
   return "$status"
 }
 
+prepare_iperf_start_gate() {
+  local run_dir=$1
+  iperf_start_control=
+  iperf_start_library=
+  if [ "$PROTOCOL" = udp ] && [ "$IPERF_START_GATE" = on ]; then
+    if ! test -r /usr/local/lib/tayga-perf/iperf-start-gate.so || ! test -x /usr/local/libexec/tayga-perf/iperf-start-control; then
+      echo 'iperf start helpers are missing; build/install make iperf-start-tools' >&2
+      return 1
+    fi
+    iperf_start_control="$run_dir/iperf-start.control"
+    iperf_start_library=/usr/local/lib/tayga-perf/iperf-start-gate.so
+    /usr/local/libexec/tayga-perf/iperf-start-control init "$iperf_start_control" "$((CLIENTS * 2))" || return 1
+    sha256sum "$iperf_start_library" > "$run_dir/iperf-start-gate.sha256"
+  fi
+}
+
 run_warmup() {
   local warmup_dir
   test "$WARMUP" -gt 0 || return 0
   warmup_dir="$ARTIFACT_DIR/warmup-$1"
   mkdir -p "$warmup_dir"
+  prepare_iperf_start_gate "$warmup_dir" || return 2
   start_iperf_servers || { echo "warmup server startup failed for $1" >&2; return 1; }
   start_clients "$warmup_dir" "$1" "$WARMUP" no
+  if test -n "$iperf_start_control"; then
+    /usr/local/libexec/tayga-perf/iperf-start-control wait-ready "$iperf_start_control" > "$warmup_dir/iperf-start.ready.json" || return 2
+    /usr/local/libexec/tayga-perf/iperf-start-control release "$iperf_start_control" > "$warmup_dir/iperf-start.released.json" || return 2
+  fi
   local w_status=0
   wait_clients "$warmup_dir" "$((WARMUP + 15))" || w_status=$?
   client_pids=
   cleanup_iperf_servers
+  iperf_start_control=
+  iperf_start_library=
   if [ "$w_status" -ne 0 ]; then
     echo "warmup failed for $1 (status $w_status)" >&2
     printf '%s\n' "warmup_failed" > "$warmup_dir/failed.marker"
@@ -597,9 +654,11 @@ run_iperf() {
   local direction=$1
   local run_dir="$ARTIFACT_DIR/$direction"
   mkdir -p "$run_dir"
-  if ! run_warmup "$direction"; then
+  if run_warmup "$direction"; then :; else
+    warmup_status=$?
     echo "Warmup failed for $direction; marking run as degraded" >&2
     printf '%s\n' "warmup_failed" > "$run_dir/warmup-failed.marker"
+    test "$warmup_status" -ne 2 || return 1
   fi
   drain_s=${RECEIVER_DRAIN_SECONDS:-0.5}
   drain_int=0
@@ -615,11 +674,19 @@ run_iperf() {
     udp_drain_guard=/usr/local/lib/tayga-perf/udp-drain-guard.so
     sha256sum /usr/local/lib/tayga-perf/udp-drain-guard.so > "$run_dir/udp-drain-guard.sha256"
   fi
+  prepare_iperf_start_gate "$run_dir" || return 1
   start_iperf_servers || return 1
   client_duration=$(( DURATION + drain_int ))
   start_clients "$run_dir" "$direction" "$client_duration" yes
   # Give every wrapper time to block on its FIFO before a common release.
   sleep 1
+  if test -n "$iperf_start_control"; then
+    release_pids=
+    while read -r gate; do printf 'go\n' > "$gate" & release_pids="$release_pids $!"; done < "$run_dir/gates"
+    for release_pid in $release_pids; do wait "$release_pid" || true; done
+    release_pids=
+    /usr/local/libexec/tayga-perf/iperf-start-control wait-ready "$iperf_start_control" > "$run_dir/iperf-start.ready.json" || return 1
+  fi
   : > "$run_dir/endpoint-affinity.before"
   for endpoint_pid in $client_pids $iperf_pids; do
     printf 'pid=%s\n' "$endpoint_pid" >> "$run_dir/endpoint-affinity.before"
@@ -674,10 +741,14 @@ run_iperf() {
   ip netns exec client ping -c "$((DURATION * 5))" -i 0.2 -W 1 11.0.0.2 > "$run_dir/ping.txt" 2>&1 &
   ping_pid=$!
   monotonic_traffic_start=$(monotonic_ns)
-  release_pids=
-  while read -r gate; do printf 'go\n' > "$gate" & release_pids="$release_pids $!"; done < "$run_dir/gates"
-  for release_pid in $release_pids; do wait "$release_pid" || true; done
-  release_pids=
+  if test -n "$iperf_start_control"; then
+    /usr/local/libexec/tayga-perf/iperf-start-control release "$iperf_start_control" > "$run_dir/iperf-start.released.json" || return 1
+  else
+    release_pids=
+    while read -r gate; do printf 'go\n' > "$gate" & release_pids="$release_pids $!"; done < "$run_dir/gates"
+    for release_pid in $release_pids; do wait "$release_pid" || true; done
+    release_pids=
+  fi
   if [ "$drain_int" -gt 0 ]; then
     sleep "$DURATION"
     if ! /usr/local/libexec/tayga-perf/udp-drain-control stop "$udp_drain_control" > "$run_dir/udp-drain.stop.json"; then
@@ -706,6 +777,8 @@ run_iperf() {
   cleanup_iperf_servers
   udp_drain_control=
   udp_drain_guard=
+  iperf_start_control=
+  iperf_start_library=
   if test -n "$ping_pid"; then
     wait "$ping_pid" || true
   fi
@@ -987,6 +1060,16 @@ for path in sorted(glob.glob(os.path.join(run_dir, "client-*.json"))):
         print(f"ERROR direction={direction} file={os.path.basename(path)} reason={exc}", file=sys.stderr)
         workload_errors.append(f"client report {os.path.basename(path)} error: {exc}")
 
+start_gate_status = None
+if protocol == "udp" and os.environ.get("IPERF_START_GATE", "on") == "on":
+    try:
+        start_gate_status = json.load(open(os.path.join(run_dir, "iperf-start.released.json")))
+        expected = 2 * int(os.environ["CLIENTS"])
+        if start_gate_status["expected"] != expected or start_gate_status["arrived"] != expected or start_gate_status["released"] != 1:
+            raise ValueError("not all endpoints reached the start gate")
+    except (OSError, ValueError, KeyError) as exc:
+        capture_errors.append(f"iperf start gate validation failed: {exc}")
+
 drain_status = None
 if protocol == "udp" and float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")) > 0:
     try:
@@ -1236,6 +1319,8 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               worker_metrics=worker_metrics,
               receiver_drain_guard_sha256=(open(os.path.join(run_dir, "udp-drain-guard.sha256")).read().split()[0] if drain_status else None),
               receiver_drain_method="udp-write-eagain-v1" if os.path.exists(os.path.join(run_dir, "udp-drain.status.json")) else "none",
+              iperf_start_gate=start_gate_status,
+              iperf_start_gate_sha256=(open(os.path.join(run_dir, "iperf-start-gate.sha256")).read().split()[0] if start_gate_status else None),
               receiver_drain_seconds=float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")),
               git_revision=revision,
               source_tree_sha256=source_tree_sha256,
@@ -1433,7 +1518,7 @@ printf 'pid=%s workers=%s clients=%s flows-per-client=%s protocol=%s rate-per-fl
 status=0
 for direction in $DIRECTIONS; do
   case "$direction" in
-    upload|download|bidir) run_iperf "$direction" || status=1;;
+    upload|download|bidir) run_iperf "$direction" || { status=1; break; };;
     *) echo "unknown direction: $direction" >&2; status=1;;
   esac
 done

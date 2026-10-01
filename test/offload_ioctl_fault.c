@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -15,6 +16,12 @@
 static int tun_fds[128];
 static int tun_fd_count;
 static int test_tun_io_ready;
+static unsigned burst_reads, burst_polls;
+
+static int burst_fd(int fd)
+{
+	return getenv("TAYGA_TEST_BURST") && tun_fd_count > 1 && fd == tun_fds[1];
+}
 
 static int is_test_tun_fd(int fd)
 {
@@ -88,6 +95,16 @@ ssize_t read(int fd, void *buffer, size_t size)
 	static ssize_t (*real_read)(int, void *, size_t);
 	if (!real_read)
 		real_read = dlsym(RTLD_NEXT, "read");
+	if (burst_polls && burst_fd(fd)) {
+		burst_reads++;
+		if (!strcmp(getenv("TAYGA_TEST_BURST"), "drain") && burst_reads == 33) {
+			errno = EAGAIN;
+			return -1;
+		}
+		if (size < 11) { errno = EINVAL; return -1; }
+		memset(buffer, 0, 11); /* Valid framing, deliberately unknown IP version. */
+		return 11;
+	}
 	if (test_tun_io_ready && getenv("TAYGA_TEST_TUN_READ_FAIL") && is_test_tun_fd(fd)) {
 		errno = EIO;
 		return -1;
@@ -100,6 +117,14 @@ int poll(struct pollfd *fds, nfds_t count, int timeout)
 	static int (*real_poll)(struct pollfd *, nfds_t, int);
 	if (!real_poll)
 		real_poll = dlsym(RTLD_NEXT, "poll");
+	if (count == 1 && burst_fd(fds[0].fd)) {
+		if (++burst_polls == 1) fds[0].revents = POLLIN;
+		else {
+			fprintf(stderr, "TEST_BURST_READS=%u\n", burst_reads);
+			fds[0].revents = POLLERR;
+		}
+		return 1;
+	}
 	if (getenv("TAYGA_TEST_TUN_READ_FAIL")) {
 		for (nfds_t i = 0; i < count; i++) {
 			if (is_test_tun_fd(fds[i].fd)) {

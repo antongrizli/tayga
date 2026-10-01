@@ -192,7 +192,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install
@@ -278,3 +278,10 @@ tools/udp-drain-guard.so: tools/udp-drain-guard.c
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -o $@ $< -ldl
 tools/udp-drain-control: tools/udp-drain-guard.c
 	$(CC) -O2 -Wall -Wextra -DUDP_DRAIN_CONTROLLER -o $@ $<
+
+.PHONY: iperf-start-tools
+iperf-start-tools: tools/iperf-start-gate.so tools/iperf-start-control
+tools/iperf-start-gate.so: tools/iperf-start-gate.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -ldl
+tools/iperf-start-control: tools/iperf-start-gate.c
+	$(CC) $(CFLAGS) -DIPERF_GATE_CONTROLLER -o $@ $<

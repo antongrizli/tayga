@@ -23,6 +23,25 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 static int tun_owner_lock = -1;
+/* Build-only research candidate; normal builds keep existing TUN semantics.
+ * IFF_NAPI must be identical on initial, fallback and worker attachments.
+ * Unsupported kernels fail initialization; this is never silently enabled. */
+#ifdef TAYGA_EXPERIMENTAL_NAPI
+#define TAYGA_TUN_BASE_FLAGS (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_NAPI)
+static int tun_verify_napi(int fd, int queue)
+{
+	struct ifreq actual;
+	memset(&actual, 0, sizeof(actual));
+	if (ioctl(fd, TUNGETIFF, &actual) < 0 || !(actual.ifr_flags & IFF_NAPI)) {
+		slog(LOG_CRIT, "Experimental TUN NAPI queue %d could not be verified\n", queue);
+		return -1;
+	}
+	slog(LOG_INFO, "Experimental TUN NAPI verified on queue %d\n", queue);
+	return 0;
+}
+#else
+#define TAYGA_TUN_BASE_FLAGS (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE)
+#endif
 #define TCP_OFFLOAD_FLAGS (TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6)
 #define UDP_OFFLOAD_FLAGS (TCP_OFFLOAD_FLAGS | TUN_F_USO4 | TUN_F_USO6)
 
@@ -560,7 +579,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 	if (want_vnet) {
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	}
@@ -573,7 +592,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 				strerror(errno));
 			want_vnet = 0;
 			gcfg.vnet_hdr_sz = 0;
-			ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
@@ -604,6 +623,9 @@ int tun_setup(int do_mktun, int do_rmtun)
 	fd = -1;
 	memset(&ifr, 0, sizeof(ifr));
 	if (ioctl(gcfg.tun_fd, TUNGETIFF, &ifr) < 0) goto setup_fail;
+	#ifdef TAYGA_EXPERIMENTAL_NAPI
+	if (!do_rmtun && tun_verify_napi(gcfg.tun_fd, -1) < 0) goto setup_fail;
+#endif
 	want_vnet = !!(ifr.ifr_flags & IFF_VNET_HDR);
 	gcfg.vnet_hdr_sz = 0;
 	if (want_vnet && !do_rmtun) {
@@ -707,7 +729,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	}
 	/* Setup multiqueue additional queues */
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 	if (gcfg.vnet_hdr_sz > 0)
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	strcpy(ifr.ifr_name, gcfg.tundev);
@@ -724,6 +746,9 @@ int tun_setup(int do_mktun, int do_rmtun)
 					"%s\n", gcfg.tundev, strerror(errno));
 			goto setup_fail;
 		}
+#ifdef TAYGA_EXPERIMENTAL_NAPI
+		if (tun_verify_napi(gcfg.tun_fd_addl[i], i) < 0) goto setup_fail;
+#endif
 		if (gcfg.vnet_hdr_sz) {
 			int size = 0;
 			if (ioctl(gcfg.tun_fd_addl[i], TUNGETVNETHDRSZ, &size) < 0 || size != gcfg.vnet_hdr_sz) {
