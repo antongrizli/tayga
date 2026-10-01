@@ -65,6 +65,7 @@ void usage(int code) {
 			"--rmtun            : Remove the persistent TUN interface\n"
 			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
+			"--tun-steering MODE: kernel (default) or experimental groups (fresh disposable Linux TUN only)\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
 	exit(code);
@@ -378,6 +379,7 @@ int main(int argc, char **argv)
 		{ "debug", 0, 0, 'd' },
 		{ "tun-offload", 1, 0, 1001 },
 		{ "check-offload", 0, 0, 1002 },
+		{ "tun-steering", 1, 0, 1003 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -388,6 +390,14 @@ int main(int argc, char **argv)
 		if (c == -1)
 			break;
 		switch (c) {
+		case 1003:
+#ifndef __linux__
+			if (strcmp(optarg, "kernel")) die("Experimental steering requires Linux");
+#endif
+			if (!strcmp(optarg, "kernel")) gcfg.tun_steering_groups = 0;
+			else if (!strcmp(optarg, "groups")) gcfg.tun_steering_groups = 1;
+			else die("Invalid --tun-steering: use kernel or groups");
+			break;
 		case 1002:
 			return tun_check_offload_support();
 		case 1001:

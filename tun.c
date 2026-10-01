@@ -17,11 +17,13 @@
  */
 #include "tayga.h"
 #include "stats.h"
+#include "packet_io.h"
 #if defined(__linux__)
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include "tun_steering.h"
 static int tun_owner_lock = -1;
 /* Build-only research candidate; normal builds keep existing TUN semantics.
  * IFF_NAPI must be identical on initial, fallback and worker attachments.
@@ -553,6 +555,12 @@ int tun_setup(int do_mktun, int do_rmtun)
 	struct tun_saved_config *saved = NULL;
 	int attached_queues = 0;
 	int created_persistent = 0;
+	/* No existing interface/BPF attachment is replaced. On last close this
+	 * disposable device and its maps disappear, including after SIGKILL. */
+	if (gcfg.tun_steering_groups && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
+		slog(LOG_CRIT, "Experimental group steering requires a fresh disposable TUN device\n");
+		return ERROR_REJECT;
+	}
 	int want_vnet = !do_rmtun && gcfg.tun_offload != TUN_OFFLOAD_OFF;
 
 	gcfg.tun_fd = -1;
@@ -580,6 +588,9 @@ int tun_setup(int do_mktun, int do_rmtun)
 
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
+	/* Atomic creation guard: the name check above alone cannot exclude a
+	 * device created by another owner between the check and TUNSETIFF. */
+	if (gcfg.tun_steering_groups) ifr.ifr_flags |= IFF_TUN_EXCL;
 	if (want_vnet) {
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	}
@@ -593,6 +604,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			want_vnet = 0;
 			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
+			if (gcfg.tun_steering_groups) ifr.ifr_flags |= IFF_TUN_EXCL;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
@@ -783,6 +795,25 @@ int tun_setup(int do_mktun, int do_rmtun)
 	if (gcfg.tun_offload_effective == TUN_OFFLOAD_OFF && gcfg.tun_offload == TUN_OFFLOAD_AUTO) {
 		slog(LOG_WARNING, "TUN fallback to offload=off (retaining negotiated framing)\n");
 	}
+	/* Finalize queue indices before publishing the interface to traffic. */
+	if (gcfg.workers > 0) {
+		memset(&ifr, 0, sizeof(ifr));
+		ifr.ifr_flags = IFF_DETACH_QUEUE;
+		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, &ifr) < 0) goto setup_fail;
+	}
+	if (gcfg.tun_steering_groups) {
+		char verifier[16384] = {0};
+		int program = steering_program(gcfg.workers > 0 ? gcfg.workers : 1, verifier, sizeof(verifier));
+		int active_fd = gcfg.workers > 0 ? gcfg.tun_fd_addl[0] : gcfg.tun_fd;
+		if (program >= 0) {
+			if (!ioctl(active_fd, TUNSETSTEERINGEBPF, &program)) gcfg.tun_steering_effective = 1;
+			else gcfg.tun_steering_errno = errno;
+			close(program);
+		} else gcfg.tun_steering_errno = errno;
+		if (!gcfg.tun_steering_effective)
+			slog(LOG_WARNING, "Group steering unavailable; retaining kernel steering: %s; verifier: %.400s\n", strerror(gcfg.tun_steering_errno), verifier);
+	}
+	slog(LOG_INFO, "TUN steering requested=%s effective=%s\n", gcfg.tun_steering_groups ? "groups" : "kernel", gcfg.tun_steering_effective ? "groups" : "kernel");
 	/* Bring tun device up */
 	if(gcfg.tun_up || restore_up) {
 		if(netlink_set_if_flags(ifidx,IFF_UP,IFF_UP)) goto setup_fail;
@@ -835,16 +866,6 @@ int tun_setup(int do_mktun, int do_rmtun)
 	}
 
 
-	/* Disable queue of main tun if we have >0 workers */
-	if(gcfg.workers > 0) {
-		memset(&ifr, 0, sizeof(ifr));
-		ifr.ifr_flags = IFF_DETACH_QUEUE;
-		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, (void *)&ifr) < 0) {
-			slog(LOG_CRIT, "Unable to detach main TUN queue: %s\n", strerror(errno));
-			goto setup_fail;
-		}
-	}
-
 	if (gcfg.tun_offload_flags) {
 		if (gcfg.tun_has_uso)
 			slog(LOG_INFO, "TUN offload active: vnet_hdr_sz=%d, TSO4|TSO6|CSUM|USO4|USO6 (experimental UDP USO)\n", gcfg.vnet_hdr_sz);
@@ -870,6 +891,7 @@ setup_fail:
 	gcfg.tun_fd = -1;
 	gcfg.tun_offload_complete = 0;
 	if (tun_owner_lock >= 0) close(tun_owner_lock);
+	gcfg.tun_steering_effective = 0;
 	tun_owner_lock = -1;
 	return ERROR_REJECT;
 }
@@ -1076,7 +1098,7 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 		total_len += iov[i].iov_len;
 
 	for (int attempt = 0; attempt < 5; attempt++) {
-		ret = writev(tun_fd, iov, iovcnt);
+		ret = packet_io_transmit(tun_fd, iov, iovcnt);
 		if (likely(ret == (ssize_t)total_len)) {
 			int ip_idx = 0;
 			if (gcfg.vnet_hdr_sz > 0 && iov[0].iov_len == (size_t)gcfg.vnet_hdr_sz)
@@ -1146,7 +1168,10 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 		read_len += gcfg.vnet_hdr_sz;
 	}
 
-	ret = read(tun_fd, read_ptr, read_len);
+	struct packet_io_buffer input = {.data=read_ptr, .capacity=read_len,
+		.owner=PACKET_IO_BORROWED, .headroom=(size_t)(read_ptr-recv_buf),
+		.ingress_fd=tun_fd, .features=gcfg.tun_offload_flags};
+	ret = packet_io_receive(tun_fd, &input);
 	if (unlikely(ret < 0)) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return TUN_READ_WOULDBLOCK;

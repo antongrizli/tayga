@@ -136,6 +136,10 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "  \"pref64\": \"%s\",\n", prefix_buf);
 	fprintf(f, "  \"pref64_source\": \"%s\",\n", pref64_source);
 	fprintf(f, "  \"offload_mode\": \"%s\",\n", offload_str);
+	fprintf(f, "  \"steering_requested\": \"%s\",\n", gcfg.tun_steering_groups ? "groups" : "kernel");
+	fprintf(f, "  \"steering_effective\": \"%s\",\n", gcfg.tun_steering_effective ? "groups" : "kernel");
+	fprintf(f, "  \"steering_fallback_errno\": %d,\n", gcfg.tun_steering_errno);
+	fprintf(f, "  \"steering_buckets\": %u,\n", gcfg.tun_steering_effective ? 65536 : 0);
 	fprintf(f, "  \"offload_effective\": \"%s\",\n", tun_offload_name(gcfg.tun_offload_effective));
 	fprintf(f, "  \"offload_flags\": %u,\n", gcfg.tun_offload_flags);
 	fprintf(f, "  \"udp_offload_available\": %s,\n", gcfg.tun_has_uso ? "true" : "false");

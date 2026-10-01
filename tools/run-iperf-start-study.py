@@ -52,6 +52,14 @@ def main():
             row=dict(case=label,protocol=protocol,gate=gate,mode=mode,scope=scope,direction=direction,status=status,path=str(path),result=result)
             rows.append(row);current.append(row)
         (root/'ledger.json').write_text(json.dumps(rows,indent=2)+'\n')
+        if mode=='record':
+            for row in current:
+                if not row['result'].get('capture_valid'): continue
+                target=folder/row['direction']
+                with (target/'perf-report.txt').open('w') as report, (target/'perf-report-diagnostics.txt').open('w') as diagnostics:
+                    subprocess.run(['perf','report','--stdio','--no-children','--call-graph','none','--percent-limit','0.5','--sort','symbol,dso','-i',str(target/'perf.data')],stdout=report,stderr=diagnostics,check=True)
+        if protocol=='tcp' and not all(r['result'].get('capture_valid') and r['result'].get('workload_valid') and r['result'].get('acceptance_pass') for r in current):
+            raise RuntimeError('TCP regression did not pass capture/workload/acceptance gates')
         if gate=='on' and protocol=='udp' and drain!='0' and not all(r['result'].get('capture_valid') and r['result'].get('workload_valid') for r in current):
             raise RuntimeError('gated workload incomplete; stop and investigate')
     if not a.validation_only:

@@ -21,6 +21,7 @@ unit_conffile.conf
 unit_checksum
 unit_ip4_id
 unit_tun
+unit_packet_io
 unit_gso
 unit_pref64
 unit_stats

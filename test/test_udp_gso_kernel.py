@@ -201,7 +201,19 @@ def run_group(args, mode, workers, mtu, direction, root):
         cfg.write_text(f"tun-device usotun\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8:64::1\n"
                        f"prefix 64:ff9b::/96\nwkpf-strict no\nmap {ADDR4} {ADDR6}\n"
                        f"workers {workers}\ntun-offload {mode}\nofflink-mtu {mtu}\n")
-        ns_command(trans, args.binary, "-c", cfg, "--mktun")
+        if args.steering == "groups":
+            # Fresh disposable TUN is mandatory for the experimental policy.
+            # Configure the test MTU/routes after negotiation; offlink-mtu is
+            # already fixed in the daemon configuration before startup.
+            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg), "--tun-steering=groups"],
+                                      stdout=log_fd, stderr=log_fd)
+            for _ in range(100):
+                if "requested=groups effective=groups" in log.read_text(): break
+                assert daemon.poll() is None, log.read_text()
+                time.sleep(.05)
+            else: raise AssertionError("experimental steering not activated")
+        else:
+            ns_command(trans, args.binary, "-c", cfg, "--mktun")
         command("ip", "-n", trans, "link", "set", "usotun", "mtu", mtu, "up")
         if direction == "upload":
             source_in, dest_in, family_in = ADDR4, PEER4, 4
@@ -217,8 +229,9 @@ def run_group(args, mode, workers, mtu, direction, root):
             command("ip", "-n", trans, "-6", "route", "add", ADDR6 + "/128", "dev", "usotun")
             command("ip", "-n", trans, "route", "add", ADDR4 + "/32", "via", "10.23.0.2", "dev", "out0")
             command("ip", "-n", recv, "addr", "add", ADDR4 + "/32", "dev", "lo")
-        daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg)],
-                                  stdout=log_fd, stderr=log_fd)
+        if daemon is None:
+            daemon = subprocess.Popen(["ip", "netns", "exec", trans, args.binary, "-d", "-c", str(cfg)],
+                                      stdout=log_fd, stderr=log_fd)
         time.sleep(0.15)
         assert daemon.poll() is None, log.read_text()
         before = {}
@@ -305,6 +318,7 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="/usr/sbin/tayga")
+    parser.add_argument("--steering", choices=("kernel", "groups"), default="kernel")
     parser.add_argument("--output", required=True)
     parser.add_argument("--modes", nargs="+", choices=("off", "tcp", "auto", "udp"), default=["udp"])
     parser.add_argument("--workers", nargs="+", type=int, default=[0, 3])
@@ -318,6 +332,8 @@ def main():
     args.binary = str(Path(args.binary).resolve())
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=False)
+    (root / 'test-runner.py').write_bytes(Path(__file__).read_bytes())
+    (root / 'settings.json').write_text(json.dumps(vars(args), indent=2))
     binary_hash = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
     results = []
     try:
@@ -329,7 +345,7 @@ def main():
     finally:
         # Include cases completed before a later case in the same group failed.
         results = [json.loads(p.read_text()) for p in sorted(root.glob("*/*/result.json"))]
-        (root / "summary.json").write_text(json.dumps({"binary": args.binary, "binary_sha256": binary_hash,
+        (root / "summary.json").write_text(json.dumps({"binary": args.binary, "binary_sha256": binary_hash, "steering": args.steering,
                     "kernel": command("uname", "-a").stdout.strip(), "completed_cases": len(results),
                     "results": results}, indent=2) + "\n")
     print(f"All {len(results)} kernel UDP cases passed. Artifacts: {root}")

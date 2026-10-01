@@ -151,3 +151,90 @@ separate process/system profiles. It requires explicit source identity of the
 unchanged installed TAYGA executable. Invalid original workloads are retained,
 not pooled with complete ones. A no-drain result-exchange failure is retained as
 a separate observation; it is not considered fixed by initialization readiness.
+
+`sudo python3 test/test_benchmark_start_gate_failure.py` injects a missing warmup
+participant, verifies bounded failure, stops the next direction and checks cleanup.
+Use an otherwise idle guest; `IPERF_START_FAILURE_OUTPUT` can retain its artifacts.
+
+### Final-result control tracing and retained server logs
+
+`tools/run-iperf-read-diagnostic.py --start-gate on --clients 4` performs bounded,
+maximum-load diagnostic comparisons with and without receiver drain. Its optional
+`--benchmark` freezes the selected benchmark into the artifact directory. Supply
+`--git-revision` and `--source-tree-sha256` from the installed TAYGA executable's
+verified build, rather than from a different current checkout. Instrumented runs
+are excluded from capacity comparisons.
+
+The preload diagnostic records TCP control read lengths, short/EOF/error results
+and exchange begin/end timestamps while preserving syscall results and errno.
+Server logs are stored inside each warmup/direction directory. Run
+`python3 test/test_iperf_read_diagnostic.py` on Linux and
+`python3 test/test_iperf_server_logs.py` for evidence-preservation regressions.
+See [the result-exchange investigation](../docs/UDP-RESULT-EXCHANGE-INVESTIGATION-2026-10-01.md)
+and [the backend design](../docs/TUN-BACKEND-OPTIMISATION-DESIGN-2026-10-01.md).
+
+`--control-only` avoids socket-type queries on successful UDP data reads and logs
+TCP framing select results and iperf state transitions. Four diagnostic tests cover
+errno, timeout/EOF/short reads and the absence of UDP socket queries.
+
+`python3 test/test_udp_common_stop.py` checks that zero-drain UDP stops at the
+common measurement boundary before result exchange, validates stop/attachment
+state and allows zero blocked writes when senders finish naturally. TCP retains
+its normal end sequence. See [the common-stop fix](../docs/UDP-COMMON-STOP-FIX-2026-10-01.md).
+
+### Matched TCP benchmark and worker distribution
+
+`tools/run-tcp-worker-study.py` requires Linux root, explicit before/after benchmark
+scripts, a new output folder and the source identity of the measured installed
+TAYGA executable. It freezes both scripts and holds the workflow lock. Three
+alternating one-worker A/B pairs precede three balanced-order rounds with
+1/2/3 workers. All capacity directions use four TCP clients, one flow each,
+RATE=0, identical settings and no profiler. Separate process/system perf captures
+follow for one and three workers. Incomplete TCP captures/workloads or acceptance
+failures stop the study and preserve evidence.
+
+Client tuples and worker counters are retained. Tuples are recorded, not fixed;
+this reveals natural queue variability rather than isolating worker count from
+flow hash placement. `tools/summarize-tcp-worker-study.py OUTPUT` rejects missing
+or duplicated groups, mixed executable identities, capped traffic and mismatched
+treatment metadata. Worker shares use IPv4 input for upload and IPv6 input for
+download, excluding the main slot and the opposite-family ACK input. They count
+input frames, including aggregates; they are not byte or CPU shares.
+
+Run `python3 test/test_tcp_worker_study.py` for schedule/summary tests.
+
+### TCP flow count and CPU placement
+
+`tools/run-tcp-flow-study.py` freezes the installed benchmark and runner, holds
+the workflow lock and records all connection tuples and daemon/startup hashes.
+It alternates four and sixteen streams over three pairs at two and three
+workers. Capacity uses RATE=0 without profiling. Ports are recorded rather
+than fixed; distribution represents natural kernel placement.
+
+Use `tools/summarize-tcp-flow-study.py OUTPUT` to validate the complete matrix,
+workload settings, executable identity, stream counts and all acceptance gates.
+A change in stream count is a workload change, not an implementation speedup.
+
+The runner's `--placement-study` option requires four guest CPUs and uses
+sixteen streams throughout. It alternates unrestricted scheduler affinity with
+partitioned process affinity. Two workers use CPUs 0,1, with client CPU 2 and
+server CPU 3. Three workers use CPUs 0,1,2; both endpoints share CPU 3. These
+are explicit experimental layouts, not defaults or kernel steering settings.
+Separate process/system profiles follow capacity runs for each treatment.
+`tools/summarize-tcp-placement-study.py OUTPUT` rejects missing profiles,
+incomplete pairs and unexpected affinity, and keeps profiles out of capacity
+statistics. Degraded complete profiles remain labelled as diagnostics; capacity
+requires all acceptance gates. `--resume` verifies frozen identities/settings,
+retains the original runner and records the resumed runner, refusing partial
+cases and rejected capacity. Run `python3 test/test_tcp_flow_study.py` for eight
+validation tests.
+
+### Experimental address-group steering and reference adapter
+
+`--tun-steering=kernel` is the default. Linux-only `--tun-steering=groups` requires a fresh disposable TUN and is an experimental address-pair policy; it failed the measured CLAT throughput gate. See [implementation and results](../docs/TUN-STEERING-AND-REFERENCE-ADAPTER-IMPLEMENTATION-2026-10-01.md).
+
+`make test` includes `unit_packet_io`. On Linux as root, run `python3 test/test_tun_steering.py` for real queue ordering/concurrency/descriptor-pressure tests, and `python3 test/test_tun_steering_lifecycle.py /path/to/frozen/tayga` for reload, termination, existing-device rejection and fallback. Both reserve the workflow lock. UDP wire tests accept `--steering groups` in addition to the default kernel policy.
+
+In the prepared guest, `sudo python3 tools/run-tun-steering-study.py --candidate /path/to/frozen/tayga --revision BUILD_REVISION --source-sha SOURCE_SNAPSHOT_SHA --output /tmp/new-steering-study` captures unrestricted alternating capacity and separate perf sessions, restoring installed files on exit. `--reference-only` selects sixteen-stream TCP pairs; `--verification-only` selects final-image kernel/groups TCP/UDP checks; `--profiles-only --kernel-only` selects final production-policy profiles. Use immutable sources and new output directories. Resume only with matching frozen identities/settings. UDP zero-loss rejection is preserved. Run `python3 tools/summarize-tun-steering-study.py /tmp/new-steering-study` to validate and summarize.
+
+`sudo python3 tools/run-steering-integrity.py --binary /path/to/frozen/tayga --output /tmp/new-steering-integrity` temporarily installs the selected image for TCP/UDP integrity and PMTU checks, then restores the original files. `python3 test/test_tun_steering_study.py` validates the measurement tooling. These experiments require serialized use of the prepared Linux guest.

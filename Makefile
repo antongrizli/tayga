@@ -119,12 +119,13 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats
+test: unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io
 	./unit_conffile
 	./unit_checksum
 	./unit_udp_checksum
 	./unit_ip4_id
 	./unit_tun
+	./unit_packet_io
 	./unit_gso
 	./unit_pref64
 	./unit_stats
@@ -149,6 +150,11 @@ unit_ip4_id: test/unit_ip4_id.c nat64.c addrmap.c dynamic.c gso.c tun.c log.c st
 
 unit_tun: test/unit_tun.c tun.c log.c stats.c tayga.h stats.h
 	$(CC) $(CFLAGS) -I. -pthread -o unit_tun test/unit_tun.c tun.c log.c stats.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS) -lpthread
+
+unit_packet_io: test/unit_packet_io.c packet_io.h
+	$(CC) $(CFLAGS) -I. -o $@ test/unit_packet_io.c
+
+tayga unit_tun unit_gso unit_ip4_id unit_udp_checksum: packet_io.h tun_steering.h
 
 unit_gso: test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c tayga.h gso.h stats.h
 	$(CC) $(CFLAGS) -I. -pthread -o unit_gso test/unit_gso.c gso.c addrmap.c dynamic.c nat64.c tun.c log.c stats.c $(LDFLAGS) -lpthread
@@ -192,7 +198,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
+	$(RM) unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install

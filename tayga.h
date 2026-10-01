@@ -421,6 +421,9 @@ struct config {
 	pthread_mutex_t map_mutex;
 	pthread_t threads[MAX_WORKERS];
 	int tun_fd_addl[MAX_WORKERS];
+	int tun_steering_groups; /* opt-in, fresh nonpersistent interfaces only */
+	int tun_steering_effective;
+	int tun_steering_errno;
 
 	//Offload parameters
 	enum tun_offload_mode tun_offload; /* requested policy */

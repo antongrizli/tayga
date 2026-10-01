@@ -436,10 +436,12 @@ cleanup_iperf_servers() {
 }
 
 start_iperf_servers() {
+  local server_log_dir=${1:-$ARTIFACT_DIR}
+  mkdir -p "$server_log_dir"
   cleanup_iperf_servers
   for client_no in $(seq 1 "$CLIENTS"); do
     exec_with_affinity "$SERVER_CPUSET" ip netns exec server env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
-      >"$ARTIFACT_DIR/iperf-server-$client_no.log" 2>&1 &
+      >"$server_log_dir/iperf-server-$client_no.log" 2>&1 &
     iperf_pids="$iperf_pids $!"
   done
   # iperf3 binds each port asynchronously. Wait for every listener instead of
@@ -630,7 +632,7 @@ run_warmup() {
   warmup_dir="$ARTIFACT_DIR/warmup-$1"
   mkdir -p "$warmup_dir"
   prepare_iperf_start_gate "$warmup_dir" || return 2
-  start_iperf_servers || { echo "warmup server startup failed for $1" >&2; return 1; }
+  start_iperf_servers "$warmup_dir" || { echo "warmup server startup failed for $1" >&2; return 1; }
   start_clients "$warmup_dir" "$1" "$WARMUP" no
   if test -n "$iperf_start_control"; then
     /usr/local/libexec/tayga-perf/iperf-start-control wait-ready "$iperf_start_control" > "$warmup_dir/iperf-start.ready.json" || return 2
@@ -667,7 +669,9 @@ run_iperf() {
   fi
   udp_drain_control=
   udp_drain_guard=
-  if test "$drain_int" -gt 0; then
+  # Stop every UDP sender at the common end, even without an added drain.
+  # Reverse servers otherwise keep flooding while TCP TEST_END is delayed.
+  if [ "$PROTOCOL" = udp ]; then
     test -r /usr/local/lib/tayga-perf/udp-drain-guard.so || return 1
     udp_drain_control="$run_dir/udp-drain.control"
     /usr/local/libexec/tayga-perf/udp-drain-control init "$udp_drain_control" || return 1
@@ -675,7 +679,7 @@ run_iperf() {
     sha256sum /usr/local/lib/tayga-perf/udp-drain-guard.so > "$run_dir/udp-drain-guard.sha256"
   fi
   prepare_iperf_start_gate "$run_dir" || return 1
-  start_iperf_servers || return 1
+  start_iperf_servers "$run_dir" || return 1
   client_duration=$(( DURATION + drain_int ))
   start_clients "$run_dir" "$direction" "$client_duration" yes
   # Give every wrapper time to block on its FIFO before a common release.
@@ -749,16 +753,20 @@ run_iperf() {
     for release_pid in $release_pids; do wait "$release_pid" || true; done
     release_pids=
   fi
-  if [ "$drain_int" -gt 0 ]; then
+  if [ "$PROTOCOL" = udp ]; then
     sleep "$DURATION"
     if ! /usr/local/libexec/tayga-perf/udp-drain-control stop "$udp_drain_control" > "$run_dir/udp-drain.stop.json"; then
-      echo "failed to suppress UDP sender during drain" >&2
-      printf 'failed to suppress UDP sender during drain\n' >> "$run_dir/capture_errors.txt"
+      echo "failed to stop UDP senders at measurement end" >&2
+      printf 'failed to stop UDP senders at measurement end\n' >> "$run_dir/capture_errors.txt"
     fi
     monotonic_traffic_end=$(monotonic_ns)
     sleep "$drain_s"
     if wait_clients "$run_dir"; then status=0; else status=$?; fi
-    monotonic_drain_end=$(monotonic_ns)
+    if [ "$drain_int" -gt 0 ]; then
+      monotonic_drain_end=$(monotonic_ns)
+    else
+      monotonic_drain_end=$monotonic_traffic_end
+    fi
   else
     if wait_clients "$run_dir"; then status=0; else status=$?; fi
     monotonic_traffic_end=$(monotonic_ns)
@@ -1071,10 +1079,11 @@ if protocol == "udp" and os.environ.get("IPERF_START_GATE", "on") == "on":
         capture_errors.append(f"iperf start gate validation failed: {exc}")
 
 drain_status = None
-if protocol == "udp" and float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")) > 0:
+if protocol == "udp":
     try:
-        drain_status = json.load(open(os.path.join(run_dir, "udp-drain.status.json")))
-        if drain_status["stopped"] != 1 or drain_status["attached"] < 2 * int(os.environ["CLIENTS"]) or drain_status["blocked_writes"] <= 0:
+        with open(os.path.join(run_dir, "udp-drain.status.json")) as status_file:
+            drain_status = json.load(status_file)
+        if drain_status["stopped"] != 1 or drain_status["attached"] < 2 * int(os.environ["CLIENTS"]) or (float(os.environ.get("RECEIVER_DRAIN_SECONDS", "0.5")) > 0 and drain_status["blocked_writes"] <= 0):
             raise ValueError("drain guard did not attach and suppress UDP writes")
     except (OSError, ValueError, KeyError) as exc:
         capture_errors.append(f"UDP drain validation failed: {exc}")
