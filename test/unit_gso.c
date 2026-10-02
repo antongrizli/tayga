@@ -1523,6 +1523,11 @@ static void test_partial_udp_fragmentation(void)
     gcfg.tun_offload_effective = TUN_OFFLOAD_TCP;
 	gcfg.mtu = 1280;
 	gcfg.ipv6_offlink_mtu = 1280;
+	/* The real packet handler emits a BSD TUN family header before IPv6. */
+	size_t ip_offset = gcfg.vnet_hdr_sz;
+#ifndef __linux__
+	ip_offset += sizeof(struct tun_pi);
+#endif
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 	uint8_t buf[HEADROOM + 20 + 1508] = {0};
@@ -1551,10 +1556,10 @@ static void test_partial_udp_fragmentation(void)
 	size_t total = 0;
 	for (int i = 0; i < 2; i++) {
 		ssize_t n = recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT);
-		assert(n > gcfg.vnet_hdr_sz + 48);
+		assert(n > (ssize_t)(ip_offset + 48));
 		struct virtio_net_hdr_raw *vh = (void *)rx;
 		assert(!(vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM));
-		struct ip6 *ip6 = (void *)(rx + gcfg.vnet_hdr_sz);
+		struct ip6 *ip6 = (void *)(rx + ip_offset);
 		translated = *ip6;
 		assert(ip6->next_header == 44);
 		struct ip6_frag *frag = (void *)(ip6 + 1);

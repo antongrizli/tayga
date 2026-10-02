@@ -96,6 +96,11 @@ void test_config_compare(void) {
     expectl(gcfg.udp_cksum_mode, tcfg.udp_cksum_mode, "udp_cksum_mode");
     expectl(gcfg.tun_offload, tcfg.tun_offload, "tun_offload");
     expectl(gcfg.tun_up, tcfg.tun_up, "tun_up");
+    expectl(gcfg.dispatch_mode, tcfg.dispatch_mode, "dispatch_mode");
+    expectl(gcfg.async_tun, tcfg.async_tun, "async_tun");
+    expectl(gcfg.tun_steering_groups, tcfg.tun_steering_groups, "tun_steering_groups");
+    expectl(gcfg.tun_steering_effective, 0, "tun_steering_effective");
+    expectl(gcfg.tun_steering_errno, 0, "tun_steering_errno");
 
     /* Pointers in gcfg which are not touched by conffile.c */
     expectl(gcfg.tun_fd, 0, "tun_fd");
@@ -271,7 +276,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),2200,"sizeof");
+    expectl(sizeof(struct config),2256,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */

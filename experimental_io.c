@@ -13,7 +13,13 @@
 #define DISPATCH_FRAGMENTS 1024
 #define EXP_WORKERS 8
 #define ASYNC_FRAMES 64
+#ifdef DISPATCH_TEST_CLOCK
+/* Avoid libc clock symbol redirects (including musl's 32-bit time64 ABI). */
+extern uint64_t dispatch_test_seconds(void);
+static uint64_t mono_seconds(void) {return dispatch_test_seconds();}
+#else
 static uint64_t mono_seconds(void) {struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec;}
+#endif
 _Atomic uint64_t dispatch_drops, dispatch_held, dispatch_expired;
 _Atomic uint64_t async_accepted, async_completed, async_errors, async_pressure;
 struct fragment_entry {

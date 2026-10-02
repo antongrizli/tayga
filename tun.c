@@ -1179,10 +1179,12 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 			return TUN_READ_WOULDBLOCK;
 		if (errno == EINTR)
 			return TUN_READ_INTR;
+		int saved_errno = errno;
 		stats_error();
 		stats_packet_done();
 		slog(LOG_ERR, "received error when reading from tun "
-				"device: %s\n", strerror(errno));
+				"device: %s\n", strerror(saved_errno));
+		errno = saved_errno;
 		return TUN_READ_FATAL;
 	}
 	/* A full read buffer may have truncated a larger TUN frame. The allocation

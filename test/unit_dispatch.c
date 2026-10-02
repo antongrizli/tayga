@@ -3,8 +3,8 @@
 #include "flow_dispatch.h"
 #include <assert.h>
 struct config gcfg;
-static time_t clock_seconds=100;
-int __wrap_clock_gettime(clockid_t clock,struct timespec *out) {(void)clock;out->tv_sec=clock_seconds;out->tv_nsec=0;return 0;}
+static uint64_t clock_seconds=100;
+uint64_t dispatch_test_seconds(void) {return clock_seconds;}
 static void packet(uint8_t *b,unsigned port,unsigned id,unsigned fragment)
 {
 	memset(b,0,HEADROOM+64);uint8_t *p=b+HEADROOM;

@@ -158,7 +158,7 @@ unit_tun: test/unit_tun.c tun.c experimental_io.c log.c stats.c tayga.h stats.h
 	$(CC) $(CFLAGS) -I. -pthread -o unit_tun test/unit_tun.c tun.c experimental_io.c log.c stats.c -Wl,--wrap=write -Wl,--wrap=writev $(LDFLAGS) -lpthread
 
 unit_dispatch: test/unit_dispatch.c experimental_io.c flow_dispatch.h experimental_io.h packet_io_lifetime.h
-	$(CC) $(CFLAGS) -I. -o $@ test/unit_dispatch.c experimental_io.c stats.c log.c $(LDFLAGS) -pthread -Wl,--wrap=clock_gettime
+	$(CC) $(CFLAGS) -DDISPATCH_TEST_CLOCK -I. -o $@ test/unit_dispatch.c experimental_io.c stats.c log.c $(LDFLAGS) -pthread
 
 unit_async_tun: test/unit_async_tun.c experimental_io.c experimental_io.h packet_io_lifetime.h
 	$(CC) $(CFLAGS) -I. -o $@ test/unit_async_tun.c experimental_io.c stats.c log.c $(LDFLAGS) -pthread
