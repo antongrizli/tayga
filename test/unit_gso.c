@@ -15,6 +15,12 @@
 #include "gso.h"
 #include "stats.h"
 
+/* Offset the 10-byte virtio header by two bytes so IP/TCP headers are
+ * four-byte aligned, including packets with a four-byte BSD TUN header.
+ * Keep the receive capacity an array so sizeof still gives the buffer size. */
+#define RX_BUFFER(name, size) \
+    struct { alignas(4) uint8_t padding[2]; uint8_t data[size]; } name
+
 static inline void get_gso_snapshot(struct tayga_stats *s) {
 	stats_flush_worker();
 	stats_get_snapshot(s);
@@ -266,7 +272,7 @@ static void test_gso_translate_and_split(void)
 
 	/* Construct GSO packet: IPv6 + TCP + Payload */
 	/* 2 full segments (1400 each) + 1 tail segment (400 bytes) = 3200 bytes payload */
-	uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
+	alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
 	uint8_t *raw_pkt = pkt_buf + HEADROOM;
 	struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -320,11 +326,11 @@ static void test_gso_translate_and_split(void)
 	assert(s_curr.gso_split_tail_pkts == s_prev.gso_split_tail_pkts + 1);
 
 	/* Inspect Datagram 1: Head GSO aggregate */
-	uint8_t rx_buf[4096];
-	ssize_t n1 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+	RX_BUFFER(rx_buf, 4096);
+	ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 	assert(n1 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
 
-	struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf;
+	struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf.data;
 	assert(v1->gso_type == VIRTIO_NET_HDR_GSO_TCPV4);
 	assert(v1->gso_size == 1400);
 	assert(v1->hdr_len == sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
@@ -333,7 +339,7 @@ static void test_gso_translate_and_split(void)
 	assert(v1->csum_offset == 16);
 	assert(v1->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM);
 
-	struct ip4 *ip4_1 = (struct ip4 *)(rx_buf + 10);
+	struct ip4 *ip4_1 = (struct ip4 *)(rx_buf.data + 10);
 	assert(ip4_1->ver_ihl == 0x45);
 	assert(ntohs(ip4_1->length) == sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
 	assert(ip4_1->flags_offset == htons(IP4_F_DF)); /* DF=1 */
@@ -342,25 +348,25 @@ static void test_gso_translate_and_split(void)
 	assert(ip4_1->proto == IPPROTO_TCP);
 	assert(ip_checksum(ip4_1, sizeof(struct ip4)) == 0);
 
-	struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+	struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 	assert(tcp_1->seq == htonl(1000));
 	assert(tcp_1->flags == TCP_FLAG_ACK); /* FIN and PSH cleared */
 	uint16_t exp_seed = gso_calc_tcp_pseudo4(&ip4_1->src, &ip4_1->dest, sizeof(struct tcp_hdr) + 2800);
 	assert(ntohs(tcp_1->cksum) == exp_seed);
 
-	uint8_t *payload_1 = rx_buf + 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr);
+	uint8_t *payload_1 = rx_buf.data + 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr);
 	for (int i = 0; i < 2800; i++) {
 		assert(payload_1[i] == (uint8_t)(i & 0xff));
 	}
 
 	/* Inspect Datagram 2: Tail short packet */
-	ssize_t n2 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+	ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 	assert(n2 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 400);
 
-	struct virtio_net_hdr_raw *v2 = (struct virtio_net_hdr_raw *)rx_buf;
+	struct virtio_net_hdr_raw *v2 = (struct virtio_net_hdr_raw *)rx_buf.data;
 	assert(v2->gso_type == VIRTIO_NET_HDR_GSO_NONE);
 
-	struct ip4 *ip4_2 = (struct ip4 *)(rx_buf + 10);
+	struct ip4 *ip4_2 = (struct ip4 *)(rx_buf.data + 10);
 	assert(ip4_2->ver_ihl == 0x45);
 	assert(ntohs(ip4_2->length) == sizeof(struct ip4) + sizeof(struct tcp_hdr) + 400);
 	assert(ip4_2->flags_offset == 0); /* DF=0 because total length <= 1260 */
@@ -369,7 +375,7 @@ static void test_gso_translate_and_split(void)
 	assert(ip4_2->proto == IPPROTO_TCP);
 	assert(ip_checksum(ip4_2, sizeof(struct ip4)) == 0);
 
-	struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+	struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 	assert(tcp_2->seq == htonl(1000 + 2800)); /* seq advanced by 2800 */
 	assert(tcp_2->flags == (TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN)); /* flags preserved */
 
@@ -378,7 +384,7 @@ static void test_gso_translate_and_split(void)
 	                               ip4_checksum(ip4_2, tail_tcp_total_len, IPPROTO_TCP));
 	assert(tail_cksum == 0); /* Valid full TCP checksum */
 
-	uint8_t *payload_2 = rx_buf + 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr);
+	uint8_t *payload_2 = rx_buf.data + 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr);
 	for (int i = 0; i < 400; i++) {
 		assert(payload_2[i] == (uint8_t)((2800 + i) & 0xff));
 	}
@@ -398,7 +404,7 @@ static void test_gso_boundary_1260_1261(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 1220];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 1220];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -432,11 +438,11 @@ static void test_gso_boundary_1260_1261(void)
 		int res = gso_translate_tcp_6to4(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[2048];
-		ssize_t n = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, 2048);
+		ssize_t n = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n == 10 + 1260);
 
-		struct ip4 *ip4 = (struct ip4 *)(rx_buf + 10);
+		struct ip4 *ip4 = (struct ip4 *)(rx_buf.data + 10);
 		assert(ntohs(ip4->length) == 1260);
 		assert(ip4->flags_offset == 0); /* DF=0 per RFC 7915 §5.1 */
 		assert(ip4->ident != 0); /* Generated IPv4 ID */
@@ -450,7 +456,7 @@ static void test_gso_boundary_1260_1261(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 1221];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 1221];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -484,11 +490,11 @@ static void test_gso_boundary_1260_1261(void)
 		int res = gso_translate_tcp_6to4(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[2048];
-		ssize_t n = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, 2048);
+		ssize_t n = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n == 10 + 1261);
 
-		struct ip4 *ip4 = (struct ip4 *)(rx_buf + 10);
+		struct ip4 *ip4 = (struct ip4 *)(rx_buf.data + 10);
 		assert(ntohs(ip4->length) == 1261);
 		assert(ip4->flags_offset == htons(IP4_F_DF)); /* DF=1 per RFC 7915 §5.1 */
 		assert(ip4->ident == 0); /* ID=0 */
@@ -511,7 +517,7 @@ static void test_gso_tcp_options(void)
 	/* TCP header with 12 bytes options -> 32 bytes header (doff = 8) */
 	uint32_t tcp_hdr_len = 32;
 	uint32_t payload_len = 3200; /* 2*1400 + 400 */
-	uint8_t pkt_buf[HEADROOM + 40 + 32 + 3200];
+	alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 32 + 3200];
 	uint8_t *raw_pkt = pkt_buf + HEADROOM;
 	struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -556,24 +562,24 @@ static void test_gso_tcp_options(void)
 	assert(res == 0);
 
 	/* Head datagram */
-	uint8_t rx_buf[4096];
-	ssize_t n1 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+	RX_BUFFER(rx_buf, 4096);
+	ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 	assert(n1 == 10 + sizeof(struct ip4) + tcp_hdr_len + 2800);
 
-	struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf;
+	struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf.data;
 	assert(v1->hdr_len == sizeof(struct ip4) + tcp_hdr_len);
 	assert(v1->csum_start == sizeof(struct ip4));
 
-	struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+	struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 	assert((tcp_1->doff_res >> 4) * 4 == tcp_hdr_len);
 	uint8_t *opts_1 = (uint8_t *)tcp_1 + sizeof(struct tcp_hdr);
 	assert(memcmp(opts_1, opts, 12) == 0);
 
 	/* Tail datagram */
-	ssize_t n2 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+	ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 	assert(n2 == 10 + sizeof(struct ip4) + tcp_hdr_len + 400);
 
-	struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+	struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 	assert((tcp_2->doff_res >> 4) * 4 == tcp_hdr_len);
 	uint8_t *opts_2 = (uint8_t *)tcp_2 + sizeof(struct tcp_hdr);
 	assert(memcmp(opts_2, opts, 12) == 0);
@@ -589,7 +595,7 @@ static void test_gso_ipv4_options(void)
 	setup_test_mapping();
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
-	uint8_t pkt_buf[HEADROOM + 24 + sizeof(struct tcp_hdr) + 64] = {0};
+	alignas(4) uint8_t pkt_buf[HEADROOM + 24 + sizeof(struct tcp_hdr) + 64] = {0};
 	uint8_t *raw = pkt_buf + HEADROOM;
 	struct ip4 *ip4 = (struct ip4 *)raw;
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(raw + 24);
@@ -618,13 +624,13 @@ static void test_gso_ipv4_options(void)
 	p.vhdr.csum_start = 24;
 	p.vhdr.csum_offset = 16;
 	assert(gso_translate_tcp_4to6(&p) == 0);
-	uint8_t rx[256];
-	ssize_t n = recv(sv[1], rx, sizeof(rx), 0);
+	RX_BUFFER(rx, 256);
+	ssize_t n = recv(sv[1], rx.data, sizeof(rx.data), 0);
 	assert(n == 10 + sizeof(struct ip6) + sizeof(*tcp) + 64);
-	struct virtio_net_hdr_raw *vh = (void *)rx;
+	struct virtio_net_hdr_raw *vh = (void *)rx.data;
 	assert(vh->hdr_len == sizeof(struct ip6) + sizeof(*tcp) + 16);
 	assert(vh->csum_start == sizeof(struct ip6));
-	struct ip6 *ip6 = (void *)(rx + 10);
+	struct ip6 *ip6 = (void *)(rx.data + 10);
 	assert(ip6->next_header == IPPROTO_TCP);
 	struct tcp_hdr *out_tcp = (void *)((uint8_t *)ip6 + sizeof(*ip6));
 	assert(out_tcp->src_port == htons(12345));
@@ -634,7 +640,7 @@ static void test_gso_ipv4_options(void)
 	assert(memcmp((uint8_t *)out_tcp + sizeof(*tcp), expected_payload, sizeof(expected_payload)) == 0);
 
 	/* An unexpired LSRR option must not be translated. */
-	uint8_t source_route_buf[HEADROOM + 28 + sizeof(*tcp) + 8] = {0};
+	alignas(4) uint8_t source_route_buf[HEADROOM + 28 + sizeof(*tcp) + 8] = {0};
 	raw = source_route_buf + HEADROOM;
 	ip4 = (struct ip4 *)raw;
 	tcp = (struct tcp_hdr *)(raw + 28);
@@ -655,7 +661,7 @@ static void test_gso_ipv4_options(void)
 	p.vhdr.csum_start = 28;
 	p.vhdr.csum_offset = 16;
 	assert(gso_translate_tcp_4to6(&p) < 0);
-	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	assert(recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT) < 0);
 	/* Reject an IHL larger than the packet before reading its checksum. */
 	ip4->ver_ihl = 0x4f;
 	p.data_len = sizeof(struct ip4) + sizeof(*tcp);
@@ -676,7 +682,7 @@ static void test_gso_ecn_cwr(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -716,15 +722,15 @@ static void test_gso_ecn_cwr(void)
 		int res = gso_translate_tcp_6to4(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[4096];
+		RX_BUFFER(rx_buf, 4096);
 		/* Datagram 1: Head aggregate */
-		ssize_t n1 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n1 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 2800);
 
-		struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf;
+		struct virtio_net_hdr_raw *v1 = (struct virtio_net_hdr_raw *)rx_buf.data;
 		assert(v1->gso_type == (VIRTIO_NET_HDR_GSO_TCPV4 | VIRTIO_NET_HDR_GSO_ECN));
 
-		struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+		struct tcp_hdr *tcp_1 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 		/* Head MUST retain CWR, ECE, ACK, while FIN/PSH are cleared */
 		assert((tcp_1->flags & TCP_FLAG_CWR) != 0);
 		assert((tcp_1->flags & TCP_FLAG_ECE) != 0);
@@ -732,10 +738,10 @@ static void test_gso_ecn_cwr(void)
 		assert((tcp_1->flags & (TCP_FLAG_FIN | TCP_FLAG_PSH)) == 0);
 
 		/* Datagram 2: Tail short segment */
-		ssize_t n2 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n2 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 400);
 
-		struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+		struct tcp_hdr *tcp_2 = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 		/* Tail MUST CLEAR CWR per RFC 3168 §6.1.5, while retaining ECE, ACK, FIN, PSH */
 		assert((tcp_2->flags & TCP_FLAG_CWR) == 0);
 		assert((tcp_2->flags & TCP_FLAG_ECE) != 0);
@@ -753,7 +759,7 @@ static void test_gso_ecn_cwr(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
 		/* 2000 bytes payload with gso_size 1000 -> 2 segments (1000 + 1000) */
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 2000];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 2000];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -785,19 +791,19 @@ static void test_gso_ecn_cwr(void)
 		int res = gso_software_segment_and_send_6to4(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[2048];
+		RX_BUFFER(rx_buf, 2048);
 		/* Segment 1: offset == 0, carries CWR */
-		ssize_t n1 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n1 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 		assert((seg1_tcp->flags & TCP_FLAG_CWR) != 0);
 		assert((seg1_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg1_tcp->flags & (TCP_FLAG_FIN | TCP_FLAG_PSH)) == 0);
 
 		/* Segment 2: offset > 0, CWR cleared, FIN/PSH preserved */
-		ssize_t n2 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n2 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip4));
+		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
 		assert((seg2_tcp->flags & TCP_FLAG_CWR) == 0);
 		assert((seg2_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg2_tcp->flags & TCP_FLAG_FIN) != 0);
@@ -812,7 +818,7 @@ static void test_gso_ecn_cwr(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 20 + 20 + 2000];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 20 + 20 + 2000];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip4 *ip4 = (struct ip4 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip4));
@@ -845,19 +851,19 @@ static void test_gso_ecn_cwr(void)
 		int res = gso_software_segment_and_send_4to6(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[2048];
+		RX_BUFFER(rx_buf, 2048);
 		/* Segment 1: offset == 0, carries CWR */
-		ssize_t n1 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n1 == 10 + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip6));
+		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip6));
 		assert((seg1_tcp->flags & TCP_FLAG_CWR) != 0);
 		assert((seg1_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg1_tcp->flags & (TCP_FLAG_FIN | TCP_FLAG_PSH)) == 0);
 
 		/* Segment 2: offset > 0, CWR cleared, FIN/PSH preserved */
-		ssize_t n2 = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n2 == 10 + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf + 10 + sizeof(struct ip6));
+		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip6));
 		assert((seg2_tcp->flags & TCP_FLAG_CWR) == 0);
 		assert((seg2_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg2_tcp->flags & TCP_FLAG_FIN) != 0);
@@ -880,7 +886,7 @@ static void test_gso_ttl_hop_limit(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 2800];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 2800];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -914,8 +920,8 @@ static void test_gso_ttl_hop_limit(void)
 		int res = gso_translate_tcp_6to4(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[4096];
-		ssize_t n = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, 4096);
+		ssize_t n = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n > 0);
 
 #ifdef __linux__
@@ -926,14 +932,14 @@ static void test_gso_ttl_hop_limit(void)
 
 		if (hl <= 1) {
 			/* Expect ICMPv6 Time Exceeded (Type 3, Code 0) */
-			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + 10 + ICMP_PI_LEN);
+			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf.data + 10 + ICMP_PI_LEN);
 			assert(rx_ip6->next_header == 58); /* ICMPv6 */
-			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + ICMP_PI_LEN + sizeof(struct ip6));
+			struct icmp *rx_icmp = (struct icmp *)(rx_buf.data + 10 + ICMP_PI_LEN + sizeof(struct ip6));
 			assert(rx_icmp->type == 3); /* Time Exceeded */
 			assert(rx_icmp->code == 0); /* Hop limit exceeded in transit */
 		} else {
 			/* hl == 2: Forwarded IPv4 packet with TTL = 1 */
-			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + 10);
+			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf.data + 10);
 			assert(rx_ip4->proto == IPPROTO_TCP);
 			assert(rx_ip4->ttl == 1);
 		}
@@ -947,7 +953,7 @@ static void test_gso_ttl_hop_limit(void)
 		int sv[2];
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-		uint8_t pkt_buf[HEADROOM + 20 + 20 + 2800];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 20 + 20 + 2800];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip4 *ip4 = (struct ip4 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip4));
@@ -982,20 +988,20 @@ static void test_gso_ttl_hop_limit(void)
 		int res = gso_translate_tcp_4to6(&p);
 		assert(res == 0);
 
-		uint8_t rx_buf[4096];
-		ssize_t n = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, 4096);
+		ssize_t n = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(n > 0);
 
 		if (ttl_in <= 1) {
 			/* Expect ICMPv4 Time Exceeded (Type 11, Code 0) */
-			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + 10 + ICMP_PI_LEN);
+			struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf.data + 10 + ICMP_PI_LEN);
 			assert(rx_ip4->proto == 1); /* ICMPv4 */
-			struct icmp *rx_icmp = (struct icmp *)(rx_buf + 10 + ICMP_PI_LEN + sizeof(struct ip4));
+			struct icmp *rx_icmp = (struct icmp *)(rx_buf.data + 10 + ICMP_PI_LEN + sizeof(struct ip4));
 			assert(rx_icmp->type == 11); /* Time Exceeded */
 			assert(rx_icmp->code == 0); /* TTL expired in transit */
 		} else {
 			/* ttl_in == 2: Forwarded IPv6 packet with Hop Limit = 1 */
-			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + 10);
+			struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf.data + 10);
 			assert(rx_ip6->next_header == IPPROTO_TCP);
 			assert(rx_ip6->hop_limit == 1);
 		}
@@ -1019,7 +1025,7 @@ static void test_gso_mock_write_error(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		close(sv[1]); /* Close read end to cause write failure */
 
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 2800];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 2800];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -1069,7 +1075,7 @@ static void test_gso_mock_write_error(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		close(sv[1]);
 
-		uint8_t pkt_buf[HEADROOM + 20 + 20 + 2800];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 20 + 20 + 2800];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip4 *ip4 = (struct ip4 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip4));
@@ -1147,7 +1153,7 @@ static void test_gso_mock_write_error(void)
 		}
 
 		/* Setup GSO packet with head + short tail */
-		uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 40 + 20 + 3200];
 		uint8_t *raw_pkt = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)raw_pkt;
 		struct tcp_hdr *tcp = (struct tcp_hdr *)(raw_pkt + sizeof(struct ip6));
@@ -1201,21 +1207,21 @@ static void test_gso_mock_write_error(void)
 		}
 
 		/* Now the next bytes in stream MUST be the Head GSO aggregate */
-		uint8_t rx_buf[4096];
+		RX_BUFFER(rx_buf, 4096);
 		size_t head_rcvd = 0;
 		while (head_rcvd < head_dgram_sz) {
 			size_t to_read = head_dgram_sz - head_rcvd;
-			ssize_t nr = recv(sv[1], rx_buf + head_rcvd, to_read, 0);
+			ssize_t nr = recv(sv[1], rx_buf.data + head_rcvd, to_read, 0);
 			assert(nr > 0);
 			head_rcvd += nr;
 		}
 		assert(head_rcvd == head_dgram_sz);
-		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
+		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf.data;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_TCPV4);
 
 		/* And no tail packet exists in the stream */
 		assert(set_nonblock(sv[1]) == 0);
-		ssize_t nt = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		ssize_t nt = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(nt < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
 
 		close(sv[0]);
@@ -1236,7 +1242,7 @@ static void test_gso_udp_uso(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		gcfg.tun_has_uso = 1;
 
-		uint8_t pkt_buf[HEADROOM + 8192];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 8192];
 		uint8_t *pkt_data = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)pkt_data;
 		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip6));
@@ -1277,17 +1283,17 @@ static void test_gso_udp_uso(void)
 
 		assert(gso_translate_udp_6to4(&p) == 0);
 
-		uint8_t rx_buf[HEADROOM + 8192];
-		ssize_t nr = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, HEADROOM + 8192);
+		ssize_t nr = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len));
 
-		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
+		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf.data;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4);
 		assert(vh->gso_size == segment_size);
 		assert(vh->csum_start == sizeof(struct ip4));
 		assert(vh->csum_offset == 6);
 
-		struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf + gcfg.vnet_hdr_sz);
+		struct ip4 *rx_ip4 = (struct ip4 *)(rx_buf.data + gcfg.vnet_hdr_sz);
 		assert(rx_ip4->proto == IPPROTO_UDP);
 		assert(rx_ip4->ttl == 63);
 		assert(ntohs(rx_ip4->length) == sizeof(struct ip4) + sizeof(struct udp_hdr) + payload_len);
@@ -1295,7 +1301,7 @@ static void test_gso_udp_uso(void)
 		assert(ntohs(rx_ip4->ident) == (small ? 65534 : 0));
 		assert(next_ip4_ident() == (small ? 1 : 65534));
 
-		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf + gcfg.vnet_hdr_sz + sizeof(struct ip4));
+		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf.data + gcfg.vnet_hdr_sz + sizeof(struct ip4));
 		assert(rx_udp->src_port == htons(12345));
 		assert(rx_udp->dst_port == htons(8080));
 
@@ -1309,7 +1315,7 @@ static void test_gso_udp_uso(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		gcfg.tun_has_uso = 1;
 
-		uint8_t pkt_buf[HEADROOM + 8192];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 8192];
 		uint8_t *pkt_data = pkt_buf + HEADROOM;
 		struct ip4 *ip4 = (struct ip4 *)pkt_data;
 		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip4));
@@ -1349,21 +1355,21 @@ static void test_gso_udp_uso(void)
 
 		assert(gso_translate_udp_4to6(&p) == 0);
 
-		uint8_t rx_buf[HEADROOM + 8192];
-		ssize_t nr = recv(sv[1], rx_buf, sizeof(rx_buf), 0);
+		RX_BUFFER(rx_buf, HEADROOM + 8192);
+		ssize_t nr = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
 		assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + sizeof(struct udp_hdr) + payload_len));
 
-		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf;
+		struct virtio_net_hdr_raw *vh = (struct virtio_net_hdr_raw *)rx_buf.data;
 		assert(vh->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4);
 		assert(vh->gso_size == 1200);
 		assert(vh->csum_start == sizeof(struct ip6));
 		assert(vh->csum_offset == 6);
 
-		struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf + gcfg.vnet_hdr_sz);
+		struct ip6 *rx_ip6 = (struct ip6 *)(rx_buf.data + gcfg.vnet_hdr_sz);
 		assert(rx_ip6->next_header == IPPROTO_UDP);
 		assert(rx_ip6->hop_limit == 63);
 
-		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf + gcfg.vnet_hdr_sz + sizeof(struct ip6));
+		struct udp_hdr *rx_udp = (struct udp_hdr *)(rx_buf.data + gcfg.vnet_hdr_sz + sizeof(struct ip6));
 		assert(rx_udp->src_port == htons(12345));
 		assert(rx_udp->dst_port == htons(8080));
 
@@ -1377,7 +1383,7 @@ static void test_gso_udp_uso(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		gcfg.tun_has_uso = 0;
 
-		uint8_t pkt_buf[HEADROOM + 8192];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 8192];
 		uint8_t *pkt_data = pkt_buf + HEADROOM;
 		struct ip6 *ip6 = (struct ip6 *)pkt_data;
 		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip6));
@@ -1417,10 +1423,10 @@ static void test_gso_udp_uso(void)
 		assert(gso_translate_udp_6to4(&p) == 0);
 
 		/* Segment 1: 3000 payload */
-		uint8_t rx1[4096];
-		ssize_t n1 = recv(sv[1], rx1, sizeof(rx1), 0);
+		RX_BUFFER(rx1, 4096);
+		ssize_t n1 = recv(sv[1], rx1.data, sizeof(rx1.data), 0);
 		assert(n1 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
-		uint8_t *seg1 = rx1 + gcfg.vnet_hdr_sz;
+		uint8_t *seg1 = rx1.data + gcfg.vnet_hdr_sz;
 		struct ip4 *ip4_1 = (struct ip4 *)seg1;
 		struct udp_hdr *udp_1 = (struct udp_hdr *)(seg1 + sizeof(struct ip4));
 		assert(ntohs(udp_1->length) == sizeof(struct udp_hdr) + 3000);
@@ -1428,10 +1434,10 @@ static void test_gso_udp_uso(void)
 		                ip4_checksum(ip4_1, ntohs(udp_1->length), IPPROTO_UDP)) == 0);
 
 		/* Segment 2: 3000 payload */
-		uint8_t rx2[4096];
-		ssize_t n2 = recv(sv[1], rx2, sizeof(rx2), 0);
+		RX_BUFFER(rx2, 4096);
+		ssize_t n2 = recv(sv[1], rx2.data, sizeof(rx2.data), 0);
 		assert(n2 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
-		uint8_t *seg2 = rx2 + gcfg.vnet_hdr_sz;
+		uint8_t *seg2 = rx2.data + gcfg.vnet_hdr_sz;
 		struct ip4 *ip4_2 = (struct ip4 *)seg2;
 		struct udp_hdr *udp_2 = (struct udp_hdr *)(seg2 + sizeof(struct ip4));
 		assert(ntohs(udp_2->length) == sizeof(struct udp_hdr) + 3000);
@@ -1439,10 +1445,10 @@ static void test_gso_udp_uso(void)
 		                ip4_checksum(ip4_2, ntohs(udp_2->length), IPPROTO_UDP)) == 0);
 
 		/* Segment 3: 100 payload */
-		uint8_t rx3[4096];
-		ssize_t n3 = recv(sv[1], rx3, sizeof(rx3), 0);
+		RX_BUFFER(rx3, 4096);
+		ssize_t n3 = recv(sv[1], rx3.data, sizeof(rx3.data), 0);
 		assert(n3 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 100));
-		uint8_t *seg3 = rx3 + gcfg.vnet_hdr_sz;
+		uint8_t *seg3 = rx3.data + gcfg.vnet_hdr_sz;
 		struct ip4 *ip4_3 = (struct ip4 *)seg3;
 		struct udp_hdr *udp_3 = (struct udp_hdr *)(seg3 + sizeof(struct ip4));
 		assert(ntohs(udp_3->length) == sizeof(struct udp_hdr) + 100);
@@ -1459,7 +1465,7 @@ static void test_gso_udp_uso(void)
 		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 		gcfg.tun_has_uso = 0;
 
-		uint8_t pkt_buf[HEADROOM + 8192];
+		alignas(4) uint8_t pkt_buf[HEADROOM + 8192];
 		uint8_t *pkt_data = pkt_buf + HEADROOM;
 		struct ip4 *ip4 = (struct ip4 *)pkt_data;
 		struct udp_hdr *udp = (struct udp_hdr *)(pkt_data + sizeof(struct ip4));
@@ -1495,11 +1501,11 @@ static void test_gso_udp_uso(void)
 
 		const uint32_t segment_sizes[] = {3000, 3000, 100};
 		for (size_t i = 0; i < sizeof(segment_sizes) / sizeof(segment_sizes[0]); i++) {
-			uint8_t rx[4096];
-			ssize_t nr = recv(sv[1], rx, sizeof(rx), 0);
+			RX_BUFFER(rx, 4096);
+			ssize_t nr = recv(sv[1], rx.data, sizeof(rx.data), 0);
 			uint32_t udp_segment_len = sizeof(struct udp_hdr) + segment_sizes[i];
 			assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + udp_segment_len));
-			struct ip6 *ip6 = (struct ip6 *)(rx + gcfg.vnet_hdr_sz);
+			struct ip6 *ip6 = (struct ip6 *)(rx.data + gcfg.vnet_hdr_sz);
 			struct udp_hdr *rx_udp = (struct udp_hdr *)((uint8_t *)ip6 + sizeof(struct ip6));
 			assert(ip6->next_header == IPPROTO_UDP);
 			assert(ntohs(ip6->payload_length) == udp_segment_len);
@@ -1530,7 +1536,7 @@ static void test_partial_udp_fragmentation(void)
 #endif
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
-	uint8_t buf[HEADROOM + 20 + 1508] = {0};
+	alignas(4) uint8_t buf[HEADROOM + 20 + 1508] = {0};
 	struct ip4 *ip4 = (struct ip4 *)(buf + HEADROOM);
 	ip4->ver_ihl = 0x45;
 	ip4->length = htons(20 + 1508);
@@ -1551,15 +1557,16 @@ static void test_partial_udp_fragmentation(void)
 	p.vhdr.csum_start = 20;
 	p.vhdr.csum_offset = 6;
 	handle_ip4(&p);
-	uint8_t assembled[1508], rx[2048];
+	alignas(4) uint8_t assembled[1508];
+	RX_BUFFER(rx, 2048);
 	struct ip6 translated;
 	size_t total = 0;
 	for (int i = 0; i < 2; i++) {
-		ssize_t n = recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT);
+		ssize_t n = recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT);
 		assert(n > (ssize_t)(ip_offset + 48));
-		struct virtio_net_hdr_raw *vh = (void *)rx;
+		struct virtio_net_hdr_raw *vh = (void *)rx.data;
 		assert(!(vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM));
-		struct ip6 *ip6 = (void *)(rx + ip_offset);
+		struct ip6 *ip6 = (void *)(rx.data + ip_offset);
 		translated = *ip6;
 		assert(ip6->next_header == 44);
 		struct ip6_frag *frag = (void *)(ip6 + 1);
@@ -1578,7 +1585,7 @@ static void test_partial_udp_fragmentation(void)
 	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_UDP_L4;
 	p.vhdr.gso_size = 0;
 	handle_ip4(&p);
-	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	assert(recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT) < 0);
 	/* More than 128 logical datagrams in one aggregate is rejected before any
 	 * output, bounding software work and matching the UDP_SEGMENT API limit. */
 	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
@@ -1587,7 +1594,7 @@ static void test_partial_udp_fragmentation(void)
 	p.vhdr.csum_start = sizeof(struct ip4);
 	p.vhdr.csum_offset = 6;
 	handle_ip4(&p);
-	assert(recv(sv[1], rx, sizeof(rx), MSG_DONTWAIT) < 0);
+	assert(recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT) < 0);
 	close(sv[0]);
 	close(sv[1]);
 	printf("PASS: Partial UDP fragmentation checksum and invalid GSO rejection\n");

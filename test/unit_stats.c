@@ -111,8 +111,14 @@ static void test_idle_sync(void) {
     atomic_store(&idle_ack, false);
     usleep(20000);
     bool synced = true; uint64_t missing = 0;
+#ifdef __linux__
     assert(stats_sync_workers(&synced, &missing) == -1);
     assert(!synced && missing == (UINT64_C(1) << 63));
+#else
+    /* BSD only flushes the caller; it does not request worker acknowledgments. */
+    assert(stats_sync_workers(&synced, &missing) == 0);
+    assert(synced && missing == 0);
+#endif
     atomic_store(&idle_ack, true);
     assert(stats_sync_workers(&synced, &missing) == 0);
     assert(synced && missing == 0);
