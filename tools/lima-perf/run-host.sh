@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
+export PERF_SESSION_ROOT
 
 INSTANCE="${INSTANCE:-tayga-perf}"
 PROJECT="${PROJECT:-/Users/antongrizli/Documents/MikroTik}"
@@ -11,6 +13,10 @@ DISK_GB="${DISK_GB:-24}"
 VM_TYPE="${VM_TYPE:-vz}"
 SESSION_STAMP="${SESSION_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 GIT_REVISION="${GIT_REVISION:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf unknown)}"
+if [[ ! "$SESSION_STAMP" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  echo "SESSION_STAMP must be a single safe directory name." >&2
+  exit 64
+fi
 
 if ! command -v limactl >/dev/null 2>&1; then
   echo "limactl is required (install Lima with Homebrew)." >&2
@@ -40,6 +46,7 @@ fi
 
 echo "Running guest perf workflow"
 # This workflow is noninteractive. Preserve stdin for any calling matrix script.
+guest_status=0
 limactl shell "$INSTANCE" -- env \
   "REPO=$REPO" "PROJECT=$PROJECT" \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
@@ -62,7 +69,7 @@ limactl shell "$INSTANCE" -- env \
   "IPERF_START_GATE=${IPERF_START_GATE:-on}" \
   "RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}" \
   "PROTOCOL=${PROTOCOL:-tcp}" "RATE=${RATE:-0}" \
-  "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
+  "PERF_SESSION_ROOT=$PERF_SESSION_ROOT" "DURATION=${DURATION:-60}" "WARMUP=${WARMUP:-10}" \
   "DIRECTIONS=${DIRECTIONS:-download}" "MAX_TUN_DROPS=${MAX_TUN_DROPS:-0}" \
   "MAX_UDP_LOSS_PERCENT=${MAX_UDP_LOSS_PERCENT:-0}" "TUN_TXQLEN=${TUN_TXQLEN-1000}" \
   "MAX_PING_LOSS_PERCENT=${MAX_PING_LOSS_PERCENT:-0}" \
@@ -75,9 +82,21 @@ limactl shell "$INSTANCE" -- env \
     task_status=$?
     rm -f "$task_runner"
     exit "$task_status"
-  ' bash "$REPO/tools/lima-perf/run-guest.sh" < /dev/null
+  ' bash "$REPO/tools/lima-perf/run-guest.sh" < /dev/null || guest_status=$?
 
-SESSION_DIR="$REPO/perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
-if [ -d "$SESSION_DIR" ]; then
-  printf 'requested_revision=%s\n' "$GIT_REVISION" > "$SESSION_DIR/host-request.txt"
+SESSION_DIR="$PERF_SESSION_ROOT/$SESSION_STAMP-lima-debian13-arm64"
+GUEST_SESSION="/tmp/tayga-perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
+# The state directory need not be mounted in Lima. Fetch on the host, including
+# rejected workloads, and delete the guest copy only after successful extraction.
+session_archive=$(mktemp)
+trap 'rm -f -- "$session_archive"' EXIT
+if limactl shell "$INSTANCE" -- tar -C "$GUEST_SESSION" -cf - . < /dev/null > "$session_archive" \
+    && mkdir -p "$SESSION_DIR" && tar -xf "$session_archive" -C "$SESSION_DIR"; then
+  printf 'requested_revision=%s\nguest_exit_status=%s\n' "$GIT_REVISION" "$guest_status" > "$SESSION_DIR/host-request.txt"
+  echo "Perf session saved on host: $SESSION_DIR"
+  limactl shell "$INSTANCE" -- rm -rf -- "$GUEST_SESSION" < /dev/null || echo "Guest copy retained: $GUEST_SESSION" >&2
+else
+  echo "Unable to collect perf session; guest data retained: $GUEST_SESSION" >&2
+  [ "$guest_status" -ne 0 ] || guest_status=1
 fi
+exit "$guest_status"

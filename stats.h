@@ -36,6 +36,15 @@ struct worker_pub_stats {
 	_Atomic uint64_t dropped_pkts;
 	_Atomic uint64_t dropped_bytes;
 	_Atomic uint64_t error_pkts;
+	_Atomic uint64_t tx_failed_frames;
+	_Atomic uint64_t tx_eagain;
+	_Atomic uint64_t tx_enobufs;
+	_Atomic uint64_t tx_eintr;
+	_Atomic uint64_t tx_short;
+	_Atomic uint64_t tx_fatal;
+	_Atomic uint64_t tx_other;
+	_Atomic uint64_t warnings_suppressed;
+
 
 	/* GSO telemetry integrated per worker */
 	_Atomic uint64_t gso_rx_pkts;
@@ -74,6 +83,15 @@ struct worker_priv_stats {
 	uint64_t dropped_pkts;
 	uint64_t dropped_bytes;
 	uint64_t error_pkts;
+	uint64_t tx_failed_frames;
+	uint64_t tx_eagain;
+	uint64_t tx_enobufs;
+	uint64_t tx_eintr;
+	uint64_t tx_short;
+	uint64_t tx_fatal;
+	uint64_t tx_other;
+	uint64_t warnings_suppressed;
+
 
 	uint64_t gso_rx_pkts;
 	uint64_t gso_rx_bytes;
@@ -111,6 +129,15 @@ struct tayga_stats {
 	uint64_t dropped_pkts;
 	uint64_t dropped_bytes;
 	uint64_t error_pkts;
+	uint64_t tx_failed_frames;
+	uint64_t tx_eagain;
+	uint64_t tx_enobufs;
+	uint64_t tx_eintr;
+	uint64_t tx_short;
+	uint64_t tx_fatal;
+	uint64_t tx_other;
+	uint64_t warnings_suppressed;
+
 
 	uint64_t gso_rx_pkts;
 	uint64_t gso_rx_bytes;
@@ -131,6 +158,7 @@ struct tayga_stats {
 
 	time_t start_time;
 	bool workers_synced;
+	bool main_synced;
 	uint64_t unacked_mask;
 };
 
@@ -143,7 +171,12 @@ extern atomic_uint_fast64_t g_stats_snapshot_seq;
 extern atomic_int g_workers_running;
 extern atomic_bool g_worker_slot_active[STATS_MAX_SLOTS];
 
+extern atomic_bool g_tun_tx_fatal;
+void stats_tx_failure(int error, uint32_t ip_bytes, bool short_write);
+void stats_warn_limited(unsigned reason, const char *message, int error);
 void stats_init(void);
+void stats_main_start(void);
+void stats_main_stop(void);
 void stats_thread_init(int worker_idx);
 void stats_thread_exit(void);
 void stats_flush_worker(void);

@@ -182,6 +182,7 @@ struct async_context {
 	struct packet_frame_token tokens[ASYNC_FRAMES]; struct packet_frame_pool pool;
 	unsigned queue[ASYNC_FRAMES], head, tail, count, cursor, outstanding;
 	int fd[ASYNC_FRAMES], initialized, failed;
+	unsigned char failure_counted[ASYNC_FRAMES];
 	uint8_t *storage;
 };
 static struct async_context contexts[EXP_WORKERS];
@@ -212,8 +213,13 @@ int async_tun_service(void)
 		if(slot>=ASYNC_FRAMES || !c->outstanding || c->frames[slot].state!=PACKET_FRAME_TX_SUBMITTED) {c->failed=1;io_uring_cqe_seen(&c->ring,cqe);return -1;}
 		struct packet_frame *f=&c->frames[slot];
 		if(cqe->res!=(int)f->length) {
-			atomic_fetch_add(&async_errors,1);stats_error();stats_drop(f->length);
-			if(cqe->res!=-EAGAIN && cqe->res!=-ENOBUFS && cqe->res!=-EINTR)c->failed=1;
+			atomic_fetch_add(&async_errors,1);
+			c->failure_counted[slot]=1;
+			stats_tx_failure(cqe->res < 0 ? -cqe->res : EIO,
+				f->length >= (size_t)gcfg.vnet_hdr_sz ? f->length-gcfg.vnet_hdr_sz : 0, cqe->res >= 0);
+			/* Match sync policy: short/backpressure/other failures drop one
+			 * frame; failed device descriptors stop the service. */
+			if(cqe->res==-EBADF || cqe->res==-ENODEV || cqe->res==-EIO || cqe->res==-ESHUTDOWN)c->failed=1;
 		} else {
 			unsigned header=gcfg.vnet_hdr_sz;
 			if(f->length>header) {
@@ -251,11 +257,11 @@ ssize_t async_tun_submit(int fd,const struct iovec *iov,int count)
 	if(async_tun_service()<0) {errno=EIO;return -1;}
 	unsigned slot=ASYNC_FRAMES;
 	for(unsigned n=0;n<ASYNC_FRAMES;n++) {unsigned j=(c->cursor+n)%ASYNC_FRAMES;if(c->frames[j].state==PACKET_FRAME_FREE){slot=j;break;}}
-	if(slot==ASYNC_FRAMES) {atomic_fetch_add(&async_pressure,1);stats_drop(total);stats_error();errno=EAGAIN;return -1;}
+	if(slot==ASYNC_FRAMES) {atomic_fetch_add(&async_pressure,1);errno=EAGAIN;return -1;}
 	if(packet_frame_acquire(&c->pool,slot,&c->tokens[slot]))return -1;
 	c->cursor=(slot+1)%ASYNC_FRAMES;
 	size_t pos=0;for(int i=0;i<count;i++){memcpy(c->frames[slot].storage+pos,iov[i].iov_base,iov[i].iov_len);pos+=iov[i].iov_len;}
-	c->frames[slot].length=total;c->fd[slot]=fd;
+	c->frames[slot].length=total;c->fd[slot]=fd;c->failure_counted[slot]=0;
 	packet_frame_transition(&c->pool,c->tokens[slot],PACKET_FRAME_TRANSLATING);
 	packet_frame_transition(&c->pool,c->tokens[slot],PACKET_FRAME_PENDING_TX);
 	c->queue[c->tail++%ASYNC_FRAMES]=slot;c->count++;atomic_fetch_add(&async_accepted,1);
@@ -270,7 +276,21 @@ int async_tun_finish(void)
 		if(async_tun_service()<0)break;
 		if(current->outstanding) {struct io_uring_cqe *cqe;struct __kernel_timespec timeout={0,10000000};io_uring_wait_cqe_timeout(&current->ring,&cqe,&timeout);}
 	}
-	if(current->count || current->outstanding) {current->failed=1;return -1;}return current->failed?-1:0;
+	if(current->count || current->outstanding) {
+		current->failed=1;
+		/* Queued/unknown writes abandoned by shutdown are failed frames too.
+		 * Storage owned by the kernel remains retained; account each frame once. */
+		for(unsigned i=0;i<ASYNC_FRAMES;i++) {
+			struct packet_frame *f=&current->frames[i];
+			if(!current->failure_counted[i] &&
+			   (f->state==PACKET_FRAME_PENDING_TX || f->state==PACKET_FRAME_TX_SUBMITTED)) {
+				current->failure_counted[i]=1;atomic_fetch_add(&async_errors,1);
+				stats_tx_failure(ECANCELED, f->length >= (size_t)gcfg.vnet_hdr_sz ? f->length-gcfg.vnet_hdr_sz : 0, false);
+			}
+		}
+		return -1;
+	}
+	return current->failed?-1:0;
 }
 void async_tun_destroy(void)
 {

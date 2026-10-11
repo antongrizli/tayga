@@ -38,7 +38,7 @@ from pathlib import Path
 import sys, shlex, subprocess
 p=Path('/usr/local/sbin/clat-start.sh')
 s=p.read_text()
-old='exec /usr/sbin/tayga -c /run/clat.conf -d'
+old='exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d'
 assert s.count(old)==1
 prefix=sys.argv[1]+'/tcmalloc/heap/tayga'
 libraries=subprocess.check_output(['ldconfig', '-p'], text=True).splitlines()

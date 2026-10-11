@@ -29,11 +29,16 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
-time_t now;
+_Atomic time_t now;
 static const char *progname;
 static int signalfds[2];
 static _Atomic bool g_shutdown = false;
 static _Atomic bool g_tun_io_failure = false;
+#ifdef __linux__
+static uint8_t *worker_buffers[MAX_WORKERS];
+static atomic_int worker_start_gate = 0;
+static atomic_int workers_ready = 0;
+#endif
 
 static void tun_io_fail(const char *where, int error)
 {
@@ -69,6 +74,8 @@ void usage(int code) {
 			"--tun-steering MODE: kernel (default) or experimental groups (fresh disposable Linux TUN only)\n"
 			"--dispatch MODE   : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
 			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
+			"--runtime-dir DIR : Runtime files directory (default /run; TAYGA_RUNTIME_DIR)\n"
+			"--status-file FILE: Instance status path (TAYGA_STATUS_FILE)\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
 	exit(code);
@@ -265,16 +272,16 @@ static void print_op_info(void)
 static void * worker(void * arg)
 {
 	int idx = *(int *)arg;
-	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
-	if (!recv_buf) {
-		slog(LOG_CRIT, "Error: unable to allocate %d bytes for "
-				"receive buffer\n", RECV_BUF_SIZE);
-		exit(1);
-	}
+	uint8_t *recv_buf = worker_buffers[idx];
+	stats_thread_init(idx);
+	atomic_fetch_add_explicit(&workers_ready, 1, memory_order_release);
+	int gate;
+	while (!(gate = atomic_load_explicit(&worker_start_gate, memory_order_acquire)))
+		usleep(1000);
+	if (gate < 0) { stats_thread_exit(); return NULL; }
 
 	if(gcfg.async_tun)async_tun_select(idx);
 	/* Enter worker loop */
-	stats_thread_init(idx);
 	atomic_fetch_add_explicit(&g_workers_running, 1, memory_order_release);
 	slog(LOG_DEBUG,"Starting worker thread %d\n",idx);
 
@@ -287,6 +294,9 @@ static void * worker(void * arg)
 	clock_gettime(CLOCK_MONOTONIC, &last_flush);
 	unsigned direct_burst = 0;
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		if (atomic_load_explicit(&g_tun_tx_fatal, memory_order_relaxed)) {
+			tun_io_fail("fatal TUN transmit failure", EIO); break;
+		}
 		if(gcfg.async_tun && async_tun_service()<0) {tun_io_fail("async completion failed",EIO);break;}
 		if(gcfg.dispatch_mode) {
 			uint8_t *frame;int length;int slot=dispatch_take(idx,&frame,&length);
@@ -350,7 +360,6 @@ static void * worker(void * arg)
 	stats_flush_worker();
 	stats_thread_exit();
 	atomic_fetch_sub_explicit(&g_workers_running, 1, memory_order_release);
-	free(recv_buf);
 	return NULL;
 }
 #endif //__linux__
@@ -366,6 +375,8 @@ int main(int argc, char **argv)
 	char *user = NULL;
 	char *group = NULL;
 	char *pidfile = NULL;
+	const char *runtime_dir = getenv("TAYGA_RUNTIME_DIR");
+	const char *status_path = getenv("TAYGA_STATUS_FILE");
 	int do_chroot = 0;
 	int detach = 1;
 	int do_mktun = 0;
@@ -377,6 +388,10 @@ int main(int argc, char **argv)
 	/* Init config structure */
 	if(config_init() < 0) return 1;
 	stats_init();
+	atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
+	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) ||
+	    pthread_mutex_init(&gcfg.map_mutex, NULL))
+		die("Failed to initialize mapping mutexes");
 
 	static struct option longopts[] = {
 		{ "mktun", 0, 0, 0 },
@@ -397,6 +412,8 @@ int main(int argc, char **argv)
 		{ "tun-steering", 1, 0, 1003 },
 		{ "dispatch", 1, 0, 1004 },
 		{ "packet-io", 1, 0, 1005 },
+		{ "runtime-dir", 1, 0, 1006 },
+		{ "status-file", 1, 0, 1007 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -407,6 +424,8 @@ int main(int argc, char **argv)
 		if (c == -1)
 			break;
 		switch (c) {
+		case 1006: runtime_dir = optarg; break;
+		case 1007: status_path = optarg; break;
 		case 1004:
 			if(!strcmp(optarg,"kernel"))gcfg.dispatch_mode=0;
 			else if(!strcmp(optarg,"flows"))gcfg.dispatch_mode=1;
@@ -525,6 +544,22 @@ int main(int argc, char **argv)
 
 	/* Parse config file options */
 	if(config_read(conffile) < 0) return 1;
+	if (runtime_dir) {
+		if (runtime_dir[0] != '/' || strlen(runtime_dir) >= sizeof(gcfg.runtime_dir))
+			die("runtime-dir must be an absolute path of at most 511 bytes");
+		strcpy(gcfg.runtime_dir, runtime_dir);
+	}
+#ifdef __linux__
+	struct stat namespace_stat;
+	if (!stat("/proc/self/ns/net", &namespace_stat)) gcfg.runtime_netns = namespace_stat.st_ino;
+#endif
+	snprintf(gcfg.status_path, sizeof(gcfg.status_path), "%s/tayga-status.json", gcfg.runtime_dir);
+	snprintf(gcfg.clat_info_path, sizeof(gcfg.clat_info_path), "%s/clat-info.json", gcfg.runtime_dir);
+	if (status_path) {
+		if (status_path[0] != '/' || strlen(status_path) >= sizeof(gcfg.status_path))
+			die("status-file must be an absolute path of at most 767 bytes");
+		strcpy(gcfg.status_path, status_path);
+	}
 
 	/* Validate config (and load map file) */
 	if(config_validate() < 0) return 1;
@@ -640,6 +675,21 @@ int main(int argc, char **argv)
 		close(pidfd);
 	}
 
+#ifdef __linux__
+	FILE *identity = fopen("/proc/self/stat", "r");
+	if (identity) {
+		char line[4096];
+		if (fgets(line, sizeof(line), identity)) {
+			char *tail = strrchr(line, ')'), *save = NULL;
+			if (tail) {
+				char *token = strtok_r(tail+1, " ", &save);
+				for (int field = 3; token && field < 22; field++) token = strtok_r(NULL, " ", &save);
+				if (token) snprintf(gcfg.process_start_ticks, sizeof(gcfg.process_start_ticks), "%s", token);
+			}
+		}
+		fclose(identity);
+	}
+#endif
 	slog(LOG_INFO, "Starting tayga " TAYGA_VERSION "\n");
 	slog(LOG_DEBUG, "Compiled from " TAYGA_BRANCH "\n");
 	slog(LOG_DEBUG, "Commit " TAYGA_COMMIT "\n");
@@ -663,6 +713,7 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 
+		close(urandom_fd);
 		gcfg.rand[0] |= 1; /* need an odd number for IPv4 hash */
 	}
 	
@@ -683,22 +734,60 @@ int main(int argc, char **argv)
 	if(gcfg.dispatch_mode && (gcfg.workers<1 || gcfg.workers>8 || gcfg.tun_steering_groups || gcfg.dynamic_pool || gcfg.map_file[0]))
 		die("Experimental dispatch requires 1..8 workers, static inline mappings and kernel steering");
 	if(gcfg.async_tun && gcfg.workers>8)die("Experimental io_uring supports at most 8 workers");
-	if(tun_setup(0, 0)) exit(1);
-	if(gcfg.dispatch_mode && dispatch_init(gcfg.workers))die("Dispatcher initialization failed: %s",strerror(errno));
-	if(gcfg.async_tun && async_tun_init())die("io_uring initialization failed: %s",strerror(errno));
+	/* Load dynamic maps if configured */
+	if (gcfg.data_dir[0])
+		load_dynamic(gcfg.dynamic_pool);
+
+	if (gcfg.cache_size)
+		if (create_cache()) return 1;
+
+	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
+	if (!recv_buf) {
+		slog(LOG_CRIT, "Error: unable to allocate %d bytes for "
+				"receive buffer\n", RECV_BUF_SIZE);
+		return 1;
+	}
+
+#ifdef __linux__
+	int created_workers = 0;
+	static int thread_ids[MAX_WORKERS];
+	for (int i = 0; i < gcfg.workers; i++) {
+		worker_buffers[i] = malloc(RECV_BUF_SIZE);
+		if (!worker_buffers[i]) {
+			for (int j = 0; j < i; j++) free(worker_buffers[j]);
+			free(recv_buf);
+			return 1;
+		}
+	}
+#endif
+	signal_setup();
+	if(tun_setup(0, 0)) goto startup_failed;
+	if(gcfg.dispatch_mode && dispatch_init(gcfg.workers)) goto startup_failed;
+	if(gcfg.async_tun && async_tun_init()) goto startup_failed;
 	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
 	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
+
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		thread_ids[i] = i;
+		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
+		if (ret) { errno = ret; goto startup_failed; }
+		created_workers++;
+	}
+	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
+		usleep(1000);
+#endif
 
 	if (do_chroot) {
 		if (chroot(gcfg.data_dir) < 0) {
 			slog(LOG_CRIT, "Unable to chroot to %s: %s\n",
 					gcfg.data_dir, strerror(errno));
-			exit(1);
+			goto startup_failed;
 		}
 		if (chdir("/")) {
 			slog(LOG_CRIT, "Error: unable to chdir to /, aborting: %s\n",
 					strerror(errno));
-			exit(1);
+			goto startup_failed;
 		}
 	}
 
@@ -708,47 +797,23 @@ int main(int argc, char **argv)
 				setgroups(1, &gr->gr_gid) < 0) {
 			slog(LOG_CRIT, "Error: cannot set gid to %d: %s\n",
 					gr->gr_gid, strerror(errno));
-			exit(1);
+			goto startup_failed;
 		}
 	}
 
 	if (pw) {
-		if (setreuid(pw->pw_uid, pw->pw_uid) < 0 ||
-				setreuid(pw->pw_uid, pw->pw_uid) < 0) {
+		if (setreuid(pw->pw_uid, pw->pw_uid) < 0) {
 			slog(LOG_CRIT, "Error: cannot set uid to %d: %s\n",
 					pw->pw_uid, strerror(errno));
-			exit(1);
+			goto startup_failed;
 		}
 	}
 
-	/* Initialize mutexes */
-	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) != 0) {
-		slog(LOG_CRIT, "Failed to initialize cache mutex\n");
-		exit(1);
-	}
-	if (pthread_mutex_init(&gcfg.map_mutex, NULL) != 0) {
-		slog(LOG_CRIT, "Failed to initialize map mutex\n");
-		exit(1);
-	}
 
-	signal_setup();
 
 	/* Print running information */
 	print_op_info();
 
-	/* Load dynamic maps if configured */
-	if (gcfg.data_dir[0])
-		load_dynamic(gcfg.dynamic_pool);
-
-	if (gcfg.cache_size)
-		create_cache();
-
-	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
-	if (!recv_buf) {
-		slog(LOG_CRIT, "Error: unable to allocate %d bytes for "
-				"receive buffer\n", RECV_BUF_SIZE);
-		exit(1);
-	}
 
 	memset(pollfds, 0, 2 * sizeof(struct pollfd));
 	pollfds[0].fd = signalfds[0];
@@ -756,30 +821,17 @@ int main(int argc, char **argv)
 	pollfds[1].fd = gcfg.tun_fd;
 	pollfds[1].events = POLLIN;
 
-	/* Tell systemd logger we are ready */
-	if(gcfg.log_out == LOG_TO_JOURNAL) {
-		int r = notify("READY=1");
-		if (r < 0) {
-			slog(LOG_CRIT, "Failed to notify readiness to $NOTIFY_SOCKET: %s\n", strerror(-r));
-			exit(1);
-		}
-	}
 
+	tun_setup_commit();
+	stats_main_start();
 #ifdef __linux__
-	/* Launch worker threads */
-	static int thread_ids[MAX_WORKERS];
-	for(int i = 0; i < gcfg.workers; i++) {
-		thread_ids[i] = i;
-		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
-		if (ret != 0) {
-			slog(LOG_CRIT, "Failed to create worker thread %d: %s\n", 
-				i, strerror(ret));
-			exit(1);
-		}
-	}
+	atomic_store_explicit(&worker_start_gate, 1, memory_order_release);
 #endif
-
-	telemetry_start("/run/tayga-status.json", 5);
+	telemetry_start(gcfg.status_path, 5);
+	if (gcfg.log_out == LOG_TO_JOURNAL) {
+		int r = notify("READY=1");
+		if (r < 0) slog(LOG_WARNING, "Readiness notification failed: %s\n", strerror(-r));
+	}
 
 	struct timespec last_main_flush, main_mono_now;
 	clock_gettime(CLOCK_MONOTONIC, &last_main_flush);
@@ -787,6 +839,9 @@ int main(int argc, char **argv)
 
 	/* Main loop */
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		if (atomic_load_explicit(&g_tun_tx_fatal, memory_order_relaxed)) {
+			tun_io_fail("fatal TUN transmit failure", EIO); break;
+		}
 		if(gcfg.dispatch_mode)dispatch_expire();
 		if(gcfg.async_tun && !gcfg.workers && async_tun_service()<0){tun_io_fail("main async completion failed",EIO);break;}
 		ret = poll(pollfds, 2, gcfg.async_tun && !gcfg.workers ? 1 : 500);
@@ -837,7 +892,7 @@ int main(int argc, char **argv)
 			stats_flush_idle();
 			last_main_flush = main_mono_now;
 		}
-		time(&now);
+		atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
 		if (gcfg.cache_size && (gcfg.last_cache_maint +
 						CACHE_CHECK_INTERVAL < now ||
 					gcfg.last_cache_maint > now)) {
@@ -853,14 +908,15 @@ int main(int argc, char **argv)
 	}
 
 	/* Graceful shutdown */
+	stats_main_stop();
 	if(gcfg.dispatch_mode)dispatch_stop();
 #ifdef __linux__
 	for (int i = 0; i < gcfg.workers; i++) {
 		pthread_join(gcfg.threads[i], NULL);
 	}
-	if (atomic_load_explicit(&g_tun_io_failure, memory_order_relaxed))
-		exit_code = 1;
 #endif
+	if (atomic_load_explicit(&g_tun_io_failure, memory_order_relaxed) || atomic_load(&g_tun_tx_fatal))
+		exit_code = 1;
 	if(gcfg.async_tun && !gcfg.workers && async_tun_finish()<0)exit_code=1;
 	if(gcfg.dispatch_mode)dispatch_destroy();
 	if(gcfg.async_tun)async_tun_destroy();
@@ -872,5 +928,21 @@ int main(int argc, char **argv)
 	telemetry_stop();
 	free(recv_buf);
 
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) free(worker_buffers[i]);
+#endif
 	return exit_code;
+
+startup_failed:
+	slog(LOG_CRIT, "Startup failed: %s\n", strerror(errno));
+#ifdef __linux__
+	atomic_store_explicit(&worker_start_gate, -1, memory_order_release);
+	for (int i = 0; i < created_workers; i++) pthread_join(gcfg.threads[i], NULL);
+	for (int i = 0; i < gcfg.workers; i++) free(worker_buffers[i]);
+#endif
+	if (gcfg.async_tun) async_tun_destroy();
+	if (gcfg.dispatch_mode) dispatch_destroy();
+	tun_setup_abort();
+	free(recv_buf);
+	return 1;
 }

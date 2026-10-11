@@ -226,3 +226,18 @@ tayga.conf.
 **tayga**(8)
 
 <https://github.com/apalrd/tayga/>
+
+**runtime-dir** *absolute-directory*
+:   Directory for runtime state and the ownership lock. Defaults to `/run`;
+    the directory must exist. See tayga(8) for command-line/environment overrides
+    and explicit per-instance status paths.
+
+# MAP-FILE RELOAD TRANSACTIONS
+
+A map-file replacement is completely parsed before publication. Invalid lines,
+invalid prefixes, file read errors or conflicts with retained configuration or
+active dynamic mappings reject the replacement and preserve the previous table.
+Within the file, conflicting entries retain the historical last-entry-wins
+behavior. Publication and cache eviction occur under the mapping mutex, in
+`map_mutex` then `cache_mutex` order. Static configurations without map-file or
+dynamic-pool continue to bypass both mapping locks and the cache.

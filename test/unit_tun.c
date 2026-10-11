@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 
 #include "tayga.h"
+#include "stats.h"
 
 struct config gcfg;
 
@@ -24,11 +25,13 @@ enum mock_mode {
 	MOCK_PASSTHROUGH = 0,
 	MOCK_EINTR_ONCE,
 	MOCK_EINTR_ALWAYS,
-	MOCK_SHORT_WRITE
+	MOCK_SHORT_WRITE,
+	MOCK_ERRNO
 };
 
 static enum mock_mode current_mock_mode = MOCK_PASSTHROUGH;
 static int write_call_count = 0;
+static int mock_errno;
 
 ssize_t __wrap_write(int fd, const void *buf, size_t count)
 {
@@ -46,6 +49,7 @@ ssize_t __wrap_write(int fd, const void *buf, size_t count)
 		errno = EINTR;
 		return -1;
 
+	case MOCK_ERRNO: errno = mock_errno; return -1;
 	case MOCK_SHORT_WRITE:
 		/* Return 10 bytes instead of full count */
 		if (count > 10)
@@ -74,6 +78,7 @@ ssize_t __wrap_writev(int fd, const struct iovec *iov, int iovcnt)
 		errno = EINTR;
 		return -1;
 
+	case MOCK_ERRNO: errno = mock_errno; return -1;
 	case MOCK_SHORT_WRITE:
 		/* Return short write */
 		return 10;
@@ -86,6 +91,23 @@ ssize_t __wrap_writev(int fd, const struct iovec *iov, int iovcnt)
 
 int main(void)
 {
+	stats_init();
+	char frame[64] = {0x45}; struct iovec vector = {frame, sizeof(frame)};
+	int errors[] = {EAGAIN, ENOBUFS, EBADF, ENODEV};
+	for (unsigned i = 0; i < sizeof(errors)/sizeof(errors[0]); i++) {
+		current_mock_mode = MOCK_ERRNO; mock_errno = errors[i]; write_call_count = 0;
+		assert(tun_writev(42, &vector, 1) == -1 && errno == errors[i]);
+		assert(write_call_count == 1);
+	}
+	assert(g_tls_priv.tx_failed_frames == 4 && g_tls_priv.dropped_pkts == 4);
+	assert(g_tls_priv.tx_eagain == 1 && g_tls_priv.tx_enobufs == 1 && g_tls_priv.tx_fatal == 2);
+	assert(atomic_load(&g_tun_tx_fatal));
+	current_mock_mode = MOCK_ERRNO; mock_errno = EAGAIN;
+	for (int i = 0; i < 1000; i++) assert(tun_write(42, frame, sizeof(frame)) < 0);
+	assert(g_tls_priv.warnings_suppressed > 900);
+	assert(g_tls_priv.tx_failed_frames == 1004 && g_tls_priv.error_pkts == 1004);
+	assert(tun_writev(42, NULL, 0) == -1 && errno == EINVAL);
+	stats_init(); current_mock_mode = MOCK_PASSTHROUGH; write_call_count = 0;
 	printf("Running unit_tun tests...\n");
 
 	int sv[2];

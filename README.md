@@ -88,7 +88,7 @@ For container and script deployments:
 export CLAT_OFFLOAD=auto
 ```
 
-See the [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) for configuration and the [**2026-09-29 session investigation**](docs/PERFORMANCE-SESSION-INVESTIGATION-2026-09-29.md) for current synthetic Linux measurements and their limits.
+See the [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) for configuration. Hardware capacity must be established with a reproducible measurement on the target system.
 
 ## CLAT performance harness
 

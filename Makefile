@@ -123,7 +123,9 @@ taygabe: $(SOURCES)
 
 # Test suite compiles with -Werror to detect compiler warnings
 .PHONY: test
-test: unit_dispatch unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime
+test: unit_addrmap unit_netlink unit_dispatch unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime
+	./unit_addrmap
+	./unit_netlink
 	./unit_dispatch
 	./unit_conffile
 	./unit_checksum
@@ -213,7 +215,7 @@ man:
 .PHONY: clean
 clean:
 	$(RM) tayga taygabe tayga-nat64.tar tayga-clat.tar tayga.tar pref64-discover
-	$(RM) unit_dispatch unit_async_tun unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
+	$(RM) unit_addrmap unit_netlink unit_dispatch unit_async_tun unit_conffile unit_checksum unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats unit_packet_io unit_packet_io_lifetime tools/probe-tun-offload tools/udp-drain-guard.so tools/udp-drain-control tools/iperf-start-gate.so tools/iperf-start-control *.gcda *.gcno
 
 # Install tayga and man pages
 .PHONY: install
@@ -306,3 +308,24 @@ tools/iperf-start-gate.so: tools/iperf-start-gate.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -ldl
 tools/iperf-start-control: tools/iperf-start-gate.c
 	$(CC) $(CFLAGS) -DIPERF_GATE_CONTROLLER -o $@ $<
+
+unit_addrmap: test/unit_addrmap.c addrmap.c dynamic.c conffile.c log.c tayga.h list.h
+	$(CC) $(CFLAGS) -DADDRMAP_TEST_HOOK -I. -pthread -o $@ test/unit_addrmap.c addrmap.c dynamic.c conffile.c log.c $(LDFLAGS)
+
+unit_netlink: test/unit_netlink.c netlink_io.h
+	$(CC) $(CFLAGS) -I. -o $@ test/unit_netlink.c $(LDFLAGS)
+
+.PHONY: test-portable
+test-portable:
+	PYTHONPATH="$(TOPDIR)/test" python3 test/run_portable.py
+
+ifeq ($(WITH_URING),1)
+test: test-uring
+.PHONY: test-uring
+test-uring: unit_async_tun
+	./unit_async_tun
+endif
+
+.PHONY: check-docs
+check-docs:
+	python3 tools/check-doc-links.py

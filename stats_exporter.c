@@ -26,13 +26,31 @@ static bool g_telemetry_triggered = false;
 static pthread_mutex_t g_telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_telemetry_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t s_stats_export_mutex = PTHREAD_MUTEX_INITIALIZER;
-static char g_telemetry_path[256] = "/run/tayga-status.json";
+static char g_telemetry_path[768] = "/run/tayga-status.json";
 static int g_telemetry_interval = 5;
+
+static void json_string(FILE *out, const char *value)
+{
+	fputc('"', out);
+	for (const unsigned char *c = (const unsigned char *)value; *c; c++) {
+		if (*c == '"' || *c == '\\') fputc('\\', out);
+		if (*c < 32 || *c > 126) fprintf(out, "\\u%04x", *c);
+		else fputc(*c, out);
+	}
+	fputc('"', out);
+}
 
 void stats_write_json(const char *path, const char *state)
 {
-	pthread_mutex_lock(&s_stats_export_mutex);
-	char tmp_path[512];
+	/* The main packet loop must continue acknowledging a background exporter
+	 * while waiting for its lock (otherwise the exporter waits on this caller). */
+	if (g_tls_priv.slot_idx == 0) {
+		while (pthread_mutex_trylock(&s_stats_export_mutex) == EBUSY) {
+			stats_check_sync_request();
+			usleep(250);
+		}
+	} else pthread_mutex_lock(&s_stats_export_mutex);
+	char tmp_path[832];
 	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%lu", path, (unsigned long)pthread_self());
 
 	FILE *f = fopen(tmp_path, "w");
@@ -54,6 +72,7 @@ void stats_write_json(const char *path, const char *state)
 
 	struct list_head *entry;
 	if (gcfg.map6_list.next && gcfg.map6_list.prev) {
+		if (!gcfg.maps_immutable) pthread_mutex_lock(&gcfg.map_mutex);
 		list_for_each(entry, &gcfg.map6_list) {
 			struct map6 *m6 = list_entry(entry, struct map6, list);
 			if (m6->type == MAP_TYPE_RFC6052) {
@@ -63,6 +82,7 @@ void stats_write_json(const char *path, const char *state)
 				break;
 			}
 		}
+		if (!gcfg.maps_immutable) pthread_mutex_unlock(&gcfg.map_mutex);
 	}
 
 	const char *offload_str = tun_offload_name(gcfg.tun_offload);
@@ -74,7 +94,7 @@ void stats_write_json(const char *path, const char *state)
 	static time_t last_info_read = 0;
 	if (last_info_read == 0 || now - last_info_read >= 30) {
 		last_info_read = now;
-		FILE *info = fopen("/run/clat-info.json", "r");
+		FILE *info = fopen(gcfg.clat_info_path[0] ? gcfg.clat_info_path : "/run/clat-info.json", "r");
 		if (info) {
 			char line[256];
 			while (fgets(line, sizeof(line), info)) {
@@ -117,10 +137,16 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "{\n");
 	fprintf(f, "  \"version\": \"%s\",\n", TAYGA_VERSION);
 	fprintf(f, "  \"pid\": %ld,\n", (long)getpid());
+	fprintf(f, "  \"network_namespace\": %llu,\n", gcfg.runtime_netns);
+	fprintf(f, "  \"process_start_ticks\": \"%s\",\n", gcfg.process_start_ticks);
+	fprintf(f, "  \"tun_device\": ");
+	json_string(f, gcfg.tundev);
+	fprintf(f, ",\n");
 	fprintf(f, "  \"snapshot_sequence\": %llu,\n", (unsigned long long)snap_seq);
 	fprintf(f, "  \"workers_synced\": %s,\n", s.workers_synced ? "true" : "false");
 	fprintf(f, "  \"unacknowledged_worker_slots\": [");
-	bool first_unacked = true;
+	bool first_unacked = s.main_synced;
+	if (!s.main_synced) fprintf(f, "0");
 	for (int i = 0; i < 64; i++) {
 		if (s.unacked_mask & (1ULL << i)) {
 			int slot = i + 1;
@@ -152,6 +178,14 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "  \"offload_fallback_reason\": \"%s\",\n", gcfg.tun_offload_reason ? gcfg.tun_offload_reason : "none");
 	fprintf(f, "  \"offload_fallback_errno\": %d,\n", gcfg.tun_offload_errno);
 	fprintf(f, "  \"offload_fallback_queue\": %d,\n", gcfg.tun_offload_queue);
+	fprintf(f, "  \"tx_failed_frames\": %llu,\n", (unsigned long long)s.tx_failed_frames);
+	fprintf(f, "  \"tx_eagain\": %llu,\n", (unsigned long long)s.tx_eagain);
+	fprintf(f, "  \"tx_enobufs\": %llu,\n", (unsigned long long)s.tx_enobufs);
+	fprintf(f, "  \"tx_eintr\": %llu,\n", (unsigned long long)s.tx_eintr);
+	fprintf(f, "  \"tx_short\": %llu,\n", (unsigned long long)s.tx_short);
+	fprintf(f, "  \"tx_fatal\": %llu,\n", (unsigned long long)s.tx_fatal);
+	fprintf(f, "  \"tx_other\": %llu,\n", (unsigned long long)s.tx_other);
+	fprintf(f, "  \"warnings_suppressed\": %llu,\n", (unsigned long long)s.warnings_suppressed);
 	fprintf(f, "  \"traffic\": {\n");
 	fprintf(f, "    \"rx_packets_v4\": %llu,\n", (unsigned long long)s.rx_pkts_v4);
 	fprintf(f, "    \"rx_bytes_v4\": %llu,\n", (unsigned long long)s.rx_bytes_v4);
@@ -206,8 +240,13 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "  ]\n");
 	fprintf(f, "}\n");
 
-	fclose(f);
-	rename(tmp_path, path);
+	int failed = ferror(f);
+	if (fclose(f)) failed = 1;
+	if (!failed) failed = rename(tmp_path, path);
+	if (failed) {
+		slog(LOG_WARNING, "Unable to publish stats JSON: %s\n", strerror(errno));
+		unlink(tmp_path);
+	}
 	pthread_mutex_unlock(&s_stats_export_mutex);
 }
 
@@ -271,8 +310,9 @@ void telemetry_start(const char *status_path, int interval_sec)
 	/* Write initial snapshot immediately */
 	stats_write_json(g_telemetry_path, "running");
 
-	if (pthread_create(&g_telemetry_thread, NULL, telemetry_worker_loop, NULL) != 0) {
-		slog(LOG_WARNING, "Failed to start background telemetry thread: %s\n", strerror(errno));
+	int ret = pthread_create(&g_telemetry_thread, NULL, telemetry_worker_loop, NULL);
+	if (ret != 0) {
+		slog(LOG_WARNING, "Failed to start background telemetry thread: %s\n", strerror(ret));
 		atomic_store_explicit(&g_telemetry_running, false, memory_order_relaxed);
 	}
 #endif

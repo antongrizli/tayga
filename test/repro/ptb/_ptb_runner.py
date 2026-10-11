@@ -4,6 +4,7 @@ Self-contained PMTUD sub-test B: sets up topology, injects ICMPv6 PTB
 via Scapy L2, verifies ICMPv4 Fragmentation-Needed at client.
 """
 import sys, os, time, subprocess, socket
+from pathlib import Path
 
 sys.path.insert(0, '/usr/lib/python3/dist-packages')
 import logging
@@ -143,7 +144,7 @@ def main():
     raw_bytes = bytes(ptb_pkt)
     
     # Write packet to file, then send via python in server netns
-    pkt_file = "/Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/_ptb_pkt.bin"
+    pkt_file = str(Path(__file__).with_name('_ptb_pkt.bin'))
     with open(pkt_file, "wb") as f:
         f.write(raw_bytes)
     
@@ -159,7 +160,7 @@ pkt = Ether(raw)
 sendp(pkt, iface='server0', verbose=0)
 print('SENT', len(raw), 'bytes')
 """
-    send_file = "/Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/_ptb_send.py"
+    send_file = str(Path(__file__).with_name('_ptb_send.py'))
     with open(send_file, "w") as f:
         f.write(send_script)
 

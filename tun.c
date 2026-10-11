@@ -22,10 +22,20 @@
 #if defined(__linux__)
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include "netlink_io.h"
 #include <sys/file.h>
 #include <sys/stat.h>
 #include "tun_steering.h"
 static int tun_owner_lock = -1;
+struct tun_saved_config {
+	struct tun_saved_config *next;
+	struct nlmsghdr message;
+};
+static struct {
+	struct tun_saved_config *saved, *undo;
+	int ifidx, was_up, valid, queues, created_persistent;
+} tun_transaction;
+static void tun_free_saved_config(struct tun_saved_config *saved);
 /* Build-only research candidate; normal builds keep existing TUN semantics.
  * IFF_NAPI must be identical on initial, fallback and worker attachments.
  * Unsupported kernels fail initialization; this is never silently enabled. */
@@ -159,36 +169,31 @@ int tun_check_offload_support(void)
 }
 
 #ifdef __linux__
-int netlink_wait_for_ack(int fd)
+static int tun_config_socket(void);
+
+static int netlink_exchange(const struct nlmsghdr *request)
 {
-	char buf[4096];
-	ssize_t len;
-	struct nlmsghdr *nh;
-	/* Receive ACK */
-	len = recv(fd, buf, sizeof(buf), 0);
-	if (len < 0) {
-		slog(LOG_CRIT,"NETLINK Receive Failed\n");
-		return ERROR_REJECT;
+	int fd = tun_config_socket();
+	if (fd < 0) return ERROR_REJECT;
+	struct tun_saved_config *undo = NULL;
+	if (tun_transaction.valid &&
+		(request->nlmsg_type == RTM_NEWADDR || request->nlmsg_type == RTM_NEWROUTE)) {
+		undo = malloc(offsetof(struct tun_saved_config, message) + request->nlmsg_len);
+		if (!undo) { close(fd); return ERROR_REJECT; }
+		memcpy(&undo->message, request, request->nlmsg_len);
 	}
-
-	for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
-		if (nh->nlmsg_type == NLMSG_ERROR) {
-			struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nh);
-
-			//Found our ack
-			if (err->error == 0) {
-				close(fd);
-				return 0;
-			}
-			close(fd);
-			slog(LOG_CRIT,"NETLINK Returned Error %d\n",err->error);
-			return ERROR_REJECT;
-		}
-	}
-
+	int ret = rtnl_request(fd, request);
+	int saved_errno = errno;
+	/* An ACK timeout/malformed reply cannot prove the mutation was absent.
+	 * Keep its inverse even on failure; saved state repairs replacements. */
+	if (undo) {
+		undo->next = tun_transaction.undo;
+		tun_transaction.undo = undo;
+	} else free(undo);
 	close(fd);
-	slog(LOG_CRIT,"NETLINK Response Not Received\n");
-	return ERROR_REJECT;
+	if (ret < 0) slog(LOG_CRIT, "NETLINK request failed: %s\n", strerror(saved_errno));
+	errno = saved_errno;
+	return ret;
 }
 
 
@@ -207,17 +212,11 @@ int netlink_set_if_flags(int ifidx,
 						 unsigned int flags,
 						 unsigned int change)
 {
-	int fd;
 	struct {
 		struct nlmsghdr nh;
 		struct ifinfomsg ifi;
 	} req;
 
-	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (fd < 0) {
-		slog(LOG_CRIT,"NETLINK Socket Failed\n");
-		return ERROR_REJECT;
-	}
 
 	memset(&req, 0, sizeof(req));
 
@@ -232,14 +231,7 @@ int netlink_set_if_flags(int ifidx,
 	req.ifi.ifi_flags  = flags;
 	req.ifi.ifi_change = change;
 
-	if (send(fd, &req, req.nh.nlmsg_len, 0) < 0) {
-		close(fd);
-		slog(LOG_CRIT,"NETLINK Send Failed\n");
-		return ERROR_REJECT;
-	}
-
-	/* Receive ACK */
-	return netlink_wait_for_ack(fd);
+	return netlink_exchange(&req.nh);
 }
 
 /**
@@ -260,7 +252,6 @@ int netlink_addr_modify(int ifidx,
 						int prefixlen,
 						int add)
 {
-	int fd;
 	char buf[256];
 	struct nlmsghdr *nh;
 	struct ifaddrmsg *ifa;
@@ -272,11 +263,6 @@ int netlink_addr_modify(int ifidx,
 	else addrlen = sizeof(struct in6_addr);
 
 	/* Open socket */
-	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (fd < 0) {
-		slog(LOG_CRIT,"NETLINK Socket Failed\n");
-		return ERROR_REJECT;
-	}
 
 	memset(buf, 0, sizeof(buf));
 
@@ -310,14 +296,7 @@ int netlink_addr_modify(int ifidx,
 		nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + rta->rta_len;
 	}
 
-	if (send(fd, nh, nh->nlmsg_len, 0) < 0) {
-		close(fd);
-		slog(LOG_CRIT,"NETLINK Send Failed\n");
-		return ERROR_REJECT;
-	}
-
-	/* Receive ACK */
-	return netlink_wait_for_ack(fd);
+	return netlink_exchange(nh);
 }
 
 /**
@@ -338,7 +317,6 @@ int netlink_route_dev_modify(int ifidx,
 							 int prefixlen,
 							 int add)
 {
-	int fd;
 	char buf[256];
 	struct nlmsghdr *nh;
 	struct rtmsg *rtm;
@@ -348,11 +326,6 @@ int netlink_route_dev_modify(int ifidx,
 	if (af_family == AF_INET) addrlen = sizeof(struct in_addr);
 	else addrlen = sizeof(struct in6_addr);
 
-	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (fd < 0) {
-		slog(LOG_CRIT,"NETLINK Socket Failed\n");
-		return ERROR_REJECT;
-	}
 
 	memset(buf, 0, sizeof(buf));
 
@@ -389,22 +362,12 @@ int netlink_route_dev_modify(int ifidx,
 	nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + rta->rta_len;
 
 	/* Send */
-	if (send(fd, nh, nh->nlmsg_len, 0) < 0) {
-		close(fd);
-		slog(LOG_CRIT,"NETLINK Send Failed\n");
-		return ERROR_REJECT;
-	}
-
-	/* Receive ACK */
-	return netlink_wait_for_ack(fd);
+	return netlink_exchange(nh);
 }
 
 /* Administrative DOWN removes routes (and may remove IPv6 addresses).
  * Preserve only this owned interface's configuration before quiescing it. */
-struct tun_saved_config {
-	struct tun_saved_config *next;
-	struct nlmsghdr message;
-};
+
 
 static void tun_free_saved_config(struct tun_saved_config *saved)
 {
@@ -427,6 +390,29 @@ static int tun_config_socket(void)
 	return fd;
 }
 
+static int tun_route_will_replace(const struct nlmsghdr *n)
+{
+	const struct rtmsg *r = NLMSG_DATA(n);
+	unsigned table = r->rtm_table;
+	uint8_t destination[16] = {0};
+	int bytes = RTM_PAYLOAD(n);
+	for (struct rtattr *a = RTM_RTA(r); RTA_OK(a, bytes); a = RTA_NEXT(a, bytes)) {
+		if (a->rta_type == RTA_TABLE && RTA_PAYLOAD(a) == sizeof(table)) memcpy(&table, RTA_DATA(a), sizeof(table));
+		if (a->rta_type == RTA_DST && RTA_PAYLOAD(a) <= sizeof(destination)) memcpy(destination, RTA_DATA(a), RTA_PAYLOAD(a));
+	}
+	if (table != RT_TABLE_MAIN) return 0;
+	struct list_head *entry;
+	if (r->rtm_family == AF_INET) list_for_each(entry, &gcfg.tun_rt4_list) {
+		struct tun_ip4 *route = list_entry(entry, struct tun_ip4, list);
+		if (route->prefix_len == r->rtm_dst_len && !memcmp(&route->addr, destination, 4)) return 1;
+	}
+	if (r->rtm_family == AF_INET6) list_for_each(entry, &gcfg.tun_rt6_list) {
+		struct tun_ip6 *route = list_entry(entry, struct tun_ip6, list);
+		if (route->prefix_len == r->rtm_dst_len && !memcmp(&route->addr, destination, 16)) return 1;
+	}
+	return 0;
+}
+
 static int tun_save_config(int ifidx, int type, struct tun_saved_config **saved)
 {
 	int fd = tun_config_socket();
@@ -438,20 +424,27 @@ static int tun_save_config(int ifidx, int type, struct tun_saved_config **saved)
 					.nlmsg_seq = 1 },
 		.data = { .rtm_family = AF_UNSPEC },
 	};
-	struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
-	if (sendto(fd, &request, request.header.nlmsg_len, 0,
-			   (struct sockaddr *)&kernel, sizeof(kernel)) < 0) goto fail;
+	int64_t deadline = rtnl_milliseconds() + 2000;
+	if (rtnl_send(fd, &request.header, deadline)) goto fail;
 	for (int batches = 0; batches < 256; batches++) {
 		_Alignas(struct nlmsghdr) char buffer[65536];
-		struct iovec iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
-		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
-		ssize_t len = recvmsg(fd, &msg, 0);
-		if (len <= 0 || (msg.msg_flags & MSG_TRUNC)) goto fail;
+		ssize_t len = rtnl_receive(fd, buffer, sizeof(buffer), 1, deadline);
+		if (len <= 0) goto fail;
 		for (struct nlmsghdr *n = (struct nlmsghdr *)buffer;
 			 NLMSG_OK(n, len); n = NLMSG_NEXT(n, len)) {
 			if (n->nlmsg_flags & NLM_F_DUMP_INTR) goto fail;
-			if (n->nlmsg_type == NLMSG_DONE) { close(fd); return 0; }
-			if (n->nlmsg_type == NLMSG_ERROR) goto fail;
+			if (n->nlmsg_type == NLMSG_DONE) {
+				if (n->nlmsg_len < NLMSG_LENGTH(sizeof(int)) || *(int *)NLMSG_DATA(n)) goto fail;
+				close(fd); return 0;
+			}
+			if (n->nlmsg_type == NLMSG_ERROR) {
+				(void)rtnl_ack(n, n->nlmsg_len, 1); goto fail;
+			}
+			if (n->nlmsg_type == NLMSG_NOOP) continue;
+			if ((type == RTM_GETADDR && (n->nlmsg_type != RTM_NEWADDR || n->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg)))) ||
+			    (type == RTM_GETROUTE && (n->nlmsg_type != RTM_NEWROUTE || n->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg))))) {
+				errno = EPROTO; goto fail;
+			}
 			int belongs = 0;
 			if (type == RTM_GETADDR && n->nlmsg_type == RTM_NEWADDR &&
 				n->nlmsg_len >= NLMSG_LENGTH(sizeof(struct ifaddrmsg))) {
@@ -460,6 +453,7 @@ static int tun_save_config(int ifidx, int type, struct tun_saved_config **saved)
 			} else if (type == RTM_GETROUTE && n->nlmsg_type == RTM_NEWROUTE &&
 					   n->nlmsg_len >= NLMSG_LENGTH(sizeof(struct rtmsg))) {
 				struct rtmsg *r = NLMSG_DATA(n);
+				belongs = tun_route_will_replace(n);
 				int remaining = RTM_PAYLOAD(n);
 				for (struct rtattr *a = RTM_RTA(r); RTA_OK(a, remaining);
 					 a = RTA_NEXT(a, remaining)) {
@@ -521,22 +515,8 @@ static int tun_restore_config(struct tun_saved_config *saved)
 			n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
 			n->nlmsg_seq = 1;
 			n->nlmsg_pid = 0;
-			struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
-			int ret = ERROR_REJECT;
-			if (sendto(fd, n, n->nlmsg_len, 0, (struct sockaddr *)&kernel, sizeof(kernel)) >= 0) {
-				_Alignas(struct nlmsghdr) char buffer[4096];
-				ssize_t len = recv(fd, buffer, sizeof(buffer), 0);
-				for (struct nlmsghdr *ack = (struct nlmsghdr *)buffer;
-					 NLMSG_OK(ack, len); ack = NLMSG_NEXT(ack, len)) {
-					if (ack->nlmsg_type == NLMSG_ERROR &&
-						ack->nlmsg_len >= NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
-						int error = ((struct nlmsgerr *)NLMSG_DATA(ack))->error;
-						if (!error || error == -EEXIST) ret = 0;
-						else slog(LOG_CRIT, "TUN configuration restore type=%d family=%d error=%d: %s\n",
-								  type, *(unsigned char *)NLMSG_DATA(n), -error, strerror(-error));
-					}
-				}
-			}
+			int ret = rtnl_request(fd, n);
+			if (ret < 0 && errno == EEXIST) ret = 0;
 			close(fd);
 			if (ret < 0) {
 				slog(LOG_CRIT, "Cannot restore TUN address/route after initialization\n");
@@ -547,6 +527,48 @@ static int tun_restore_config(struct tun_saved_config *saved)
 	return 0;
 }
 
+void tun_setup_commit(void)
+{
+	tun_free_saved_config(tun_transaction.saved);
+	tun_free_saved_config(tun_transaction.undo);
+	tun_transaction.saved = tun_transaction.undo = NULL;
+	tun_transaction.valid = 0;
+}
+
+void tun_setup_abort(void)
+{
+	int saved_errno = errno;
+	if (tun_transaction.valid) {
+		for (struct tun_saved_config *item = tun_transaction.undo; item; item = item->next) {
+			struct nlmsghdr *n = &item->message;
+			n->nlmsg_type = n->nlmsg_type == RTM_NEWADDR ? RTM_DELADDR : RTM_DELROUTE;
+			n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+			int fd = tun_config_socket();
+			if (fd >= 0) {
+				if (rtnl_request(fd, n) && errno != ENOENT && errno != ESRCH && errno != EADDRNOTAVAIL)
+					slog(LOG_CRIT, "TUN rollback operation failed: %s\n", strerror(errno));
+				close(fd);
+			} else slog(LOG_CRIT, "Cannot open TUN rollback socket: %s\n", strerror(errno));
+		}
+		(void)netlink_set_if_flags(tun_transaction.ifidx,
+			tun_transaction.was_up ? IFF_UP : 0, IFF_UP);
+		(void)tun_restore_config(tun_transaction.saved);
+	}
+	if (tun_transaction.created_persistent && gcfg.tun_fd >= 0)
+		ioctl(gcfg.tun_fd, TUNSETPERSIST, 0);
+	tun_setup_commit();
+	for (int i = 0; i < tun_transaction.queues; i++) {
+		close(gcfg.tun_fd_addl[i]); gcfg.tun_fd_addl[i] = -1;
+	}
+	tun_transaction.queues = 0;
+	if (gcfg.tun_fd >= 0) close(gcfg.tun_fd);
+	gcfg.tun_fd = -1;
+	if (tun_owner_lock >= 0) close(tun_owner_lock);
+	tun_owner_lock = -1;
+	gcfg.tun_offload_complete = gcfg.tun_steering_effective = 0;
+	errno = saved_errno;
+}
+
 int tun_setup(int do_mktun, int do_rmtun)
 {
 	struct ifreq ifr;
@@ -554,6 +576,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 	int ifidx = 0;
 	int restore_up = 0;
 	struct tun_saved_config *saved = NULL;
+	memset(&tun_transaction, 0, sizeof(tun_transaction));
+	gcfg.tun_fd = -1;
 	int attached_queues = 0;
 	int created_persistent = 0;
 	/* No existing interface/BPF attachment is replaced. On last close this
@@ -564,15 +588,14 @@ int tun_setup(int do_mktun, int do_rmtun)
 	}
 	int want_vnet = !do_rmtun && gcfg.tun_offload != TUN_OFFLOAD_OFF;
 
-	gcfg.tun_fd = -1;
 	/* Namespace identity prevents independent containers with equal device
 	 * names from contending. Keep the lock across daemonization and chroot. */
 	struct stat ns;
-	char lock_path[256];
+	char lock_path[768];
 	if (stat("/proc/self/ns/net", &ns) < 0)
 		goto setup_fail;
-	snprintf(lock_path, sizeof(lock_path), "/run/tayga-tun-%llu-%s.lock",
-			 (unsigned long long)ns.st_ino, gcfg.tundev);
+	snprintf(lock_path, sizeof(lock_path), "%s/tayga-tun-%llu-%s.lock",
+			 gcfg.runtime_dir[0] ? gcfg.runtime_dir : "/run", (unsigned long long)ns.st_ino, gcfg.tundev);
 	tun_owner_lock = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (tun_owner_lock < 0 || flock(tun_owner_lock, LOCK_EX | LOCK_NB) < 0) {
 		slog(LOG_CRIT, "Cannot obtain exclusive TUN ownership: %s\n", strerror(errno));
@@ -627,10 +650,15 @@ int tun_setup(int do_mktun, int do_rmtun)
 	if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0)
 		goto setup_fail;
 	restore_up = !!(ifr.ifr_flags & IFF_UP);
-	if (!do_rmtun && restore_up) {
+	if (!do_rmtun) {
 		if (tun_save_config(ifidx, RTM_GETADDR, &saved) < 0 ||
-			tun_save_config(ifidx, RTM_GETROUTE, &saved) < 0 ||
-			netlink_set_if_flags(ifidx, 0, IFF_UP)) goto setup_fail;
+			tun_save_config(ifidx, RTM_GETROUTE, &saved) < 0) goto setup_fail;
+		tun_transaction.ifidx = ifidx;
+		tun_transaction.was_up = restore_up;
+		tun_transaction.valid = 1;
+		tun_transaction.saved = saved;
+		saved = NULL;
+		if (restore_up && netlink_set_if_flags(ifidx, 0, IFF_UP)) goto setup_fail;
 	}
 	close(fd);
 	fd = -1;
@@ -667,6 +695,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			goto setup_fail;
 		}
 		created_persistent = !was_persistent;
+		tun_transaction.created_persistent = created_persistent;
 		if (ioctl(gcfg.tun_fd, TUNSETOWNER, 0) < 0) {
 			slog(LOG_CRIT, "Unable to set owner on %s, "
 					"aborting: %s\n", gcfg.tundev,
@@ -682,8 +711,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 		slog(LOG_NOTICE, "Created persistent tun device %s\n",
 				gcfg.tundev);
 		if (restore_up && (netlink_set_if_flags(ifidx, IFF_UP, IFF_UP) ||
-						   tun_restore_config(saved))) goto setup_fail;
-		tun_free_saved_config(saved); saved = NULL;
+						   tun_restore_config(tun_transaction.saved))) goto setup_fail;
+		tun_setup_commit();
 		close(gcfg.tun_fd); gcfg.tun_fd = -1;
 		close(tun_owner_lock); tun_owner_lock = -1;
 		return 0;
@@ -696,7 +725,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 		}
 		slog(LOG_NOTICE, "Removed persistent tun device %s\n",
 				gcfg.tundev);
-		tun_free_saved_config(saved); saved = NULL;
+		tun_setup_commit();
 		close(gcfg.tun_fd); gcfg.tun_fd = -1;
 		close(tun_owner_lock); tun_owner_lock = -1;
 		return 0;
@@ -754,6 +783,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			goto setup_fail;
 		}
 		attached_queues++;
+		tun_transaction.queues = attached_queues;
 		if (ioctl(gcfg.tun_fd_addl[i], TUNSETIFF, &ifr) < 0) {
 			slog(LOG_CRIT, "Unable to attach tun device %s, aborting: "
 					"%s\n", gcfg.tundev, strerror(errno));
@@ -821,8 +851,8 @@ int tun_setup(int do_mktun, int do_rmtun)
 		slog(LOG_INFO, "Tun device %s is UP\n",gcfg.tundev);
 	}
 
-	if (restore_up && tun_restore_config(saved)) goto setup_fail;
-	tun_free_saved_config(saved); saved = NULL;
+	if (restore_up && tun_restore_config(tun_transaction.saved)) goto setup_fail;
+
 
 	/* Add IPs to the tun dev */
 	char addrbuf[INET6_ADDRSTRLEN];
@@ -878,27 +908,20 @@ int tun_setup(int do_mktun, int do_rmtun)
 		 gcfg.vnet_hdr_sz, gcfg.tun_offload_flags, gcfg.tun_offload_reason);
 	return 0;
 setup_fail:
-	if (created_persistent && gcfg.tun_fd >= 0) ioctl(gcfg.tun_fd, TUNSETPERSIST, 0);
 	if (fd >= 0) close(fd);
-	if (restore_up && ifidx && !do_rmtun) {
-		if (!netlink_set_if_flags(ifidx, IFF_UP, IFF_UP)) tun_restore_config(saved);
-	}
 	tun_free_saved_config(saved);
-	for (int i = 0; i < attached_queues; i++) {
-		close(gcfg.tun_fd_addl[i]);
-		gcfg.tun_fd_addl[i] = -1;
-	}
-	if (gcfg.tun_fd >= 0) close(gcfg.tun_fd);
-	gcfg.tun_fd = -1;
-	gcfg.tun_offload_complete = 0;
-	if (tun_owner_lock >= 0) close(tun_owner_lock);
-	gcfg.tun_steering_effective = 0;
-	tun_owner_lock = -1;
+	tun_setup_abort();
 	return ERROR_REJECT;
 }
 #endif /* ifdef __linux__ */
 
 #ifdef __FreeBSD__
+void tun_setup_commit(void) {}
+void tun_setup_abort(void)
+{
+	if (gcfg.tun_fd >= 0) close(gcfg.tun_fd);
+	gcfg.tun_fd = -1;
+}
 int tun_setup(int do_mktun, int do_rmtun)
 {
 	struct ifreq ifr;
@@ -1022,51 +1045,8 @@ int tun_setup(int do_mktun, int do_rmtun)
  */
 ssize_t tun_write(int tun_fd, const void *buf, size_t len)
 {
-	if (unlikely(gcfg.vnet_hdr_sz > 0)) {
-		struct virtio_net_hdr_raw vhdr;
-		memset(&vhdr, 0, sizeof(vhdr));
-		return tun_write_vnet(tun_fd, &vhdr, buf, len);
-	}
-
-	if (gcfg.async_tun) {struct iovec iov={(void *)buf,len};return async_tun_submit(tun_fd,&iov,1);}
-	ssize_t ret;
-
-	for (int attempt = 0; attempt < 5; attempt++) {
-		ret = write(tun_fd, buf, len);
-		if (likely(ret == (ssize_t)len)) {
-			if (len > 0) {
-				uint8_t ver = ((const uint8_t *)buf)[0] >> 4;
-				if (ver == 4)
-					stats_tx4((uint32_t)len);
-				else if (ver == 6)
-					stats_tx6((uint32_t)len);
-			}
-			return ret;
-		}
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			int saved_errno = errno;
-			stats_error();
-			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-				strerror(saved_errno));
-			errno = saved_errno;
-			return -1;
-		}
-		/* Short write: packet was truncated by kernel/device.
-		 * Do not attempt to append remainder; drop, set errno = EIO, and log warning. */
-		stats_error();
-		slog(LOG_WARNING, "short write to tun device: wrote %zd of %zu bytes\n",
-			ret, len);
-		errno = EIO;
-		return -1;
-	}
-	int saved_errno = errno;
-	stats_error();
-	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-		strerror(saved_errno));
-	errno = saved_errno;
-	return -1;
+	struct iovec iov = {(void *)buf, len};
+	return tun_writev(tun_fd, &iov, 1);
 }
 
 ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const void *buf, size_t len)
@@ -1087,21 +1067,30 @@ ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const 
  */
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 {
+	if (!iov || iovcnt < 1 || iovcnt > 64) { errno = EINVAL; return -1; }
 	if (unlikely(gcfg.vnet_hdr_sz > 0 && iov[0].iov_len != (size_t)gcfg.vnet_hdr_sz)) {
-		struct virtio_net_hdr_raw vhdr;
-		memset(&vhdr, 0, sizeof(vhdr));
+		struct virtio_net_hdr_raw vhdr = {0};
 		return tun_writev_vnet(tun_fd, &vhdr, iov, iovcnt);
 	}
-
-	if (gcfg.async_tun) return async_tun_submit(tun_fd,iov,iovcnt);
 	size_t total_len = 0;
-	ssize_t ret;
-
-	for (int i = 0; i < iovcnt; i++)
+	for (int i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len > RECV_BUF_SIZE - total_len) { errno = EMSGSIZE; return -1; }
 		total_len += iov[i].iov_len;
-
+	}
+	uint32_t ip_bytes = total_len;
+	if (gcfg.vnet_hdr_sz && total_len >= (size_t)gcfg.vnet_hdr_sz) ip_bytes -= gcfg.vnet_hdr_sz;
+#ifndef __linux__
+	else if (iov[0].iov_len == sizeof(struct tun_pi)) ip_bytes -= sizeof(struct tun_pi);
+#endif
+	if (gcfg.async_tun) {
+		ssize_t result = async_tun_submit(tun_fd, iov, iovcnt);
+		if (result < 0) stats_tx_failure(errno, ip_bytes, false);
+		return result;
+	}
+	ssize_t ret = -1;
 	for (int attempt = 0; attempt < 5; attempt++) {
-		ret = packet_io_transmit(tun_fd, iov, iovcnt);
+		ret = iovcnt == 1 ? write(tun_fd, iov[0].iov_base, iov[0].iov_len) :
+			packet_io_transmit(tun_fd, iov, iovcnt);
 		if (likely(ret == (ssize_t)total_len)) {
 			int ip_idx = 0;
 			if (gcfg.vnet_hdr_sz > 0 && iov[0].iov_len == (size_t)gcfg.vnet_hdr_sz)
@@ -1120,35 +1109,20 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 			}
 			return ret;
 		}
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			int saved_errno = errno;
-			stats_error();
-			slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-				strerror(saved_errno));
-			errno = saved_errno;
-			return -1;
-		}
-		/* Short write: packet was truncated */
-		stats_error();
-		slog(LOG_WARNING, "short writev to tun device: wrote %zd of %zu bytes\n",
-			ret, total_len);
-		errno = EIO;
-		return -1;
+		if (ret < 0 && errno == EINTR) continue;
+		break;
 	}
-	int saved_errno = errno;
-	stats_error();
-	slog(LOG_WARNING, "error writing packet to tun device: %s\n",
-		strerror(saved_errno));
+	int saved_errno = ret < 0 ? errno : EIO;
+	stats_tx_failure(saved_errno, ip_bytes, ret >= 0);
 	errno = saved_errno;
 	return -1;
 }
 
 ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const struct iovec *iov, int iovcnt)
 {
+	if (!iov || iovcnt < 1 || iovcnt > 63) { errno = EINVAL; return -1; }
 	if (gcfg.vnet_hdr_sz > 0) {
-		struct iovec iov_with_vnet[iovcnt + 1];
+		struct iovec iov_with_vnet[64];
 		iov_with_vnet[0].iov_base = (void *)vhdr;
 		iov_with_vnet[0].iov_len = gcfg.vnet_hdr_sz;
 		for (int i = 0; i < iovcnt; i++)
@@ -1193,7 +1167,7 @@ int tun_read_packet(uint8_t * recv_buf, int tun_fd)
 	if (unlikely((size_t)ret == read_len)) {
 		stats_drop((uint32_t)ret);
 		stats_packet_done();
-		slog(LOG_WARNING, "dropping oversized or truncated packet (%d bytes)\n", ret);
+		stats_warn_limited(8, "oversized or truncated TUN packet", 0);
 		return TUN_READ_CONSUMED;
 	}
 
@@ -1212,7 +1186,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 		if (unlikely(ret <= gcfg.vnet_hdr_sz)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			stats_packet_done();
-			slog(LOG_WARNING, "short read with vnet header (%d bytes)\n", ret);
+			stats_warn_limited(9, "short TUN packet", 0);
 			return TUN_READ_CONSUMED;
 		}
 		*p = (struct pkt){
@@ -1232,7 +1206,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 		if (unlikely(ret < 1)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
 			stats_packet_done();
-			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
+			stats_warn_limited(9, "short TUN packet", 0);
 			return TUN_READ_CONSUMED;
 		}
 		*p = (struct pkt){
@@ -1260,8 +1234,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 		break;
 	default:
 		stats_drop(p->data_len);
-		slog(LOG_WARNING, "Dropping unknown IP version %u from "
-				"tun device\n", p->data[0] >> 4);
+		stats_warn_limited(10, "unknown IP version", 0);
 		break;
 	}
 #else
@@ -1269,7 +1242,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 		struct tun_pi *pi = (struct tun_pi *)(recv_buf + HEADROOM);
 		if ((size_t)ret < sizeof(struct tun_pi)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
-			slog(LOG_WARNING, "short read from tun device (%d bytes)\n", ret);
+			stats_warn_limited(9, "short TUN packet", 0);
 			return TUN_READ_CONSUMED;
 		}
 		p->data = recv_buf + HEADROOM + sizeof(struct tun_pi);
@@ -1285,8 +1258,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 			break;
 		default:
 			stats_drop(p->data_len);
-			slog(LOG_WARNING, "Dropping unknown proto %04x from tun device\n",
-					ntohs(pi->proto));
+			stats_warn_limited(10, "unknown TUN protocol", 0);
 			break;
 		}
 	}

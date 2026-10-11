@@ -20,8 +20,52 @@ atomic_uint_fast64_t g_stats_sync_ack[STATS_MAX_SLOTS] = {0};
 atomic_uint_fast64_t g_stats_snapshot_seq = 0;
 atomic_bool g_worker_slot_active[STATS_MAX_SLOTS];
 
+atomic_bool g_tun_tx_fatal = false;
+static __thread struct { time_t second; uint64_t suppressed; bool emitted; } warning_limit[16];
+
+void stats_warn_limited(unsigned reason, const char *message, int error)
+{
+	int saved = errno;
+	if (reason >= 16) reason = 15;
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	if (warning_limit[reason].emitted && warning_limit[reason].second == t.tv_sec) {
+		warning_limit[reason].suppressed++;
+		g_tls_priv.warnings_suppressed++;
+	} else {
+		slog(LOG_WARNING, "%s: %s (suppressed=%llu)\n", message,
+			error ? strerror(error) : "invalid packet",
+			(unsigned long long)warning_limit[reason].suppressed);
+		warning_limit[reason].second = t.tv_sec;
+		warning_limit[reason].suppressed = 0;
+		warning_limit[reason].emitted = true;
+	}
+	errno = saved;
+}
+
+void stats_tx_failure(int error, uint32_t ip_bytes, bool short_write)
+{
+	int saved = errno;
+	unsigned reason = 6;
+	stats_error();
+	stats_drop(ip_bytes);
+	g_tls_priv.tx_failed_frames++;
+	if (short_write) { g_tls_priv.tx_short++; reason = 4; }
+	else if (error == EAGAIN || error == EWOULDBLOCK) { g_tls_priv.tx_eagain++; reason = 1; }
+	else if (error == ENOBUFS) { g_tls_priv.tx_enobufs++; reason = 2; }
+	else if (error == EINTR) { g_tls_priv.tx_eintr++; reason = 3; }
+	else if (error == EBADF || error == ENODEV || error == EIO || error == ESHUTDOWN) {
+		g_tls_priv.tx_fatal++; reason = 5;
+		atomic_store_explicit(&g_tun_tx_fatal, true, memory_order_relaxed);
+	} else g_tls_priv.tx_other++;
+	stats_warn_limited(reason, short_write ? "short TUN write; frame dropped" : "TUN transmit failed", error);
+	errno = saved;
+}
+
 void stats_init(void)
 {
+	atomic_store(&g_tun_tx_fatal, false);
+	memset(warning_limit, 0, sizeof(warning_limit));
 	memset(g_worker_pub, 0, sizeof(g_worker_pub));
 	memset(&g_tls_priv, 0, sizeof(g_tls_priv));
 	g_tls_priv.slot_idx = 0;
@@ -67,12 +111,29 @@ void stats_check_sync_request(void)
 }
 
 atomic_int g_workers_running = 0;
+static pthread_t main_thread;
+static atomic_bool main_registered = false;
 
-int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
+void stats_main_start(void)
 {
-#ifdef __linux__
+	main_thread = pthread_self();
+	atomic_store_explicit(&g_worker_slot_active[0], true, memory_order_release);
+	atomic_store_explicit(&main_registered, true, memory_order_release);
+}
+
+void stats_main_stop(void)
+{
+	stats_flush_worker();
+	atomic_store_explicit(&g_worker_slot_active[0], false, memory_order_release);
+	atomic_store_explicit(&main_registered, false, memory_order_release);
+}
+
+static int stats_sync_slots(bool *synced_out, uint64_t *unacked_mask_out, bool *main_synced_out)
+{
 	uint64_t target_mask = 0;
 	int active_count = 0;
+	bool target_main = atomic_load_explicit(&main_registered, memory_order_acquire);
+	if (main_synced_out) *main_synced_out = true;
 
 	for (int i = 0; i < gcfg.workers && i < 64; i++) {
 		int slot = i + 1;
@@ -82,7 +143,7 @@ int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
 		}
 	}
 
-	if (active_count == 0) {
+	if (active_count == 0 && !target_main) {
 		if (g_tls_priv.slot_idx >= 0)
 			stats_flush_worker();
 		if (synced_out) *synced_out = true;
@@ -91,10 +152,13 @@ int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
 	}
 
 	uint64_t req = atomic_fetch_add_explicit(&g_stats_sync_req, 1, memory_order_acq_rel) + 1;
+	if (target_main && g_tls_priv.slot_idx != 0) pthread_kill(main_thread, SIGURG);
 	/* Publish before waking idle workers, so their first check sees this request. */
+#ifdef __linux__
 	for (int i = 0; i < gcfg.workers && i < 64; i++)
 		if (target_mask & (1ULL << i))
 			pthread_kill(gcfg.threads[i], SIGURG);
+#endif
 
 	if (g_tls_priv.slot_idx >= 0) {
 		stats_flush_worker();
@@ -107,7 +171,10 @@ int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
 	uint64_t unacked_mask = 0;
 
 	for (;;) {
-		bool all_acked = true;
+		bool main_acked = !target_main ||
+			!atomic_load_explicit(&main_registered, memory_order_acquire) ||
+			atomic_load_explicit(&g_stats_sync_ack[0], memory_order_acquire) >= req;
+		bool all_acked = main_acked;
 		for (int i = 0; i < gcfg.workers && i < 64; i++) {
 			if (!(target_mask & (1ULL << i)))
 				continue;
@@ -141,19 +208,18 @@ int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
 					     slot, (unsigned long long)req);
 				}
 			}
-			if (synced_out) *synced_out = (unacked_mask == 0);
+			if (main_synced_out) *main_synced_out = main_acked;
+			if (synced_out) *synced_out = (unacked_mask == 0 && main_acked);
 			if (unacked_mask_out) *unacked_mask_out = unacked_mask;
-			return (unacked_mask == 0) ? 0 : -1;
+			return (unacked_mask == 0 && main_acked) ? 0 : -1;
 		}
 		usleep(250);
 	}
-#else
-	if (g_tls_priv.slot_idx >= 0)
-		stats_flush_worker();
-	if (synced_out) *synced_out = true;
-	if (unacked_mask_out) *unacked_mask_out = 0;
-	return 0;
-#endif
+}
+
+int stats_sync_workers(bool *synced_out, uint64_t *unacked_mask_out)
+{
+	return stats_sync_slots(synced_out, unacked_mask_out, NULL);
 }
 
 void stats_flush_worker(void)
@@ -176,6 +242,15 @@ void stats_flush_worker(void)
 	atomic_store_explicit(&p->dropped_pkts, g_tls_priv.dropped_pkts, memory_order_relaxed);
 	atomic_store_explicit(&p->dropped_bytes, g_tls_priv.dropped_bytes, memory_order_relaxed);
 	atomic_store_explicit(&p->error_pkts, g_tls_priv.error_pkts, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_failed_frames, g_tls_priv.tx_failed_frames, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_eagain, g_tls_priv.tx_eagain, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_enobufs, g_tls_priv.tx_enobufs, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_eintr, g_tls_priv.tx_eintr, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_short, g_tls_priv.tx_short, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_fatal, g_tls_priv.tx_fatal, memory_order_relaxed);
+	atomic_store_explicit(&p->tx_other, g_tls_priv.tx_other, memory_order_relaxed);
+	atomic_store_explicit(&p->warnings_suppressed, g_tls_priv.warnings_suppressed, memory_order_relaxed);
+
 
 	atomic_store_explicit(&p->gso_rx_pkts, g_tls_priv.gso_rx_pkts, memory_order_relaxed);
 	atomic_store_explicit(&p->gso_rx_bytes, g_tls_priv.gso_rx_bytes, memory_order_relaxed);
@@ -202,7 +277,7 @@ void stats_get_snapshot(struct tayga_stats *out)
 	memset(out, 0, sizeof(*out));
 	out->start_time = g_stats_start_time;
 
-	stats_sync_workers(&out->workers_synced, &out->unacked_mask);
+	stats_sync_slots(&out->workers_synced, &out->unacked_mask, &out->main_synced);
 
 	for (int i = 0; i < STATS_MAX_SLOTS; i++) {
 		struct worker_pub_stats *p = &g_worker_pub[i];
@@ -219,6 +294,15 @@ void stats_get_snapshot(struct tayga_stats *out)
 		out->dropped_pkts += atomic_load_explicit(&p->dropped_pkts, memory_order_relaxed);
 		out->dropped_bytes += atomic_load_explicit(&p->dropped_bytes, memory_order_relaxed);
 		out->error_pkts += atomic_load_explicit(&p->error_pkts, memory_order_relaxed);
+		out->tx_failed_frames += atomic_load_explicit(&p->tx_failed_frames, memory_order_relaxed);
+		out->tx_eagain += atomic_load_explicit(&p->tx_eagain, memory_order_relaxed);
+		out->tx_enobufs += atomic_load_explicit(&p->tx_enobufs, memory_order_relaxed);
+		out->tx_eintr += atomic_load_explicit(&p->tx_eintr, memory_order_relaxed);
+		out->tx_short += atomic_load_explicit(&p->tx_short, memory_order_relaxed);
+		out->tx_fatal += atomic_load_explicit(&p->tx_fatal, memory_order_relaxed);
+		out->tx_other += atomic_load_explicit(&p->tx_other, memory_order_relaxed);
+		out->warnings_suppressed += atomic_load_explicit(&p->warnings_suppressed, memory_order_relaxed);
+
 
 		out->gso_rx_pkts += atomic_load_explicit(&p->gso_rx_pkts, memory_order_relaxed);
 		out->gso_rx_bytes += atomic_load_explicit(&p->gso_rx_bytes, memory_order_relaxed);

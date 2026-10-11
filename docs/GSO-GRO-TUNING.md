@@ -13,7 +13,7 @@ With **GSO/GRO Offload**, TAYGA interacts with the Linux kernel TUN driver using
 - **GRO (Receive-Side)**: When enabled on ingress interfaces (`ethtool -K <iface> gro on`), the kernel coalesces incoming TCP packets of the same flow before delivering them to TUN.
 - **RFC 7915 packet policy**: Experimental UDP USO reserves consecutive IPv4 IDs for aggregates whose output packets all have DF=0. Linux completes their checksums and increments IDs during segmentation. Aggregates crossing the 1,260-byte IPv4 length boundary use software segmentation because their packets require different DF policies. This path has been checked on Debian Linux 6.12 ARM64; validation on other target kernels remains required.
 
-TCP and UDP results are workload-specific. The current TCP measurements used aggregates averaging tens of kilobytes and reached high synthetic Lima throughput. UDP USO was disabled in those measurements, and UDP losses occurred at higher offered rates. See the [session investigation](PERFORMANCE-SESSION-INVESTIGATION-2026-09-29.md) for measured directions, rates, drops, perf scope, and limitations. No hardware capacity claim follows from those VM results.
+TCP and UDP results are workload-specific. Record offered and received rates, loss, binary hashes and profiling scope before drawing a capacity conclusion. Synthetic VM results do not establish hardware capacity.
 
 ---
 
@@ -67,7 +67,7 @@ tayga --check-offload
 
 Output on supported systems:
 ```text
-OFFLOAD_CHECK: OK (IFF_VNET_HDR supported, vnet_hdr_sz=10, TSO4|TSO6|CSUM available)
+OFFLOAD_CHECK: OK (vnet_hdr_sz=10, effective=udp, udp_available=yes)
 ```
 
 Output on unsupported systems:
@@ -118,9 +118,9 @@ The repository provides automated validation scripts in the `test/` directory:
 |---|---|
 | `test/test_auto_negotiation.py` | Default UDP selection, fallback failures and capability telemetry |
 | `test/test_auto_persistent.py` | Persistent addresses/routes, restart, exclusive ownership and removal |
-| [`test/test_correctness.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_correctness.py) | ICMP ping, 20 MB TCP upload/download SHA-256 integrity, UDP datagrams |
-| [`test/test_pmtud.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_pmtud.py) | End-to-end PMTUD & ICMPv6 Packet Too Big (1280 → 1260) translation |
-| [`test/test_preflight.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/test_preflight.py) | CLI `--check-offload`, mode startups (`auto`, `tcp`, `off`), and data path |
+| [`test/test_correctness.py`](../test/test_correctness.py) | ICMP ping, 20 MB TCP upload/download SHA-256 integrity, UDP datagrams |
+| [`test/test_pmtud.py`](../test/test_pmtud.py) | End-to-end PMTUD & ICMPv6 Packet Too Big (1280 → 1260) translation |
+| [`test/test_preflight.py`](../test/test_preflight.py) | CLI `--check-offload`, mode startups (`auto`, `tcp`, `off`), and data path |
 
 Run the complete test suite:
 ```sh
@@ -171,8 +171,7 @@ and leaf qdisc counts can overlap and must not be added together. Queues are
 removed with the disposable namespaces; production interfaces are unaffected.
 
 This treatment does not guarantee lossless overload or resolve all TUN
-pressure. See [the buffer investigation](UDP-BUFFER-PRESSURE-INVESTIGATION-0.9.12.md)
-for the evidence and validation criteria.
+pressure. Preserve rejected overload runs and validate both socket and interface counters.
 
 ### Benchmark-only UDP draining and accounting
 

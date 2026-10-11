@@ -7,9 +7,26 @@
 
 set -e
 
-STATUS_FILE="/run/tayga-status.json"
+STATUS_FILE="${TAYGA_STATUS_FILE:-${TAYGA_RUNTIME_DIR:-/run}/tayga-status.json}"
+export STATUS_FILE
 
-TAYGA_PID=$(pidof tayga 2>/dev/null || pgrep -x tayga 2>/dev/null || true)
+TAYGA_PID=""
+if command -v python3 >/dev/null 2>&1 && [ -f "$STATUS_FILE" ]; then
+  TAYGA_PID=$(python3 - <<'PY_STATUS'
+import json, os
+try:
+    d = json.load(open(os.environ['STATUS_FILE']))
+    pid = int(d['pid'])
+    ns = os.stat(f'/proc/{pid}/ns/net').st_ino
+    own_ns = os.stat('/proc/self/ns/net').st_ino
+    ticks = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[19]
+    if d.get('network_namespace') == ns == own_ns and d.get('process_start_ticks') == ticks:
+        print(pid)
+except (OSError, ValueError, KeyError, IndexError):
+    pass
+PY_STATUS
+)
+fi
 DAEMON_RUNNING=false
 if [ -n "$TAYGA_PID" ] && kill -0 "$TAYGA_PID" 2>/dev/null; then
   DAEMON_RUNNING=true
@@ -26,12 +43,12 @@ if [ ! -f "$STATUS_FILE" ]; then
   exit 1
 fi
 
-if [ "$1" = "--json" ] || [ "$1" = "-j" ]; then
+if [ "${1:-}" = "--json" ] || [ "${1:-}" = "-j" ]; then
   if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
+    DAEMON_RUNNING="$DAEMON_RUNNING" python3 -c '
 import json, sys, os
 is_running = (os.environ.get("DAEMON_RUNNING") == "true")
-with open("'"$STATUS_FILE"'") as f:
+with open(os.environ["STATUS_FILE"]) as f:
     d = json.load(f)
 d["daemon_running"] = is_running
 if not is_running:
@@ -64,7 +81,7 @@ def fmt_bytes(b):
 
 is_running = (os.environ.get("DAEMON_RUNNING") == "true")
 
-with open("/run/tayga-status.json") as f:
+with open(os.environ["STATUS_FILE"]) as f:
     d = json.load(f)
 
 v = d.get("version", "unknown")

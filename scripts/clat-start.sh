@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"
+export TAYGA_RUNTIME_DIR
+mkdir -p "$TAYGA_RUNTIME_DIR"
 
 enable_forwarding() {
   key=$1
@@ -77,7 +80,7 @@ if [ "$CLAT_OFFLOAD" != "off" ] && command -v ethtool >/dev/null 2>&1; then
   ethtool -K "$UPLINK_IF" gro on 2>/dev/null || true
 fi
 
-cat > /run/clat.conf <<CONF_EOF
+cat > "$TAYGA_RUNTIME_DIR/clat.conf" <<CONF_EOF
 tun-device ${TUN}
 ipv4-addr ${V4_TAYGA}
 ipv6-addr ${V6_TAYGA}
@@ -88,7 +91,7 @@ offlink-mtu ${CLAT_OFFLINK_MTU}
 tun-offload ${CLAT_OFFLOAD}
 CONF_EOF
 
-tayga -c /run/clat.conf --mktun
+tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun
 ip link set "$TUN" up
 ip addr replace "$V4_HOST/32" dev "$TUN"
 ip -6 addr replace "$V6_HOST/128" dev "$TUN"
@@ -97,4 +100,4 @@ ip -6 route replace "$V6_CLIENT/128" dev "$TUN"
 ip route replace default dev "$TUN"
 enable_forwarding net.ipv4.ip_forward
 enable_forwarding net.ipv6.conf.all.forwarding
-exec tayga -c /run/clat.conf -d
+exec tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d

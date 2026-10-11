@@ -1,6 +1,9 @@
 #!/bin/sh
 set -u
 
+TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"
+export TAYGA_RUNTIME_DIR
+
 echo "============================================================"
 echo " TAYGA Unified Container Diagnostics"
 echo " Date: $(date -u)"
@@ -53,7 +56,7 @@ sysctl net.ipv6.conf.all.forwarding 2>/dev/null || cat /proc/sys/net/ipv6/conf/a
 
 echo ""
 echo "--- 8. Active Configuration Files ---"
-for f in /run/clat.conf /run/tayga.conf /run/unbound.conf; do
+for f in "$TAYGA_RUNTIME_DIR/clat.conf" "$TAYGA_RUNTIME_DIR/tayga.conf" "$TAYGA_RUNTIME_DIR/unbound.conf"; do
   if [ -f "$f" ]; then
     echo ">>> $f:"
     cat "$f"

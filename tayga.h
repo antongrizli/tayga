@@ -380,6 +380,12 @@ struct config {
 	struct list_head map6_list;
 	/* Set after validation when no code path can modify static maps. */
 	int maps_immutable;
+	char runtime_dir[512];
+	int runtime_dir_configured;
+	unsigned long long runtime_netns;
+	char process_start_ticks[32];
+	char status_path[768];
+	char clat_info_path[768];
 
 	//Dynamic map parameters
 	char data_dir[512];
@@ -487,7 +493,7 @@ enum {
 
 /* TAYGA function prototypes */
 extern struct config gcfg;
-extern time_t now;
+extern _Atomic time_t now;
 
 /* addrmap.c */
 int validate_ip4_addr(const struct in_addr *a);
@@ -495,7 +501,7 @@ int validate_ip6_addr(const struct in6_addr *a);
 int is_private_ip4_addr(const struct in_addr *a);
 int calc_ip4_mask(struct in_addr *mask, const struct in_addr *addr, int len);
 int calc_ip6_mask(struct in6_addr *mask, const struct in6_addr *addr, int len);
-void create_cache(void);
+int create_cache(void);
 int insert_map4(struct map4 *m, struct map4 **conflict);
 int insert_map6(struct map6 *m, struct map6 **conflict);
 struct map4 *find_map4(const struct in_addr *addr4);
@@ -565,6 +571,8 @@ static inline unsigned tun_next_direct_burst(unsigned previous, int exhausted)
 
 /* tun.c */
 int tun_setup(int do_mktun, int do_rmtun);
+void tun_setup_commit(void);
+void tun_setup_abort(void);
 int tun_check_offload_support(void);
 int set_nonblock(int fd);
 int tun_read_packet(uint8_t * recv_buf, int tun_fd);

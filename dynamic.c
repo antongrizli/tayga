@@ -128,7 +128,7 @@ struct map6 *assign_dynamic(const struct in6_addr *addr6)
 	}
 
 	base = 0;
-	max = (1 << (32 - pool->map4.prefix_len)) - 1;
+	max = UINT32_MAX >> pool->map4.prefix_len;
 
 	for (i = 0; i < 4; ++i) {
 		base += addr6->s6_addr32[i];
@@ -293,7 +293,7 @@ malformed:
 	}
 	fclose(in);
 
-	time(&now);
+	atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
 	last_use = 0;
 	list_for_each(entry, &pool->dormant_list) {
 		d = list_entry(entry, struct map_dynamic, list);
@@ -323,48 +323,34 @@ malformed:
 	}
 }
 
-static void write_to_file(struct dynamic_pool *pool)
-{
-	FILE *out;
-	struct list_head *entry;
-	struct map_dynamic *d;
-	char addrbuf4[INET_ADDRSTRLEN];
-	char addrbuf6[INET6_ADDRSTRLEN];
+struct dynamic_snapshot {
+	struct in_addr addr4;
+	struct in6_addr addr6;
+	time_t last_use;
+};
 
-	out = fopen(TMP_MAP_FILE, "w");
-	if (!out) {
-		slog(LOG_ERR, "Unable to open %s/%s for writing: %s\n",
-				gcfg.data_dir, TMP_MAP_FILE,
-				strerror(errno));
-		return;
+static int write_to_file(const struct dynamic_snapshot *rows, size_t count, time_t written_at)
+{
+	FILE *out = fopen(TMP_MAP_FILE, "w");
+	if (!out) return -1;
+	struct tm tm;
+	char timestamp[64];
+	gmtime_r(&written_at, &tm);
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S UTC", &tm);
+	fprintf(out, "### tayga dynamic map database\n### Last written: %s\n\n", timestamp);
+	for (size_t i = 0; i < count; i++) {
+		char v4[INET_ADDRSTRLEN], v6[INET6_ADDRSTRLEN];
+		inet_ntop(AF_INET, &rows[i].addr4, v4, sizeof(v4));
+		inet_ntop(AF_INET6, &rows[i].addr6, v6, sizeof(v6));
+		fprintf(out, "%s\t%s\t%" PRId64 "\n", v4, v6, (int64_t)rows[i].last_use);
 	}
-	fprintf(out, "###\n###\n### tayga dynamic map database\n###\n"
-			"### You can edit this (carefully!) as long as "
-			"you shut down tayga first\n###\n###\n"
-			"### Last written: %s###\n###\n\n",
-			asctime(gmtime(&now)));
-	entry = pool->mapped_list.next;
-	while (entry != &pool->dormant_list) {
-		if (entry == &pool->mapped_list) {
-			entry = pool->dormant_list.next;
-			continue;
-		}
-		d = list_entry(entry, struct map_dynamic, list);
-		inet_ntop(AF_INET, &d->map4.addr, addrbuf4, sizeof(addrbuf4));
-		inet_ntop(AF_INET6, &d->map6.addr, addrbuf6, sizeof(addrbuf6));
-		fprintf(out, "%s\t%s\t%" PRId64 "\n", addrbuf4, addrbuf6,
-				d->cache_entry ?
-					d->cache_entry->last_use : d->last_use);
-		entry = entry->next;
-	}
-	fclose(out);
-	if (rename(TMP_MAP_FILE, MAP_FILE) < 0) {
-		slog(LOG_ERR, "Unable to rename %s/%s to %s/%s: %s\n",
-				gcfg.data_dir, TMP_MAP_FILE,
-				gcfg.data_dir, MAP_FILE,
-				strerror(errno));
+	int failed = ferror(out);
+	if (fclose(out)) failed = 1;
+	if (failed || rename(TMP_MAP_FILE, MAP_FILE)) {
 		unlink(TMP_MAP_FILE);
+		return -1;
 	}
+	return 0;
 }
 
 void dynamic_maint(struct dynamic_pool *pool, int shutdown)
@@ -397,20 +383,46 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown)
 		free(d);
 	}
 
-	/* Write file if we have a data-dir */
-	if (gcfg.data_dir[0]) {
-		if (shutdown || gcfg.map_write_pending ||
-				gcfg.last_map_write +
-					gcfg.max_commit_delay < now ||
-				gcfg.last_map_write > now) {
-			write_to_file(pool);
-			gcfg.last_map_write = now;
+	/* Snapshot under map -> cache locks, then perform disk I/O without either.
+	 * Clearing pending before unlocking preserves new changes during the write. */
+	struct dynamic_snapshot *rows = NULL;
+	size_t count = 0, used = 0;
+	time_t observed_time = atomic_load_explicit(&now, memory_order_relaxed);
+	int write_maps = gcfg.data_dir[0] && (shutdown || gcfg.map_write_pending ||
+		gcfg.last_map_write + gcfg.max_commit_delay < observed_time ||
+		gcfg.last_map_write > observed_time);
+	if (write_maps) {
+		list_for_each(entry, &pool->mapped_list) count++;
+		list_for_each(entry, &pool->dormant_list) count++;
+		rows = calloc(count ? count : 1, sizeof(*rows));
+		if (!rows) {
+			write_maps = 0;
+			gcfg.map_write_pending = 1;
+			slog(LOG_ERR, "Unable to allocate dynamic mapping snapshot\n");
+		}
+		else {
+			pthread_mutex_lock(&gcfg.cache_mutex);
+			struct list_head *heads[] = {&pool->mapped_list, &pool->dormant_list};
+			for (int i = 0; i < 2; i++) list_for_each(entry, heads[i]) {
+				d = list_entry(entry, struct map_dynamic, list);
+				rows[used++] = (struct dynamic_snapshot){d->map4.addr, d->map6.addr,
+					d->cache_entry ? d->cache_entry->last_use : d->last_use};
+			}
+			pthread_mutex_unlock(&gcfg.cache_mutex);
 			gcfg.map_write_pending = 0;
 		}
 	}
-
-	/* Release map mutex when done */
 	pthread_mutex_unlock(&gcfg.map_mutex);
+	if (write_maps) {
+		int failed = write_to_file(rows, used, observed_time);
+		pthread_mutex_lock(&gcfg.map_mutex);
+		if (failed) {
+			gcfg.map_write_pending = 1;
+			slog(LOG_ERR, "Unable to save dynamic mappings: %s\n", strerror(errno));
+		} else gcfg.last_map_write = observed_time;
+		pthread_mutex_unlock(&gcfg.map_mutex);
+	}
+	free(rows);
 }
 
 void dynamic_get_stats(const struct dynamic_pool *pool, uint32_t *mapped, uint32_t *dormant, uint32_t *free_addrs)

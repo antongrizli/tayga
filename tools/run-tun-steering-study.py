@@ -28,8 +28,16 @@ def install(source, target):
         temporary.unlink(missing_ok=True)
 
 def startup(source):
-    before='/usr/sbin/tayga -c /run/clat.conf --mktun'
-    after='exec /usr/sbin/tayga -c /run/clat.conf -d'
+    # Frozen older startup images use a literal /run path. Normalize only the
+    # known launch structure; preserve the original backup for restoration.
+    if '/run/clat.conf' in source and '$TAYGA_RUNTIME_DIR/clat.conf' not in source:
+        source = source.replace('/run/clat.conf', '"$TAYGA_RUNTIME_DIR/clat.conf"')
+        lines = source.splitlines(keepends=True)
+        position = 1 if lines and lines[0].startswith('#!') else 0
+        lines.insert(position, 'TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"\nexport TAYGA_RUNTIME_DIR\n')
+        source = ''.join(lines)
+    before='/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun'
+    after='exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d'
     if source.count(before)!=1 or source.count(after)!=1:raise ValueError('unknown startup structure')
     launch="""parent=$$
 (
@@ -43,9 +51,9 @@ while ! grep -q 'TUN offload negotiated:' "$ARTIFACT_DIR/clat.log"; do
 done"""
     finish=""") &
 if [ "${TAYGA_STEERING_MODE:-kernel}" = groups ]; then
-  exec /usr/sbin/tayga -c /run/clat.conf -d --tun-steering=groups
+  exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d --tun-steering=groups
 else
-  exec /usr/sbin/tayga -c /run/clat.conf -d
+  exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d
 fi"""
     return source.replace(before,launch).replace(after,finish)
 

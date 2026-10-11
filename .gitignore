@@ -39,3 +39,6 @@ unit_packet_io_lifetime
 
 unit_dispatch
 unit_async_tun
+
+unit_addrmap
+unit_netlink

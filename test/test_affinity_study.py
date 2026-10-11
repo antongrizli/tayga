@@ -2,6 +2,7 @@
 """Exercise study ordering, invalid-workload handling and summary isolation."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,7 +31,7 @@ class StudyTests(unittest.TestCase):
                               received_mbps=speed, received_active_window_mbps=speed, tayga_sha256='fixture')
                 (folder / 'result.json').write_text(json.dumps(result))
             return subprocess.CompletedProcess(command, 1 if env['PROTOCOL'] == 'udp' else 0)
-        with patch.object(study.subprocess, 'run', side_effect=fake_run), patch('sys.argv', ['study', '--repo', str(root), '--stamp', 'fixture', '--pairs', '2', '--duration', '1']):
+        with patch.dict(os.environ, {'PERF_SESSION_ROOT': str(root / 'perf-sessions')}), patch.object(study.subprocess, 'run', side_effect=fake_run), patch('sys.argv', ['study', '--repo', str(root), '--stamp', 'fixture', '--pairs', '2', '--duration', '1']):
             study.main()
         return calls
 

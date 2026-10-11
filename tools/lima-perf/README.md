@@ -3,7 +3,12 @@
 This workflow creates a Debian 13 ARM64 Lima VM, builds the current TAYGA tree,
 and runs the existing CLAT benchmark twice: once with `perf stat` and once with
 `perf record`. It stores raw counters, `perf.data`, a text report, system
-metadata, and the source hash under `tayga-clat-perf/perf-sessions/`.
+metadata, and the source hash under
+`${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}`,
+outside the repository by default. The host explicitly fetches the guest archive,
+so this directory does not need to be mounted in Lima. Rejected workloads are
+collected too and keep their failure exit status. Failed collection preserves
+the original guest data; it is deleted only after successful host extraction.
 
 Lima is used because it provides a scriptable ARM64 Linux guest and exposes the
 Linux performance counters. The Debian netinst ISO in `~/Downloads` is suitable
@@ -57,3 +62,6 @@ The guest installs `linux-perf`, builds with debug symbols and frame pointers,
 and captures `perf report` and `perf script` after recording. If the guest was
 created manually in UTM, run `run-guest.sh` inside the mounted repository after
 installing the same dependencies.
+Direct `run-guest.sh` invocations retain the session under
+`/tmp/tayga-perf-sessions/` (or an explicit `SESSION_ROOT`); collect it before
+resetting or deleting the VM.

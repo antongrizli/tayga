@@ -27,7 +27,7 @@ static inline void get_gso_snapshot(struct tayga_stats *s) {
 }
 
 struct config gcfg;
-time_t now;
+_Atomic time_t now;
 
 static void setup_test_mapping(void)
 {

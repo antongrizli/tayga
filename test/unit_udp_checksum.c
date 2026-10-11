@@ -68,7 +68,7 @@ static uint16_t calc_full_udp_cksum6(const struct in6_addr *src, const struct in
 
 /* Config and globals for unit test */
 struct config gcfg;
-time_t now;
+_Atomic time_t now;
 
 static void test_metadata_bounds(void)
 {

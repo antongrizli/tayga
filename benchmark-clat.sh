@@ -2,6 +2,9 @@
 # Reproducible static-map CLAT benchmark. It exercises LAN NAT44, the real
 # clat-start.sh entrypoint and an IPv6-only upstream server.
 set -eu
+TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"
+TAYGA_STATUS_FILE="${TAYGA_STATUS_FILE:-$TAYGA_RUNTIME_DIR/tayga-status.json}"
+export TAYGA_RUNTIME_DIR TAYGA_STATUS_FILE
 
 DURATION=${DURATION:-60}
 WARMUP=${WARMUP:-10}
@@ -389,19 +392,19 @@ sample_udp_sockets() {
 tayga_snapshot() {
   local target_path=$1
   local cur_seq=0
-  if [ -s /run/tayga-status.json ]; then
-    cur_seq=$(python3 -c 'import json, sys; d=json.load(open("/run/tayga-status.json")); print(d.get("snapshot_sequence", 0) if d.get("pid") == int(sys.argv[1]) else 0)' "$clat_pid" 2>/dev/null || echo 0)
+  if [ -s "$TAYGA_STATUS_FILE" ]; then
+    cur_seq=$(python3 -c 'import json, sys, os; d=json.load(open(os.environ.get("TAYGA_STATUS_FILE", "/run/tayga-status.json"))); print(d.get("snapshot_sequence", 0) if d.get("pid") == int(sys.argv[1]) else 0)' "$clat_pid" 2>/dev/null || echo 0)
   fi
   kill -USR2 "$clat_pid" 2>/dev/null || true
   local fresh=0
   for _ in $(seq 1 50); do
     test "$(( _ % 10 ))" -ne 0 || kill -USR2 "$clat_pid" 2>/dev/null || true
     sleep 0.02
-    if [ -s /run/tayga-status.json ]; then
+    if [ -s "$TAYGA_STATUS_FILE" ]; then
       fresh=$(python3 -c '
-import json, sys
+import json, sys, os
 try:
-    d = json.load(open("/run/tayga-status.json"))
+    d = json.load(open(os.environ.get("TAYGA_STATUS_FILE", "/run/tayga-status.json")))
     pid = int(sys.argv[1])
     cur_seq = int(sys.argv[2])
     if (d.get("pid") == pid and
@@ -504,7 +507,7 @@ cat "/proc/$clat_pid/status" > "$ARTIFACT_DIR/tayga.status.before"
 uname -a > "$ARTIFACT_DIR/kernel.txt"
 cat /proc/cpuinfo > "$ARTIFACT_DIR/cpuinfo.txt"
 iperf3 --version > "$ARTIFACT_DIR/iperf-version.txt" 2>&1
-ip netns exec clatns cat /run/clat.conf > "$ARTIFACT_DIR/clat.conf"
+ip netns exec clatns cat "$TAYGA_RUNTIME_DIR/clat.conf" > "$ARTIFACT_DIR/clat.conf"
 sha256sum /usr/local/sbin/clat-start.sh > "$ARTIFACT_DIR/clat-start.sha256"
 ip -n clatns -j link show dev clat > "$ARTIFACT_DIR/clat.link.json"
 ip netns exec clatns sh -c 'command -v ethtool >/dev/null && ethtool -k veth-nat64 || true' \

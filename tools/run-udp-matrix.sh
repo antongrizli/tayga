@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
+export PERF_SESSION_ROOT
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -7,7 +9,7 @@ touch /tmp/tayga-perf-workflow.lock 2>/dev/null || true
 exec 9</tmp/tayga-perf-workflow.lock
 flock -n 9 || { echo "Another TAYGA workflow is active in this guest." >&2; exit 75; }
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT_DIR="${OUT_DIR:-$REPO/perf-sessions/$STAMP-udp-capacity-search}"
+OUT_DIR="${OUT_DIR:-$PERF_SESSION_ROOT/$STAMP-udp-capacity-search}"
 CLIENTS="${CLIENTS:-20}"
 FLOWS="${FLOWS:-1}"
 WORKERS="${WORKERS:-3}"

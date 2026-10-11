@@ -231,14 +231,21 @@ class HostRunnerStdinTests(unittest.TestCase):
             (root / "limactl").write_text('''#!/bin/sh
 case "$1" in
   list) printf 'NAME STATUS\\ntayga-perf Running\\n';;
-  shell) cat > "$LIMA_STDIN";;
+  shell) case "$4" in
+    env) cat > "$LIMA_STDIN";;
+    tar) tar -C "$LIMA_EMPTY_DIR" -cf - .;;
+    rm) cat > "$LIMA_STDIN";;
+    *) exit 1;;
+    esac;;
   *) exit 1;;
 esac
 ''')
             (root / "limactl").chmod(0o755)
+            (root / "empty").mkdir()
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        REPO=str(root), ISO=str(root / "absent.iso"), INSTANCE="tayga-perf",
-                       SESSION_STAMP="stdin-test", LIMA_STDIN=str(root / "stdin"))
+                       SESSION_STAMP="stdin-test", LIMA_STDIN=str(root / "stdin"),
+                       LIMA_EMPTY_DIR=str(root / "empty"), PERF_SESSION_ROOT=str(root / "results"))
             runner = Path(__file__).resolve().parents[1] / "tools/lima-perf/run-host.sh"
             run = subprocess.run(["bash", str(runner)], env=env, input="remaining orchestration commands\n",
                                  capture_output=True, text=True)

@@ -20,7 +20,9 @@ def main():
     if args.pairs < 1 or args.duration < 1 or not args.stamp or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.stamp):
         parser.error('positive pairs/duration and an alphanumeric stamp are required')
     repo = args.repo.resolve()
-    output = repo / 'perf-sessions' / args.stamp
+    default_root = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'tayga/perf-sessions'
+    session_root = Path(os.environ.get('PERF_SESSION_ROOT', str(default_root)))
+    output = session_root / args.stamp
     output.mkdir(parents=True, exist_ok=False)
     rows = []
     for protocol in args.protocol:
@@ -32,10 +34,10 @@ def main():
         runs += [(0, arm, 'record') for arm in ('scheduler', 'separate')]
         for pair, arm, mode in runs:
             stamp = f'{args.stamp}-{protocol}-{arm}-pair{pair}-{mode}'
-            session = repo / 'perf-sessions' / f'{stamp}-lima-debian13-arm64'
+            session = session_root / f'{stamp}-lima-debian13-arm64'
             if session.exists():
                 raise RuntimeError(f'refusing to overwrite {session}')
-            env = dict(os.environ, REPO=str(repo), SESSION_STAMP=stamp,
+            env = dict(os.environ, REPO=str(repo), PERF_SESSION_ROOT=str(session_root), SESSION_STAMP=stamp,
                        CLIENTS='2', FLOWS='1', WORKERS='1', RATE='0', WARMUP='0',
                        DURATION=str(args.duration if mode == 'none' else 15),
                        DIRECTIONS='upload download', PROTOCOL=protocol, PERF_MODES=mode,

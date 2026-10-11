@@ -141,11 +141,10 @@ int is_private_ip4_addr(const struct in_addr *a)
  */
 int calc_ip4_mask(struct in_addr *mask, const struct in_addr *addr, int len)
 {
-	mask->s_addr = htonl(~(0xffffffff >> len));
-	if (len == 32) mask->s_addr = 0xffffffff;
-	if (addr && (addr->s_addr & ~mask->s_addr))
+	if (len < 0 || len > 32)
 		return -1;
-	return 0;
+	mask->s_addr = htonl(len == 0 ? 0 : UINT32_MAX << (32 - len));
+	return addr && (addr->s_addr & ~mask->s_addr) ? -1 : 0;
 }
 
 /**
@@ -158,37 +157,20 @@ int calc_ip4_mask(struct in_addr *mask, const struct in_addr *addr, int len)
  */
 int calc_ip6_mask(struct in6_addr *mask, const struct in6_addr *addr, int len)
 {
-	if (len > 32) {
-		mask->s6_addr32[0] = ~0;
-		if (len > 64) {
-			mask->s6_addr32[1] = ~0;
-			if (len > 96) {
-				mask->s6_addr32[2] = ~0;
-				mask->s6_addr32[3] =
-					htonl(~((1 << (128 - len)) - 1));
-			} else {
-				mask->s6_addr32[2] =
-					htonl(~((1 << (96 - len)) - 1));
-				mask->s6_addr32[3] = 0;
-			}
-		} else {
-			mask->s6_addr32[1] = htonl(~((1 << (64 - len)) - 1));
-			mask->s6_addr32[2] = 0;
-			mask->s6_addr32[3] = 0;
-		}
-	} else {
-		mask->s6_addr32[0] = htonl(~((1 << (32 - len)) - 1));
-		mask->s6_addr32[1] = 0;
-		mask->s6_addr32[2] = 0;
-		mask->s6_addr32[3] = 0;
-	}
-	if (!addr)
-		return 0;
-	if ((addr->s6_addr32[0] & ~mask->s6_addr32[0]) ||
-			(addr->s6_addr32[1] & ~mask->s6_addr32[1]) ||
-			(addr->s6_addr32[2] & ~mask->s6_addr32[2]) ||
-			(addr->s6_addr32[3] & ~mask->s6_addr32[3]))
+	if (len < 0 || len > 128)
 		return -1;
+	memset(mask, 0, sizeof(*mask));
+	for (int i = 0; i < 16; i++) {
+		int bits = len - i * 8;
+		if (bits >= 8)
+			mask->s6_addr[i] = 0xff;
+		else if (bits > 0)
+			mask->s6_addr[i] = (uint8_t)(0xffu << (8 - bits));
+	}
+	if (addr)
+		for (int i = 0; i < 16; i++)
+			if (addr->s6_addr[i] & (uint8_t)~mask->s6_addr[i])
+				return -1;
 	return 0;
 }
 
@@ -234,33 +216,31 @@ static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
  * so the code here must initialize each of the buckets.
  *
  */
-void create_cache(void)
+int create_cache(void)
 {
 	int i, hash_size = 1 << gcfg.hash_bits;
 	struct list_head *entry;
 	struct cache_entry *c;
 
-	if (gcfg.hash_table4) {
-		free(gcfg.hash_table4);
-		free(gcfg.hash_table6);
+	struct list_head *new4 = malloc(hash_size * sizeof(*new4));
+	struct list_head *new6 = malloc(hash_size * sizeof(*new6));
+	int new_pool = list_empty(&gcfg.cache_pool) && list_empty(&gcfg.cache_active);
+	struct cache_entry *storage = new_pool ? calloc(gcfg.cache_size, sizeof(*storage)) : NULL;
+	if (!new4 || !new6 || (new_pool && !storage)) {
+		free(new4); free(new6); free(storage);
+		errno = ENOMEM;
+		slog(LOG_CRIT, "Unable to allocate mapping cache\n");
+		return ERROR_REJECT;
 	}
-
-	gcfg.hash_table4 = (struct list_head *)
-				malloc(hash_size * sizeof(struct list_head));
-	gcfg.hash_table6 = (struct list_head *)
-				malloc(hash_size * sizeof(struct list_head));
-	if (!gcfg.hash_table4 || !gcfg.hash_table6) {
-		slog(LOG_CRIT, "Unable to allocate %d bytes for hash table\n",
-				hash_size * sizeof(struct list_head));
-		exit(1);
-	}
+	free(gcfg.hash_table4); free(gcfg.hash_table6);
+	gcfg.hash_table4 = new4; gcfg.hash_table6 = new6;
 	for (i = 0; i < hash_size; ++i) {
 		INIT_LIST_HEAD(&gcfg.hash_table4[i]);
 		INIT_LIST_HEAD(&gcfg.hash_table6[i]);
 	}
 
-	if (list_empty(&gcfg.cache_pool) && list_empty(&gcfg.cache_active)) {
-		c = calloc(gcfg.cache_size, sizeof(struct cache_entry));
+	if (new_pool) {
+		c = storage;
 		for (i = 0; i < gcfg.cache_size; ++i) {
 			INIT_LIST_HEAD(&c->list);
 			INIT_LIST_HEAD(&c->hash4);
@@ -277,6 +257,7 @@ void create_cache(void)
 						hash_ip6(&c->addr6));
 		}
 	}
+	return 0;
 }
 
 /* This must be called within cache mutex lock */
@@ -286,6 +267,16 @@ static struct cache_entry *cache_insert(const struct in_addr *addr4,
 {
 	struct cache_entry *c;
 
+	/* Both mapping and cache locks are held. Concurrent misses may already
+	 * have inserted this pair while this caller waited for map_mutex. */
+	struct list_head *entry;
+	list_for_each(entry, &gcfg.hash_table4[hash4]) {
+		c = list_entry(entry, struct cache_entry, hash4);
+		if (c->addr4.s_addr == addr4->s_addr && IN6_ARE_ADDR_EQUAL(&c->addr6, addr6)) {
+			c->last_use = now;
+			return c;
+		}
+	}
 	if (list_empty(&gcfg.cache_pool))
 		return NULL;
 	c = list_entry(gcfg.cache_pool.next, struct cache_entry, list);
@@ -552,11 +543,12 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_DROP;
 	}
-	if (!gcfg.maps_immutable)
-		pthread_mutex_unlock(&gcfg.map_mutex);
-
 	if (gcfg.cache_size) {		
 		pthread_mutex_lock(&gcfg.cache_mutex);
+#ifdef ADDRMAP_TEST_HOOK
+		extern void addrmap_test_before_publish(void);
+		addrmap_test_before_publish();
+#endif
 		c = cache_insert(addr4, addr6, hash, hash_ip6(addr6));
 
 		/* Alloc Dynamic */
@@ -568,6 +560,8 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 		pthread_mutex_unlock(&gcfg.cache_mutex);
 	}
 
+	if (!gcfg.maps_immutable)
+		pthread_mutex_unlock(&gcfg.map_mutex);
 	return ERROR_NONE;
 }
 
@@ -713,11 +707,12 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_DROP;
 	}
-	if (!gcfg.maps_immutable)
-		pthread_mutex_unlock(&gcfg.map_mutex);
-
 	if (gcfg.cache_size) {
 		pthread_mutex_lock(&gcfg.cache_mutex);
+#ifdef ADDRMAP_TEST_HOOK
+		extern void addrmap_test_before_publish(void);
+		addrmap_test_before_publish();
+#endif
 		c = cache_insert(addr4, addr6, hash_ip4(addr4), hash);
 
 		/* Is Dynamic */
@@ -729,6 +724,8 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 		pthread_mutex_unlock(&gcfg.cache_mutex);
 	}
 
+	if (!gcfg.maps_immutable)
+		pthread_mutex_unlock(&gcfg.map_mutex);
 	return ERROR_NONE;
 }
 
@@ -741,8 +738,10 @@ static void report_ageout(struct cache_entry *c)
 	if (!m4 || m4->type != MAP_TYPE_DYNAMIC_HOST)
 		return;
 	d = container_of(m4, struct map_dynamic, map4);
-	d->last_use = c->last_use;
-	d->cache_entry = NULL;
+	if (d->cache_entry == c) {
+		d->last_use = c->last_use;
+		d->cache_entry = NULL;
+	}
 }
 
 /**
@@ -789,6 +788,7 @@ static void cache_evict_map4(const struct map4 *m4)
     list_for_each_safe(entry, next, &gcfg.cache_active) {
         c = list_entry(entry, struct cache_entry, list);
         if (m4->addr.s_addr == (m4->mask.s_addr & c->addr4.s_addr)) {
+            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
             list_del(&c->hash4);
             list_del(&c->hash6);
             list_add(&c->list, &gcfg.cache_pool);
@@ -811,6 +811,7 @@ static void cache_evict_map6(const struct map6 *m6)
     list_for_each_safe(entry, next, &gcfg.cache_active) {
         c = list_entry(entry, struct cache_entry, list);
 		if (IN6_IS_IN_NET(&c->addr6, &m6->addr, &m6->mask)){
+            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
             list_del(&c->hash4);
             list_del(&c->hash6);
             list_add(&c->list, &gcfg.cache_pool);
@@ -841,383 +842,141 @@ static void addrmap_delete4(struct map4 *m4)
     }
 }
 
-/**
- * @brief Delete the parent map entry of this map6
- *
- * Caller must hold map_mutex
- */
-static void addrmap_delete6(struct map6 *m6)
+/* Parse an entire replacement before publishing any map-file changes. */
+static struct map_static *parse_map_entry(int line, char *v4, char *v6)
 {
-    if (m6->type == MAP_TYPE_STATIC) {
-        struct map_static *m = container_of(m6, struct map_static, map6);
-
-        /* Remove from map lists */
-        list_del(&m->map4.list);
-        list_del(&m->map6.list);
-
-        /* Evict matching cache entries */
-        cache_evict_map4(&m->map4);
-        cache_evict_map6(&m->map6);
-		free(m);
-    }
-}
-
-/**
- * @brief Parse and insert/update a single map entry from the map file.
- *
- * @param ln   Line number in the map file
- * @param args Arguments parsed from map file, same as conffile `map`
- * @returns ERROR_NONE on success, ERROR_REJECT on any error
- */
-static int addrmap_entry(int ln, char **args)
-{
-	struct map_static *m, *n1, *n2;
-	struct map4 *m4 = NULL;
-	struct map6 *m6 = NULL;
-	char *slash;
-	unsigned int prefix4, prefix6;
-	int ret;
-
-	/* Allocate and initialize a new static map entry */
-	m = (struct map_static *)malloc(sizeof(struct map_static));
-	if (!m) {
-		slog(LOG_CRIT, "MAP-FILE: Unable to allocate map-file static map memory\n");
-		return ERROR_REJECT;
+	struct map_static *m = calloc(1, sizeof(*m));
+	if (!m) return NULL;
+	char *addresses[2] = {v4, v6};
+	int lengths[2] = {32, 128};
+	for (int i = 0; i < 2; i++) {
+		char *slash = strchr(addresses[i], '/');
+		if (slash) {
+			char *end;
+			*slash++ = 0;
+			errno = 0;
+			long bits = strtol(slash, &end, 10);
+			if (errno || !*slash || *end || bits < 0 || bits > lengths[i]) goto bad;
+			lengths[i] = (int)bits;
+		}
 	}
-	memset(m, 0, sizeof(struct map_static));
-	m->map4.type = MAP_TYPE_STATIC;
-	m->map4.prefix_len = 32;
-	calc_ip4_mask(&m->map4.mask, NULL, 32);
-	INIT_LIST_HEAD(&m->map4.list);
-	m->map6.type = MAP_TYPE_STATIC;
-	m->map6.prefix_len = 128;
-	calc_ip6_mask(&m->map6.mask, NULL, 128);
-	INIT_LIST_HEAD(&m->map6.list);
-	m->line_no = ln;
+	if (32 - lengths[0] != 128 - lengths[1] ||
+		inet_pton(AF_INET, v4, &m->map4.addr) != 1 ||
+		inet_pton(AF_INET6, v6, &m->map6.addr) != 1 ||
+		calc_ip4_mask(&m->map4.mask, &m->map4.addr, lengths[0]) ||
+		calc_ip6_mask(&m->map6.mask, &m->map6.addr, lengths[1]) ||
+		validate_ip4_addr(&m->map4.addr) == ERROR_DROP ||
+		validate_ip6_addr(&m->map6.addr) < 0) goto bad;
+	m->map4.type = m->map6.type = MAP_TYPE_STATIC;
+	m->map4.prefix_len = lengths[0];
+	m->map6.prefix_len = lengths[1];
 	m->origin = MAP_ORIGIN_MAPFILE;
-
-	/* Parse IPv4 prefix length if provided */
-	slash = strchr(args[0], '/');
-	prefix4 = 32;
-	if (slash) {
-		prefix4 = (unsigned int)atoi(slash + 1);
-		slash[0] = '\0';
-	}
-
-	/* Parse IPv4 address */
-	if (!inet_pton(AF_INET, args[0], &m->map4.addr)) {
-		slog(LOG_ERR, "MAP-FILE: Expected an IPv4 subnet but found "
-		     "\"%s\" on line %d\n", args[0], ln);
-		free(m);
-		return ERROR_REJECT;
-	}
-	m->map4.prefix_len = prefix4;
-	calc_ip4_mask(&m->map4.mask, NULL, prefix4);
-
-	/* Parse IPv6 prefix length if provided */
-	slash = strchr(args[1], '/');
-	prefix6 = 128;
-	if (slash) {
-		prefix6 = (unsigned int)atoi(slash + 1);
-		slash[0] = '\0';
-	}
-
-	/* Validate that suffix lengths match */
-	if ((32 - prefix4) != (128 - prefix6)) {
-		slog(LOG_ERR, "MAP-FILE: IPv4 and IPv6 subnet must be the same "
-		     "size, but found \"%s\" and \"%s\" on line %d\n",
-		     args[0], args[1], ln);
-		free(m);
-		return ERROR_REJECT;
-	}
-
-	/* Parse IPv6 address */
-	if (!inet_pton(AF_INET6, args[1], &m->map6.addr)) {
-		slog(LOG_ERR, "MAP-FILE: Expected an IPv6 subnet but found "
-		     "\"%s\" on line %d\n", args[1], ln);
-		free(m);
-		return ERROR_REJECT;
-	}
-	m->map6.prefix_len = prefix6;
-	calc_ip6_mask(&m->map6.mask, NULL, prefix6);
-
-	/* Validate IPv4 address */
-	ret = validate_ip4_addr(&m->map4.addr);
-	if (ret == ERROR_LOCAL) {
-		slog(LOG_WARNING, "MAP-FILE: Using link-local address %s in map "
-		     "directive, use with caution\n", args[0]);
-	} else if (ret < 0) {
-		slog(LOG_ERR, "MAP-FILE: Cannot use reserved address %s in map "
-		     "directive\n", args[0]);
-		free(m);
-		return ERROR_REJECT;
-	}
-
-	/* Validate IPv6 address */
-	if (validate_ip6_addr(&m->map6.addr) < 0) {
-		slog(LOG_ERR, "MAP-FILE: Cannot use reserved address %s in map "
-		     "directive\n", args[1]);
-		free(m);
-		return ERROR_REJECT;
-	}
-
-	/* Lock map to insert into v4/v6 */
-	pthread_mutex_lock(&gcfg.map_mutex);
-
-	/*
-	 * Attempt to insert both sides.  insert_map4/6 returns -1 and sets
-	 * m4/m6 when an entry with the same address already exists.
-	 * After this pair of calls:
-	 *
-	 *   m4 == NULL, m6 == NULL  -> completely new mapping
-	 *   m4 != NULL, m6 != NULL  -> both sides already existed
-	 *   m4 != NULL, m6 == NULL  -> IPv4 side already existed
-	 *   m4 == NULL, m6 != NULL  -> IPv6 side already existed
-	 *
-	 */
-	insert_map4(&m->map4, &m4);
-	insert_map6(&m->map6, &m6);
-
-	if (!m4 && !m6) {
-		/*
-		 * Brand-new mapping on both sides – nothing more to do,
-		 * m is now fully inserted.
-		 * Still evict from cache, in case there is a larger mapping entry
-		 */
-    	cache_evict_map4(&m->map4);
-	    cache_evict_map6(&m->map6);
-	} else if (m4 && m6) {
-		/*
-		 * Both sides conflicted with existing entries.
-		 */
-		if (m4->type != MAP_TYPE_STATIC || m6->type != MAP_TYPE_STATIC) {
-			slog(LOG_ERR, "MAP-FILE: Existing incompatible (non-static) "
-			     "map entry found for mapping on line %d "
-			     "(m4 type %d, m6 type %d)\n", ln, m4->type, m6->type);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		}
-
-		/* Get parents of both entries */
-		n1 = container_of(m4, struct map_static, map4);
-		n2 = container_of(m6, struct map_static, map6);
-
-		if (n1->origin != MAP_ORIGIN_MAPFILE || n2->origin != MAP_ORIGIN_MAPFILE) {
-			/* This map cannot be replaced, so same behavior as a non-static map */
-			slog(LOG_ERR, "MAP-FILE: Existing fixed map entry found with non-writable"
-				" origin on line %d (m4 orgin %d, m6 origin %d)\n", ln, n1->origin, n2->origin);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		} else if (n1 == n2) {
-			/*
-			 * Exact same entry already present – just refresh
-			 * the tracking fields on the *existing* object and
-			 * discard the new allocation.
-			 */
-			n1->line_no = ln;
-			n1->origin  = MAP_ORIGIN_MAPFILE;
-			free(m);
-		} else {
-			/*
-			 * Two separate existing entries cover these addresses.
-			 * Remove both and insert the new entry.
-			 */
-			slog(LOG_DEBUG, "MAP-FILE: Replacing two separate existing "
-			     "entries with updated mapping on line %d\n", ln);
-			addrmap_delete4(m4);
-			addrmap_delete6(m6);
-			m4 = NULL;
-			m6 = NULL;
-			insert_map4(&m->map4, &m4);
-			insert_map6(&m->map6, &m6);
-		}
-	} else if (m4) {
-		/*
-		 * IPv4 side conflicted; IPv6 side was inserted cleanly.
-		 */
-		if (m4->type != MAP_TYPE_STATIC) {
-			slog(LOG_ERR, "MAP-FILE: IPv4 entry on line %d conflicts "
-			     "with non-static type (%d)\n", ln, m4->type);
-			/* Remove the IPv6 half we just inserted */
-			list_del(&m->map6.list);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		}
-		/* Get parent static map entry */
-		n1 = container_of(m4, struct map_static, map4);
-
-		/* We cannot overwrite conf-file mappings */
-		if (n1->origin != MAP_ORIGIN_MAPFILE) {
-			slog(LOG_ERR, "MAP-FILE: IPv4 entry on line %d conflicts "
-			     "with non-writable origin (%d)\n", ln, n1->origin);
-			/* Remove the IPv6 half we just inserted */
-			list_del(&m->map6.list);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		}
-		addrmap_delete4(m4);
-		m4 = NULL;
-		insert_map4(&m->map4, &m4);
-		/* Purge IPv6 from cache since it has changed */
-		cache_evict_map6(&m->map6);
-	} else {
-		/*
-		 * IPv6 side conflicted; IPv4 side was inserted cleanly.
-		 */
-		if (m6->type != MAP_TYPE_STATIC) {
-			slog(LOG_ERR, "MAP-FILE: IPv6 entry on line %d conflicts "
-			     "with non-static type (%d)\n", ln, m6->type);
-			/* Remove the IPv4 half we just inserted */
-			list_del(&m->map4.list);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		}
-		/* Get parent static map entry */
-		n2 = container_of(m6, struct map_static, map6);
-
-		/* We cannot overwrite conf-file mappings */
-		if (n2->origin != MAP_ORIGIN_MAPFILE) {
-			slog(LOG_ERR, "MAP-FILE: IPv6 entry on line %d conflicts "
-			     "with non-writable origin (%d)\n", ln, n2->origin);
-			/* Remove the IPv4 half we just inserted */
-			list_del(&m->map4.list);
-			free(m);
-			pthread_mutex_unlock(&gcfg.map_mutex);
-			return ERROR_REJECT;
-		}
-		addrmap_delete6(m6);
-		m6 = NULL;
-		insert_map6(&m->map6, &m6);
-		/* Purge IPv4 from cache since it has changed */
-		cache_evict_map4(&m->map4);
-	}
-
-	/* Finished without error */
-	pthread_mutex_unlock(&gcfg.map_mutex);
-	return ERROR_NONE;
+	m->line_no = line;
+	INIT_LIST_HEAD(&m->map4.list);
+	INIT_LIST_HEAD(&m->map6.list);
+	return m;
+ bad:
+	slog(LOG_ERR, "MAP-FILE: invalid mapping on line %d; keeping previous mappings\n", line);
+	free(m);
+	return NULL;
 }
 
+static int map6_overlaps(const struct map6 *a, const struct map6 *b)
+{
+	return IN6_IS_IN_NET(&a->addr, &b->addr, &b->mask) ||
+		IN6_IS_IN_NET(&b->addr, &a->addr, &a->mask);
+}
 
-/**
- * @brief (re)load the static map file
- *
- * Algorithm:
- *  1. Open the file, exit on error without modifying mappings
- *  2. Mark every MAP_ORIGIN_MAPFILE entry with line_no = -1
- *  3. Parse the file; addrmap_entry updates line_no on existing entries
- *     and inserts new ones
- *  4. Delete every MAP_ORIGIN_MAPFILE entry still at -1
- *     (i.e. entries that were removed from the file).
- * 
- * This function returns error if the file is not readable
- * it does NOT return error if there are errors with individual lines
- */
+static int is_file_map4(const struct map4 *m)
+{
+	return m->type == MAP_TYPE_STATIC &&
+		container_of(m, struct map_static, map4)->origin == MAP_ORIGIN_MAPFILE;
+}
+
 int addrmap_reload(void)
 {
-	struct list_head *entry, *next;
-	struct map4 *m4;
-	struct map_static *s;
-	FILE *in;
-	char *args[MAX_ARGS];
-	char line[512];
-	int ln = 0;
-	int arg_count;
-	char *c, *tokptr;
-
-	/* Skip reloading if no file is configured */
-	if (!gcfg.map_file[0]) {
-		return ERROR_NONE;
-	}
-	slog(LOG_DEBUG,"MAP-FILE: loading file %s\n",gcfg.map_file);
-
-	/* Step 1 - open file and check for file-access errors */
-	in = fopen(gcfg.map_file, "r");
+	if (!gcfg.map_file[0]) return ERROR_NONE;
+	#ifdef ADDRMAP_TEST_HOOK
+	extern FILE *addrmap_test_open_file(const char *path);
+	FILE *in = addrmap_test_open_file(gcfg.map_file);
+#else
+	FILE *in = fopen(gcfg.map_file, "r");
+#endif
 	if (!in) {
-		slog(LOG_ERR, "MAP-FILE: Unable to open %s: %s\n",
-		     gcfg.map_file, strerror(errno));
+		slog(LOG_ERR, "MAP-FILE: cannot open %s: %s\n", gcfg.map_file, strerror(errno));
 		return ERROR_REJECT;
 	}
-
-	/* Step 2 - mark existing entries in the map list */
-	pthread_mutex_lock(&gcfg.map_mutex);
-	list_for_each(entry, &gcfg.map4_list) {
-		m4 = list_entry(entry, struct map4, list);
-		if (m4->type == MAP_TYPE_STATIC) {
-			s = container_of(m4, struct map_static, map4);
-			if (s->origin == MAP_ORIGIN_MAPFILE) {
-				s->line_no *= -1;
-			}
-		}
-	}
-	pthread_mutex_unlock(&gcfg.map_mutex);
-
-	/* Step 3 - parse the file */
+	LIST_HEAD(staged);
+	char line[512];
+	int lineno = 0, failed = 0;
+	struct list_head *entry, *next;
 	while (fgets(line, sizeof(line), in)) {
-		++ln;
-
-		if (strlen(line) + 1 == sizeof(line)) {
-			slog(LOG_ERR, "MAP-FILE: Line %d of %s is too long\n",
-			     ln, gcfg.map_file);
-			continue;
+		lineno++;
+		if (strlen(line) == sizeof(line) - 1) { failed = 1; break; }
+		char *save, *args[4];
+		int count = 0;
+		for (char *tok = strtok_r(line, DELIM, &save); tok && *tok != '#';
+			 tok = strtok_r(NULL, DELIM, &save)) {
+			if (count == 4) { failed = 1; break; }
+			args[count++] = tok;
 		}
-
-		/* Parse line into array of arguments */
-		arg_count = 0;
-		for (;;) {
-			c = strtok_r(arg_count ? NULL : line, DELIM, &tokptr);
-			/* Skip comments */
-			if (!c || *c == '#')
-				break;
-			if (arg_count == MAX_ARGS) {
-				slog(LOG_ERR, "MAP-FILE: Too many tokens on line "
-				     "%d of %s\n", ln, gcfg.map_file);
-				break;
-			}
-			args[arg_count++] = c;
-		}
-
-		/* Skip blank lines */
-		if (arg_count == 0)
-			continue;
-
-		/* The only valid directive in the map file is "map" */
-		if (strcasecmp(args[0], "map") != 0) {
-			slog(LOG_ERR, "MAP-FILE: Unknown directive \"%s\" on "
-			     "line %d of %s\n", args[0], ln, gcfg.map_file);
-			continue;
-		}
-
-		/* "map" requires exactly 2 arguments, plus `map` directive */
-		--arg_count;
-		if (arg_count != 2) {
-			slog(LOG_ERR, "MAP-FILE: \"map\" directive requires "
-			     "exactly 2 arguments on line %d of %s\n",
-			     ln, gcfg.map_file);
-			continue;
-		}
-
-		/* Pass args[1] and args[2] (skip the "map" token) */
-		addrmap_entry(ln, &args[1]);
-	}
-	fclose(in);
-
-	/* Step 4 - delete entries not reloaded */
-	pthread_mutex_lock(&gcfg.map_mutex);
-	list_for_each_safe(entry, next, &gcfg.map4_list) {
-		m4 = list_entry(entry, struct map4, list);
-		if (m4->type == MAP_TYPE_STATIC) {
-			s = container_of(m4, struct map_static, map4);
-			if (s->origin == MAP_ORIGIN_MAPFILE && s->line_no < 0) {
-				addrmap_delete4(m4);
+		if (failed) break;
+		if (!count) continue;
+		if (count != 3 || strcasecmp(args[0], "map")) { failed = 1; break; }
+		struct map_static *m = parse_map_entry(lineno, args[1], args[2]);
+		if (!m) { failed = 1; break; }
+		/* Preserve the documented last-entry-wins behavior within the file.
+		 * Conflicts with fixed/dynamic mappings reject the whole transaction. */
+		list_for_each_safe(entry, next, &staged) {
+			struct map_static *old = list_entry(entry, struct map_static, map4.list);
+			if ((old->map4.prefix_len == m->map4.prefix_len &&
+				 old->map4.addr.s_addr == m->map4.addr.s_addr) || map6_overlaps(&old->map6, &m->map6)) {
+				list_del(entry);
+				free(old);
 			}
 		}
+		list_add_tail(&m->map4.list, &staged);
 	}
-	pthread_mutex_unlock(&gcfg.map_mutex);
-	/* Only file access errors are returned as errors */
-	return ERROR_NONE;
+	if (ferror(in)) failed = 1;
+	if (fclose(in)) failed = 1;
+	if (!failed) {
+		pthread_mutex_lock(&gcfg.map_mutex);
+		list_for_each(entry, &staged) {
+			struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			struct list_head *fixed;
+			list_for_each(fixed, &gcfg.map4_list) {
+				struct map4 *f = list_entry(fixed, struct map4, list);
+				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
+					f->addr.s_addr == m->map4.addr.s_addr) failed = 1;
+			}
+			list_for_each(fixed, &gcfg.map6_list) {
+				struct map6 *f = list_entry(fixed, struct map6, list);
+				int file = f->type == MAP_TYPE_STATIC &&
+					container_of(f, struct map_static, map6)->origin == MAP_ORIGIN_MAPFILE;
+				if (!file && map6_overlaps(f, &m->map6)) failed = 1;
+			}
+		}
+		if (!failed) {
+			list_for_each_safe(entry, next, &gcfg.map4_list) {
+				struct map4 *m = list_entry(entry, struct map4, list);
+				if (is_file_map4(m)) addrmap_delete4(m);
+			}
+			list_for_each_safe(entry, next, &staged) {
+				struct map_static *m = list_entry(entry, struct map_static, map4.list);
+				list_del(entry);
+				insert_map4(&m->map4, NULL);
+				insert_map6(&m->map6, NULL);
+				cache_evict_map4(&m->map4);
+				cache_evict_map6(&m->map6);
+			}
+		}
+		pthread_mutex_unlock(&gcfg.map_mutex);
+	}
+	list_for_each_safe(entry, next, &staged) {
+		struct map_static *m = list_entry(entry, struct map_static, map4.list);
+		list_del(entry);
+		free(m);
+	}
+	if (failed) slog(LOG_ERR, "MAP-FILE: reload rejected near line %d; previous mappings retained\n", lineno);
+	return failed ? ERROR_REJECT : ERROR_NONE;
 }

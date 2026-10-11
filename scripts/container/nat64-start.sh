@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"
+export TAYGA_RUNTIME_DIR
+
 # Helper to enable kernel forwarding safely
 enable_forwarding() {
   key=$1
@@ -61,10 +64,10 @@ echo " DNS64 Upstreams   : $DNS64_UPSTREAM"
 echo " Data Directory    : $DATA_DIR"
 echo "============================================================"
 
-mkdir -p /run "$DATA_DIR"
+mkdir -p "$TAYGA_RUNTIME_DIR" "$DATA_DIR"
 
 # Generate tayga.conf
-cat > /run/tayga.conf <<CONF_EOF
+cat > "$TAYGA_RUNTIME_DIR/tayga.conf" <<CONF_EOF
 tun-device nat64
 ipv4-addr ${TAYGA_ADDR4}
 ipv6-addr ${TAYGA_ADDR6}
@@ -81,8 +84,8 @@ ENABLE_DNS64="${ENABLE_DNS64:-yes}"
 
 # Generate unbound.conf for DNS64 if enabled
 if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
-  mkdir -p /run/unbound
-  cat > /run/unbound.conf <<CONF_EOF
+  mkdir -p "$TAYGA_RUNTIME_DIR"/unbound
+  cat > "$TAYGA_RUNTIME_DIR/unbound.conf" <<CONF_EOF
 server:
     verbosity: 1
     interface: 0.0.0.0
@@ -111,7 +114,7 @@ CONF_EOF
   for upstream in $DNS64_UPSTREAM; do
     trimmed=$(echo "$upstream" | tr -d ' ')
     if [ -n "$trimmed" ]; then
-      echo "    forward-addr: $trimmed" >> /run/unbound.conf
+      echo "    forward-addr: $trimmed" >> "$TAYGA_RUNTIME_DIR/unbound.conf"
     fi
   done
   IFS="$OLD_IFS"
@@ -119,7 +122,7 @@ fi
 
 # Make tunnel adapter
 echo "==> Creating tunnel adapter nat64..."
-/usr/sbin/tayga -c /run/tayga.conf --mktun
+/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/tayga.conf" --mktun
 ip link set dev nat64 up
 ip route replace "$TAYGA_POOL4" dev nat64
 ip -6 route replace "$TAYGA_PREF64" dev nat64
@@ -148,12 +151,12 @@ trap 'cleanup 0' INT TERM HUP
 
 if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
   echo "==> Starting Unbound DNS64..."
-  /usr/sbin/unbound -d -c /run/unbound.conf &
+  /usr/sbin/unbound -d -c "$TAYGA_RUNTIME_DIR/unbound.conf" &
   UNBOUND_PID=$!
 fi
 
 echo "==> Starting TAYGA..."
-/usr/sbin/tayga -c /run/tayga.conf -d &
+/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/tayga.conf" -d &
 TAYGA_PID=$!
 
 # Monitor child processes; exit with code 1 if either dies

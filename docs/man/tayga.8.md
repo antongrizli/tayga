@@ -79,6 +79,37 @@ network interface.
 **-p** *pidfile* | **\-\-pidfile** *pidfile*
 :   Write process ID of daemon to *pidfile*
 
+# RUNTIME FILES AND TELEMETRY
+
+**\-\-runtime-dir** *directory*
+:   Directory for the namespace/device ownership lock, `clat-info.json` and
+    default `tayga-status.json`. Default: `/run`. The directory must exist.
+    `TAYGA_RUNTIME_DIR` or configuration `runtime-dir` may set it; command-line
+    and environment settings override the configuration. All cooperating
+    owners of the same TUN must use the same lock directory.
+
+**\-\-status-file** *absolute-path*
+:   Explicit status output path, also settable with `TAYGA_STATUS_FILE`.
+    Give concurrent instances separate status paths or runtime directories.
+    The status contains PID, process start ticks, network namespace and TUN
+    device identity. The Linux status helper validates the recorded identity
+    before sending SIGUSR2. Paths used after chroot refer to the new root and
+    must be writable by the final service user.
+
+TX failure counters count failed TUN frames, including GSO aggregates, rather
+than reconstructed wire datagrams. `tx_eagain`, `tx_enobufs`, `tx_eintr`,
+`tx_short`, `tx_fatal` and `tx_other` partition `tx_failed_frames`. Each failed
+frame increments general errors and drops once; bytes exclude TUN framing.
+Synchronous `EINTR` retries are limited to five attempts. Fatal device errors
+stop the service. Packet warnings are limited independently per thread/reason
+per monotonic second; `warnings_suppressed` reports suppression.
+
+`workers_synced` means all active slots, including the main packet loop, have
+flushed through the requested generation. A timeout records unacknowledged
+slots (main is slot 0). It is not a globally frozen packet instant: traffic may
+continue while the atomic counters are read.
+
+
 # AUTHOR
 
 Maintained by Andrew Palardy \<andrew@apalrd.net\>

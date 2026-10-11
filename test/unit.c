@@ -21,7 +21,7 @@
 #include <time.h>
 
 /* Global vars */
-time_t now;
+_Atomic time_t now;
 
 /* Overall test status (1 on failure, 0 on pass) */
 int test_stat = 0;

@@ -5,8 +5,10 @@
 # ==============================================================================
 set -euo pipefail
 
-REPO_DIR="/Users/antongrizli/Documents/MikroTik/tayga-clat-perf"
-OUT_DIR="$REPO_DIR/perf-sessions/post-impl-saturation-arm64"
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
+export PERF_SESSION_ROOT REPO_DIR
+OUT_DIR="$PERF_SESSION_ROOT/post-impl-saturation-arm64"
 mkdir -p "$OUT_DIR/baseline-off" "$OUT_DIR/gso-tcp"
 
 echo "============================================================"
@@ -76,6 +78,7 @@ echo "============================================================"
 
 python3 - <<'EOF'
 import json, os, sys
+session_root = os.environ["PERF_SESSION_ROOT"]
 
 def parse_run(d):
     up_path = os.path.join(d, "upload", "result.json")
@@ -90,12 +93,12 @@ def parse_run(d):
         dn = json.load(f)
     return {"upload": up, "download": dn}
 
-repo = "/Users/antongrizli/Documents/MikroTik/tayga-clat-perf"
-pre_off = parse_run(f"{repo}/perf-sessions/pre-impl-saturation-arm64/baseline-off")
-pre_tcp = parse_run(f"{repo}/perf-sessions/pre-impl-saturation-arm64/gso-tcp")
+repo = os.environ["REPO_DIR"]
+pre_off = parse_run(f"{session_root}/pre-impl-saturation-arm64/baseline-off")
+pre_tcp = parse_run(f"{session_root}/pre-impl-saturation-arm64/gso-tcp")
 
-post_off = parse_run(f"{repo}/perf-sessions/post-impl-saturation-arm64/baseline-off")
-post_tcp = parse_run(f"{repo}/perf-sessions/post-impl-saturation-arm64/gso-tcp")
+post_off = parse_run(f"{session_root}/post-impl-saturation-arm64/baseline-off")
+post_tcp = parse_run(f"{session_root}/post-impl-saturation-arm64/gso-tcp")
 
 def get_row(label, s):
     up = s["upload"]
@@ -172,7 +175,7 @@ report_md = f"""# Post-Implementation Saturation Benchmark & Pre/Post Comparison
 {verdict}
 """
 
-with open(f"{repo}/perf-sessions/post-impl-saturation-arm64/POST-IMPL-REPORT.md", "w") as f:
+with open(f"{session_root}/post-impl-saturation-arm64/POST-IMPL-REPORT.md", "w") as f:
     f.write(report_md)
 
 print(report_md)

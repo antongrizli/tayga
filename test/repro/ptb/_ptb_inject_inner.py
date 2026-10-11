@@ -1,3 +1,4 @@
+from pathlib import Path
 import sys
 sys.path.insert(0, '/usr/lib/python3/dist-packages')
 import logging; logging.getLogger('scapy.runtime').setLevel(logging.ERROR)

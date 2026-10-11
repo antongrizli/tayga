@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+TAYGA_RUNTIME_DIR="${TAYGA_RUNTIME_DIR:-/run}"
+export TAYGA_RUNTIME_DIR
+
 # Helper to enable kernel forwarding safely
 enable_forwarding() {
   key=$1
@@ -169,9 +172,9 @@ if [ "$TAYGA_OFFLOAD_VAL" != "off" ] && command -v ethtool >/dev/null 2>&1; then
   ethtool -K "$UPLINK_IF" gro on 2>/dev/null || echo "Note: ethtool GRO toggle not supported on $UPLINK_IF (continuing)"
 fi
 
-# Generate /run/clat.conf
-mkdir -p /run
-cat > /run/clat.conf <<CONF_EOF
+# Generate "$TAYGA_RUNTIME_DIR/clat.conf"
+mkdir -p "$TAYGA_RUNTIME_DIR"
+cat > "$TAYGA_RUNTIME_DIR/clat.conf" <<CONF_EOF
 tun-device ${TUN}
 ipv4-addr ${V4_TAYGA}
 ipv6-addr ${V6_TAYGA}
@@ -184,7 +187,7 @@ CONF_EOF
 
 # Set up TUN adapter and routes
 echo "==> Setting up TUN device $TUN and routing table..."
-/usr/sbin/tayga -c /run/clat.conf --mktun
+/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun
 ip link set "$TUN" up
 ip addr replace "$V4_HOST/32" dev "$TUN"
 ip -6 addr replace "$V6_HOST/128" dev "$TUN"
@@ -195,7 +198,7 @@ ip route replace default dev "$TUN"
 enable_forwarding net.ipv4.ip_forward
 enable_forwarding net.ipv6.conf.all.forwarding
 
-cat > /run/clat-info.json <<INFO_EOF
+cat > "$TAYGA_RUNTIME_DIR/clat-info.json" <<INFO_EOF
 {
   "mode": "clat",
   "pref64": "${PREF64}",
@@ -210,4 +213,4 @@ cat > /run/clat-info.json <<INFO_EOF
 INFO_EOF
 
 echo "==> Launching TAYGA daemon in foreground..."
-exec /usr/sbin/tayga -c /run/clat.conf -d
+exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d

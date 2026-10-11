@@ -5,8 +5,10 @@
 # ==============================================================================
 set -euo pipefail
 
-REPO_DIR="/Users/antongrizli/Documents/MikroTik/tayga-clat-perf"
-OUT_DIR="$REPO_DIR/perf-sessions/ablation-study-arm64"
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
+export PERF_SESSION_ROOT REPO_DIR
+OUT_DIR="$PERF_SESSION_ROOT/ablation-study-arm64"
 mkdir -p "$OUT_DIR"
 
 echo "============================================================"
@@ -111,7 +113,7 @@ def get_run(path):
         dn = json.load(f)
     return {"upload": up, "download": dn}
 
-out_dir = "/Users/antongrizli/Documents/MikroTik/tayga-clat-perf/perf-sessions/ablation-study-arm64"
+out_dir = os.path.join(os.environ["PERF_SESSION_ROOT"], "ablation-study-arm64")
 
 passes = [1, 2, 3, 4, 5]
 cases = {

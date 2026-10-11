@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
+export PERF_SESSION_ROOT
 
 PROJECT="${PROJECT:-/Users/antongrizli/Documents/MikroTik}"
 REPO="${REPO:-$PROJECT/tayga-clat-perf}"
 STAMP="${SESSION_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 if [ -z "${SESSION_ROOT:-}" ]; then
   SESSION_ROOT="/tmp/tayga-perf-sessions/$STAMP-lima-debian13-arm64"
-  REMOVE_SESSION_ROOT=yes
-else
-  REMOVE_SESSION_ROOT=no
 fi
 if [ -z "${BUILD_ROOT:-}" ]; then
   BUILD_ROOT="$(mktemp -d /tmp/tayga-clat-perf-build.XXXXXX)"
@@ -187,14 +186,8 @@ fi
 sudo chown -R "$(id -u):$(id -g)" "$SESSION_ROOT"
 
 find "$SESSION_ROOT" -maxdepth 3 -type f -printf '%P\n' | sort > "$SESSION_ROOT/file-list.txt"
-HOST_RESULTS="$REPO/perf-sessions/$STAMP-lima-debian13-arm64"
-if mkdir -p "$HOST_RESULTS" 2>/dev/null && cp -a "$SESSION_ROOT"/. "$HOST_RESULTS"/ 2>/dev/null; then
-  echo "Perf session copied to host mount: $HOST_RESULTS"
-  if [ "$REMOVE_SESSION_ROOT" = yes ]; then
-    rm -rf -- "$SESSION_ROOT"
-  fi
-else
-  echo "Perf session remains in guest: $SESSION_ROOT"
-fi
+# A host path outside the shared mount can silently resolve to a guest-only
+# directory. run-host.sh collects explicitly and removes this copy on success.
+echo "Perf session retained in guest for collection: $SESSION_ROOT"
 echo "Perf session complete: $SESSION_ROOT"
 exit "$overall_status"

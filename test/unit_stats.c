@@ -129,8 +129,30 @@ static void test_idle_sync(void) {
     puts("PASS: idle sparse highest-slot worker synchronization (100 requests)");
 }
 
+static atomic_bool main_snapshot_done;
+static struct tayga_stats main_snapshot;
+static void *main_snapshot_reader(void *unused)
+{
+    (void)unused; stats_thread_init(-1); stats_get_snapshot(&main_snapshot);
+    atomic_store(&main_snapshot_done, true); return NULL;
+}
+static void test_main_sync(void)
+{
+    stats_init(); gcfg.workers = 0; stats_main_start(); stats_rx4(77);
+    atomic_store(&main_snapshot_done, false);
+    pthread_t reader; assert(pthread_create(&reader, NULL, main_snapshot_reader, NULL) == 0);
+    while (!atomic_load(&main_snapshot_done)) { stats_check_sync_request(); usleep(1000); }
+    pthread_join(reader, NULL);
+    assert(main_snapshot.main_synced && main_snapshot.workers_synced);
+    assert(main_snapshot.rx_pkts_v4 == 1 && main_snapshot.rx_bytes_v4 == 77);
+    stats_main_stop();
+    puts("PASS: background snapshot publishes partial main batch with zero workers");
+}
+
 int main(void)
 {
+	assert(pthread_mutex_init(&gcfg.map_mutex, NULL) == 0);
+	assert(pthread_mutex_init(&gcfg.cache_mutex, NULL) == 0);
 	printf("=== Testing stats subsystem ===\n");
 
 	/* Test 1: stats_init */
@@ -393,6 +415,7 @@ int main(void)
 	printf("PASS: low-rate continuous streaming interval flush publishes within 1 second\n");
 
 	test_idle_sync();
+	test_main_sync();
 	printf("All stats unit tests PASSED.\n");
 	return 0;
 }

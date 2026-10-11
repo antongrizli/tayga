@@ -69,12 +69,22 @@ def main():
                         if child.poll() is None:child.kill();child.wait()
                 assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
             assert run(str(binary),'-c',str(conf),'--mktun',stdout=subprocess.DEVNULL).returncode==0
-            rejected=run(str(binary),'-c',str(conf),'-d',*flags,capture_output=True,text=True,timeout=5)
-            assert rejected.returncode!=0 and 'fresh disposable' in rejected.stdout+rejected.stderr
+            fresh_required = groups or selected.get('dispatch') == 'flows'
+            if fresh_required:
+                rejected=run(str(binary),'-c',str(conf),'-d',*flags,capture_output=True,text=True,timeout=5)
+                assert rejected.returncode!=0 and 'fresh disposable' in rejected.stdout+rejected.stderr
+            else:
+                # Production kernel policy explicitly permits owned persistent devices.
+                accepted=subprocess.Popen(['ip','netns','exec',ns,str(binary),'-c',str(conf),'-d',*flags],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                try:
+                    time.sleep(.25); assert accepted.poll() is None
+                    accepted.terminate(); assert accepted.wait(timeout=5)==0
+                finally:
+                    if accepted.poll() is None: accepted.kill(); accepted.wait()
             assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL).returncode==0
             run(str(binary),'-c',str(conf),'--rmtun',check=True,stdout=subprocess.DEVNULL)
             if not groups:
-                print("PASS: flow/uring reload, TERM/KILL cleanup, existing-device rejection")
+                print("PASS: reload, TERM/KILL cleanup and policy-specific existing-device handling")
                 return
             # Remove both privilege alternatives while retaining TUN capability.
             with (Path(folder)/'fallback').open('w') as output:

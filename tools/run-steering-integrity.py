@@ -15,7 +15,7 @@ spec=importlib.util.spec_from_file_location('study',Path(__file__).with_name('ru
 study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',required=True,type=Path);p.add_argument('--output',required=True,type=Path);a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',required=True,type=Path);p.add_argument('--output',required=True,type=Path);p.add_argument('--steering',choices=('kernel','groups'),default='groups');a=p.parse_args()
     if os.geteuid()!=0:p.error('Linux root required')
     lock=open('/tmp/tayga-perf-workflow.lock','a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     root=a.output;root.mkdir(exist_ok=False)
@@ -23,14 +23,14 @@ def main():
     shutil.copy2(daemon,root/'original-tayga');shutil.copy2(start,root/'original-startup.sh')
     generated=study.startup(start.read_text())
     before="while ! grep -q 'TUN offload negotiated:' \"$ARTIFACT_DIR/clat.log\"; do"
-    after='''while ! python3 -c 'import json,sys; d=json.load(open("/run/tayga-status.json")); sys.exit(not(d.get("pid")==int(sys.argv[1]) and d.get("offload_negotiation_complete")))' "$parent" 2>/dev/null; do'''
+    after='''while ! python3 -c 'import json,sys,os; d=json.load(open(os.environ.get("TAYGA_STATUS_FILE", "/run/tayga-status.json"))); sys.exit(not(d.get("pid")==int(sys.argv[1]) and d.get("offload_negotiation_complete")))' "$parent" 2>/dev/null; do'''
     assert before in generated
     (root/'experimental-startup.sh').write_text(generated.replace(before,after))
     def interrupted(signum,frame):raise KeyboardInterrupt(signum)
     signal.signal(signal.SIGTERM,interrupted)
     try:
         study.install(a.binary,daemon);study.install(root/'experimental-startup.sh',start);start.chmod(0o755)
-        env=dict(os.environ,TAYGA_STEERING_MODE='groups',TEST_SIZE_MB='4')
+        env=dict(os.environ,TAYGA_STEERING_MODE=a.steering,TEST_SIZE_MB='4')
         for name in ('test_correctness.py','test_pmtud.py'):
             test=Path(__file__).resolve().parents[1]/'test'/name
             (root/name).write_bytes(test.read_bytes())
@@ -43,8 +43,8 @@ def main():
                     except subprocess.TimeoutExpired:child.kill();child.wait()
                     raise
             if status:raise RuntimeError(f'{name} failed; see retained log')
-            snapshot=json.loads(Path('/run/tayga-status.json').read_text())
-            assert snapshot['steering_effective']=='groups',snapshot
+            snapshot=json.loads(Path(os.environ.get('TAYGA_STATUS_FILE', str(Path(os.environ.get('TAYGA_RUNTIME_DIR', '/run'))/'tayga-status.json'))).read_text())
+            assert snapshot['steering_effective']==a.steering,snapshot
             (root/(name+'.status.json')).write_text(json.dumps(snapshot,indent=2))
             print(f'PASS {name}',flush=True)
     finally:

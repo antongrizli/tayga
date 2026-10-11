@@ -1,0 +1,76 @@
+name: Correctness and review gates
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  portable:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: make test-portable check-docs
+      - name: Native packet ownership checks
+        run: make unit_packet_io unit_packet_io_lifetime LDFLAGS='' && ./unit_packet_io && ./unit_packet_io_lifetime
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Address and undefined behavior
+        run: make test CC=clang CFLAGS='-O1 -g -Wall -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
+        env:
+          ASAN_OPTIONS: detect_leaks=0 # Legacy config fixtures retain maps.
+      - name: New mapping fixtures must also pass leak detection
+        run: ASAN_OPTIONS=detect_leaks=1 ./unit_addrmap
+      - name: Thread sanitizer on mapping and counters
+        run: |
+          make clean
+          make unit_addrmap unit_stats CC=gcc CFLAGS='-O1 -g -Wall -fsanitize=thread -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=thread -no-pie'
+          ./unit_addrmap
+          ./unit_stats
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+  linux-kernel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dependencies and opt-in io_uring build
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev python3-scapy python3-pyroute2 iproute2 nftables tcpdump socat iputils-ping ethtool
+      - run: make WITH_URING=1 all test
+      - name: Kernel negotiation, rollback, wire and lifecycle
+        run: |
+          sudo touch /tmp/tayga-perf-workflow.lock
+          sudo python3 test/test_auto_negotiation.py --binary "$PWD/tayga" --output /tmp/review-results/negotiation
+          sudo python3 test/test_auto_persistent.py --binary "$PWD/tayga" --output /tmp/review-results/persistent
+          sudo python3 test/test_startup_rollback.py --binary "$PWD/tayga" --output /tmp/review-results/rollback
+          sudo python3 test/test_worker_burst.py --binary "$PWD/tayga" --output /tmp/review-results/burst
+          sudo python3 test/test_udp_gso_kernel.py --binary "$PWD/tayga" --output /tmp/review-results/wire --modes auto off tcp udp --workers 0 3 --mtus 1280 1500
+          sudo python3 test/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=kernel --packet-io=sync
+      - name: TCP and UDP payload integrity and end-to-end PMTUD
+        run: |
+          sudo install -m 755 tayga /usr/sbin/tayga
+          sudo install -m 755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
+          sudo python3 tools/run-steering-integrity.py --binary "$PWD/tayga" --steering kernel --output /tmp/review-results/integrity-pmtud
+      - name: Async kernel wire gate when io_uring is available
+        run: |
+          ./unit_async_tun 2>&1 | tee /tmp/review-results/uring-availability.log
+          if grep -q '^SKIP:' /tmp/review-results/uring-availability.log; then
+            echo '::notice::Kernel io_uring unavailable; build succeeded, runtime gate skipped'
+          else
+            sudo python3 test/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
+            sudo python3 test/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
+          fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: kernel-review-results
+          path: /tmp/review-results
+          if-no-files-found: warn

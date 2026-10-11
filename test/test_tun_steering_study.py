@@ -16,7 +16,7 @@ class StudyTest(unittest.TestCase):
   self.assertNotIn('--mktun',script)
   self.assertIn('parent=$$',script)
   self.assertIn('TUN offload negotiated:',script)
-  self.assertIn('exec /usr/sbin/tayga -c /run/clat.conf -d --tun-steering=groups',script)
+  self.assertIn('exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d --tun-steering=groups',script)
   self.assertEqual(subprocess.run(['sh','-n'],input=script,text=True,capture_output=True).returncode,0)
  def test_unknown_startup_rejected(self):
   with self.assertRaises(ValueError):study.startup('exit 0\n')

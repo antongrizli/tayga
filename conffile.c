@@ -553,7 +553,7 @@ static int config_dynamic_pool(int ln, int arg_count, char **args)
 	}
 
 	pool->free_head.addr = ntohl(m4->addr.s_addr);
-	pool->free_head.count = (1 << (32 - m4->prefix_len)) - 1;
+	pool->free_head.count = UINT32_MAX >> m4->prefix_len;
 	INIT_LIST_HEAD(&pool->free_head.list);
 	list_add(&pool->free_head.list, &pool->free_list);
 
@@ -722,6 +722,18 @@ static int config_tun_offload(int ln, int arg_count, char **args)
 	return 0;
 }
 
+static int config_runtime_dir(int ln, int argc, char **argv)
+{
+	(void)argc;
+	if (gcfg.runtime_dir_configured || argv[0][0] != '/' || strlen(argv[0]) >= sizeof(gcfg.runtime_dir)) {
+		slog(LOG_CRIT, "Invalid runtime-dir on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	strcpy(gcfg.runtime_dir, argv[0]);
+	gcfg.runtime_dir_configured = 1;
+	return 0;
+}
+
 struct {
 	/* Long name */
 	char *name;
@@ -741,6 +753,7 @@ struct {
 	{ "tun-device", 	config_tun_device, 		1 },
 	{ "map", 			config_map, 			2 },
 	{ "dynamic-pool", 	config_dynamic_pool,	1 },
+	{ "runtime-dir", config_runtime_dir, 1 },
 	{ "data-dir", 		config_data_dir, 		1 },
 	{ "map-file", 		config_map_file, 		1 },
 	{ "strict-frag-hdr",config_strict_fh, 		1 },
@@ -755,6 +768,7 @@ int config_init(void)
 {
 	/* Initialize configuration structure to defaults */
 	memset(&gcfg, 0, sizeof(struct config));
+	strcpy(gcfg.runtime_dir, "/run");
 	INIT_LIST_HEAD(&gcfg.map4_list);
 	INIT_LIST_HEAD(&gcfg.map6_list);
 	gcfg.dyn_min_lease = 7200 + 4 * 60; /* just over two hours */

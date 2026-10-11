@@ -19,11 +19,11 @@ def main():
     for src,name in ((daemon,'original-tayga'),(start,'original-startup.sh'),(bench,'benchmark.sh'),(a.binary,'candidate-tayga')):shutil.copy2(src,root/name)
     generated=study.startup(start.read_text())
     # Both arms use the same fresh TUN topology. Only candidate receives new flags.
-    old='exec /usr/sbin/tayga -c /run/clat.conf -d\n'
+    old='exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d\n'
     assert generated.count(old)==1
-    generated=generated.replace(old,'exec /usr/sbin/tayga -c /run/clat.conf -d ${TAYGA_EXPERIMENT_FLAGS:-}\n')
+    generated=generated.replace(old,'exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d ${TAYGA_EXPERIMENT_FLAGS:-}\n')
     if a.integrity_only:
-        generated=generated.replace('while ! grep -q \'TUN offload negotiated:\' "$ARTIFACT_DIR/clat.log"; do', 'while ! python3 -c \'import json,sys; d=json.load(open("/run/tayga-status.json")); sys.exit(not(d.get("pid")==int(sys.argv[1]) and d.get("offload_negotiation_complete")))\' "$parent" 2>/dev/null; do')
+        generated=generated.replace('while ! grep -q \'TUN offload negotiated:\' "$ARTIFACT_DIR/clat.log"; do', 'while ! python3 -c \'import json,sys,os; d=json.load(open(os.environ.get("TAYGA_STATUS_FILE", "/run/tayga-status.json"))); sys.exit(not(d.get("pid")==int(sys.argv[1]) and d.get("offload_negotiation_complete")))\' "$parent" 2>/dev/null; do')
     (root/'experimental-startup.sh').write_text(generated)
     (root/'experimental-startup.sh').chmod(0o755)
     (root/'runner.py').write_bytes(Path(__file__).read_bytes())
@@ -55,7 +55,7 @@ def main():
                     script.write_text(source.read_text().replace('stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)', 'stdout=open('+repr(str(diagnostic))+', \"w\"), stderr=subprocess.STDOUT)'))
                     status=run(['python3',str(script)],env,root/(policy+'-'+name+'.log'))
                     if status:raise RuntimeError(f'{policy}/{name} failed')
-                    state=json.load(open('/run/tayga-status.json'));assert state['dispatch_mode']==dispatch and state['packet_io']==io
+                    state=json.load(open(os.environ.get('TAYGA_STATUS_FILE', str(Path(os.environ.get('TAYGA_RUNTIME_DIR', '/run'))/'tayga-status.json'))));assert state['dispatch_mode']==dispatch and state['packet_io']==io
                     (root/(policy+'-'+name+'.status.json')).write_text(json.dumps(state,indent=2));print('PASS',policy,name,flush=True)
             return
         cases=[]
