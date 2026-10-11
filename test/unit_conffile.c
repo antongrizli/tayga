@@ -276,7 +276,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),2256,"sizeof");
+    expectl(sizeof(struct config),4352,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */
@@ -646,6 +646,30 @@ void test_config_read(void) {
     fwrite(testcase,strlen(testcase),1,fd);
     fclose(fd);
     
+    config_init();
+    expect(config_read(conffile),"Failed");
+
+    /* Test Case - runtime dir duplicate */
+    if(!print_fail_only) printf("TEST CASE: runtime dir duplicate\n");
+    fd = fopen(conffile,"w");
+    expect((long)fd,"fopen");
+    if(!fd) return;
+    testcase = "runtime-dir /run/tayga\nruntime-dir /var/run/tayga\n";
+    fwrite(testcase,strlen(testcase),1,fd);
+    fclose(fd);
+
+    config_init();
+    expect(config_read(conffile),"Failed");
+
+    /* Test Case - runtime dir invalid */
+    if(!print_fail_only) printf("TEST CASE: runtime dir relative\n");
+    fd = fopen(conffile,"w");
+    expect((long)fd,"fopen");
+    if(!fd) return;
+    testcase = "runtime-dir run/tayga\n";
+    fwrite(testcase,strlen(testcase),1,fd);
+    fclose(fd);
+
     config_init();
     expect(config_read(conffile),"Failed");
 
