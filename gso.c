@@ -267,6 +267,94 @@ void gso_dump_stats(void)
 		(unsigned long long)s.udp_gso_sw_segments);
 }
 
+static int gso_map_6to4_with_icmp(struct pkt *p, struct ip6 *ip6, uint32_t l4_proto,
+                                  struct in_addr *src4, struct in_addr *dst4)
+{
+	if (unlikely(IN6_ARE_ADDR_EQUAL(&ip6->dest, &gcfg.local_addr6))) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = (uint8_t)l4_proto;
+		log_pkt6(LOG_OPT_SELF | LOG_OPT_REJECT, p, "Unknown protocol to self");
+		host_send_icmp6_error(4, 1, 6, p);
+		return 1;
+	}
+	int ret = map_ip6_to_ip4(dst4, &ip6->dest, 0);
+	if (ret) {
+		if (ret == ERROR_REJECT) {
+			p->ip6 = ip6;
+			p->header_len = 0;
+			p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+			p->data_len -= sizeof(struct ip6);
+			p->data_proto = (uint8_t)l4_proto;
+			log_pkt6(LOG_OPT_REJECT, p, "Destination address rejected");
+			host_send_icmp6_error(1, 0, 0, p);
+			return 1;
+		}
+		return -1;
+	}
+	ret = map_ip6_to_ip4(src4, &ip6->src, 1);
+	if (ret) {
+		if (ret == ERROR_REJECT) {
+			p->ip6 = ip6;
+			p->header_len = 0;
+			p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+			p->data_len -= sizeof(struct ip6);
+			p->data_proto = (uint8_t)l4_proto;
+			log_pkt6(LOG_OPT_REJECT, p, "Source address rejected");
+			host_send_icmp6_error(1, 5, 0, p);
+			return 1;
+		}
+		return -1;
+	}
+	return 0;
+}
+
+static int gso_map_4to6_with_icmp(struct pkt *p, struct ip4 *ip4, uint32_t ip4_hdr_len,
+                                  uint32_t l4_proto, struct in6_addr *src6, struct in6_addr *dst6)
+{
+	if (unlikely(ip4->dest.s_addr == gcfg.local_addr4.s_addr)) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = (uint8_t)l4_proto;
+		log_pkt4(LOG_OPT_SELF | LOG_OPT_REJECT, p, "Unknown protocol to self");
+		host_send_icmp4_error(3, 2, 0, p);
+		return 1;
+	}
+	int ret = map_ip4_to_ip6(dst6, &ip4->dest);
+	if (ret) {
+		if (ret == ERROR_REJECT) {
+			p->ip4 = ip4;
+			p->header_len = ip4_hdr_len;
+			p->data = (uint8_t *)ip4 + ip4_hdr_len;
+			p->data_len -= ip4_hdr_len;
+			p->data_proto = (uint8_t)l4_proto;
+			log_pkt4(LOG_OPT_REJECT, p, "Destination Address Rejected");
+			host_send_icmp4_error(3, 1, 0, p);
+			return 1;
+		}
+		return -1;
+	}
+	ret = map_ip4_to_ip6(src6, &ip4->src);
+	if (ret) {
+		if (ret == ERROR_REJECT) {
+			p->ip4 = ip4;
+			p->header_len = ip4_hdr_len;
+			p->data = (uint8_t *)ip4 + ip4_hdr_len;
+			p->data_len -= ip4_hdr_len;
+			p->data_proto = (uint8_t)l4_proto;
+			log_pkt4(LOG_OPT_REJECT, p, "Source Address Rejected");
+			host_send_icmp4_error(3, 10, 0, p);
+			return 1;
+		}
+		return -1;
+	}
+	return 0;
+}
+
 int gso_translate_tcp_6to4(struct pkt *p)
 {
 	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV6)
@@ -334,9 +422,9 @@ int gso_translate_tcp_6to4(struct pkt *p)
 
 	/* Fast-path: map addresses */
 	struct in_addr src4, dst4;
-	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0) {
-		return -1;
-	}
+	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_TCP, &src4, &dst4);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	/* Extract fields from IPv6 header BEFORE forming IPv4 header at p->data + 20 */
 	uint8_t tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
@@ -533,8 +621,9 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	uint8_t ttl = ip4->ttl;
 	struct in_addr src4 = ip4->src, dst4 = ip4->dest;
 	struct in6_addr src6, dst6;
-	if (map_ip4_to_ip6(&src6, &src4) < 0 || map_ip4_to_ip6(&dst6, &dst4) < 0)
-		return -1;
+	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_TCP, &src6, &dst6);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	/* Update TCP checksum seed for IPv6 pseudo-header */
 	uint32_t tcp_len = tcp_hdr_len + payload_len;
@@ -599,8 +688,9 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 	uint32_t gso_size = p->vhdr.gso_size;
 
 	struct in_addr src4, dst4;
-	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0)
-		return -1;
+	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_TCP, &src4, &dst4);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
@@ -714,8 +804,9 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 	uint32_t gso_size = p->vhdr.gso_size;
 
 	struct in6_addr src6, dst6;
-	if (map_ip4_to_ip6(&src6, &ip4->src) < 0 || map_ip4_to_ip6(&dst6, &ip4->dest) < 0)
-		return -1;
+	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_TCP, &src6, &dst6);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
@@ -823,8 +914,9 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 	}
 
 	struct in_addr src4, dst4;
-	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0)
-		return -1;
+	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_UDP, &src4, &dst4);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
 	uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];
@@ -936,8 +1028,9 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 	}
 
 	struct in6_addr src6, dst6;
-	if (map_ip4_to_ip6(&src6, &src4) < 0 || map_ip4_to_ip6(&dst6, &dst4) < 0)
-		return -1;
+	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_UDP, &src6, &dst6);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
 	uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];
@@ -1046,6 +1139,18 @@ int gso_translate_udp_6to4(struct pkt *p)
 	}
 	uint32_t full_segments = payload_len / gso_size;
 	uint32_t tail_len = payload_len % gso_size;
+	uint32_t max_seg_wire6 = sizeof(struct ip6) + sizeof(struct udp_hdr) +
+		(full_segments ? gso_size : payload_len);
+	if (unlikely(gcfg.mtu > 0 && max_seg_wire6 > gcfg.mtu)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_UDP;
+		log_pkt6(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp6_error(2, 0, gcfg.mtu, p);
+		return 0;
+	}
 	uint32_t max_segment_len = sizeof(struct ip4) + sizeof(struct udp_hdr) +
 		(full_segments ? gso_size : payload_len);
 	uint32_t tail_segment_len = sizeof(struct ip4) + sizeof(struct udp_hdr) + tail_len;
@@ -1061,8 +1166,9 @@ int gso_translate_udp_6to4(struct pkt *p)
 	}
 
 	struct in_addr src4, dst4;
-	if (map_ip6_to_ip4(&src4, &ip6->src, 1) < 0 || map_ip6_to_ip4(&dst4, &ip6->dest, 0) < 0)
-		return -1;
+	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_UDP, &src4, &dst4);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint8_t tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
 	uint8_t ttl = ip6->hop_limit - 1;
@@ -1152,11 +1258,24 @@ int gso_translate_udp_4to6(struct pkt *p)
 	uint32_t udp_len = p->data_len - ip4_hdr_len;
 	if (udp_len > UINT16_MAX || ntohs(udp->length) != udp_len)
 		return -1;
-	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
-	if (p->vhdr.gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
-	    gso_validate_udp_segment_count(payload_len, p->vhdr.gso_size) < 0) {
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
+	    gso_validate_udp_segment_count(payload_len, gso_size) < 0) {
 		stats_gso_invalid();
 		return -1;
+	}
+	uint32_t max_seg_wire4 = sizeof(struct ip4) + sizeof(struct udp_hdr) +
+		(payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
+	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_UDP;
+		log_pkt4(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
+		return 0;
 	}
 	/* IPv4 options are discarded during IPv4-to-IPv6 translation. */
 	if (!gcfg.tun_has_uso || ip4_hdr_len != sizeof(struct ip4)) {
@@ -1164,8 +1283,9 @@ int gso_translate_udp_4to6(struct pkt *p)
 	}
 
 	struct in6_addr src6, dst6;
-	if (map_ip4_to_ip6(&src6, &ip4->src) < 0 || map_ip4_to_ip6(&dst6, &ip4->dest) < 0)
-		return -1;
+	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_UDP, &src6, &dst6);
+	if (map_rc != 0)
+		return map_rc > 0 ? 0 : -1;
 
 	uint8_t tos = ip4->tos;
 	uint8_t hop_limit = ip4->ttl - 1;

@@ -215,6 +215,7 @@ static int config_prefix(int ln, int arg_count, char **args)
 	}
 	if (insert_map6(&m->map6, &m6) < 0) {
 		abort_on_conflict6("Error: NAT64 prefix", ln, m6);
+		list_del(&m->map4.list);
 		free(m);
 		return ERROR_REJECT;
 	}
@@ -330,6 +331,7 @@ static int config_tun_ip(int ln, int arg_count, char **args)
 		if(slash[1] > '9' || slash[1] < '0' || (!prefix && slash[1] != '0')) {
 			slog(LOG_CRIT, "Invalid prefix length in %s for "
 			     "address on line %d\n", args[0], ln);
+			free(ip6);
 			return ERROR_REJECT;
 		}
 		slash[0] = '\0';
@@ -368,6 +370,7 @@ static int config_tun_ip(int ln, int arg_count, char **args)
 	//Error handling
 	slog(LOG_CRIT, "Expected an IPv4 or IPv6 address but found \"%s\" on "
 		     "line %d\n", args[0], ln);
+	free(ip6);
 	return ERROR_REJECT;
 }
 
@@ -394,6 +397,7 @@ static int config_tun_route(int ln, int arg_count, char **args)
 		if(slash[1] > '9' || slash[1] < '0' || (!prefix && slash[1] != '0')) {
 			slog(LOG_CRIT, "Invalid prefix length in %s for "
 			     "route on line %d\n", args[0], ln);
+			free(ip6);
 			return ERROR_REJECT;
 		}
 		slash[0] = '\0';
@@ -432,6 +436,7 @@ static int config_tun_route(int ln, int arg_count, char **args)
 	//Error handling
 	slog(LOG_CRIT, "Expected an IPv4 or IPv6 route but found \"%s\" on "
 		     "line %d\n", args[0], ln);
+	free(ip6);
 	return ERROR_REJECT;
 }
 
@@ -495,21 +500,26 @@ static int config_map(int ln, int arg_count, char **args)
 	} else if (ret < 0) {
 		slog(LOG_CRIT, "Cannot use reserved address %s in map "
 				"directive, aborting...\n", args[0]);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (validate_ip6_addr(&m->map6.addr) < 0) {
 		slog(LOG_CRIT, "Cannot use reserved address %s in map "
 				"directive, aborting...\n", args[1]);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (insert_map4(&m->map4, &m4) < 0) {
 		abort_on_conflict4("Error: IPv4 address in map directive",
 				ln, m4);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (insert_map6(&m->map6, &m6) < 0) {
 		abort_on_conflict6("Error: IPv6 address in map directive",
 				ln, m6);
+		list_del(&m->map4.list);
+		free(m);
 		return ERROR_REJECT;
 	}
 	return ERROR_NONE;
@@ -547,6 +557,7 @@ static int config_dynamic_pool(int ln, int arg_count, char **args)
 			calc_ip4_mask(&m4->mask, &m4->addr, m4->prefix_len)) {
 		slog(LOG_CRIT, "Expected an IPv4 prefix but found \"%s\" on "
 				"line %d\n", args[0], ln);
+		free(pool);
 		return ERROR_REJECT;
 	}
 	int ret = validate_ip4_addr(&m4->addr);
@@ -556,16 +567,19 @@ static int config_dynamic_pool(int ln, int arg_count, char **args)
 	} else if (ret < 0) {
 		slog(LOG_CRIT, "Cannot use reserved address %s in dynamic-pool "
 				"directive, aborting...\n", args[0]);
+		free(pool);
 		return ERROR_REJECT;
 	}
 	if (m4->prefix_len > 31) {
 		slog(LOG_CRIT, "Cannot use a prefix longer than /31 in "
 			       "dynamic-pool directive, aborting...\n");
+		free(pool);
 		return ERROR_REJECT;
 	}
 	if (insert_map4(&pool->map4, &m4) < 0) {
 		abort_on_conflict4("Error: IPv4 prefix in dynamic-pool "
 				"directive", ln, m4);
+		free(pool);
 		return ERROR_REJECT;
 	}
 

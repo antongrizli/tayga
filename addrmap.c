@@ -345,21 +345,32 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 int insert_map4(struct map4 *m, struct map4 **conflict)
 {
 	struct list_head *entry;
+	struct list_head *insert_pos = NULL;
 	struct map4 *s;
 
 	list_for_each(entry, &gcfg.map4_list) {
 		s = list_entry(entry, struct map4, list);
-		if (s->prefix_len < m->prefix_len)
-			break;
 		if (s->prefix_len == m->prefix_len &&
-				s->addr.s_addr == m->addr.s_addr) {
-			if (conflict)
-				*conflict = s;
-			return -1;
+				s->addr.s_addr == m->addr.s_addr)
+			goto conflict;
+		if (s->type == MAP_TYPE_STATIC && m->type == MAP_TYPE_STATIC) {
+			const struct map_static *ss = container_of(s, struct map_static, map4);
+			const struct map_static *ms = container_of(m, struct map_static, map4);
+			if (ss->origin == ms->origin &&
+			    ((s->addr.s_addr & m->mask.s_addr) == m->addr.s_addr ||
+			     (m->addr.s_addr & s->mask.s_addr) == s->addr.s_addr))
+				goto conflict;
 		}
+		if (s->prefix_len < m->prefix_len && !insert_pos)
+			insert_pos = entry;
 	}
-	list_add_tail(&m->list, entry);
+	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map4_list);
 	return 0;
+
+conflict:
+	if (conflict)
+		*conflict = s;
+	return -1;
 }
 /**
  * @brief Insert an IPv6 entry into the map
@@ -408,6 +419,16 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 {
 	/* Do not allow invalid addresses to be appended to prefix */
 	if(validate_ip4_addr(addr4)) return ERROR_DROP;
+
+	/* Do not allow translation of well-known prefix with private IPv4
+	 * But still allow local-use prefix */
+	if (prefix->s6_addr32[0] == WKPF &&
+		!prefix->s6_addr32[1] &&
+		!prefix->s6_addr32[2] &&
+		gcfg.wkpf_strict &&
+		is_private_ip4_addr(addr4))
+		return ERROR_REJECT;
+
 	switch (prefix_len) {
 	case 32:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
@@ -456,14 +477,6 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
                 addr4->s_addr >> 24);
 		return ERROR_NONE;
 	case 96:
-		//Do not allow translation of well-known prefix
-		//But still allow local-use prefix
-		if (prefix->s6_addr32[0] == WKPF &&
-			!prefix->s6_addr32[1] &&
-			!prefix->s6_addr32[2] &&
-			gcfg.wkpf_strict &&
-			is_private_ip4_addr(addr4))
-			return ERROR_REJECT;
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
 		addr6->s6_addr32[1] = prefix->s6_addr32[1];
 		addr6->s6_addr32[2] = prefix->s6_addr32[2];
@@ -887,8 +900,9 @@ int addrmap_reload(void)
 			struct list_head *fixed;
 			list_for_each(fixed, &gcfg.map4_list) {
 				struct map4 *f = list_entry(fixed, struct map4, list);
-				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
-					f->addr.s_addr == m->map4.addr.s_addr) {
+				if (!is_file_map4(f) && f->type == MAP_TYPE_STATIC &&
+					((f->addr.s_addr & m->map4.mask.s_addr) == m->map4.addr.s_addr ||
+					 (m->map4.addr.s_addr & f->mask.s_addr) == f->addr.s_addr)) {
 					conflict = 1;
 					break;
 				}

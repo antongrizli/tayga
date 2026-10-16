@@ -242,6 +242,8 @@ struct pkt {
 // Ensure that the data field has enough alignment for ip4 and ip6 structs
 static_assert((offsetof(struct pkt, data) & (alignof(struct ip4) - 1)) == 0,"Packet data must be aligned for IP4");
 static_assert((offsetof(struct pkt, data) & (alignof(struct ip6) - 1)) == 0,"Packet data must be aligned for IP6");
+static_assert((HEADROOM & (alignof(struct ip4) - 1)) == 0, "HEADROOM must be aligned for IP4");
+static_assert((HEADROOM & (alignof(struct ip6) - 1)) == 0, "HEADROOM must be aligned for IP6");
 
 /// Type of mapping in mapping list
 enum {
