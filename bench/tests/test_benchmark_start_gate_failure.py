@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 
-ROOT=Path(__file__).resolve().parents[1]
+ROOT=Path(__file__).resolve().parents[2]
 
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid()==0,'Linux root and installed benchmark helpers required')
 class FailureTest(unittest.TestCase):

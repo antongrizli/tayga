@@ -8,7 +8,7 @@ import sys
 import time
 import unittest
 
-text = (Path(__file__).resolve().parents[1]/'benchmark-clat.sh').read_text()
+text = (Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
 start = text.index('  python3 - $clat_pid ')
 helper = text[text.index('\n', start)+1:].split('\nPY\n', 1)[0]
 

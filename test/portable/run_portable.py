@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Explicit portable suite; do not discover integration modules with side effects."""
+import sys
+from pathlib import Path
 import unittest
+
+TOPDIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TOPDIR / 'bench/tests'))
+sys.path.insert(0, str(TOPDIR / 'bench'))
+
 MODULES = (
     "test_affinity_study", "test_benchmark_offload", "test_benchmark_udp_accounting",
     "test_compare_perf_sessions", "test_iperf_server_logs", "test_tcp_flow_study",

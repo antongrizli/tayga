@@ -16,7 +16,7 @@ class GateTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory();cls.root=Path(cls.temp.name)
         cls.library=cls.root/'gate.so';cls.controller=cls.root/'controller'
-        source=Path(__file__).resolve().parents[1]/'tools/iperf-start-gate.c'
+        source=Path(__file__).resolve().parents[2]/'bench/shims/iperf-start-gate.c'
         subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(source),'-ldl','-o',str(cls.library)],check=True)
         subprocess.run(['cc','-DIPERF_GATE_CONTROLLER','-Wall','-Wextra','-Werror',str(source),'-o',str(cls.controller)],check=True)
 

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 
-TOOL = Path(__file__).resolve().parents[1] / "tools" / "compare-perf-sessions.py"
+TOOL = Path(__file__).resolve().parents[2] / "bench/taygabench/compare.py"
 
 
 def result(direction, rate, offload, received):

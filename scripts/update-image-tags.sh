@@ -4,11 +4,11 @@ set -euo pipefail
 
 TAG="${1:-}"
 REPO="${2:-antongrizli/tayga}"
-TARGET_DIR="${3:-scripts/mikrotik}"
+TARGET_DIR="${3:-deploy/mikrotik}"
 
 if [ -z "$TAG" ]; then
   echo "Usage: $0 <version-tag> [repo] [target-directory]" >&2
-  echo "Example: $0 0.9.12 antongrizli/tayga scripts/mikrotik" >&2
+  echo "Example: $0 0.9.12 antongrizli/tayga deploy/mikrotik" >&2
   exit 1
 fi
 

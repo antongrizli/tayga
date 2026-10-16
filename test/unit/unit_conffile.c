@@ -15,7 +15,7 @@
  *  GNU General Public License for more details.
  */
 
-#include "test/unit.h"
+#include "unit.h"
 #include "tayga.h"
 
 /* Test copy of gcfg */
@@ -301,7 +301,7 @@ void test_config_read(void) {
 
 
     /* Example config */
-    conffile = "tayga.conf.example";
+    conffile = "packaging/tayga.conf.example";
     if(!print_fail_only) printf("TEST CASE: example conf file\n");
     config_init();
     expect(!config_read(conffile),"Passed");

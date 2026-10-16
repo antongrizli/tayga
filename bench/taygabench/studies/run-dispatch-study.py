@@ -49,7 +49,7 @@ def main():
                 dispatch,io=policy.split('-')
                 for name in ('test_correctness.py','test_pmtud.py'):
                     env=dict(os.environ,TEST_SIZE_MB='4',TAYGA_EXPERIMENT_FLAGS=f'--dispatch={dispatch} --packet-io={io}')
-                    source=Path(__file__).resolve().parents[1]/'test'/name
+                    source=Path(__file__).resolve().parents[2]/test/system/name
                     diagnostic=root/(policy+'-'+name+'.daemon.log')
                     script=root/(policy+'-'+name)
                     script.write_text(source.read_text().replace('stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)', 'stdout=open('+repr(str(diagnostic))+', \"w\"), stderr=subprocess.STDOUT)'))

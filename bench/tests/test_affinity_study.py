@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 import subprocess
 
-spec = importlib.util.spec_from_file_location('affinity_study', Path(__file__).resolve().parents[1] / 'tools/run-affinity-study.py')
+spec = importlib.util.spec_from_file_location('affinity_study', Path(__file__).resolve().parents[2] / 'bench/taygabench/studies/run-affinity-study.py')
 study = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(study)
 

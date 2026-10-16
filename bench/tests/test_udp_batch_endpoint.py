@@ -20,7 +20,7 @@ class EndpointTests(unittest.TestCase):
         cls.temp=tempfile.TemporaryDirectory()
         cls.root=Path(cls.temp.name)
         cls.binary=cls.root/'endpoint'
-        subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[1]/'tools/udp-batch-endpoint.c'),'-o',str(cls.binary)],check=True)
+        subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/udp-batch-endpoint.c'),'-o',str(cls.binary)],check=True)
 
         cls.fault=cls.root/'fault.so'
         subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parent/'udp_endpoint_fault.c'),'-ldl','-o',str(cls.fault)],check=True)

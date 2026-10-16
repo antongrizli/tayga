@@ -5,14 +5,14 @@ import subprocess
 import unittest
 import tempfile
 import copy
-ROOT=Path(__file__).resolve().parents[1]
-spec=importlib.util.spec_from_file_location('study',ROOT/'tools/run-tun-steering-study.py')
+ROOT=Path(__file__).resolve().parents[2]
+spec=importlib.util.spec_from_file_location('study',ROOT/'bench/taygabench/studies/run-tun-steering-study.py')
 study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
-spec=importlib.util.spec_from_file_location('summary',ROOT/'tools/summarize-tun-steering-study.py')
+spec=importlib.util.spec_from_file_location('summary',ROOT/'bench/taygabench/summarize/summarize-tun-steering-study.py')
 summary=importlib.util.module_from_spec(spec);spec.loader.exec_module(summary)
 class StudyTest(unittest.TestCase):
  def test_startup_preserves_daemon_pid_and_waits_for_negotiation(self):
-  script=study.startup((ROOT/'scripts/container/clat-start.sh').read_text())
+  script=study.startup((ROOT/'container/rootfs/usr/local/sbin/clat-start.sh').read_text())
   self.assertNotIn('--mktun',script)
   self.assertIn('parent=$$',script)
   self.assertIn('TUN offload negotiated:',script)

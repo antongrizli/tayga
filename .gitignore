@@ -1,46 +1,55 @@
+# Build output
+/build/
+/dist/
 *.o
+*.d
+*.tar
+*.gz
 tayga
 taygabe
-tayga.conf
-*.tar
-*.d
-tayga-cov
-*.gcno 
+pref64-discover
+
+# Test / Coverage artifacts
 *.gcda
+*.gcno
 *.gcov
 *.rpt
 *.pcap
-*.pyc
 *.log
-html/*
-latex/*
-.vscode/*
 callgrind*
-unit_conffile
+unit_*
+
+# Local runtime & configurations
+/tayga.conf
+/tayga.map
 unit_conffile.conf
-unit_checksum
-unit_ip4_id
-unit_tun
-unit_packet_io
-unit_gso
-unit_pref64
-unit_stats
-unit_udp_checksum
-pref64-discover
-tayga.map
-perf-sessions
-dist/
+/perf-sessions/
+/perf-comparisons/
+
+# Tools & shims built in-tree
+/tools/*.so
+/tools/probe-tun-offload
 /tools/udp-drain-guard.so
 /tools/udp-drain-control
 /tools/iperf-start-gate.so
 /tools/iperf-start-control
+/bench/shims/*.so
 
-unit_packet_io_lifetime
+# Editor & OS files
+.DS_Store
+.vscode/
+*.swp
 
-unit_dispatch
-unit_async_tun
+# Python cache & test artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
 
-unit_addrmap
-unit_netlink
+# Documentation generator output
+html/*
+latex/*
 
-improvenments
+# Working directories / proposals
+improvements/
+improvenments/

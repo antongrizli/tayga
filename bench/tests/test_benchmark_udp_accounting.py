@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 import unittest
 
-script = (Path(__file__).resolve().parents[1] / "benchmark-clat.sh").read_text()
+script = (Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh").read_text()
 start = script.index("def udp_packet_accounting(")
 end = script.index("\nfor path in sorted(", start)
 namespace = {}
@@ -83,7 +83,7 @@ class UdpCounterTests(unittest.TestCase):
 
 class TreatmentValidationTests(unittest.TestCase):
     def test_invalid_treatments_exit_before_topology_setup(self):
-        harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+        harness = Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh"
         for config in ({"PERF_SCOPE": "invalid"}, {"FQ_RATE": "."}, {"FQ_RATE": "1MM"},
                        {"FQ_RATE": "750M", "SENDER_FQ": "off"},
                        {"SENDER_FQ_FLOW_LIMIT": "0"}, {"SENDER_FQ_FLOW_LIMIT": "10001"},
@@ -158,7 +158,7 @@ class InterfaceCounterTests(unittest.TestCase):
 
 class QueueValidationTests(unittest.TestCase):
     def test_invalid_queue_settings_fail_before_topology_setup(self):
-        harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+        harness = Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh"
         for updates in (dict(SENDER_FQ_LIMIT="0"), dict(VETH_QUEUES="65"),
                         dict(SENDER_FQ_LIMIT="100", SENDER_FQ_FLOW_LIMIT="101")):
             with self.subTest(updates=updates):
@@ -246,7 +246,7 @@ esac
                        REPO=str(root), ISO=str(root / "absent.iso"), INSTANCE="tayga-perf",
                        SESSION_STAMP="stdin-test", LIMA_STDIN=str(root / "stdin"),
                        LIMA_EMPTY_DIR=str(root / "empty"), PERF_SESSION_ROOT=str(root / "results"))
-            runner = Path(__file__).resolve().parents[1] / "tools/lima-perf/run-host.sh"
+            runner = Path(__file__).resolve().parents[2] / "bench/lima/run-host.sh"
             run = subprocess.run(["bash", str(runner)], env=env, input="remaining orchestration commands\n",
                                  capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
@@ -284,7 +284,7 @@ else:
                        BENCHMARK_LOCK_DIR=str(root / "lock"), PERF_SCOPE="process",
                        FQ_RATE="0", SENDER_FQ="off", SENDER_FQ_FLOW_LIMIT="100", PROTOCOL="tcp",
                        PACING_TIMER_US="1000", SOCKET_SAMPLE_INTERVAL="0", BLOCK_SIZE="")
-            harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+            harness = Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh"
             run = subprocess.run(["sh", str(harness)], env=env, capture_output=True)
             self.assertEqual(run.returncode, 1, run.stderr.decode())
             self.assertEqual(json.loads(state.read_text()), original)
@@ -439,7 +439,7 @@ class WorkerCounterTests(unittest.TestCase):
         self.assertEqual(ledger[2]["total_lost_packets"], 15)
 
     def test_invalid_receiver_drain_fails_before_topology_setup(self):
-        harness = Path(__file__).resolve().parents[1] / "benchmark-clat.sh"
+        harness = Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh"
         for bad_val in ("-1", "abc", "1.2.3"):
             env = dict(os.environ, PROTOCOL="udp", RECEIVER_DRAIN_SECONDS=bad_val)
             run = subprocess.run(["sh", str(harness)], env=env, capture_output=True)

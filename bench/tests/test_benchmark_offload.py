@@ -5,7 +5,7 @@ import copy
 from pathlib import Path
 import unittest
 
-script = (Path(__file__).resolve().parents[1] / 'benchmark-clat.sh').read_text()
+script = (Path(__file__).resolve().parents[2] / 'bench/clat/benchmark-clat.sh').read_text()
 start = script.index('def negotiated_offload_mode(')
 end = script.index('\neffective_offload =', start)
 namespace = {}

@@ -15,7 +15,7 @@ def main():
     parser.add_argument('--duration', type=int, default=30)
     parser.add_argument('--protocol', choices=('tcp', 'udp'), nargs='+', default=['tcp', 'udp'])
     parser.add_argument('--profiles-only', action='store_true')
-    parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
     if args.pairs < 1 or args.duration < 1 or not args.stamp or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.stamp):
         parser.error('positive pairs/duration and an alphanumeric stamp are required')

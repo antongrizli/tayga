@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-spec=importlib.util.spec_from_file_location('batch_summary',Path(__file__).resolve().parents[1]/'tools/summarize-udp-batch-study.py')
+spec=importlib.util.spec_from_file_location('batch_summary',Path(__file__).resolve().parents[2]/'bench/taygabench/summarize/summarize-udp-batch-study.py')
 study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
 
 class SummaryTests(unittest.TestCase):

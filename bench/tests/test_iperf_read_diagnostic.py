@@ -12,7 +12,7 @@ class DiagnosticTest(unittest.TestCase):
     def test_errors_and_payload_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);lib=root/'diagnostic.so';binary=root/'fixture'
-            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[1]/'tools/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
+            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
             source=root/'fixture.c'
             source.write_text('''#include <assert.h>
 #include <errno.h>
@@ -50,7 +50,7 @@ int main(void) {
     def test_udp_connect_return_and_errno_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);lib=root/'diagnostic.so';mock=root/'mock.so';binary=root/'fixture'
-            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[1]/'tools/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
+            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
             (root/'mock.c').write_text('#include <errno.h>\nint i_errno=123;\nint iperf_udp_connect(void *test) { (void)test; errno=EPROTO; return -1; }\n')
             subprocess.run(['cc','-shared','-fPIC',str(root/'mock.c'),'-o',str(mock)],check=True)
             (root/'fixture.c').write_text('#include <assert.h>\n#include <errno.h>\nint iperf_udp_connect(void *);\nint main(void) { assert(iperf_udp_connect(0)==-1 && errno==EPROTO); return 0; }\n')
@@ -62,7 +62,7 @@ int main(void) {
     def test_control_framing_and_exchange_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);lib=root/'diagnostic.so';mock=root/'mock.so';binary=root/'fixture'
-            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[1]/'tools/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
+            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
             (root/'mock.c').write_text('#include <errno.h>\n#include <unistd.h>\n#include <sys/select.h>\nint i_errno=0;\nint Nread(int fd,char *b,unsigned long count,int protocol) { (void)protocol; fd_set f; FD_ZERO(&f); FD_SET(fd,&f); struct timeval t={0,1000}; int r=select(fd+1,&f,0,0,&t); return r>0?read(fd,b,count):r; }\nint iperf_set_send_state(void *test,signed char state) { (void)test; (void)state; errno=ERANGE; return 7; }\nint iperf_exchange_results(void *test) { (void)test; i_errno=123; errno=EPROTO; return -1; }\n')
             subprocess.run(['cc','-shared','-fPIC',str(root/'mock.c'),'-o',str(mock)],check=True)
             (root/'fixture.c').write_text('#include <assert.h>\n#include <errno.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint Nread(int,char *,unsigned long,int);\nint iperf_exchange_results(void *);\nint iperf_set_send_state(void *,signed char);\nint main(void) { int f[2]; char b[4]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,f)==0); errno=EDOM; assert(Nread(f[0],b,4,1)==0 && errno==EDOM); assert(write(f[1],"AB",2)==2); errno=EDOM; assert(Nread(f[0],b,4,1)==2 && errno==EDOM); close(f[1]); assert(Nread(f[0],b,4,1)==0); assert(iperf_exchange_results(0)==-1 && errno==EPROTO); assert(iperf_set_send_state(0,4)==7 && errno==ERANGE); close(f[0]); return 0; }\n')
@@ -82,7 +82,7 @@ int main(void) {
     def test_control_only_skips_udp_socket_queries(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);lib=root/'diagnostic.so';mock=root/'mock.so';binary=root/'fixture'
-            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[1]/'tools/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
+            subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/iperf-read-diagnostic.c'),'-ldl','-o',str(lib)],check=True)
             (root/'mock.c').write_text('#define _GNU_SOURCE\n#include <sys/socket.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nstatic int queries;\nint query_count(void) { return queries; }\nint getsockopt(int fd,int level,int option,void *value,socklen_t *length) { ++queries; return syscall(SYS_getsockopt,fd,level,option,value,length); }\n')
             subprocess.run(['cc','-shared','-fPIC',str(root/'mock.c'),'-o',str(mock)],check=True)
             (root/'fixture.c').write_text('#include <assert.h>\n#include <errno.h>\n#include <fcntl.h>\n#include <sys/socket.h>\n#include <unistd.h>\nint query_count(void);\nint main(void) { int f[2]; char b[4]; assert(socketpair(AF_UNIX,SOCK_DGRAM,0,f)==0); assert(send(f[1],"AB",2,0)==2); errno=EDOM; assert(read(f[0],b,4)==2 && errno==EDOM); assert(fcntl(f[0],F_SETFL,O_NONBLOCK)==0); assert(read(f[0],b,4)==-1 && errno==EAGAIN); assert(query_count()==0); close(f[0]);close(f[1]);return 0; }\n')

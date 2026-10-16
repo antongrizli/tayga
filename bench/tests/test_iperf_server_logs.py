@@ -7,7 +7,7 @@ import unittest
 
 class ServerLogTest(unittest.TestCase):
     def test_phase_logs_are_retained(self):
-        source=(Path(__file__).resolve().parents[1]/'benchmark-clat.sh').read_text()
+        source=(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
         start=source.index('start_iperf_servers() {')
         function=source[start:source.index('\n}\n',start)+3]
         with tempfile.TemporaryDirectory() as temp:

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SOURCE=(Path(__file__).resolve().parents[1]/'benchmark-clat.sh').read_text()
+SOURCE=(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
 
 class CommonStopTest(unittest.TestCase):
     def test_udp_stops_before_wait_without_added_drain(self):

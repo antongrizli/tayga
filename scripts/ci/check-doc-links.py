@@ -5,7 +5,7 @@ import re
 import subprocess
 from urllib.parse import unquote, urlsplit
 
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[2]
 tracked = subprocess.check_output(['git', '-C', str(root), 'ls-files', '--cached', '--others', '--exclude-standard', '*.md'], text=True).splitlines()
 errors = []
 for name in tracked:

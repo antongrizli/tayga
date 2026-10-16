@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec=importlib.util.spec_from_file_location('batch_study',Path(__file__).resolve().parents[1]/'tools/run-udp-batch-study.py')
+spec=importlib.util.spec_from_file_location('batch_study',Path(__file__).resolve().parents[2]/'bench/taygabench/studies/run-udp-batch-study.py')
 study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
 
 class StudyTests(unittest.TestCase):

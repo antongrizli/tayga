@@ -43,16 +43,11 @@ RUN apk add --no-cache \
 COPY --from=build-env /app/tayga /usr/sbin/tayga
 COPY --from=build-env /app/pref64-discover /usr/local/sbin/pref64-discover
 
-# Install container scripts and templates
-COPY scripts/container/entrypoint.sh /usr/local/sbin/entrypoint.sh
-COPY scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
-COPY scripts/container/nat64-start.sh /usr/local/sbin/nat64-start.sh
-COPY scripts/container/diagnose.sh /usr/local/sbin/diagnose.sh
-COPY scripts/container/tayga-status.sh /usr/local/sbin/tayga-status
-COPY scripts/container/config/unbound.conf.template /etc/unbound/unbound.conf.template
+# Install container scripts and templates from container rootfs
+COPY container/rootfs/ /
 
 # Ensure executable permissions and create backward-compatibility links
-RUN chmod +x /usr/sbin/tayga /usr/local/sbin/pref64-discover /usr/local/sbin/*.sh /usr/local/sbin/tayga-status \
+RUN chmod +x /usr/sbin/tayga /usr/local/sbin/pref64-discover /usr/local/sbin/*.sh /usr/local/sbin/tayga-status 2>/dev/null || true \
     && mkdir -p /app /run /var/lib/tayga \
     && ln -s /usr/sbin/tayga /app/tayga \
     && ln -s /usr/local/sbin/entrypoint.sh /app/launch.sh \

@@ -116,17 +116,17 @@ The repository provides automated validation scripts in the `test/` directory:
 
 | Test Script | Scope |
 |---|---|
-| `test/test_auto_negotiation.py` | Default UDP selection, fallback failures and capability telemetry |
-| `test/test_auto_persistent.py` | Persistent addresses/routes, restart, exclusive ownership and removal |
-| [`test/test_correctness.py`](../test/test_correctness.py) | ICMP ping, 20 MB TCP upload/download SHA-256 integrity, UDP datagrams |
-| [`test/test_pmtud.py`](../test/test_pmtud.py) | End-to-end PMTUD & ICMPv6 Packet Too Big (1280 → 1260) translation |
-| [`test/test_preflight.py`](../test/test_preflight.py) | CLI `--check-offload`, mode startups (`auto`, `tcp`, `off`), and data path |
+| `test/system/test_auto_negotiation.py` | Default UDP selection, fallback failures and capability telemetry |
+| `test/system/test_auto_persistent.py` | Persistent addresses/routes, restart, exclusive ownership and removal |
+| [`test/system/test_correctness.py`](../../test/system/test_correctness.py) | ICMP ping, 20 MB TCP upload/download SHA-256 integrity, UDP datagrams |
+| [`test/system/test_pmtud.py`](../../test/system/test_pmtud.py) | End-to-end PMTUD & ICMPv6 Packet Too Big (1280 → 1260) translation |
+| [`test/system/test_preflight.py`](../../test/system/test_preflight.py) | CLI `--check-offload`, mode startups (`auto`, `tcp`, `off`), and data path |
 
 Run the complete test suite:
 ```sh
-sudo python3 test/test_correctness.py
-sudo python3 test/test_pmtud.py
-sudo python3 test/test_preflight.py
+sudo python3 test/system/test_correctness.py
+sudo python3 test/system/test_pmtud.py
+sudo python3 test/system/test_preflight.py
 ```
 
 ## 6. Bounded UDP sender buffering in the benchmark

@@ -12,9 +12,9 @@ import tempfile
 import time
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-CONTROLLER = ROOT / 'tools/udp-drain-control'
-GUARD = ROOT / 'tools/udp-drain-guard.so'
+ROOT = Path(__file__).resolve().parents[2]
+CONTROLLER = ROOT / 'bench/shims/udp-drain-control'
+GUARD = ROOT / 'bench/shims/udp-drain-guard.so'
 
 @unittest.skipUnless(sys.platform == "linux" and GUARD.exists() and CONTROLLER.exists(),
                      "requires Linux and make udp-drain-tools")

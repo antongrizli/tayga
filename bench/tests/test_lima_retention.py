@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 MOCK = '''#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
 a = sys.argv[1:]
@@ -37,7 +37,7 @@ class RetentionTests(unittest.TestCase):
                        FAKE_SESSION=str(base/'guest'), FAKE_WORKLOAD_STATUS=str(status),
                        GIT_REVISION='fixture-revision')
             if copy_fail: env['FAKE_COPY_FAIL'] = 'yes'
-            result = subprocess.run(['bash',str(REPO/'tools/lima-perf/run-host.sh')],
+            result = subprocess.run(['bash',str(REPO/'bench/lima/run-host.sh')],
                                     env=env, capture_output=True, text=True)
             destination = root/'fixture-lima-debian13-arm64'
             copied = (destination/'result.json').is_file() if not root_file else False

@@ -65,7 +65,7 @@ $BUILDER build \
   --platform "$ARCH" \
   --target production \
   -t "$IMAGE_TAG" \
-  -f Dockerfile .
+  -f container/Containerfile .
 
 echo "--> Exporting image archive to $OUTPUT_TAR..."
 rm -f "$OUTPUT_TAR"

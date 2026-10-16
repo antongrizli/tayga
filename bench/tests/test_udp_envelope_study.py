@@ -1,7 +1,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
-spec=importlib.util.spec_from_file_location('envelope',Path(__file__).resolve().parents[1]/'tools/run-udp-envelope-study.py')
+spec=importlib.util.spec_from_file_location('envelope',Path(__file__).resolve().parents[2]/'bench/taygabench/studies/run-udp-envelope-study.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class EnvelopeTests(unittest.TestCase):
     def rows(self):

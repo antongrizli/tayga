@@ -3,9 +3,9 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-ROOT=Path(__file__).resolve().parents[1]
+ROOT=Path(__file__).resolve().parents[2]
 def module(name):
- spec=importlib.util.spec_from_file_location(name,ROOT/'tools'/f'{name}.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+ spec=importlib.util.spec_from_file_location(name,(ROOT / 'bench/taygabench/studies' / f'{name}.py') if (ROOT / 'bench/taygabench/studies' / f'{name}.py').exists() else (ROOT / 'bench/taygabench/summarize' / f'{name}.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 run=module('run-tcp-worker-study');summary=module('summarize-tcp-worker-study')
 class StudyTest(unittest.TestCase):
  def test_alternating_and_balanced_order(self):
