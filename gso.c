@@ -1013,7 +1013,6 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 	}
 
 	uint8_t tos = ip4->tos, ttl = ip4->ttl;
-	struct in_addr src4 = ip4->src, dst4 = ip4->dest;
 	struct udp_hdr *orig_udp = (struct udp_hdr *)(p->data + ip4_hdr_len);
 	uint8_t *payload = (uint8_t *)orig_udp + sizeof(struct udp_hdr);
 	uint32_t udp_len = p->data_len - ip4_hdr_len;
@@ -1258,6 +1257,7 @@ int gso_translate_udp_4to6(struct pkt *p)
 	uint32_t udp_len = p->data_len - ip4_hdr_len;
 	if (udp_len > UINT16_MAX || ntohs(udp->length) != udp_len)
 		return -1;
+	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
 	uint32_t gso_size = p->vhdr.gso_size;
 	if (gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
 	    gso_validate_udp_segment_count(payload_len, gso_size) < 0) {
