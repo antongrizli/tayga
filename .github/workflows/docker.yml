@@ -143,7 +143,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile
+          file: ./container/Containerfile
           target: production
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
@@ -160,7 +160,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile
+          file: ./container/Containerfile
           target: clat
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
@@ -177,7 +177,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile
+          file: ./container/Containerfile
           target: nat64
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true

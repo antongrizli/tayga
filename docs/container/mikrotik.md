@@ -4,13 +4,13 @@ Using TAYGA on MikroTik RouterOS 7 is supported for both NAT64 and CLAT using na
 
 For complete step-by-step setup guides, environment variable references, and downloadable RouterOS configuration scripts (`.rsc`), see:
 
-👉 **[MikroTik RouterOS TAYGA Setup Guide & Scripts](../../scripts/mikrotik/README.md)**
+👉 **[MikroTik RouterOS TAYGA Setup Guide & Scripts](../../deploy/mikrotik/README.md)**
 
 ## Quick Overview
 
 ### Automated Setup Scripts
-- **[NAT64 Setup Script](../../scripts/mikrotik/nat64-setup.rsc)** (`nat64-setup.rsc`)
-- **[CLAT Setup Script](../../scripts/mikrotik/clat-setup.rsc)** (`clat-setup.rsc`)
+- **[NAT64 Setup Script](../../deploy/mikrotik/nat64-setup.rsc)** (`nat64-setup.rsc`)
+- **[CLAT Setup Script](../../deploy/mikrotik/clat-setup.rsc)** (`clat-setup.rsc`)
 
 ### Speedrun NAT64 Container
 

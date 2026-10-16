@@ -12,7 +12,7 @@ Pre-built statically linked binaries are available from [Releases](https://githu
 
 ## Compiling
 
-`tayga` requires GNU `make` to build. If you would like to run the test suite, see [Test Documentation](test/index.md) for additional dependencies.
+`tayga` requires GNU `make` to build. If you would like to run the test suite, see [Test Documentation](test/README.md) for additional dependencies.
 
 ```sh
 git clone https://github.com/antongrizli/tayga.git
@@ -88,7 +88,7 @@ For container and script deployments:
 export CLAT_OFFLOAD=auto
 ```
 
-See the [**GSO & GRO Tuning Guide**](docs/GSO-GRO-TUNING.md) for configuration. Hardware capacity must be established with a reproducible measurement on the target system.
+See the [**GSO & GRO Tuning Guide**](docs/performance/gso-gro-tuning.md) for configuration. Hardware capacity must be established with a reproducible measurement on the target system.
 
 ## CLAT performance harness
 
@@ -150,7 +150,7 @@ The default is `FORWARDING_GRO=off` and `CLAT_OFFLOAD=auto`.
 For real Linux TUN packet validation against a selected executable:
 
 ```sh
-sudo python3 test/test_udp_gso_kernel.py --binary ./tayga --output /tmp/tayga-udp-kernel-results
+sudo python3 test/system/test_udp_gso_kernel.py --binary ./tayga --output /tmp/tayga-udp-kernel-results
 ```
 
 This saves independent post-segmentation captures and checks both directions,

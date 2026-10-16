@@ -48,17 +48,17 @@ jobs:
       - name: Kernel negotiation, rollback, wire and lifecycle
         run: |
           sudo touch /tmp/tayga-perf-workflow.lock
-          sudo python3 test/test_auto_negotiation.py --binary "$PWD/tayga" --output /tmp/review-results/negotiation
-          sudo python3 test/test_auto_persistent.py --binary "$PWD/tayga" --output /tmp/review-results/persistent
-          sudo python3 test/test_startup_rollback.py --binary "$PWD/tayga" --output /tmp/review-results/rollback
-          sudo python3 test/test_worker_burst.py --binary "$PWD/tayga" --output /tmp/review-results/burst
-          sudo python3 test/test_udp_gso_kernel.py --binary "$PWD/tayga" --output /tmp/review-results/wire --modes auto off tcp udp --workers 0 3 --mtus 1280 1500
-          sudo python3 test/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=kernel --packet-io=sync
+          sudo python3 test/system/test_auto_negotiation.py --binary "$PWD/tayga" --output /tmp/review-results/negotiation
+          sudo python3 test/system/test_auto_persistent.py --binary "$PWD/tayga" --output /tmp/review-results/persistent
+          sudo python3 test/system/test_startup_rollback.py --binary "$PWD/tayga" --output /tmp/review-results/rollback
+          sudo python3 test/system/test_worker_burst.py --binary "$PWD/tayga" --output /tmp/review-results/burst
+          sudo python3 test/system/test_udp_gso_kernel.py --binary "$PWD/tayga" --output /tmp/review-results/wire --modes auto off tcp udp --workers 0 3 --mtus 1280 1500
+          sudo python3 test/system/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=kernel --packet-io=sync
       - name: TCP and UDP payload integrity and end-to-end PMTUD
         run: |
           sudo install -m 755 tayga /usr/sbin/tayga
-          sudo install -m 755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
-          sudo python3 tools/run-steering-integrity.py --binary "$PWD/tayga" --steering kernel --output /tmp/review-results/integrity-pmtud
+          sudo install -m 755 container/rootfs/usr/local/sbin/clat-start.sh /usr/local/sbin/clat-start.sh
+          sudo python3 bench/taygabench/studies/run-steering-integrity.py --binary "$PWD/tayga" --steering kernel --output /tmp/review-results/integrity-pmtud
       - name: Async kernel wire gate when io_uring is available
         run: |
           sudo mkdir -p /tmp/review-results && sudo chown -R "$USER:$USER" /tmp/review-results
@@ -66,8 +66,8 @@ jobs:
           if grep -q '^SKIP:' /tmp/review-results/uring-availability.log; then
             echo '::notice::Kernel io_uring unavailable; build succeeded, runtime gate skipped'
           else
-            sudo python3 test/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
-            sudo python3 test/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
+            sudo python3 test/system/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
+            sudo python3 test/system/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
           fi
       - uses: actions/upload-artifact@v6
         if: always()
