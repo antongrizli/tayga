@@ -23,7 +23,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='tayga-auto-negotiation-') as tmp:
         shim = Path(tmp) / 'fault.so'
         subprocess.run(['cc', '-Wall', '-Werror', '-fPIC', '-shared',
-                        str(Path(__file__).with_name('offload_ioctl_fault.c')),
+                        str(Path(__file__).resolve().parents[1] / "fault/offload_ioctl_fault.c"),
                         '-o', str(shim), '-ldl'], check=True)
         cases = [(None, 'auto', 'udp'), ('uso', 'auto', 'tcp'),
                  ('eintr-once', 'auto', 'udp'), ('eintr-always', 'auto', None),

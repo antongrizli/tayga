@@ -15,7 +15,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="tayga-offload-fault-") as tmp:
         shim = str(Path(tmp) / "ioctl-fault.so")
         subprocess.run(["cc", "-Wall", "-Werror", "-shared", "-fPIC",
-                        str(Path(__file__).with_name("offload_ioctl_fault.c")),
+                        str(Path(__file__).resolve().parents[1] / "fault/offload_ioctl_fault.c"),
                         "-o", shim, "-ldl"], check=True)
         original = os.environ.copy()
         try:

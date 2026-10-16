@@ -77,7 +77,7 @@ def main():
                         print('PASS', case, flush=True)
             # Removal succeeds even when header capability queries are broken.
             shim = Path(tmp) / 'fault.so'
-            subprocess.run(['cc', '-Wall', '-Werror', '-shared', '-fPIC', str(Path(__file__).with_name('offload_ioctl_fault.c')),
+            subprocess.run(['cc', '-Wall', '-Werror', '-shared', '-fPIC', str(Path(__file__).resolve().parents[1] / "fault/offload_ioctl_fault.c"),
                             '-o', str(shim), '-ldl'], check=True)
             env = os.environ.copy()
             env.update(LD_PRELOAD=str(shim), TAYGA_TEST_OFFLOAD_FAIL='header')

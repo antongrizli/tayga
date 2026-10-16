@@ -19,7 +19,7 @@ def main():
     with open('/tmp/tayga-perf-workflow.lock', 'a') as lock, tempfile.TemporaryDirectory() as temp:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         tmp = Path(temp); shim = tmp/'fault.so'
-        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', str(Path(__file__).with_name('startup_fault.c')), '-o', str(shim), '-ldl'], check=True)
+        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', str(Path(__file__).resolve().parents[1] / "fault/startup_fault.c"), '-o', str(shim), '-ldl'], check=True)
         ns = 'tayga-rollback-'+str(os.getpid())
         subprocess.run(['ip', 'netns', 'add', ns], check=True)
         def run(*cmd, **kw):

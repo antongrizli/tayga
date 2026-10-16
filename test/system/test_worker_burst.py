@@ -19,7 +19,7 @@ with open('/tmp/tayga-perf-workflow.lock') as lock:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         shim = tmp/'fault.so'
-        subprocess.run(['cc', '-Wall', '-Werror', '-shared', '-fPIC', str(Path(__file__).with_name('offload_ioctl_fault.c')), '-o', str(shim), '-ldl'], check=True)
+        subprocess.run(['cc', '-Wall', '-Werror', '-shared', '-fPIC', str(Path(__file__).resolve().parents[1] / "fault/offload_ioctl_fault.c"), '-o', str(shim), '-ldl'], check=True)
         cfg = tmp/'tayga.conf'
         cfg.write_text('tun-device bursttest\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\nprefix 64:ff9b::/96\nworkers 1\ntun-offload auto\n')
         for case, expected in [('full', 256), ('drain', 33)]:

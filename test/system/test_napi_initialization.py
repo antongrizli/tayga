@@ -18,7 +18,7 @@ with open('/tmp/tayga-perf-workflow.lock') as lock:
     rows=[]
     with tempfile.TemporaryDirectory() as name:
         root=Path(name);shim=root/'fault.so'
-        subprocess.run(['cc','-Wall','-Wextra','-Werror','-shared','-fPIC',str(Path(__file__).with_name('napi_ioctl_fault.c')),'-o',str(shim),'-ldl'],check=True)
+        subprocess.run(['cc','-Wall','-Wextra','-Werror','-shared','-fPIC',str(Path(__file__).resolve().parents[1] / "fault/napi_ioctl_fault.c"),'-o',str(shim),'-ldl'],check=True)
         for mode in ('auto','tcp','off'):
             for workers in (0,3):
                 for fault in ('unsupported-main','unsupported-worker','unverified-main','unverified-worker'):
