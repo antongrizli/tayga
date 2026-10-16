@@ -363,6 +363,7 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 				return ERROR_DROP;
 			}
 			if (gcfg.vnet_hdr_sz == 0) {
+				put_u16(p->data + 6, 0);
 				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
 				                       ip6_checksum(ip6, p->data_len, IPPROTO_UDP));
 				if (ck == 0)
@@ -419,6 +420,7 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 				return ERROR_DROP;
 			}
 			if (gcfg.vnet_hdr_sz == 0) {
+				put_u16(p->data + 16, 0);
 				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
 				                       ip6_checksum(ip6, p->data_len, IPPROTO_TCP));
 				put_u16(p->data + 16, ck);
@@ -1118,6 +1120,7 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 				return ERROR_DROP;
 			}
 			if (gcfg.vnet_hdr_sz == 0) {
+				put_u16(p->data + 6, 0);
 				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
 				                       ip4_checksum(ip4, p->data_len, IPPROTO_UDP));
 				if (ck == 0)
@@ -1174,6 +1177,7 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 				return ERROR_DROP;
 			}
 			if (gcfg.vnet_hdr_sz == 0) {
+				put_u16(p->data + 16, 0);
 				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
 				                       ip4_checksum(ip4, p->data_len, IPPROTO_TCP));
 				put_u16(p->data + 16, ck);

@@ -353,14 +353,6 @@ int insert_map4(struct map4 *m, struct map4 **conflict)
 		if (s->prefix_len == m->prefix_len &&
 				s->addr.s_addr == m->addr.s_addr)
 			goto conflict;
-		if (s->type == MAP_TYPE_STATIC && m->type == MAP_TYPE_STATIC) {
-			const struct map_static *ss = container_of(s, struct map_static, map4);
-			const struct map_static *ms = container_of(m, struct map_static, map4);
-			if (ss->origin == ms->origin &&
-			    ((s->addr.s_addr & m->mask.s_addr) == m->addr.s_addr ||
-			     (m->addr.s_addr & s->mask.s_addr) == s->addr.s_addr))
-				goto conflict;
-		}
 		if (s->prefix_len < m->prefix_len && !insert_pos)
 			insert_pos = entry;
 	}
@@ -900,9 +892,8 @@ int addrmap_reload(void)
 			struct list_head *fixed;
 			list_for_each(fixed, &gcfg.map4_list) {
 				struct map4 *f = list_entry(fixed, struct map4, list);
-				if (!is_file_map4(f) && f->type == MAP_TYPE_STATIC &&
-					((f->addr.s_addr & m->map4.mask.s_addr) == m->map4.addr.s_addr ||
-					 (m->map4.addr.s_addr & f->mask.s_addr) == f->addr.s_addr)) {
+				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
+					f->addr.s_addr == m->map4.addr.s_addr) {
 					conflict = 1;
 					break;
 				}
