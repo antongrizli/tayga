@@ -1606,9 +1606,9 @@ static void test_gso_sw_seg_4to6_jumbo_mss(void)
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
 
-	RX_BUFFER(rx_buf, HEADROOM + 16384);
-	memset(&rx_buf, 0, sizeof(rx_buf));
-	uint8_t *base = rx_buf.data + HEADROOM;
+	alignas(4) uint8_t pkt_buf[HEADROOM + 16384];
+	memset(pkt_buf, 0, sizeof(pkt_buf));
+	uint8_t *base = pkt_buf + HEADROOM;
 
 	uint32_t payload_len = 8000;
 	uint32_t tcp_len = sizeof(struct tcp_hdr) + payload_len;

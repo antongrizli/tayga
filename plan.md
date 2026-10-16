@@ -26,19 +26,19 @@ The `antongrizli/tayga` fork is a high-performance stateless NAT64 / 464XLAT (CL
 
 #### `[SEC-01]` Data Race & Use-After-Free on `SIGHUP` Map Reload When `maps_immutable` Is Latched
 - **Severity:** `CRITICAL`
-- **Location:** [`conffile.c:916`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L916), [`tayga.c:147-154`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tayga.c#L147-L154), [`addrmap.c:503-509`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L503-L509), [`addrmap.c:896-982`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L896-L982)
+- **Location:** [`conffile.c:916`](conffile.c#L916), [`tayga.c:147-154`](tayga.c#L147-L154), [`addrmap.c:503-509`](addrmap.c#L503-L509), [`addrmap.c:896-982`](addrmap.c#L896-L982)
 - **Standard / Mechanism:** C11 Memory Model / POSIX Threads (`pthread_mutex_t`)
 - **Root Cause Analysis:**
-  1. In [`config_validate()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L916), `gcfg.maps_immutable` is set to `1` when `!gcfg.dynamic_pool && !gcfg.map_file[0]`. When `gcfg.map_file[0]` *is* set, `maps_immutable` is `0`, and `config_validate()` sets `gcfg.cache_size = 8192`.
-  2. However, in [`addrmap_reload()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L960-L971), the main thread acquires `gcfg.map_mutex` and calls [`addrmap_delete4(m)`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L829-L843), which unlinks `m->map4.list` and `m->map6.list` and immediately calls `free(m)`.
-  3. Meanwhile, in [`stats_exporter.c:75-86`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/stats_exporter.c#L75-L86) and [`tayga.c:193`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tayga.c#L193), and crucially in [`addrmap_reload()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L969-L970), `cache_evict_map4()` and `cache_evict_map6()` are called while holding `map_mutex` and acquiring `cache_mutex`.
-  4. Look closely at [`map_ip4_to_ip6()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L486-L500) and [`map_ip6_to_ip4()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L635-L649): worker threads check the cache (`gcfg.hash_table4` / `gcfg.hash_table6`) **while holding only `cache_mutex` (without `map_mutex`)**!
-  5. During `addrmap_reload()` ([`addrmap.c:960-971`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L960-L971)):
+  1. In [`config_validate()`](conffile.c#L916), `gcfg.maps_immutable` is set to `1` when `!gcfg.dynamic_pool && !gcfg.map_file[0]`. When `gcfg.map_file[0]` *is* set, `maps_immutable` is `0`, and `config_validate()` sets `gcfg.cache_size = 8192`.
+  2. However, in [`addrmap_reload()`](addrmap.c#L960-L971), the main thread acquires `gcfg.map_mutex` and calls [`addrmap_delete4(m)`](addrmap.c#L829-L843), which unlinks `m->map4.list` and `m->map6.list` and immediately calls `free(m)`.
+  3. Meanwhile, in [`stats_exporter.c:75-86`](stats_exporter.c#L75-L86) and [`tayga.c:193`](tayga.c#L193), and crucially in [`addrmap_reload()`](addrmap.c#L969-L970), `cache_evict_map4()` and `cache_evict_map6()` are called while holding `map_mutex` and acquiring `cache_mutex`.
+  4. Look closely at [`map_ip4_to_ip6()`](addrmap.c#L486-L500) and [`map_ip6_to_ip4()`](addrmap.c#L635-L649): worker threads check the cache (`gcfg.hash_table4` / `gcfg.hash_table6`) **while holding only `cache_mutex` (without `map_mutex`)**!
+  5. During `addrmap_reload()` ([`addrmap.c:960-971`](addrmap.c#L960-L971)):
      - First loop (lines 960–963): `addrmap_delete4(m)` deletes old `MAP_ORIGIN_MAPFILE` entries and calls `cache_evict_map4()` / `cache_evict_map6()` (which briefly lock and unlock `cache_mutex` per deleted entry).
      - Suppose `tayga.conf` has a `/96` RFC 6052 prefix (`2001:db8:64::/96`), and `map-file` adds a more specific static override (`map 192.0.2.1 2001:db8:1::1`) on `SIGHUP`.
      - Before `SIGHUP`, a worker thread translates `192.0.2.1` via the `/96` prefix: it misses the cache, waits on `map_mutex` while `addrmap_reload()` is running, or hits the cache entry for `192.0.2.1 -> 2001:db8:64::c000:201` **between** `cache_evict_map4()` releases in `addrmap_delete4()` and `insert_map4()` in the second loop!
-     - Even worse: in [`addrmap_delete4()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L839-L840), `cache_evict_map4()` acquires `cache_mutex`, iterates `cache_active`, and calls [`report_ageout(c)`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L791). What if a `map-file` entry is `/24` (`10.0.0.0/24`) that was previously mapped to `2001:db8:a::/120`, and while `addrmap_reload()` is between `cache_evict_map4()` and `cache_evict_map6()`, a worker thread looking up in `hash_table6` (holding only `cache_mutex`) refreshes or reads the half-evicted state?
-     - Furthermore, in [`conffile.c:488-497`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L488-L497), `insert_map4()` only checks for conflicts with **identical `prefix_len`** (`s->prefix_len == m->prefix_len && s->addr.s_addr == m->addr.s_addr`)! Unlike `insert_map6()` (which checks `IN6_IS_IN_NET` for overlapping prefixes of different lengths), `insert_map4()` **allows overlapping IPv4 subnets of different prefix lengths** (e.g., `/24` and `/32`), and `addrmap_reload()` (lines 932 and 949) also only checks `f->prefix_len == m->map4.prefix_len && f->addr.s_addr == m->map4.addr.s_addr`!
+     - Even worse: in [`addrmap_delete4()`](addrmap.c#L839-L840), `cache_evict_map4()` acquires `cache_mutex`, iterates `cache_active`, and calls [`report_ageout(c)`](addrmap.c#L791). What if a `map-file` entry is `/24` (`10.0.0.0/24`) that was previously mapped to `2001:db8:a::/120`, and while `addrmap_reload()` is between `cache_evict_map4()` and `cache_evict_map6()`, a worker thread looking up in `hash_table6` (holding only `cache_mutex`) refreshes or reads the half-evicted state?
+     - Furthermore, in [`conffile.c:488-497`](conffile.c#L488-L497), `insert_map4()` only checks for conflicts with **identical `prefix_len`** (`s->prefix_len == m->prefix_len && s->addr.s_addr == m->addr.s_addr`)! Unlike `insert_map6()` (which checks `IN6_IS_IN_NET` for overlapping prefixes of different lengths), `insert_map4()` **allows overlapping IPv4 subnets of different prefix lengths** (e.g., `/24` and `/32`), and `addrmap_reload()` (lines 932 and 949) also only checks `f->prefix_len == m->map4.prefix_len && f->addr.s_addr == m->map4.addr.s_addr`!
 - **Proposed Patch:**
 ```diff
 --- a/addrmap.c
@@ -120,51 +120,51 @@ The `antongrizli/tayga` fork is a high-performance stateless NAT64 / 464XLAT (CL
 
 #### `[RFC-01]` `[SPEC-VIOLATION]` Broken Inner Packet-in-Packet Translation in ICMPv4/ICMPv6 Error Handlers (Missing Fragment Header & Extension Header Translation)
 - **Severity:** `HIGH`
-- **Location:** [`nat64.c:662-842`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L662-L842) (`xlate_4to6_icmp_error`), [`nat64.c:1357-1527`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1357-L1527) (`xlate_6to4_icmp_error`)
+- **Location:** [`nat64.c:662-842`](nat64.c#L662-L842) (`xlate_4to6_icmp_error`), [`nat64.c:1357-1527`](nat64.c#L1357-L1527) (`xlate_6to4_icmp_error`)
 - **Standard / Mechanism:** RFC 7915 Sections 4.2, 4.3, 5.2, and 5.3 (Translating ICMPv4/ICMPv6 Error Messages & Inner Headers)
 - **Root Cause Analysis:**
   1. **IPv4-to-IPv6 ICMP Error (`xlate_4to6_icmp_error`):**
      - Line 707 calls `xlate_header_4to6(&p_em, &header.ip6_em, ntohs(p_em.ip4->length) - p_em.header_len);`.
-     - If the embedded offending IPv4 packet (`p_em`) was fragmented (`MF == 1` or `FragOffset > 0`), RFC 7915 Section 4.2 requires inserting an IPv6 Fragment Header (`struct ip6_frag`) into the translated inner IPv6 packet so the receiving IPv6 host can match or process the error. However, `struct ip6_error` ([`nat64.c:34-39`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L34-L39)) has no `ip6_frag` field and never emits one!
+     - If the embedded offending IPv4 packet (`p_em`) was fragmented (`MF == 1` or `FragOffset > 0`), RFC 7915 Section 4.2 requires inserting an IPv6 Fragment Header (`struct ip6_frag`) into the translated inner IPv6 packet so the receiving IPv6 host can match or process the error. However, `struct ip6_error` ([`nat64.c:34-39`](nat64.c#L34-L39)) has no `ip6_frag` field and never emits one!
      - Worse, if `p_em` had `VIRTIO_NET_HDR_F_NEEDS_CSUM` or if `p_em` was truncated (as almost all ICMPv4 error payloads are—RFC 792 only requires 28 bytes of inner packet, or up to 576 bytes per RFC 1812):
-       - In `xlate_payload_4to6(&p_em, &header.ip6_em, 1)` ([`nat64.c:320-331`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L320-L331)): if the inner packet is **ICMPv4 Echo (`data_proto == 1`)**, `xlate_payload_4to6` computes `cksum = ip6_checksum(ip6, htons(p->ip4->length) - p->header_len, 58)` and incrementally updates `p->icmp->cksum` assuming `p->icmp->cksum` covered the full inner packet. That works for non-truncated Echo, **except** it only checks `p->icmp->type == 8`, translating *any* other inner ICMP type to `129` (Echo Reply).
-       - For inner **UDP (`case 17`)** with checksum `0x0000` and `UDP_CKSUM_CALC` ([`nat64.c:366-370`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L366-L370)): when `em == 1`, it returns `ERROR_NONE` **leaving `*tck = 0x0000` in the translated inner IPv6 UDP header**, or if `UDP_CKSUM_CALC` was supposed to compute it, it cannot if truncated, yet leaving `0x0000` is noted in RFC 7915 §4.5.
-       - Most critically, look at [`nat64.c:675-684`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L675-L684) and [`nat64.c:1369-1378`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1369-L1378) (RFC 4884 ICMP Multipart Extensions length attribute):
+       - In `xlate_payload_4to6(&p_em, &header.ip6_em, 1)` ([`nat64.c:320-331`](nat64.c#L320-L331)): if the inner packet is **ICMPv4 Echo (`data_proto == 1`)**, `xlate_payload_4to6` computes `cksum = ip6_checksum(ip6, htons(p->ip4->length) - p->header_len, 58)` and incrementally updates `p->icmp->cksum` assuming `p->icmp->cksum` covered the full inner packet. That works for non-truncated Echo, **except** it only checks `p->icmp->type == 8`, translating *any* other inner ICMP type to `129` (Echo Reply).
+       - For inner **UDP (`case 17`)** with checksum `0x0000` and `UDP_CKSUM_CALC` ([`nat64.c:366-370`](nat64.c#L366-L370)): when `em == 1`, it returns `ERROR_NONE` **leaving `*tck = 0x0000` in the translated inner IPv6 UDP header**, or if `UDP_CKSUM_CALC` was supposed to compute it, it cannot if truncated, yet leaving `0x0000` is noted in RFC 7915 §4.5.
+       - Most critically, look at [`nat64.c:675-684`](nat64.c#L675-L684) and [`nat64.c:1369-1378`](nat64.c#L1369-L1378) (RFC 4884 ICMP Multipart Extensions length attribute):
          - When `em_len` (the RFC 4884 length field in `icmp->word`) is non-zero, TAYGA truncates `p_em.data_len = em_len`, stripping the trailing ICMP extension structure!
          - However, TAYGA **does not clear or update the RFC 4884 length byte in `header.icmp.word`** when `p->icmp->type == 11` (Time Exceeded) or `p->icmp->type == 3` (Dest Unreachable), wait—it sets `header.icmp.word = 0`, which zeroes the length field, *dropping* the extensions, which is acceptable if the length field is zeroed.
-         - **Wait:** What if `parse_ip4(&p_em)` runs on a truncated inner IPv4 packet? Look at [`parse_ip4()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L631-L641):
+         - **Wait:** What if `parse_ip4(&p_em)` runs on a truncated inner IPv4 packet? Look at [`parse_ip4()`](nat64.c#L631-L641):
            ```c
            if ((p->ip4->flags_offset & htons(IP4_F_MF)) && (p->data_len & 0x7)) {
                log_pkt4(LOG_OPT_DROP,p,"Fragment Misalignment");
                return ERROR_DROP;
            }
            ```
-           In an ICMPv4 error message quoting a fragmented IPv4 packet (`MF == 1`), `p_em.data_len` is the **truncated length of the quoted packet inside the ICMP error** (e.g., 8 bytes or 36 bytes), NOT the full original fragment length! If the truncated quote length is not a multiple of 8 bytes (or if `parse_ip6(&p_em, 1)` at [`nat64.c:1315-1319`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1315-L1319) sees `MF == 1` on a truncated inner IPv6 fragment whose quoted length is not a multiple of 8), `parse_ip4` / `parse_ip6` **falsely rejects the ICMP error as `"Fragment Misalignment"`**!
+           In an ICMPv4 error message quoting a fragmented IPv4 packet (`MF == 1`), `p_em.data_len` is the **truncated length of the quoted packet inside the ICMP error** (e.g., 8 bytes or 36 bytes), NOT the full original fragment length! If the truncated quote length is not a multiple of 8 bytes (or if `parse_ip6(&p_em, 1)` at [`nat64.c:1315-1319`](nat64.c#L1315-L1319) sees `MF == 1` on a truncated inner IPv6 fragment whose quoted length is not a multiple of 8), `parse_ip4` / `parse_ip6` **falsely rejects the ICMP error as `"Fragment Misalignment"`**!
   2. **Inner TTL / Hop Limit Not Adjusted or Validated per RFC 7915:**
-     - In [`xlate_4to6_icmp_error()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L707-L708) and [`xlate_6to4_icmp_error()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1483-L1484), `xlate_header_4to6` / `xlate_header_6to4` copies TTL/Hop Limit as-is (which is correct for the embedded packet), **but** in `xlate_6to4_icmp_error()` ([`nat64.c:1478-1484`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1478-L1484)), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` is called **BEFORE** `xlate_header_6to4(&p_em, &header.ip4_em, ...)`!
+     - In [`xlate_4to6_icmp_error()`](nat64.c#L707-L708) and [`xlate_6to4_icmp_error()`](nat64.c#L1483-L1484), `xlate_header_4to6` / `xlate_header_6to4` copies TTL/Hop Limit as-is (which is correct for the embedded packet), **but** in `xlate_6to4_icmp_error()` ([`nat64.c:1478-1484`](nat64.c#L1478-L1484)), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` is called **BEFORE** `xlate_header_6to4(&p_em, &header.ip4_em, ...)`!
      - Look at what happens when `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` runs before `xlate_header_6to4`:
        - `header.ip4_em` is **uninitialized stack memory** (except `.src` and `.dest` set at lines 1472–1474)!
        - If `UDP_CKSUM_CALC` is active and the inner packet has a zero UDP checksum (or `vnet_hdr_sz == 0` with `NEEDS_CSUM`), `ip4_checksum(ip4, ...)` reads `ip4->src` and `ip4->dest`, which are initialized, so that happens to survive, **but** in `xlate_header_6to4(&p_em, &header.ip4_em, ntohs(p_em.ip6->payload_length) - p_em.header_len)`:
-       - Look at [`nat64.c:1483-1484`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1483-L1484):
+       - Look at [`nat64.c:1483-1484`](nat64.c#L1483-L1484):
          ```c
          xlate_header_6to4(&p_em, &header.ip4_em,
              ntohs(p_em.ip6->payload_length) - p_em.header_len);
          ```
          What if `ntohs(p_em.ip6->payload_length) < p_em.header_len` in a malformed inner IPv6 packet inside an ICMPv6 error?
-         Check [`parse_ip6(&p_em, 1)`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1277-L1302):
+         Check [`parse_ip6(&p_em, 1)`](nat64.c#L1277-L1302):
          ```c
          if (p->data_len > ntohs(p->ip6->payload_length))
              p->data_len = ntohs(p->ip6->payload_length);
          ```
          If the outer ICMPv6 error packet has 100 bytes of inner payload (`p_em.data_len = 60` after stripping 40B `ip6`), and the inner `p_em.ip6->payload_length` is `1400` (because the inner packet was a 1440-byte packet that got truncated to 100 bytes inside the ICMPv6 error!), then `p_em.data_len` is `60`, while `ntohs(p_em.ip6->payload_length)` is `1400`. That works when `payload_length >= header_len`.
   3. **RFC 7915 Section 4.2 & 5.2 Parameter Problem Pointer Translation:**
-     - In [`xlate_4to6_icmp_error()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L781-L793):
+     - In [`xlate_4to6_icmp_error()`](nat64.c#L781-L793):
        ```c
        static const int32_t new_ptr_tbl[] = {0,1,4,4,-1,-1,-1,-1,7,6,-1,-1,8,8,8,8,24,24,24,24};
        int32_t old_ptr = (ntohl(p->icmp->word) >> 24);
        ```
        Wait: `ntohl(p->icmp->word)` is `uint32_t`, so `>> 24` is in `[0, 255]`. If `old_ptr > 19`, it drops the packet.
-     - In [`xlate_6to4_icmp_error()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1437-L1453):
+     - In [`xlate_6to4_icmp_error()`](nat64.c#L1437-L1453):
        ```c
        static const int32_t new_ptr_tbl[] = {0,1,-1,-1,2,2,9,8};
        int32_t old_ptr = ntohl(p->icmp->word);
@@ -187,7 +187,7 @@ The `antongrizli/tayga` fork is a high-performance stateless NAT64 / 464XLAT (CL
        Because `old_ptr` is negative, `old_ptr > 39`, `old_ptr > 23`, and `old_ptr > 7` are all **FALSE**! Execution falls into the `else` branch and executes **`new_ptr_tbl[old_ptr]` with an arbitrary negative 32-bit index (`-2147483648` to `-1`)**, causing an **immediate out-of-bounds memory read / segmentation fault (remote crash DoS) from a single unauthenticated IPv6 packet**!
 
 Let's double-check this!
-In `xlate_6to4_icmp_error()` ([`nat64.c:1438-1449`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1438-L1449)):
+In `xlate_6to4_icmp_error()` ([`nat64.c:1438-1449`](nat64.c#L1438-L1449)):
 ```c
 int32_t old_ptr = ntohl(p->icmp->word);
 int32_t new_ptr;
@@ -209,11 +209,11 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[SEC-01]` Remote Unauthenticated Crash (Out-of-Bounds Read) via Signed Integer Underflow in ICMPv6 Parameter Problem Pointer Translation
 - **Severity:** `CRITICAL`
-- **Location:** [`nat64.c:1436-1450`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1436-L1450) (`xlate_6to4_icmp_error`)
+- **Location:** [`nat64.c:1436-1450`](nat64.c#L1436-L1450) (`xlate_6to4_icmp_error`)
 - **Standard / Mechanism:** C99 Signed Integer Conversion / RFC 7915 Section 5.2 (ICMPv6 Parameter Problem Code 0 Pointer Translation)
 - **Root Cause Analysis:**
   1. When an ICMPv6 Error message of Type 4 (Parameter Problem), Code 0 is received on the TUN interface, `handle_ip6()` dispatches it to `xlate_6to4_icmp_error()`.
-  2. At [`nat64.c:1438`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1438), the 32-bit ICMPv6 Pointer field is extracted into a signed 32-bit integer:
+  2. At [`nat64.c:1438`](nat64.c#L1438), the 32-bit ICMPv6 Pointer field is extracted into a signed 32-bit integer:
      ```c
      int32_t old_ptr = ntohl(p->icmp->word);
      ```
@@ -248,13 +248,13 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[RFC-01]` `[SPEC-VIOLATION]` EAM / Static Subnet Mapping (`MAP_TYPE_STATIC`) Fails for Prefixes Shorter Than `/96` (IPv6) and Violates RFC 7757 Suffix Symmetry
 - **Severity:** `HIGH`
-- **Location:** [`addrmap.c:514-520`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L514-L520) (`map_ip4_to_ip6`), [`addrmap.c:665-674`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L665-L674) (`map_ip6_to_ip4`), [`conffile.c:440-473`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L440-L473) (`config_map`), [`addrmap.c:863`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L863) (`parse_map_entry`)
+- **Location:** [`addrmap.c:514-520`](addrmap.c#L514-L520) (`map_ip4_to_ip6`), [`addrmap.c:665-674`](addrmap.c#L665-L674) (`map_ip6_to_ip4`), [`conffile.c:440-473`](conffile.c#L440-L473) (`config_map`), [`addrmap.c:863`](addrmap.c#L863) (`parse_map_entry`)
 - **Standard / Mechanism:** RFC 7757 Section 3.1 & 3.2 (Explicit Address Mapping for Stateless IP/ICMP Translation)
 - **Root Cause Analysis:**
-  1. In [`config_map()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L452-L473):
+  1. In [`config_map()`](conffile.c#L452-L473):
      - `calc_ip4_mask(&m->map4.mask, NULL, prefix4)` and `calc_ip6_mask(&m->map6.mask, NULL, prefix6)` are called with **`addr = NULL`**, which **skips validating that the configured subnet has zero host bits**! (Contrast with `parse_map_entry()` in `addrmap.c:866-867` which passes `&m->map4.addr` and `&m->map6.addr`).
      - Additionally, `prefix4` and `prefix6` in `config_map()` are parsed via `atoi(slash + 1)` without checking `prefix4 > 32` or `prefix6 > 128` or non-numeric characters (e.g., `/96` on IPv4 wraps `(32 - prefix4)` in unsigned arithmetic if both overflow similarly, or `prefix4 = 0` leads to undefined shift if not guarded).
-  2. In [`map_ip4_to_ip6()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L517-L519) and [`map_ip6_to_ip4()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L668-L670), static subnet translation is implemented as:
+  2. In [`map_ip4_to_ip6()`](addrmap.c#L517-L519) and [`map_ip6_to_ip4()`](addrmap.c#L668-L670), static subnet translation is implemented as:
      ```c
      if (map4->prefix_len < 32) {
          addr6->s6_addr32[3] = s->map6.addr.s6_addr32[3] | (addr4->s_addr & ~map4->mask.s_addr);
@@ -342,21 +342,21 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[RFC-02]` `[SPEC-VIOLATION]` Incomplete RFC 7915 ICMPv4/ICMPv6 Error Translation: Truncated Inner Fragments Dropped & Inner IPv6 Fragment Header Omitted
 - **Severity:** `HIGH`
-- **Location:** [`nat64.c:631-635`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L631-L635) (`parse_ip4`), [`nat64.c:1315-1319`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1315-L1319) (`parse_ip6`), [`nat64.c:686-709`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L686-L709) (`xlate_4to6_icmp_error`), [`nat64.c:1478-1488`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1478-L1488) (`xlate_6to4_icmp_error`)
+- **Location:** [`nat64.c:631-635`](nat64.c#L631-L635) (`parse_ip4`), [`nat64.c:1315-1319`](nat64.c#L1315-L1319) (`parse_ip6`), [`nat64.c:686-709`](nat64.c#L686-L709) (`xlate_4to6_icmp_error`), [`nat64.c:1478-1488`](nat64.c#L1478-L1488) (`xlate_6to4_icmp_error`)
 - **Standard / Mechanism:** RFC 7915 Sections 4.2, 4.3, 5.2, and 5.3
 - **Root Cause Analysis:**
   1. **False "Fragment Misalignment" Drop on Quoted Inner Packets:**
      - `parse_ip4()` is called both on top-level IPv4 packets (`handle_ip4`) and on embedded inner IPv4 packets inside ICMPv4 errors (`xlate_4to6_icmp_error` at line 686).
      - Unlike `parse_ip6(struct pkt *p, int em)`, `parse_ip4(struct pkt *p)` does not take an `int em` parameter!
-     - When an ICMPv4 error embeds a partial/truncated quote of a fragmented IPv4 packet (`MF == 1`), `p_em.data_len` is the *quoted* bytes present in the ICMP error (e.g., 20B IPv4 + 8B L4 = 8 bytes of `data_len`, or any non-multiple of 8 if truncated by an intermediate router or RFC 4884). Moreover, even in `parse_ip6(p, em)` ([`nat64.c:1315-1325`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1315-L1325)), `if ((p->ip6_frag->offset_flags & htons(IP6_F_MF)) && (p->data_len & 0x7))` is checked **even when `em == 1`**! If an ICMPv6 error (such as Time Exceeded or Destination Unreachable) truncates a fragmented IPv6 packet at a byte boundary not divisible by 8, `parse_ip6(&p_em, 1)` drops the entire ICMPv6 error!
+     - When an ICMPv4 error embeds a partial/truncated quote of a fragmented IPv4 packet (`MF == 1`), `p_em.data_len` is the *quoted* bytes present in the ICMP error (e.g., 20B IPv4 + 8B L4 = 8 bytes of `data_len`, or any non-multiple of 8 if truncated by an intermediate router or RFC 4884). Moreover, even in `parse_ip6(p, em)` ([`nat64.c:1315-1325`](nat64.c#L1315-L1325)), `if ((p->ip6_frag->offset_flags & htons(IP6_F_MF)) && (p->data_len & 0x7))` is checked **even when `em == 1`**! If an ICMPv6 error (such as Time Exceeded or Destination Unreachable) truncates a fragmented IPv6 packet at a byte boundary not divisible by 8, `parse_ip6(&p_em, 1)` drops the entire ICMPv6 error!
      - Furthermore, in `parse_ip4(&p_em)` when `em == 0` vs `em == 1`, if `p_em` is an inner ICMPv4 Echo Request that was fragmented (`MF == 1`), `parse_ip4` drops it at line 614 (`ICMP Fragmented`).
   2. **Inner ICMP Checksum Corruption on Truncated Inner Echo Request (`xlate_payload_4to6` / `xlate_payload_6to4`):**
-     - When an ICMPv4/v6 error quotes a truncated ICMP Echo Request (e.g., an ICMPv6 Packet Too Big quoting a 1500-byte ICMPv6 Echo Request, which is truncated to 1280 bytes total / 1232 bytes inner packet, or 576 bytes in IPv4), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` ([`nat64.c:1065-1074`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1065-L1074)) computes:
+     - When an ICMPv4/v6 error quotes a truncated ICMP Echo Request (e.g., an ICMPv6 Packet Too Big quoting a 1500-byte ICMPv6 Echo Request, which is truncated to 1280 bytes total / 1232 bytes inner packet, or 576 bytes in IPv4), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` ([`nat64.c:1065-1074`](nat64.c#L1065-L1074)) computes:
        ```c
        cksum = ~ip6_checksum(p->ip6, htons(p->ip6->payload_length) - p->header_len, 58);
        ```
        Notice `htons(p->ip6->payload_length)` instead of `ntohs(p->ip6->payload_length)` (macro-equivalent on little/big endian, though semantically `ntohs`), which is the **original un-truncated payload length** from the inner IPv6 header—that actually matches the pseudo-header used when the original sender computed `p->icmp->cksum`!
-     - However, in `xlate_6to4_icmp_error()` ([`nat64.c:1478-1484`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1478-L1484)), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` is called **before** `xlate_header_6to4(&p_em, &header.ip4_em, ...)`, so `header.ip4_em.proto` and `header.ip4_em.length` are uninitialized during `xlate_payload_6to4`.
+     - However, in `xlate_6to4_icmp_error()` ([`nat64.c:1478-1484`](nat64.c#L1478-L1484)), `xlate_payload_6to4(&p_em, &header.ip4_em, 1)` is called **before** `xlate_header_6to4(&p_em, &header.ip4_em, ...)`, so `header.ip4_em.proto` and `header.ip4_em.length` are uninitialized during `xlate_payload_6to4`.
   3. **Missing Inner IPv6 Fragment Header in `xlate_4to6_icmp_error()`:**
      - If `p_em.ip4->flags_offset & htons(IP4_F_MASK | IP4_F_MF)` is non-zero, RFC 7915 §4.2 mandates translating the inner IPv4 fragment info into an inner IPv6 Fragment Header (`Next Header = 44`). Currently `xlate_4to6_icmp_error()` omits the inner Fragment Header and writes the L4 protocol directly into `header.ip6_em.next_header`.
 - **Proposed Patch:**
@@ -501,14 +501,14 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[GSO-01]` Stack Buffer Too Small (`2048` Bytes) in `gso_software_segment_and_send_4to6()` Causes Silent Drops on Jumbo MTU Links
 - **Severity:** `HIGH`
-- **Location:** [`gso.c:695-708`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L695-L708) (`gso_software_segment_and_send_4to6`), [`gso.c:381`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L381) (`gso_translate_tcp_6to4`)
+- **Location:** [`gso.c:695-708`](gso.c#L695-L708) (`gso_software_segment_and_send_4to6`), [`gso.c:381`](gso.c#L381) (`gso_translate_tcp_6to4`)
 - **Standard / Mechanism:** Linux Kernel `virtio_net_hdr` GSO Segmentation / Jumbo Frames (`MTU > 2000`)
 - **Root Cause Analysis:**
   1. Compare the stack segment buffers across the four software segmentation functions in `gso.c`:
-     - `gso_software_segment_and_send_6to4()` ([`gso.c:581`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L581)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];`
-     - `gso_software_segment_and_send_udp_6to4()` ([`gso.c:802`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L802)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];`
-     - `gso_software_segment_and_send_udp_4to6()` ([`gso.c:915`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L915)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];`
-     - `gso_software_segment_and_send_4to6()` ([`gso.c:695`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L695)): **`uint8_t seg_buf[HEADROOM + 2048];`**!
+     - `gso_software_segment_and_send_6to4()` ([`gso.c:581`](gso.c#L581)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];`
+     - `gso_software_segment_and_send_udp_6to4()` ([`gso.c:802`](gso.c#L802)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];`
+     - `gso_software_segment_and_send_udp_4to6()` ([`gso.c:915`](gso.c#L915)): `uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];`
+     - `gso_software_segment_and_send_4to6()` ([`gso.c:695`](gso.c#L695)): **`uint8_t seg_buf[HEADROOM + 2048];`**!
   2. In `gso_software_segment_and_send_4to6()`, if `gso_size > 1988` (e.g. a 9000-byte jumbo frame link with `gso_size = 8940`), `ip6_total = 40 + tcp_hdr_len + gso_size` exceeds `sizeof(seg_buf) - HEADROOM` (`2048`), causing `gso_software_segment_and_send_4to6()` to abort with `stats_gso_invalid(); return -1;` and drop the entire TCP flow!
   3. (Note: In `gso_translate_tcp_6to4()` line 381, `tail_buf[HEADROOM + 2048]` is safe only because `tail_ip4_len <= 1260` is guaranteed by the `if` condition on line 333.)
 - **Proposed Patch:**
@@ -530,15 +530,15 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[GSO-02]` `[SPEC-VIOLATION]` GSO Fast-Path Bypasses MTU Enforcement, ICMP Error Generation on Unmapped Addresses, and Destination-Self Checks
 - **Severity:** `HIGH`
-- **Location:** [`gso.c:268-546`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L268-L546) (`gso_translate_tcp_6to4`, `gso_translate_tcp_4to6`), [`gso.c:972-1175`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L972-L1175) (`gso_translate_udp_6to4`, `gso_translate_udp_4to6`), [`nat64.c:846-860`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L846-L860), [`nat64.c:1531-1545`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1531-L1545)
+- **Location:** [`gso.c:268-546`](gso.c#L268-L546) (`gso_translate_tcp_6to4`, `gso_translate_tcp_4to6`), [`gso.c:972-1175`](gso.c#L972-L1175) (`gso_translate_udp_6to4`, `gso_translate_udp_4to6`), [`nat64.c:846-860`](nat64.c#L846-L860), [`nat64.c:1531-1545`](nat64.c#L1531-L1545)
 - **Standard / Mechanism:** RFC 7915 Sections 4.1 & 5.1, RFC 6877 (464XLAT Path MTU Discovery), Linux TUN GSO Contract
 - **Root Cause Analysis:**
   1. **Missing ICMP Destination Unreachable on Address Mapping Rejection:**
      - In the scalar path (`xlate_4to6_data` / `xlate_6to4_data`), when `map_ip4_to_ip6` or `map_ip6_to_ip4` returns `ERROR_REJECT` (e.g., private IPv4 address with `wkpf_strict`, unmapped destination, or exhausted dynamic pool), TAYGA sends an ICMPv4 Type 3 (Code 1 or 10) or ICMPv6 Type 1 (Code 0 or 5) Destination Unreachable message.
-     - In `gso_translate_*` ([`gso.c:322, 508, 1035, 1138`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L322)), when `map_ip6_to_ip4` or `map_ip4_to_ip6` returns `ERROR_REJECT`, the function simply returns `-1`, and `handle_ip4` / `handle_ip6` ([`nat64.c:858, 1543`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L858)) **silently drops the packet** without sending any ICMP Destination Unreachable! Because modern Linux TCP/UDP stacks send GSO aggregates for almost all bulk transfers, connections to unroutable/rejected addresses hang until timeout instead of failing fast with `EHOSTUNREACH` / `EACCES`.
+     - In `gso_translate_*` ([`gso.c:322, 508, 1035, 1138`](gso.c#L322)), when `map_ip6_to_ip4` or `map_ip4_to_ip6` returns `ERROR_REJECT`, the function simply returns `-1`, and `handle_ip4` / `handle_ip6` ([`nat64.c:858, 1543`](nat64.c#L858)) **silently drops the packet** without sending any ICMP Destination Unreachable! Because modern Linux TCP/UDP stacks send GSO aggregates for almost all bulk transfers, connections to unroutable/rejected addresses hang until timeout instead of failing fast with `EHOSTUNREACH` / `EACCES`.
   2. **Missing Single-Segment MTU Check / ICMP Packet Too Big (PMTUD Blackhole):**
      - In `gso_translate_tcp_4to6()` and `gso_translate_udp_4to6()`, an incoming IPv4 GSO aggregate has segment MSS `gso_size`. Each segmented IPv6 packet will have size `sizeof(struct ip6) + l4_hdr_len + gso_size`.
-     - If `sizeof(struct ip6) + l4_hdr_len + gso_size > gcfg.mtu` (for example, an IPv4 sender sends a GSO aggregate with 1460B MSS (`1500B` IPv4 segments) into a TUN interface with `gcfg.mtu = 1500`, which after `+20B` IPv6 header expansion produces **1520-byte IPv6 segments** when `DF=1`), the scalar path ([`nat64.c:487-490`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L487-L490)) sends `ICMPv4 Fragmentation Needed (Type 3, Code 4, MTU = gcfg.mtu - 20)`!
+     - If `sizeof(struct ip6) + l4_hdr_len + gso_size > gcfg.mtu` (for example, an IPv4 sender sends a GSO aggregate with 1460B MSS (`1500B` IPv4 segments) into a TUN interface with `gcfg.mtu = 1500`, which after `+20B` IPv6 header expansion produces **1520-byte IPv6 segments** when `DF=1`), the scalar path ([`nat64.c:487-490`](nat64.c#L487-L490)) sends `ICMPv4 Fragmentation Needed (Type 3, Code 4, MTU = gcfg.mtu - 20)`!
      - However, `gso_translate_tcp_4to6()` and `gso_translate_udp_4to6()` **never check whether an individual translated segment (`sizeof(struct ip6) + l4_hdr_len + gso_size`) exceeds `gcfg.mtu`**! Instead, they emit the GSO super-packet to the TUN device, bypassing PMTUD (`ICMPv4 Fragmentation Needed`) and causing downstream IPv6 links to drop the oversized segments (PMTUD blackhole)!
      - Similarly, in `gso_translate_tcp_6to4()` and `gso_translate_udp_6to4()`, if `sizeof(struct ip6) + l4_hdr_len + gso_size > gcfg.mtu`, no `ICMPv6 Packet Too Big (Type 2, Code 0, MTU = gcfg.mtu)` is generated!
   3. **Missing Address Validation (`validate_ip6_addr` / `validate_ip4_addr`):**
@@ -614,13 +614,13 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[RFC-03]` `[SPEC-VIOLATION]` TCP Checksum Incremental Update Erroneously Rewrites `0x0000` to `0xFFFF`
 - **Severity:** `MEDIUM`
-- **Location:** [`nat64.c:429-431`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L429-L431) (`xlate_payload_4to6`), [`nat64.c:1173-1175`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1173-L1175) (`xlate_payload_6to4`), [`nat64.c:410-411`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L410-L411), [`nat64.c:1154-1155`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1154-L1155), [`gso.c:116-117`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L116-L117), [`gso.c:150-151`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/gso.c#L150-L151)
+- **Location:** [`nat64.c:429-431`](nat64.c#L429-L431) (`xlate_payload_4to6`), [`nat64.c:1173-1175`](nat64.c#L1173-L1175) (`xlate_payload_6to4`), [`nat64.c:410-411`](nat64.c#L410-L411), [`nat64.c:1154-1155`](nat64.c#L1154-L1155), [`gso.c:116-117`](gso.c#L116-L117), [`gso.c:150-151`](gso.c#L150-L151)
 - **Standard / Mechanism:** RFC 793 / RFC 9293 (TCP Checksum), RFC 1624 Section 5 (Incremental Checksum Update: `+0` vs `-0`)
 - **Root Cause Analysis:**
   1. In one's complement arithmetic (`ones_add` and `ip_checksum`), the final inversion `~sum` never produces `0xFFFF` (`-0`) unless `sum == 0x0000` (which cannot occur for non-zero words because carry folding `while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16)` produces a value in `[0x0001, 0xFFFF]`, and `~0xFFFF == 0x0000`).
   2. For **UDP** (RFC 768 / RFC 8200), a checksum value of `0x0000` means "no checksum was computed", so when a calculated UDP checksum equals `0x0000`, it **MUST** be replaced with `0xFFFF`.
   3. For **TCP** (RFC 9293), `0x0000` has no special "no checksum" meaning; standard TCP checksum calculation (`~sum`) produces `0x0000` when the 16-bit one's complement sum is `0xFFFF`. While most receivers verify TCP checksums by summing the header (including the checksum field) and folding to `0xFFFF` (which accepts both `0x0000` and `0xFFFF`), strict middleboxes, hardware offloads, and RFC 1624 test vectors (including `test/translate.py`) distinguish TCP `0x0000` from UDP `0xFFFF`.
-  4. Conversely, look at [`nat64.c:359`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L359) and [`nat64.c:1103`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1103) in the `VIRTIO_NET_HDR_F_NEEDS_CSUM` UDP branch:
+  4. Conversely, look at [`nat64.c:359`](nat64.c#L359) and [`nat64.c:1103`](nat64.c#L1103) in the `VIRTIO_NET_HDR_F_NEEDS_CSUM` UDP branch:
      ```c
      *tck = htons(gso_calc_udp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
      ```
@@ -684,18 +684,18 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[RFC-04]` `[SPEC-VIOLATION]` RFC 6052 Section 3.1 Well-Known Prefix (`64:ff9b::/96`) Validation Misses Non-Global IPv4 Ranges and Non-`/96` WKPF Lengths
 - **Severity:** `MEDIUM`
-- **Location:** [`addrmap.c:97-132`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L97-L132) (`is_private_ip4_addr`), [`conffile.c:191-198`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L191-L198) (`config_prefix`), [`addrmap.c:452-457`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L452-L457) (`append_to_prefix`)
+- **Location:** [`addrmap.c:97-132`](addrmap.c#L97-L132) (`is_private_ip4_addr`), [`conffile.c:191-198`](conffile.c#L191-L198) (`config_prefix`), [`addrmap.c:452-457`](addrmap.c#L452-L457) (`append_to_prefix`)
 - **Standard / Mechanism:** RFC 6052 Section 3.1 (Restrictions on the Use of the Well-Known Prefix `64:ff9b::/96`) & RFC 6890 (Special-Purpose IP Address Registries)
 - **Root Cause Analysis:**
   1. **RFC 6052 Section 3.1 Prefix Length Restriction:**
      - The Well-Known Prefix `64:ff9b::/96` may **only** be used as a `/96` prefix (unlike RFC 8215 `64:ff9b:1::/48`, which is the Local-Use NAT64 prefix and can be `/48`, `/56`, `/64`, or `/96`).
-     - In [`config_prefix()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L191-L198), TAYGA allows `prefix 64:ff9b::/32` or `prefix 64:ff9b::/64`! And when `prefix_len != 96`, the `wkpf_strict` check in [`append_to_prefix()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L450-L457) (which is only inside `case 96:`) is **completely bypassed**!
+     - In [`config_prefix()`](conffile.c#L191-L198), TAYGA allows `prefix 64:ff9b::/32` or `prefix 64:ff9b::/64`! And when `prefix_len != 96`, the `wkpf_strict` check in [`append_to_prefix()`](addrmap.c#L450-L457) (which is only inside `case 96:`) is **completely bypassed**!
   2. **Missing Non-Global IPv4 Ranges in `is_private_ip4_addr()`:**
      - RFC 6052 Section 3.1 states: *"The Well-Known Prefix MUST NOT be used to represent non-global IPv4 addresses, such as those defined in [RFC1918] or listed in Section 3 of [RFC5735] (now RFC 6890)."*
-     - Look at [`validate_ip4_addr()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L30-L54) and [`is_private_ip4_addr()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L97-L132):
+     - Look at [`validate_ip4_addr()`](addrmap.c#L30-L54) and [`is_private_ip4_addr()`](addrmap.c#L97-L132):
        - `validate_ip4_addr()` returns `ERROR_LOCAL` (`-3`) for `169.254.0.0/16` (Link-Local, RFC 3927) and `ERROR_NONE` (`0`) for `240.0.0.0/4` (Class E Reserved, RFC 1112).
-       - In `parse_ip4()` ([`nat64.c:600-601`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L600-L601)), TAYGA only checks `validate_ip4_addr(...) == ERROR_DROP`! Thus, `169.254.x.x` (`ERROR_LOCAL`) is accepted by `parse_ip4()`.
-       - In `map_ip6_to_ip4()` ([`addrmap.c:676-690`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/addrmap.c#L676-L690)), `extract_from_prefix()` returns `validate_ip4_addr(addr4)` (`ERROR_LOCAL = -3 < 0`), which drops `169.254.0.0/16`, and in `append_to_prefix()` (`if (validate_ip4_addr(addr4)) return ERROR_DROP;`), `169.254.0.0/16` is dropped.
+       - In `parse_ip4()` ([`nat64.c:600-601`](nat64.c#L600-L601)), TAYGA only checks `validate_ip4_addr(...) == ERROR_DROP`! Thus, `169.254.x.x` (`ERROR_LOCAL`) is accepted by `parse_ip4()`.
+       - In `map_ip6_to_ip4()` ([`addrmap.c:676-690`](addrmap.c#L676-L690)), `extract_from_prefix()` returns `validate_ip4_addr(addr4)` (`ERROR_LOCAL = -3 < 0`), which drops `169.254.0.0/16`, and in `append_to_prefix()` (`if (validate_ip4_addr(addr4)) return ERROR_DROP;`), `169.254.0.0/16` is dropped.
        - However, `240.0.0.0/4` (Class E, non-global), `192.0.0.0/24` (IETF Protocol Assignments, RFC 6890—except when used with local prefix or `wkpf-strict off` for `192.0.0.0/29` DS-Lite/CLAT), and `192.88.99.0/24` (6to4 relay anycast) are **not checked in `is_private_ip4_addr()`**, allowing `64:ff9b::240.0.0.1` to be translated even when `wkpf_strict == 1`!
 - **Proposed Patch:**
 ```diff
@@ -736,11 +736,11 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[STAB-01]` Algorithmic Complexity DoS ($O(2^{32 - \text{prefix\_len}})$ Under Mutex) in `assign_dynamic()` When Dynamic Pool Approaches Capacity
 - **Severity:** `MEDIUM`
-- **Location:** [`dynamic.c:140-163`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/dynamic.c#L140-L163) (`assign_dynamic`)
+- **Location:** [`dynamic.c:140-163`](dynamic.c#L140-L163) (`assign_dynamic`)
 - **Standard / Mechanism:** Daemon Concurrency & Resource Exhaustion
 - **Root Cause Analysis:**
-  1. When an IPv6 packet with an unmapped source address arrives (`map_ip6_to_ip4` with `dyn_alloc = 1`), the worker thread acquires `gcfg.map_mutex` and calls [`assign_dynamic(addr6)`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/dynamic.c#L108).
-  2. Look at the allocation loop in [`dynamic.c:140-163`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/dynamic.c#L140-L163):
+  1. When an IPv6 packet with an unmapped source address arrives (`map_ip6_to_ip4` with `dyn_alloc = 1`), the worker thread acquires `gcfg.map_mutex` and calls [`assign_dynamic(addr6)`](dynamic.c#L108).
+  2. Look at the allocation loop in [`dynamic.c:140-163`](dynamic.c#L140-L163):
      ```c
      max = UINT32_MAX >> pool->map4.prefix_len;
      ...
@@ -810,10 +810,10 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[SEC-03]` Unaligned 16-bit and 32-bit Pointer Dereferences Across `nat64.c`, `gso.c`, and `addrmap.c` (UBSan / Strict-Alignment Faults)
 - **Severity:** `MEDIUM`
-- **Location:** [`nat64.c:133-138`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L133-L138) (`ip_checksum`), [`nat64.c:345, 350, 363, 405, 418, 533, 1089, 1094, 1107, 1149, 1162`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L345), [`tun.c:1139-1145`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tun.c#L1139-L1145)
+- **Location:** [`nat64.c:133-138`](nat64.c#L133-L138) (`ip_checksum`), [`nat64.c:345, 350, 363, 405, 418, 533, 1089, 1094, 1107, 1149, 1162`](nat64.c#L345), [`tun.c:1139-1145`](tun.c#L1139-L1145)
 - **Standard / Mechanism:** ISO C11 §6.3.2.3p7 (Pointer Alignment Invariants)
 - **Root Cause Analysis:**
-  1. Look at [`tun_read_packet()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tun.c#L1139-L1145):
+  1. Look at [`tun_read_packet()`](tun.c#L1139-L1145):
      ```c
      uint8_t *read_ptr = recv_buf + HEADROOM;
      ...
@@ -825,7 +825,7 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
      - `recv_buf` is allocated by `malloc(RECV_BUF_SIZE)` (16-byte aligned on 64-bit Linux) and `HEADROOM` is `64`, so `recv_buf + HEADROOM` (`p->data`) is 4-byte aligned.
      - Even when `vnet_hdr_sz == 10`, `read_ptr` is `recv_buf + 54`, so the 10-byte `virtio_net_hdr` lands at `[54..63]`, and the IP header starts at `recv_buf + 64` (4-byte aligned)! That is a very thoughtful design by the author.
   2. **However**, where can `p->data` or `d` passed to `ip_checksum(void *d, uint32_t c)` become **unaligned**?
-     - Look at [`host_handle_icmp4()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L276) / [`host_handle_icmp6()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L959) and `ip_checksum(void *d, uint32_t c)` ([`nat64.c:130-147`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L130-L147)):
+     - Look at [`host_handle_icmp4()`](nat64.c#L276) / [`host_handle_icmp6()`](nat64.c#L959) and `ip_checksum(void *d, uint32_t c)` ([`nat64.c:130-147`](nat64.c#L130-L147)):
        ```c
        uint16_t *p = d;
        while (c > 1) {
@@ -834,7 +834,7 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
        }
        ```
        While standard headers are 4-byte multiples, in unit tests or custom callers (or if an inner packet inside an extension or non-standard buffer is passed), `uint16_t *p = d` assumes 2-byte alignment and violates strict aliasing if `d` points to a struct (`struct ip4`, `struct icmp`, `struct tcp_hdr`) without `memcpy` or `may_alias`.
-     - More importantly, in [`tayga.h:243-244`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tayga.h#L243-L244):
+     - More importantly, in [`tayga.h:243-244`](tayga.h#L243-L244):
        ```c
        static_assert((offsetof(struct pkt, data) & (alignof(struct ip4) - 1)) == 0,"Packet data must be aligned for IP4");
        ```
@@ -871,10 +871,10 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[SEC-04]` Privilege Dropping Deficiencies in `tayga.c`: Supplementary Groups Not Cleared When `-u` Is Used Without `-g`, and Redundant `setregid` Call
 - **Severity:** `MEDIUM`
-- **Location:** [`tayga.c:794-810`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tayga.c#L794-L810) (`main`)
+- **Location:** [`tayga.c:794-810`](tayga.c#L794-L810) (`main`)
 - **Standard / Mechanism:** Linux Capabilities & POSIX Privilege Dropping (`setgroups`, `setresgid`, `setresuid`)
 - **Root Cause Analysis:**
-  1. Look at [`tayga.c:794-810`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tayga.c#L794-L810):
+  1. Look at [`tayga.c:794-810`](tayga.c#L794-L810):
      ```c
      if (gr) {
          if (setregid(gr->gr_gid, gr->gr_gid) < 0 ||
@@ -923,10 +923,10 @@ Let's elevate that specific out-of-bounds read to `[SEC-01]` (`CRITICAL`) and ke
 
 #### `[STAB-02]` Memory Leaks in `conffile.c` Error Paths and Unbounded Extension Header Chain Walking in `parse_ip6()`
 - **Severity:** `LOW`
-- **Location:** [`nat64.c:1280-1302`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1280-L1302) (`parse_ip6`), [`conffile.c:181-207`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L181-L207), [`conffile.c:317-358`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L317-L358), [`conffile.c:381-422`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/conffile.c#L381-L422)
+- **Location:** [`nat64.c:1280-1302`](nat64.c#L1280-L1302) (`parse_ip6`), [`conffile.c:181-207`](conffile.c#L181-L207), [`conffile.c:317-358`](conffile.c#L317-L358), [`conffile.c:381-422`](conffile.c#L381-L422)
 - **Standard / Mechanism:** RFC 8200 / RFC 8504 (IPv6 Extension Header Processing Limits), C Resource Management
 - **Root Cause Analysis:**
-  1. In [`flow_dispatch.h:47-48`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/flow_dispatch.h#L47-L48), the author bounded the IPv6 extension header loop to `count < 8 && off <= 296`. However, in [`parse_ip6()`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/nat64.c#L1280-L1302), the `while (p->data_proto == 0 || p->data_proto == 43 || p->data_proto == 60)` loop has no chain-count cap: a 64KB packet filled with 8-byte dummy Destination Options headers (`Hdr Ext Len = 0`) forces 8,187 loop iterations per packet before dropping. Additionally, if `seg_ptr += hdr_len` overflows `uint16_t` (Wait: `p->data_len` is bounded by `ntohs(p->ip6->payload_length) <= 65535`, and `seg_ptr` starts at `40`, so if `payload_length == 65500` of extension headers followed by a Routing Header with `seg_left > 0`, **`uint16_t seg_ptr = 40 + 65500` wraps 16-bit unsigned integer to `4`**, emitting a bogus ICMPv6 Parameter Problem pointer!). Changing `seg_ptr` to `uint32_t` prevents this 16-bit wrap.
+  1. In [`flow_dispatch.h:47-48`](flow_dispatch.h#L47-L48), the author bounded the IPv6 extension header loop to `count < 8 && off <= 296`. However, in [`parse_ip6()`](nat64.c#L1280-L1302), the `while (p->data_proto == 0 || p->data_proto == 43 || p->data_proto == 60)` loop has no chain-count cap: a 64KB packet filled with 8-byte dummy Destination Options headers (`Hdr Ext Len = 0`) forces 8,187 loop iterations per packet before dropping. Additionally, if `seg_ptr += hdr_len` overflows `uint16_t` (Wait: `p->data_len` is bounded by `ntohs(p->ip6->payload_length) <= 65535`, and `seg_ptr` starts at `40`, so if `payload_length == 65500` of extension headers followed by a Routing Header with `seg_left > 0`, **`uint16_t seg_ptr = 40 + 65500` wraps 16-bit unsigned integer to `4`**, emitting a bogus ICMPv6 Parameter Problem pointer!). Changing `seg_ptr` to `uint32_t` prevents this 16-bit wrap.
   2. In `conffile.c`, `config_prefix`, `config_tun_ip`, `config_tun_route`, `config_map`, and `config_dynamic_pool` allocate heap structs (`m`, `ip6`, `pool`) and return `ERROR_REJECT` without `free()` on several validation error branches (spotted when running `unit_conffile` under ASan/LSan).
 - **Proposed Patch:**
 ```diff
@@ -965,7 +965,7 @@ During the reconnaissance and line-by-line review, the following areas were veri
 Below are concrete C unit test cases (compatible with `test/unit_gso.c`, `test/unit_addrmap.c`, and `test/unit_udp_checksum.c`) to verify the findings and prevent regressions:
 
 ### Test 1: Regression Test for `[SEC-01]` (Negative `old_ptr` in ICMPv6 Parameter Problem)
-Add to [`test/unit_udp_checksum.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/unit_udp_checksum.c):
+Add to [`test/unit_udp_checksum.c`](test/unit_udp_checksum.c):
 ```c
 static void test_icmp6_param_problem_negative_ptr(void)
 {
@@ -1066,7 +1066,7 @@ static void test_icmp6_error_truncated_fragment_quote(void)
 ```
 
 ### Test 3: Regression Test for `[GSO-01]` (4to6 Software Segmentation with Jumbo `gso_size > 2000`)
-Add to [`test/unit_gso.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/test/unit_gso.c):
+Add to [`test/unit_gso.c`](test/unit_gso.c):
 ```c
 static void test_gso_sw_seg_4to6_jumbo_mss(void)
 {
