@@ -344,30 +344,21 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 int insert_map4(struct map4 *m, struct map4 **conflict)
 {
 	struct list_head *entry;
-	struct list_head *insert_pos = NULL;
 	struct map4 *s;
 
 	list_for_each(entry, &gcfg.map4_list) {
 		s = list_entry(entry, struct map4, list);
-		if (s->prefix_len < m->prefix_len) {
-			if (s->type != MAP_TYPE_RFC6052 &&
-			    (m->addr.s_addr & s->mask.s_addr) == s->addr.s_addr)
-				goto conflict;
-			if (!insert_pos)
-				insert_pos = entry;
-		} else {
-			if (m->type != MAP_TYPE_RFC6052 &&
-			    (s->addr.s_addr & m->mask.s_addr) == m->addr.s_addr)
-				goto conflict;
+		if (s->prefix_len < m->prefix_len)
+			break;
+		if (s->prefix_len == m->prefix_len &&
+				s->addr.s_addr == m->addr.s_addr) {
+			if (conflict)
+				*conflict = s;
+			return -1;
 		}
 	}
-	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map4_list);
+	list_add_tail(&m->list, entry);
 	return 0;
-
-conflict:
-	if (conflict)
-		*conflict = s;
-	return -1;
 }
 /**
  * @brief Insert an IPv6 entry into the map
@@ -788,75 +779,6 @@ void addrmap_maint(void)
 	}
 	pthread_mutex_unlock(&gcfg.cache_mutex);
 	pthread_mutex_unlock(&gcfg.map_mutex);
-}
-
-
-/**
- * @brief Evict an entry from cache by its map4
- *
- * This assumes that the parent is a static map.
- */
-static void cache_evict_map4(const struct map4 *m4)
-{
-    struct list_head *entry, *next;
-    struct cache_entry *c;
-
-    pthread_mutex_lock(&gcfg.cache_mutex);
-    list_for_each_safe(entry, next, &gcfg.cache_active) {
-        c = list_entry(entry, struct cache_entry, list);
-        if (m4->addr.s_addr == (m4->mask.s_addr & c->addr4.s_addr)) {
-            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
-            list_del(&c->hash4);
-            list_del(&c->hash6);
-            list_add(&c->list, &gcfg.cache_pool);
-        }
-    }
-    pthread_mutex_unlock(&gcfg.cache_mutex);
-}
-
-/**
- * @brief Evict an entry from cache by its map6
- *
- * This assumes that the parent is a static map.
- */
-static void cache_evict_map6(const struct map6 *m6)
-{
-    struct list_head *entry, *next;
-    struct cache_entry *c;
-
-    pthread_mutex_lock(&gcfg.cache_mutex);
-    list_for_each_safe(entry, next, &gcfg.cache_active) {
-        c = list_entry(entry, struct cache_entry, list);
-		if (IN6_IS_IN_NET(&c->addr6, &m6->addr, &m6->mask)){
-            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
-            list_del(&c->hash4);
-            list_del(&c->hash6);
-            list_add(&c->list, &gcfg.cache_pool);
-        }
-    }
-    pthread_mutex_unlock(&gcfg.cache_mutex);
-}
-
-/**
- * @brief Delete the parent map entry of this map4
- *
- * This assumes that the parent is a static map.
- * Caller must hold map_mutex
- */
-static void addrmap_delete4(struct map4 *m4)
-{
-    if (m4->type == MAP_TYPE_STATIC) {
-        struct map_static *m = container_of(m4, struct map_static, map4);
-
-        /* Remove from map lists */
-        list_del(&m->map4.list);
-        list_del(&m->map6.list);
-
-        /* Evict matching cache entries */
-        cache_evict_map4(&m->map4);
-        cache_evict_map6(&m->map6);
-		free(m);
-    }
 }
 
 /* Parse an entire replacement before publishing any map-file changes. */
