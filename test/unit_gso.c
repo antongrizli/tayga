@@ -1600,6 +1600,61 @@ static void test_partial_udp_fragmentation(void)
 	printf("PASS: Partial UDP fragmentation checksum and invalid GSO rejection\n");
 }
 
+static void test_gso_sw_seg_4to6_jumbo_mss(void)
+{
+	printf("Testing gso_software_segment_and_send_4to6() with jumbo MSS (gso_size=4000)...\n");
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+
+	alignas(4) uint8_t pkt_buf[HEADROOM + 16384];
+	memset(pkt_buf, 0, sizeof(pkt_buf));
+	uint8_t *base = pkt_buf + HEADROOM;
+
+	uint32_t payload_len = 8000;
+	uint32_t tcp_len = sizeof(struct tcp_hdr) + payload_len;
+	uint32_t ip4_len = sizeof(struct ip4) + tcp_len;
+
+	struct ip4 *ip4 = (struct ip4 *)base;
+	ip4->ver_ihl = 0x45;
+	ip4->length = htons((uint16_t)ip4_len);
+	ip4->flags_offset = htons(IP4_F_DF);
+	ip4->ttl = 64;
+	ip4->proto = IPPROTO_TCP;
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "8.8.8.8", &ip4->dest);
+	ip4->cksum = ip4_header_checksum(ip4);
+
+	struct tcp_hdr *tcp = (struct tcp_hdr *)(base + sizeof(struct ip4));
+	tcp->src_port = htons(40000);
+	tcp->dst_port = htons(443);
+	tcp->seq = htonl(1);
+	tcp->doff_res = (sizeof(struct tcp_hdr) / 4) << 4;
+	tcp->flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
+	tcp->window = htons(1024);
+	tcp->cksum = htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, tcp_len));
+
+	struct pkt p = {
+		.tun_fd = sv[0],
+		.data = base,
+		.data_len = ip4_len,
+		.has_vhdr = 1,
+		.vhdr = {
+			.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
+			.gso_type = VIRTIO_NET_HDR_GSO_TCPV4,
+			.hdr_len = sizeof(struct ip4) + sizeof(struct tcp_hdr),
+			.gso_size = 4000,
+			.csum_start = sizeof(struct ip4),
+			.csum_offset = 16,
+		}
+	};
+
+	int ret = gso_software_segment_and_send_4to6(&p);
+	assert(ret == 0);
+	close(sv[0]);
+	close(sv[1]);
+	printf("PASS: gso_software_segment_and_send_4to6() jumbo MSS\n");
+}
+
 int main(void)
 {
 	printf("=== Running unit_gso test suite ===\n");
@@ -1616,6 +1671,7 @@ int main(void)
 	test_gso_mock_write_error();
 	test_gso_udp_uso();
 	test_partial_udp_fragmentation();
+	test_gso_sw_seg_4to6_jumbo_mss();
 	gso_dump_stats();
 	printf("All unit_gso tests passed successfully!\n");
 	return 0;

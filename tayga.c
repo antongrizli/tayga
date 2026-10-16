@@ -791,12 +791,12 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (gr) {
-		if (setregid(gr->gr_gid, gr->gr_gid) < 0 ||
-				setregid(gr->gr_gid, gr->gr_gid) < 0 ||
-				setgroups(1, &gr->gr_gid) < 0) {
+	if (gr || pw) {
+		gid_t target_gid = gr ? gr->gr_gid : pw->pw_gid;
+		if (setgroups(1, &target_gid) < 0 ||
+		    setregid(target_gid, target_gid) < 0) {
 			slog(LOG_CRIT, "Error: cannot set gid to %d: %s\n",
-					gr->gr_gid, strerror(errno));
+					target_gid, strerror(errno));
 			goto startup_failed;
 		}
 	}

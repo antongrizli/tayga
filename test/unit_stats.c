@@ -78,6 +78,7 @@ static void *stress_writer(void *arg) {
 	return NULL;
 }
 
+#if MAX_WORKERS > 0
 static atomic_bool idle_ready, idle_stop, idle_ack;
 static void urgent_handler(int sig) { (void)sig; }
 static void *idle_worker(void *arg) {
@@ -128,6 +129,7 @@ static void test_idle_sync(void) {
     gcfg.workers = 0;
     puts("PASS: idle sparse highest-slot worker synchronization (100 requests)");
 }
+#endif
 
 static atomic_bool main_snapshot_done;
 static struct tayga_stats main_snapshot;
@@ -414,7 +416,9 @@ int main(void)
 	assert(atomic_load_explicit(&g_worker_pub[3].rx_pkts_v4, memory_order_relaxed) == 15);
 	printf("PASS: low-rate continuous streaming interval flush publishes within 1 second\n");
 
+#if MAX_WORKERS > 0
 	test_idle_sync();
+#endif
 	test_main_sync();
 	printf("All stats unit tests PASSED.\n");
 	return 0;

@@ -141,14 +141,35 @@ struct map6 *assign_dynamic(const struct in6_addr *addr6)
 		addr = pool->free_head.addr | ((base + i) & max);
 		if (!entry || addr == pool->free_head.addr)
 			entry = pool->free_list.next;
-		for (;;) {
+		while (entry != &pool->free_list) {
 			f = list_entry(entry, struct free_addr, list);
 			if (f->addr + f->count >= addr)
 				break;
 			entry = entry->next;
 		}
-		if (f->addr >= addr)
+		if (entry == &pool->free_list)
+			break;
+		if (f->addr >= addr) {
+			/* Skip directly over the contiguous allocated run [addr .. f->addr] */
+			uint32_t skip = f->addr - addr;
+			if (f->count == 0) {
+				/* Advance to the next free_addr block that actually has free addresses */
+				struct list_head *next_e = entry->next;
+				while (next_e != &pool->free_list) {
+					struct free_addr *nf = list_entry(next_e, struct free_addr, list);
+					if (nf->count > 0) {
+						skip = nf->addr - addr;
+						entry = next_e;
+						break;
+					}
+					next_e = next_e->next;
+				}
+				if (next_e == &pool->free_list)
+					break;
+			}
+			i += skip;
 			continue;
+		}
 		addr4.s_addr = htonl(addr);
 		m4 = find_map4(&addr4);
 		if (m4 == &pool->map4) {

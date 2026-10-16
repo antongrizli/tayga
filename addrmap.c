@@ -128,6 +128,15 @@ int is_private_ip4_addr(const struct in_addr *a)
 	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xcb007100))
 		return ERROR_REJECT;
 
+	/* 192.0.0.0/24 RFC6890 IETF Protocol Assignments (excluding 192.0.0.0/29 DS-Lite/CLAT per RFC 6877/6890) */
+	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0000000) &&
+	    (a->s_addr & htonl(0xfffffff8)) != htonl(0xc0000000))
+		return ERROR_REJECT;
+
+	/* 240.0.0.0/4 RFC1112 Reserved (Class E) */
+	if ((a->s_addr & htonl(0xf0000000)) == htonl(0xf0000000))
+		return ERROR_REJECT;
+
 	return ERROR_NONE;
 }
 
@@ -336,21 +345,24 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 int insert_map4(struct map4 *m, struct map4 **conflict)
 {
 	struct list_head *entry;
+	struct list_head *insert_pos = NULL;
 	struct map4 *s;
 
 	list_for_each(entry, &gcfg.map4_list) {
 		s = list_entry(entry, struct map4, list);
-		if (s->prefix_len < m->prefix_len)
-			break;
 		if (s->prefix_len == m->prefix_len &&
-				s->addr.s_addr == m->addr.s_addr) {
-			if (conflict)
-				*conflict = s;
-			return -1;
-		}
+				s->addr.s_addr == m->addr.s_addr)
+			goto conflict;
+		if (s->prefix_len < m->prefix_len && !insert_pos)
+			insert_pos = entry;
 	}
-	list_add_tail(&m->list, entry);
+	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map4_list);
 	return 0;
+
+conflict:
+	if (conflict)
+		*conflict = s;
+	return -1;
 }
 /**
  * @brief Insert an IPv6 entry into the map
@@ -399,6 +411,16 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 {
 	/* Do not allow invalid addresses to be appended to prefix */
 	if(validate_ip4_addr(addr4)) return ERROR_DROP;
+
+	/* Do not allow translation of well-known prefix with private IPv4
+	 * But still allow local-use prefix */
+	if (prefix->s6_addr32[0] == WKPF &&
+		!prefix->s6_addr32[1] &&
+		!prefix->s6_addr32[2] &&
+		gcfg.wkpf_strict &&
+		is_private_ip4_addr(addr4))
+		return ERROR_REJECT;
+
 	switch (prefix_len) {
 	case 32:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
@@ -447,14 +469,6 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
                 addr4->s_addr >> 24);
 		return ERROR_NONE;
 	case 96:
-		//Do not allow translation of well-known prefix
-		//But still allow local-use prefix
-		if (prefix->s6_addr32[0] == WKPF &&
-			!prefix->s6_addr32[1] &&
-			!prefix->s6_addr32[2] &&
-			gcfg.wkpf_strict &&
-			is_private_ip4_addr(addr4))
-			return ERROR_REJECT;
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
 		addr6->s6_addr32[1] = prefix->s6_addr32[1];
 		addr6->s6_addr32[2] = prefix->s6_addr32[2];
@@ -773,75 +787,6 @@ void addrmap_maint(void)
 	pthread_mutex_unlock(&gcfg.map_mutex);
 }
 
-
-/**
- * @brief Evict an entry from cache by its map4
- *
- * This assumes that the parent is a static map.
- */
-static void cache_evict_map4(const struct map4 *m4)
-{
-    struct list_head *entry, *next;
-    struct cache_entry *c;
-
-    pthread_mutex_lock(&gcfg.cache_mutex);
-    list_for_each_safe(entry, next, &gcfg.cache_active) {
-        c = list_entry(entry, struct cache_entry, list);
-        if (m4->addr.s_addr == (m4->mask.s_addr & c->addr4.s_addr)) {
-            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
-            list_del(&c->hash4);
-            list_del(&c->hash6);
-            list_add(&c->list, &gcfg.cache_pool);
-        }
-    }
-    pthread_mutex_unlock(&gcfg.cache_mutex);
-}
-
-/**
- * @brief Evict an entry from cache by its map6
- *
- * This assumes that the parent is a static map.
- */
-static void cache_evict_map6(const struct map6 *m6)
-{
-    struct list_head *entry, *next;
-    struct cache_entry *c;
-
-    pthread_mutex_lock(&gcfg.cache_mutex);
-    list_for_each_safe(entry, next, &gcfg.cache_active) {
-        c = list_entry(entry, struct cache_entry, list);
-		if (IN6_IS_IN_NET(&c->addr6, &m6->addr, &m6->mask)){
-            if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
-            list_del(&c->hash4);
-            list_del(&c->hash6);
-            list_add(&c->list, &gcfg.cache_pool);
-        }
-    }
-    pthread_mutex_unlock(&gcfg.cache_mutex);
-}
-
-/**
- * @brief Delete the parent map entry of this map4
- *
- * This assumes that the parent is a static map.
- * Caller must hold map_mutex
- */
-static void addrmap_delete4(struct map4 *m4)
-{
-    if (m4->type == MAP_TYPE_STATIC) {
-        struct map_static *m = container_of(m4, struct map_static, map4);
-
-        /* Remove from map lists */
-        list_del(&m->map4.list);
-        list_del(&m->map6.list);
-
-        /* Evict matching cache entries */
-        cache_evict_map4(&m->map4);
-        cache_evict_map6(&m->map6);
-		free(m);
-    }
-}
-
 /* Parse an entire replacement before publishing any map-file changes. */
 static struct map_static *parse_map_entry(int line, char *v4, char *v6)
 {
@@ -941,35 +886,60 @@ int addrmap_reload(void)
 	if (fclose(in)) failed = 1;
 	if (!failed) {
 		pthread_mutex_lock(&gcfg.map_mutex);
-		list_for_each(entry, &staged) {
+		list_for_each_safe(entry, next, &staged) {
 			struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			int conflict = 0;
 			struct list_head *fixed;
 			list_for_each(fixed, &gcfg.map4_list) {
 				struct map4 *f = list_entry(fixed, struct map4, list);
 				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
-					f->addr.s_addr == m->map4.addr.s_addr) failed = 1;
+					f->addr.s_addr == m->map4.addr.s_addr) {
+					conflict = 1;
+					break;
+				}
 			}
-			list_for_each(fixed, &gcfg.map6_list) {
-				struct map6 *f = list_entry(fixed, struct map6, list);
-				int file = f->type == MAP_TYPE_STATIC &&
-					container_of(f, struct map_static, map6)->origin == MAP_ORIGIN_MAPFILE;
-				if (!file && map6_overlaps(f, &m->map6)) failed = 1;
+			if (!conflict) {
+				list_for_each(fixed, &gcfg.map6_list) {
+					struct map6 *f = list_entry(fixed, struct map6, list);
+					int file = f->type == MAP_TYPE_STATIC &&
+						container_of(f, struct map_static, map6)->origin == MAP_ORIGIN_MAPFILE;
+					if (!file && map6_overlaps(f, &m->map6)) {
+						conflict = 1;
+						break;
+					}
+				}
 			}
-		}
-		if (!failed) {
-			list_for_each_safe(entry, next, &gcfg.map4_list) {
-				struct map4 *m = list_entry(entry, struct map4, list);
-				if (is_file_map4(m)) addrmap_delete4(m);
-			}
-			list_for_each_safe(entry, next, &staged) {
-				struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			if (conflict) {
+				slog(LOG_ERR, "MAP-FILE: Entry on line %d conflicts with static conf-file mapping; skipping\n", m->line_no);
 				list_del(entry);
-				insert_map4(&m->map4, NULL);
-				insert_map6(&m->map6, NULL);
-				cache_evict_map4(&m->map4);
-				cache_evict_map6(&m->map6);
+				free(m);
 			}
 		}
+		pthread_mutex_lock(&gcfg.cache_mutex);
+		list_for_each_safe(entry, next, &gcfg.map4_list) {
+			struct map4 *m = list_entry(entry, struct map4, list);
+			if (is_file_map4(m)) {
+				struct map_static *s = container_of(m, struct map_static, map4);
+				list_del(&s->map4.list);
+				list_del(&s->map6.list);
+				free(s);
+			}
+		}
+		list_for_each_safe(entry, next, &staged) {
+			struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			list_del(entry);
+			insert_map4(&m->map4, NULL);
+			insert_map6(&m->map6, NULL);
+		}
+		/* Flush active cache atomically under both map_mutex and cache_mutex */
+		list_for_each_safe(entry, next, &gcfg.cache_active) {
+			struct cache_entry *c = list_entry(entry, struct cache_entry, list);
+			if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
+			list_del(&c->hash4);
+			list_del(&c->hash6);
+			list_add(&c->list, &gcfg.cache_pool);
+		}
+		pthread_mutex_unlock(&gcfg.cache_mutex);
 		pthread_mutex_unlock(&gcfg.map_mutex);
 	}
 	list_for_each_safe(entry, next, &staged) {

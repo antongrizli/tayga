@@ -18,6 +18,18 @@
 
 #include "tayga.h"
 
+static inline uint16_t get_u16(const void *ptr)
+{
+	uint16_t val;
+	memcpy(&val, ptr, sizeof(val));
+	return val;
+}
+
+static inline void put_u16(void *ptr, uint16_t val)
+{
+	memcpy(ptr, &val, sizeof(val));
+}
+
 /* Protocol headers */
 struct ip6_data {
     struct tun_pi pi;
@@ -36,6 +48,7 @@ struct ip6_error {
     struct ip6 ip6;
     struct icmp icmp;
     struct ip6 ip6_em;
+    struct ip6_frag ip6_em_frag;
 };
 
 struct ip4_data {
@@ -130,15 +143,18 @@ void log_pkt6(int err, struct pkt *p, const char *msg)
 uint16_t ip_checksum(void *d, uint32_t c)
 {
 	uint32_t sum = 0xffff;
-	uint16_t *p = d;
+	const uint8_t *p = (const uint8_t *)d;
 
 	while (c > 1) {
-		sum += *p++;
+		uint16_t word;
+		memcpy(&word, p, sizeof(word));
+		sum += word;
+		p += 2;
 		c -= 2;
 	}
 
 	if (c)
-		sum += *((uint8_t *)p) << BIG_LITTLE(8,0);
+		sum += *p << BIG_LITTLE(8,0);
 
 	while (sum > 0xffff)
 		sum = (sum & 0xffff) + (sum >> 16);
@@ -301,7 +317,6 @@ static void xlate_header_4to6(struct pkt *p, struct ip6 *ip6,
 
 int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 {
-	uint16_t *tck;
 	uint16_t cksum;
 
 	/* Partial checksums cannot be translated safely on any fragment. */
@@ -342,26 +357,26 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 				log_pkt4(LOG_OPT_DROP, p, "Invalid UDP checksum offload metadata");
 				return ERROR_DROP;
 			}
-			uint16_t udp_len = ntohs(*(uint16_t *)(p->data + 4));
+			uint16_t udp_len = ntohs(get_u16(p->data + 4));
 			if (udp_len < 8 || udp_len > p->data_len) {
 				log_pkt4(LOG_OPT_DROP, p, "Invalid UDP header length");
 				return ERROR_DROP;
 			}
-			tck = (uint16_t *)(p->data + 6);
 			if (gcfg.vnet_hdr_sz == 0) {
-				*tck = 0;
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip6_checksum(ip6, p->data_len, IPPROTO_UDP));
-				if (*tck == 0)
-					*tck = 0xffff;
+				put_u16(p->data + 6, 0);
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip6_checksum(ip6, p->data_len, IPPROTO_UDP));
+				if (ck == 0)
+					ck = 0xffff;
+				put_u16(p->data + 6, ck);
 				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
 			} else {
-				*tck = htons(gso_calc_udp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+				put_u16(p->data + 6, htons(gso_calc_udp_pseudo6(&ip6->src, &ip6->dest, p->data_len)));
 			}
 			return ERROR_NONE;
 		}
-		tck = (uint16_t *)(p->data + 6);
-		if (!*tck) {
+		uint16_t orig_udp_ck = get_u16(p->data + 6);
+		if (!orig_udp_ck) {
 			/* UDP packet has genuinely no checksum */
 			if (em) {
 				if (gcfg.udp_cksum_mode == UDP_CKSUM_DROP)
@@ -375,12 +390,14 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 				return ERROR_DROP;
 			case UDP_CKSUM_FWD:
 				return ERROR_NONE;
-			case UDP_CKSUM_CALC:
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip6_checksum(ip6, p->data_len, 17));
-				if (*tck == 0)
-					*tck = 0xffff;
+			case UDP_CKSUM_CALC: {
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip6_checksum(ip6, p->data_len, 17));
+				if (ck == 0)
+					ck = 0xffff;
+				put_u16(p->data + 6, ck);
 				return ERROR_NONE;
+			}
 			}
 		}
 		break;
@@ -402,20 +419,17 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 				log_pkt4(LOG_OPT_DROP, p, "Invalid TCP data offset");
 				return ERROR_DROP;
 			}
-			tck = (uint16_t *)(p->data + 16);
 			if (gcfg.vnet_hdr_sz == 0) {
-				*tck = 0;
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip6_checksum(ip6, p->data_len, IPPROTO_TCP));
-				if (*tck == 0)
-					*tck = 0xffff;
+				put_u16(p->data + 16, 0);
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip6_checksum(ip6, p->data_len, IPPROTO_TCP));
+				put_u16(p->data + 16, ck);
 				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
 			} else {
-				*tck = htons(gso_calc_tcp_pseudo6(&ip6->src, &ip6->dest, p->data_len));
+				put_u16(p->data + 16, htons(gso_calc_tcp_pseudo6(&ip6->src, &ip6->dest, p->data_len)));
 			}
 			return ERROR_NONE;
 		}
-		tck = (uint16_t *)(p->data + 16);
 		break;
 	/* Any other protocol */
 	default:
@@ -426,9 +440,11 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 		return ERROR_NONE;
 	}
 	/* Calculate checksum adjustment (RFC 1624 incremental update) */
-	*tck = ones_add(*tck, ~convert_cksum(ip6, p->ip4));
-	if (*tck == 0)
-		*tck = 0xffff;
+	uint32_t csum_off = (p->data_proto == IPPROTO_UDP) ? 6 : 16;
+	uint16_t adj_ck = ones_add(get_u16(p->data + csum_off), ~convert_cksum(ip6, p->ip4));
+	if (p->data_proto == IPPROTO_UDP && adj_ck == 0)
+		adj_ck = 0xffff;
+	put_u16(p->data + csum_off, adj_ck);
 	return ERROR_NONE;
 }
 
@@ -530,12 +546,13 @@ static void xlate_4to6_data(struct pkt *p)
 	} else {
 		/* If packet had NEEDS_CSUM, complete it before fragmenting */
 		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
-			uint16_t *frag_tck = (uint16_t *)(p->data + (p->data_proto == IPPROTO_UDP ? 6 : 16));
-			*frag_tck = 0; /* Remove the pseudoheader seed before a full checksum. */
-			*frag_tck = ones_add(ip_checksum(p->data, p->data_len),
-			                     ip6_checksum(&header.ip6, p->data_len, p->data_proto));
-			if (*frag_tck == 0)
-				*frag_tck = 0xffff;
+			uint32_t csum_off = (p->data_proto == IPPROTO_UDP ? 6 : 16);
+			put_u16(p->data + csum_off, 0); /* Remove the pseudoheader seed before a full checksum. */
+			uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+			                       ip6_checksum(&header.ip6, p->data_len, p->data_proto));
+			if (p->data_proto == IPPROTO_UDP && ck == 0)
+				ck = 0xffff;
+			put_u16(p->data + csum_off, ck);
 			p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
 		}
 
@@ -581,7 +598,7 @@ static void xlate_4to6_data(struct pkt *p)
 	}
 }
 
-static int parse_ip4(struct pkt *p)
+static int parse_ip4(struct pkt *p, int em)
 {
 	p->ip4 = (struct ip4 *)(p->data);
 
@@ -611,7 +628,7 @@ static int parse_ip4(struct pkt *p)
 	p->data_proto = p->ip4->proto;
 
 	if (p->data_proto == 1) { /* ICMPv4 */
-		if (p->ip4->flags_offset & htons(IP4_F_MASK | IP4_F_MF)) {
+		if (!em && (p->ip4->flags_offset & htons(IP4_F_MASK | IP4_F_MF))) {
 			log_pkt4(LOG_OPT_DROP,p,"ICMP Fragmented");
 			return ERROR_DROP;
 		}
@@ -628,7 +645,7 @@ static int parse_ip4(struct pkt *p)
 		log_pkt4(LOG_OPT_DROP,p,"IPv4 Packet with IPv6-Only Proto");
 		return ERROR_DROP;
 	} else {
-		if ((p->ip4->flags_offset & htons(IP4_F_MF)) &&
+		if (!em && (p->ip4->flags_offset & htons(IP4_F_MF)) &&
 				(p->data_len & 0x7)) {
 			log_pkt4(LOG_OPT_DROP,p,"Fragment Misalignment");
 			return ERROR_DROP;
@@ -683,7 +700,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		}
 	}
 
-	if (parse_ip4(&p_em) < 0) {
+	if (parse_ip4(&p_em, 1) < 0) {
 		log_pkt4(LOG_OPT_DROP,p,"Failed to parse em packet");
 		return;
 	}
@@ -693,9 +710,11 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		return;
 	}
 
-	if (sizeof(struct ip6) * 2 + sizeof(struct icmp) + p_em.data_len > MTU_MIN)
+	uint16_t em_off = ntohs(p_em.ip4->flags_offset);
+	size_t em_frag_len = (em_off & (IP4_F_MASK | IP4_F_MF)) ? sizeof(struct ip6_frag) : 0;
+	if (sizeof(struct ip6) * 2 + sizeof(struct icmp) + em_frag_len + p_em.data_len > MTU_MIN)
 		p_em.data_len = MTU_MIN - sizeof(struct ip6) * 2 -
-						sizeof(struct icmp);
+						sizeof(struct icmp) - em_frag_len;
 
 	if (map_ip4_to_ip6(&header.ip6_em.src, &p_em.ip4->src) ||
 			map_ip4_to_ip6(&header.ip6_em.dest,
@@ -704,8 +723,18 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		return;
 	}
 
-	xlate_header_4to6(&p_em, &header.ip6_em,
-				ntohs(p_em.ip4->length) - p_em.header_len);
+	uint32_t em_payload_len = (uint32_t)(ntohs(p_em.ip4->length) - p_em.header_len) + (uint32_t)em_frag_len;
+	if (em_payload_len > UINT16_MAX)
+		em_payload_len = UINT16_MAX;
+	xlate_header_4to6(&p_em, &header.ip6_em, (int)em_payload_len);
+	if (em_frag_len) {
+		header.ip6_em_frag.next_header = header.ip6_em.next_header;
+		header.ip6_em_frag.reserved = 0;
+		header.ip6_em_frag.offset_flags = htons(((em_off & IP4_F_MASK) << 3) |
+		                                        ((em_off & IP4_F_MF) ? IP6_F_MF : 0));
+		header.ip6_em_frag.ident = htonl(ntohs(p_em.ip4->ident));
+		header.ip6_em.next_header = 44;
+	}
 
 	switch (p->icmp->type) {
 	case 3: /* Destination Unreachable */
@@ -779,7 +808,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 			return;
 		}
 		static const int32_t new_ptr_tbl[] = {0,1,4,4,-1,-1,-1,-1,7,6,-1,-1,8,8,8,8,24,24,24,24};
-		int32_t old_ptr = (ntohl(p->icmp->word) >> 24);
+		uint32_t old_ptr = (uint32_t)ntohl(p->icmp->word) >> 24;
 		if(old_ptr > 19) {
 			log_pkt4(LOG_OPT_DROP,p,"Parameter Problem Invalid Pointer");
 			return;
@@ -815,7 +844,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	}
 
 	xlate_header_4to6(p, &header.ip6,
-		sizeof(header.icmp) + sizeof(header.ip6_em) + p_em.data_len);
+		sizeof(header.icmp) + sizeof(header.ip6_em) + em_frag_len + p_em.data_len);
 	--header.ip6.hop_limit;
 
 	header.icmp.cksum = 0;
@@ -823,17 +852,17 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 					ntohs(header.ip6.payload_length), 58),
 			ones_add(ip_checksum(&header.icmp,
 						sizeof(header.icmp) +
-						sizeof(header.ip6_em)),
+						sizeof(header.ip6_em) + em_frag_len),
 				ip_checksum(p_em.data, p_em.data_len)));
 
 	TUN_SET_PROTO(&header.pi,  ETH_P_IPV6);
 
 #ifdef __linux__
 	iov[0].iov_base = &header.ip6;
-	iov[0].iov_len = sizeof(header.ip6) + sizeof(header.icmp) + sizeof(header.ip6_em);
+	iov[0].iov_len = sizeof(header.ip6) + sizeof(header.icmp) + sizeof(header.ip6_em) + em_frag_len;
 #else
 	iov[0].iov_base = &header;
-	iov[0].iov_len = sizeof(header);
+	iov[0].iov_len = sizeof(struct tun_pi) + sizeof(header.ip6) + sizeof(header.icmp) + sizeof(header.ip6_em) + em_frag_len;
 #endif
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
@@ -859,7 +888,7 @@ void handle_ip4(struct pkt *p)
 		return;
 	}
 
-	if (unlikely(parse_ip4(p) < 0)) {
+	if (unlikely(parse_ip4(p, 0) < 0)) {
 		stats_drop(p->data_len);
 		return; //error already logged
 	}
@@ -1045,7 +1074,6 @@ static void xlate_header_6to4(struct pkt *p, struct ip4 *ip4,
 
 int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 {
-	uint16_t *tck;
 	uint16_t cksum;
 
 	/* Partial checksums cannot be translated safely on any fragment. */
@@ -1086,26 +1114,26 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 				log_pkt6(LOG_OPT_DROP, p, "Invalid UDP checksum offload metadata");
 				return ERROR_DROP;
 			}
-			uint16_t udp_len = ntohs(*(uint16_t *)(p->data + 4));
+			uint16_t udp_len = ntohs(get_u16(p->data + 4));
 			if (udp_len < 8 || udp_len > p->data_len) {
 				log_pkt6(LOG_OPT_DROP, p, "Invalid UDP header length");
 				return ERROR_DROP;
 			}
-			tck = (uint16_t *)(p->data + 6);
 			if (gcfg.vnet_hdr_sz == 0) {
-				*tck = 0;
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip4_checksum(ip4, p->data_len, IPPROTO_UDP));
-				if (*tck == 0)
-					*tck = 0xffff;
+				put_u16(p->data + 6, 0);
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip4_checksum(ip4, p->data_len, IPPROTO_UDP));
+				if (ck == 0)
+					ck = 0xffff;
+				put_u16(p->data + 6, ck);
 				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
 			} else {
-				*tck = htons(gso_calc_udp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+				put_u16(p->data + 6, htons(gso_calc_udp_pseudo4(&ip4->src, &ip4->dest, p->data_len)));
 			}
 			return ERROR_NONE;
 		}
-		tck = (uint16_t *)(p->data + 6);
-		if (!*tck) {
+		uint16_t orig_udp_ck = get_u16(p->data + 6);
+		if (!orig_udp_ck) {
 			/* UDP packet has no checksum */
 			if (em) {
 				if (gcfg.udp_cksum_mode == UDP_CKSUM_DROP)
@@ -1119,12 +1147,14 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 				return ERROR_DROP;
 			case UDP_CKSUM_FWD:
 				return ERROR_NONE;
-			case UDP_CKSUM_CALC:
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip4_checksum(ip4, p->data_len, p->data_proto));
-				if (*tck == 0)
-					*tck = 0xffff;
+			case UDP_CKSUM_CALC: {
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip4_checksum(ip4, p->data_len, p->data_proto));
+				if (ck == 0)
+					ck = 0xffff;
+				put_u16(p->data + 6, ck);
 				return ERROR_NONE;
+			}
 			}
 		}
 		break;
@@ -1146,20 +1176,17 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 				log_pkt6(LOG_OPT_DROP, p, "Invalid TCP data offset");
 				return ERROR_DROP;
 			}
-			tck = (uint16_t *)(p->data + 16);
 			if (gcfg.vnet_hdr_sz == 0) {
-				*tck = 0;
-				*tck = ones_add(ip_checksum(p->data, p->data_len),
-				                ip4_checksum(ip4, p->data_len, IPPROTO_TCP));
-				if (*tck == 0)
-					*tck = 0xffff;
+				put_u16(p->data + 16, 0);
+				uint16_t ck = ones_add(ip_checksum(p->data, p->data_len),
+				                       ip4_checksum(ip4, p->data_len, IPPROTO_TCP));
+				put_u16(p->data + 16, ck);
 				p->vhdr.flags &= ~VIRTIO_NET_HDR_F_NEEDS_CSUM;
 			} else {
-				*tck = htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, p->data_len));
+				put_u16(p->data + 16, htons(gso_calc_tcp_pseudo4(&ip4->src, &ip4->dest, p->data_len)));
 			}
 			return ERROR_NONE;
 		}
-		tck = (uint16_t *)(p->data + 16);
 		break;
 	/* Other */
 	default:
@@ -1170,9 +1197,11 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 		return ERROR_NONE;
 	}
 	/* Adjust checksum (RFC 1624 incremental update) */
-	*tck = ones_add(*tck, convert_cksum(p->ip6, ip4));
-	if (*tck == 0)
-		*tck = 0xffff;
+	uint32_t csum_off = (p->data_proto == IPPROTO_UDP) ? 6 : 16;
+	uint16_t adj_ck = ones_add(get_u16(p->data + csum_off), convert_cksum(p->ip6, ip4));
+	if (p->data_proto == IPPROTO_UDP && adj_ck == 0)
+		adj_ck = 0xffff;
+	put_u16(p->data + csum_off, adj_ck);
 	return ERROR_NONE;
 }
 
@@ -1255,7 +1284,7 @@ static int parse_ip6(struct pkt *p,int em)
 {
 	uint32_t hdr_len;
 	uint8_t seg_left = 0;
-	uint16_t seg_ptr = sizeof(struct ip6);
+	uint32_t seg_ptr = sizeof(struct ip6);
 
 	p->ip6 = (struct ip6 *)(p->data);
 
@@ -1277,9 +1306,10 @@ static int parse_ip6(struct pkt *p,int em)
 	if (p->data_len > ntohs(p->ip6->payload_length))
 		p->data_len = ntohs(p->ip6->payload_length);
 
+	int ext_count = 0;
 	while (p->data_proto == 0 || p->data_proto == 43 ||
 			p->data_proto == 60) {
-		if (p->data_len < 2) {
+		if (++ext_count > 8 || p->data_len < 2) {
 			if(!em) log_pkt6(LOG_OPT_DROP,p,"Extension Header Invalid Length");
 			return ERROR_DROP;
 		}
@@ -1312,7 +1342,7 @@ static int parse_ip6(struct pkt *p,int em)
 		p->data_len -= sizeof(struct ip6_frag);
 		p->header_len += sizeof(struct ip6_frag);
 
-		if ((p->ip6_frag->offset_flags & htons(IP6_F_MF)) &&
+		if (!em && (p->ip6_frag->offset_flags & htons(IP6_F_MF)) &&
 				(p->data_len & 0x7)) {
 			if(!em) log_pkt6(LOG_OPT_DROP,p,"Fragment Misaligned");
 			return ERROR_DROP;
@@ -1326,7 +1356,7 @@ static int parse_ip6(struct pkt *p,int em)
 	}
 
 	if (p->data_proto == 58) {
-		if (p->ip6_frag && (p->ip6_frag->offset_flags &
+		if (!em && p->ip6_frag && (p->ip6_frag->offset_flags &
 					htons(IP6_F_MASK | IP6_F_MF))) {
 			if(!em) log_pkt6(LOG_OPT_DROP,p,"Fragmented ICMP");
 			return ERROR_DROP;
@@ -1346,8 +1376,10 @@ static int parse_ip6(struct pkt *p,int em)
 	 */
 	if(seg_left) {
 		seg_ptr += 4;
-		if(!em) log_pkt6(LOG_OPT_REJECT,p,"Routing Header with Segments Left");
-		host_send_icmp6_error(4, 0, seg_ptr, p);
+		if(!em) {
+			log_pkt6(LOG_OPT_REJECT,p,"Routing Header with Segments Left");
+			host_send_icmp6_error(4, 0, seg_ptr, p);
+		}
 		return ERROR_DROP;
 	}
 
@@ -1435,7 +1467,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		/* Erroneous Header Field Encountered */
 		if (p->icmp->code == 0) {
 			static const int32_t new_ptr_tbl[] = {0,1,-1,-1,2,2,9,8};
-			int32_t old_ptr = ntohl(p->icmp->word);
+			uint32_t old_ptr = ntohl(p->icmp->word);
 			int32_t new_ptr;
 			if(old_ptr > 39) {
 				log_pkt6(LOG_OPT_DROP,p,"Parameter Problem Invalid Pointer");
@@ -1475,13 +1507,13 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		log_pkt6(LOG_OPT_DROP,p,"Failed to map em src or dest");
 		return;
 	}
+	xlate_header_6to4(&p_em, &header.ip4_em,
+		ntohs(p_em.ip6->payload_length) - p_em.header_len);
+
 	if(xlate_payload_6to4(&p_em, &header.ip4_em,1) < 0) {
 		log_pkt6(LOG_OPT_DROP,p,"Failed to translate em payload");
 		return;
 	}
-
-	xlate_header_6to4(&p_em, &header.ip4_em,
-		ntohs(p_em.ip6->payload_length) - p_em.header_len);
 
 	header.ip4_em.cksum =
 		ip_checksum(&header.ip4_em, sizeof(header.ip4_em));

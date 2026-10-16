@@ -61,6 +61,7 @@ jobs:
           sudo python3 tools/run-steering-integrity.py --binary "$PWD/tayga" --steering kernel --output /tmp/review-results/integrity-pmtud
       - name: Async kernel wire gate when io_uring is available
         run: |
+          sudo mkdir -p /tmp/review-results && sudo chown -R "$USER:$USER" /tmp/review-results
           ./unit_async_tun 2>&1 | tee /tmp/review-results/uring-availability.log
           if grep -q '^SKIP:' /tmp/review-results/uring-availability.log; then
             echo '::notice::Kernel io_uring unavailable; build succeeded, runtime gate skipped'
