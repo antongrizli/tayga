@@ -11,6 +11,9 @@
 #include <string.h>
 #include <limits.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+
 static inline int64_t rtnl_milliseconds(void)
 {
 	struct timespec t;
@@ -91,5 +94,7 @@ static inline int rtnl_request(int fd, const struct nlmsghdr *request)
 	ssize_t len = rtnl_receive(fd, buffer, sizeof(buffer), request->nlmsg_seq, deadline);
 	return len < 0 ? -1 : rtnl_ack(buffer, (size_t)len, request->nlmsg_seq);
 }
+
+#pragma GCC diagnostic pop
 #endif
 #endif
