@@ -880,48 +880,60 @@ int addrmap_reload(void)
 	if (fclose(in)) failed = 1;
 	if (!failed) {
 		pthread_mutex_lock(&gcfg.map_mutex);
-		list_for_each(entry, &staged) {
+		list_for_each_safe(entry, next, &staged) {
 			struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			int conflict = 0;
 			struct list_head *fixed;
 			list_for_each(fixed, &gcfg.map4_list) {
 				struct map4 *f = list_entry(fixed, struct map4, list);
 				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
-					f->addr.s_addr == m->map4.addr.s_addr) failed = 1;
-			}
-			list_for_each(fixed, &gcfg.map6_list) {
-				struct map6 *f = list_entry(fixed, struct map6, list);
-				int file = f->type == MAP_TYPE_STATIC &&
-					container_of(f, struct map_static, map6)->origin == MAP_ORIGIN_MAPFILE;
-				if (!file && map6_overlaps(f, &m->map6)) failed = 1;
-			}
-		}
-		if (!failed) {
-			pthread_mutex_lock(&gcfg.cache_mutex);
-			list_for_each_safe(entry, next, &gcfg.map4_list) {
-				struct map4 *m = list_entry(entry, struct map4, list);
-				if (is_file_map4(m)) {
-					struct map_static *s = container_of(m, struct map_static, map4);
-					list_del(&s->map4.list);
-					list_del(&s->map6.list);
-					free(s);
+					f->addr.s_addr == m->map4.addr.s_addr) {
+					conflict = 1;
+					break;
 				}
 			}
-			list_for_each_safe(entry, next, &staged) {
-				struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			if (!conflict) {
+				list_for_each(fixed, &gcfg.map6_list) {
+					struct map6 *f = list_entry(fixed, struct map6, list);
+					int file = f->type == MAP_TYPE_STATIC &&
+						container_of(f, struct map_static, map6)->origin == MAP_ORIGIN_MAPFILE;
+					if (!file && map6_overlaps(f, &m->map6)) {
+						conflict = 1;
+						break;
+					}
+				}
+			}
+			if (conflict) {
+				slog(LOG_ERR, "MAP-FILE: Entry on line %d conflicts with static conf-file mapping; skipping\n", m->line_no);
 				list_del(entry);
-				insert_map4(&m->map4, NULL);
-				insert_map6(&m->map6, NULL);
+				free(m);
 			}
-			/* Flush active cache atomically under both map_mutex and cache_mutex */
-			list_for_each_safe(entry, next, &gcfg.cache_active) {
-				struct cache_entry *c = list_entry(entry, struct cache_entry, list);
-				if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
-				list_del(&c->hash4);
-				list_del(&c->hash6);
-				list_add(&c->list, &gcfg.cache_pool);
-			}
-			pthread_mutex_unlock(&gcfg.cache_mutex);
 		}
+		pthread_mutex_lock(&gcfg.cache_mutex);
+		list_for_each_safe(entry, next, &gcfg.map4_list) {
+			struct map4 *m = list_entry(entry, struct map4, list);
+			if (is_file_map4(m)) {
+				struct map_static *s = container_of(m, struct map_static, map4);
+				list_del(&s->map4.list);
+				list_del(&s->map6.list);
+				free(s);
+			}
+		}
+		list_for_each_safe(entry, next, &staged) {
+			struct map_static *m = list_entry(entry, struct map_static, map4.list);
+			list_del(entry);
+			insert_map4(&m->map4, NULL);
+			insert_map6(&m->map6, NULL);
+		}
+		/* Flush active cache atomically under both map_mutex and cache_mutex */
+		list_for_each_safe(entry, next, &gcfg.cache_active) {
+			struct cache_entry *c = list_entry(entry, struct cache_entry, list);
+			if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
+			list_del(&c->hash4);
+			list_del(&c->hash6);
+			list_add(&c->list, &gcfg.cache_pool);
+		}
+		pthread_mutex_unlock(&gcfg.cache_mutex);
 		pthread_mutex_unlock(&gcfg.map_mutex);
 	}
 	list_for_each_safe(entry, next, &staged) {
