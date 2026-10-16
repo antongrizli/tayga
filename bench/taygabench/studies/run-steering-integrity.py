@@ -32,7 +32,7 @@ def main():
         study.install(a.binary,daemon);study.install(root/'experimental-startup.sh',start);start.chmod(0o755)
         env=dict(os.environ,TAYGA_STEERING_MODE=a.steering,TEST_SIZE_MB='4')
         for name in ('test_correctness.py','test_pmtud.py'):
-            test_path=Path(__file__).resolve().parents[2]/"test/system"/name
+            test_path=Path(__file__).resolve().parents[3]/"test/system"/name
             (root/name).write_bytes(test_path.read_bytes())
             with (root/(name+'.log')).open('w') as log:
                 child=subprocess.Popen(['python3',str(test_path)],env=env,stdout=log,stderr=subprocess.STDOUT)

@@ -190,9 +190,9 @@ def main():
         if not (a.mapping and a.protocol and a.direction): p.error('--case needs mapping, protocol and direction')
         run_case(a); return
     out = Path(a.output); out.mkdir(parents=True, exist_ok=False)
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     source_hash = hashlib.sha256()
-    for source in sorted(list(root.glob('*.c'))+list(root.glob('*.h'))):
+    for source in sorted(list((root / 'src').glob('*.c')) + list((root / 'src').glob('*.h'))):
         source_hash.update(source.name.encode()+b'\0'+source.read_bytes())
     metadata = dict(binary_sha256=hashlib.sha256(Path(a.binary).read_bytes()).hexdigest(),
                     source_sha256=source_hash.hexdigest(), runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

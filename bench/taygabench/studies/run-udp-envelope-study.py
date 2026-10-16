@@ -57,7 +57,7 @@ def main():
         path=Path(getattr(a,field)).resolve();setattr(a,field,str(path));setattr(a,field+'_hash',hashlib.sha256(path.read_bytes()).hexdigest())
     for field in ('binary','endpoint'):shutil.copy2(getattr(a,field),root/('measured-'+field))
     (root/'settings.json').write_text(json.dumps(vars(a),default=str,indent=2))
-    for path in (Path(__file__),Path(__file__).with_name('run-udp-batch-study.py'),Path(__file__).resolve().parents[2] / 'bench/shims/udp-batch-endpoint.c'):
+    for path in (Path(__file__),Path(__file__).with_name('run-udp-batch-study.py'),Path(__file__).resolve().parents[3] / 'bench/shims/udp-batch-endpoint.c'):
         (root/path.name).write_bytes(path.read_bytes())
     rows=[]
     try:
