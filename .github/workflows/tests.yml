@@ -46,6 +46,8 @@ jobs:
         with:
           name: results-${{ matrix.arch }}
           path: |
+            test/**/*.rpt
             test/*.rpt
+            test/**/*.log
             test/*.log
           if-no-files-found: error

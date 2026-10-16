@@ -6,6 +6,9 @@ OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SOURCES))
 
 CPPFLAGS += -Isrc -I$(GENDIR)
 
+.PHONY: FORCE
+FORCE:
+
 $(GENDIR)/version.h: FORCE | $(GENDIR)
 	@mkdir -p $(GENDIR)
 	@printf '#ifndef __TAYGA_VERSION_H__\n#define __TAYGA_VERSION_H__\n\n#define TAYGA_VERSION "%s"\n#define TAYGA_BRANCH  "%s"\n#define TAYGA_COMMIT  "%s"\n\n#endif /* #ifndef __TAYGA_VERSION_H__ */\n' \
