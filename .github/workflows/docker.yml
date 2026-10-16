@@ -54,7 +54,7 @@ jobs:
             --build-arg TAYGA_VERSION="${{ steps.meta.outputs.clean_ver }}" \
             --build-arg TAYGA_COMMIT="${{ steps.meta.outputs.sha }}" \
             --build-arg TAYGA_BRANCH="${{ steps.meta.outputs.raw_ver }}" \
-            -t tayga-smoke:test --target production .
+            -f container/Containerfile -t tayga-smoke:test --target production .
 
       - name: Test RFC 7050 Helper in container
         run: |
