@@ -128,6 +128,14 @@ int is_private_ip4_addr(const struct in_addr *a)
 	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xcb007100))
 		return ERROR_REJECT;
 
+	/* 192.0.0.0/24 RFC6890 IETF Protocol Assignments */
+	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0000000))
+		return ERROR_REJECT;
+
+	/* 240.0.0.0/4 RFC1112 Reserved (Class E) */
+	if ((a->s_addr & htonl(0xf0000000)) == htonl(0xf0000000))
+		return ERROR_REJECT;
+
 	return ERROR_NONE;
 }
 
@@ -336,21 +344,30 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 int insert_map4(struct map4 *m, struct map4 **conflict)
 {
 	struct list_head *entry;
+	struct list_head *insert_pos = NULL;
 	struct map4 *s;
 
 	list_for_each(entry, &gcfg.map4_list) {
 		s = list_entry(entry, struct map4, list);
-		if (s->prefix_len < m->prefix_len)
-			break;
-		if (s->prefix_len == m->prefix_len &&
-				s->addr.s_addr == m->addr.s_addr) {
-			if (conflict)
-				*conflict = s;
-			return -1;
+		if (s->prefix_len < m->prefix_len) {
+			if (s->type != MAP_TYPE_RFC6052 &&
+			    (m->addr.s_addr & s->mask.s_addr) == s->addr.s_addr)
+				goto conflict;
+			if (!insert_pos)
+				insert_pos = entry;
+		} else {
+			if (m->type != MAP_TYPE_RFC6052 &&
+			    (s->addr.s_addr & m->mask.s_addr) == m->addr.s_addr)
+				goto conflict;
 		}
 	}
-	list_add_tail(&m->list, entry);
+	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map4_list);
 	return 0;
+
+conflict:
+	if (conflict)
+		*conflict = s;
+	return -1;
 }
 /**
  * @brief Insert an IPv6 entry into the map
@@ -957,18 +974,31 @@ int addrmap_reload(void)
 			}
 		}
 		if (!failed) {
+			pthread_mutex_lock(&gcfg.cache_mutex);
 			list_for_each_safe(entry, next, &gcfg.map4_list) {
 				struct map4 *m = list_entry(entry, struct map4, list);
-				if (is_file_map4(m)) addrmap_delete4(m);
+				if (is_file_map4(m)) {
+					struct map_static *s = container_of(m, struct map_static, map4);
+					list_del(&s->map4.list);
+					list_del(&s->map6.list);
+					free(s);
+				}
 			}
 			list_for_each_safe(entry, next, &staged) {
 				struct map_static *m = list_entry(entry, struct map_static, map4.list);
 				list_del(entry);
 				insert_map4(&m->map4, NULL);
 				insert_map6(&m->map6, NULL);
-				cache_evict_map4(&m->map4);
-				cache_evict_map6(&m->map6);
 			}
+			/* Flush active cache atomically under both map_mutex and cache_mutex */
+			list_for_each_safe(entry, next, &gcfg.cache_active) {
+				struct cache_entry *c = list_entry(entry, struct cache_entry, list);
+				if (c->flags & CACHE_F_REP_AGEOUT) report_ageout(c);
+				list_del(&c->hash4);
+				list_del(&c->hash6);
+				list_add(&c->list, &gcfg.cache_pool);
+			}
+			pthread_mutex_unlock(&gcfg.cache_mutex);
 		}
 		pthread_mutex_unlock(&gcfg.map_mutex);
 	}

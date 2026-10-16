@@ -199,7 +199,9 @@ static int gso_validate_ipv4_header(const struct pkt *p, uint8_t proto, uint32_t
 	    (ntohs(ip4->flags_offset) & (IP4_F_MASK | IP4_F_MF)))
 		return -1;
 	uint32_t ihl = (ip4->ver_ihl & 0x0f) * 4;
-	if (ihl < sizeof(struct ip4) || ihl > p->data_len || ip_checksum((void *)ip4, ihl) != 0)
+	if (ihl < sizeof(struct ip4) || ihl > p->data_len || ip_checksum((void *)ip4, ihl) != 0 ||
+	    validate_ip4_addr(&ip4->src) == ERROR_DROP ||
+	    validate_ip4_addr(&ip4->dest) == ERROR_DROP)
 		return -1;
 	for (uint32_t off = sizeof(struct ip4); off < ihl;) {
 		uint8_t kind = p->data[off];
@@ -280,7 +282,8 @@ int gso_translate_tcp_6to4(struct pkt *p)
 
 	struct ip6 *ip6 = (struct ip6 *)p->data;
 	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_TCP ||
-	    ntohs(ip6->payload_length) != p->data_len - sizeof(struct ip6))
+	    ntohs(ip6->payload_length) != p->data_len - sizeof(struct ip6) ||
+	    validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest))
 		return -1;
 
 	struct tcp_hdr *tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip6));
@@ -294,6 +297,18 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	uint32_t gso_size = p->vhdr.gso_size;
 	if (gso_size == 0)
 		return -1;
+
+	uint32_t max_seg_wire6 = sizeof(struct ip6) + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely(gcfg.mtu > 0 && max_seg_wire6 > gcfg.mtu)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_TCP;
+		log_pkt6(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp6_error(2, 0, gcfg.mtu, p);
+		return 0;
+	}
 
 	/* RFC 7915 §5.1: If Hop Limit <= 1, discard and send ICMPv6 Time Exceeded */
 	if (unlikely(ip6->hop_limit <= 1)) {
@@ -485,6 +500,19 @@ int gso_translate_tcp_4to6(struct pkt *p)
 		return -1;
 
 	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
+	uint32_t gso_size = p->vhdr.gso_size;
+	uint32_t max_seg_wire4 = sizeof(struct ip4) + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
+	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_TCP;
+		log_pkt4(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
+		return 0;
+	}
 
 	/* RFC 7915 §4.1: If TTL <= 1, discard and send ICMPv4 Time Exceeded */
 	if (unlikely(ip4->ttl <= 1)) {
@@ -692,7 +720,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
 
-	uint8_t seg_buf[HEADROOM + 2048];
+	uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];
 	uint8_t *seg_ip = seg_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
@@ -990,6 +1018,7 @@ int gso_translate_udp_6to4(struct pkt *p)
 	uint32_t udp_len = p->data_len - sizeof(struct ip6);
 	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_UDP ||
 	    ntohs(ip6->payload_length) != udp_len || udp_len < sizeof(struct udp_hdr) ||
+	    validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest) ||
 	    gso_validate_transport_vnet(p, sizeof(struct ip6), sizeof(struct udp_hdr), 6) < 0)
 		return -1;
 	struct udp_hdr *udp = (struct udp_hdr *)(p->data + sizeof(struct ip6));

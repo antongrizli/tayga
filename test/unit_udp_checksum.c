@@ -517,6 +517,105 @@ static void test_icmp_embedded_truncated(void)
 	printf("PASS: ICMP embedded truncated UDP header handling\n");
 }
 
+static void test_icmp6_param_problem_negative_ptr(void)
+{
+	printf("Testing ICMPv6 Parameter Problem negative pointer bounds ([SEC-01])...\n");
+	INIT_LIST_HEAD(&gcfg.map4_list);
+	INIT_LIST_HEAD(&gcfg.map6_list);
+	pthread_mutex_init(&gcfg.map_mutex, NULL);
+	pthread_mutex_init(&gcfg.cache_mutex, NULL);
+	uint8_t buf[HEADROOM + 256];
+	memset(buf, 0, sizeof(buf));
+	uint8_t *pkt_start = buf + HEADROOM;
+
+	/* Outer IPv6 header */
+	struct ip6 *ip6 = (struct ip6 *)pkt_start;
+	ip6->ver_tc_fl = htonl(0x60000000);
+	ip6->payload_length = htons(sizeof(struct icmp) + sizeof(struct ip6) + 8);
+	ip6->next_header = 58; /* ICMPv6 */
+	ip6->hop_limit = 64;
+	inet_pton(AF_INET6, "64:ff9b::808:808", &ip6->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->dest);
+
+	/* Outer ICMPv6 Parameter Problem (Type 4, Code 0) with pointer = 0x80000000 */
+	struct icmp *icmp6 = (struct icmp *)(ip6 + 1);
+	icmp6->type = 4;
+	icmp6->code = 0;
+	icmp6->word = htonl(0x80000000U); /* Negative when cast to int32_t */
+
+	/* Inner offending IPv6 header + 8B UDP */
+	struct ip6 *ip6_em = (struct ip6 *)(icmp6 + 1);
+	ip6_em->ver_tc_fl = htonl(0x60000000);
+	ip6_em->payload_length = htons(8);
+	ip6_em->next_header = IPPROTO_UDP;
+	ip6_em->hop_limit = 64;
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6_em->src);
+	inet_pton(AF_INET6, "64:ff9b::808:808", &ip6_em->dest);
+
+	icmp6->cksum = 0;
+	icmp6->cksum = ones_add(ip_checksum(icmp6, ntohs(ip6->payload_length)),
+	                        ip6_checksum(ip6, ntohs(ip6->payload_length), 58));
+
+	struct pkt p = {
+		.tun_fd = -1,
+		.data = pkt_start,
+		.data_len = sizeof(struct ip6) + ntohs(ip6->payload_length),
+	};
+
+	/* Must drop cleanly without crashing on out-of-bounds new_ptr_tbl[old_ptr] */
+	handle_ip6(&p);
+	printf("PASS: ICMPv6 Parameter Problem negative pointer safely dropped\n");
+}
+
+static void test_icmp6_error_truncated_fragment_quote(void)
+{
+	printf("Testing ICMPv6 error with truncated inner fragment ([RFC-02])...\n");
+	/* Construct an ICMPv6 Time Exceeded (Type 3, Code 0) containing an inner IPv6
+	 * header + Fragment Header (MF=1, offset=0) + 12 bytes of truncated payload
+	 * (12 is not divisible by 8). Verify parse_ip6(&p_em, 1) accepts it. */
+	uint8_t buf[HEADROOM + 256];
+	memset(buf, 0, sizeof(buf));
+	uint8_t *pkt_start = buf + HEADROOM;
+
+	struct ip6 *ip6 = (struct ip6 *)pkt_start;
+	ip6->ver_tc_fl = htonl(0x60000000);
+	ip6->payload_length = htons(sizeof(struct icmp) + sizeof(struct ip6) + sizeof(struct ip6_frag) + 12);
+	ip6->next_header = 58;
+	ip6->hop_limit = 64;
+	inet_pton(AF_INET6, "64:ff9b::808:808", &ip6->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->dest);
+
+	struct icmp *icmp6 = (struct icmp *)(ip6 + 1);
+	icmp6->type = 3; /* Time Exceeded */
+	icmp6->code = 0;
+	icmp6->word = 0;
+
+	struct ip6 *ip6_em = (struct ip6 *)(icmp6 + 1);
+	ip6_em->ver_tc_fl = htonl(0x60000000);
+	ip6_em->payload_length = htons(1408); /* Original un-truncated length */
+	ip6_em->next_header = 44; /* Fragment Header */
+	ip6_em->hop_limit = 1;
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6_em->src);
+	inet_pton(AF_INET6, "64:ff9b::808:808", &ip6_em->dest);
+
+	struct ip6_frag *frag_em = (struct ip6_frag *)(ip6_em + 1);
+	frag_em->next_header = IPPROTO_UDP;
+	frag_em->offset_flags = htons(IP6_F_MF); /* MF=1, offset=0 */
+	frag_em->ident = htonl(0x12345678);
+
+	icmp6->cksum = 0;
+	icmp6->cksum = ones_add(ip_checksum(icmp6, ntohs(ip6->payload_length)),
+	                        ip6_checksum(ip6, ntohs(ip6->payload_length), 58));
+
+	struct pkt p = {
+		.tun_fd = -1,
+		.data = pkt_start,
+		.data_len = sizeof(struct ip6) + ntohs(ip6->payload_length),
+	};
+	handle_ip6(&p);
+	printf("PASS: ICMPv6 error with truncated inner fragment handled\n");
+}
+
 int main(void)
 {
 	printf("=== Running unit_udp_checksum test suite ===\n");
@@ -526,6 +625,8 @@ int main(void)
 	test_partial_checksum_offload();
 	test_absent_checksum_policy();
 	test_icmp_embedded_truncated();
+	test_icmp6_param_problem_negative_ptr();
+	test_icmp6_error_truncated_fragment_quote();
 	printf("=== All unit_udp_checksum tests passed successfully! ===\n");
 	return 0;
 }

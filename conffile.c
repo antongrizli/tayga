@@ -182,11 +182,13 @@ static int config_prefix(int ln, int arg_count, char **args)
 			calc_ip6_mask(&m6->mask, &m6->addr, m6->prefix_len)) {
 		slog(LOG_CRIT, "Expected an IPv6 prefix but found \"%s\" on "
 				"line %d\n", args[0], ln);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (validate_ip6_addr(&m6->addr) < 0) {
 		slog(LOG_CRIT, "Cannot use reserved address %s in prefix "
 				"directive, aborting...\n", args[0]);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (m6->prefix_len != 32 && m6->prefix_len != 40 &&
@@ -194,15 +196,26 @@ static int config_prefix(int ln, int arg_count, char **args)
 			m6->prefix_len != 64 && m6->prefix_len != 96) {
 		slog(LOG_CRIT, "NAT prefix length must be 32, 40, 48, 56, 64 "
 				"or 96 only, aborting...\n");
+		free(m);
+		return ERROR_REJECT;
+	}
+	if (m6->addr.s6_addr32[0] == WKPF &&
+	    m6->addr.s6_addr32[1] == 0 &&
+	    m6->addr.s6_addr32[2] == 0 &&
+	    m6->prefix_len != 96) {
+		slog(LOG_CRIT, "Well-Known Prefix 64:ff9b::/96 can only be used with a /96 prefix length (use 64:ff9b:1::/48 per RFC 8215 for shorter local-use prefixes), aborting...\n");
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (insert_map4(&m->map4, NULL) < 0) {
 		slog(LOG_CRIT, "Error: duplicate prefix directive on line %d\n",
 				ln);
+		free(m);
 		return ERROR_REJECT;
 	}
 	if (insert_map6(&m->map6, &m6) < 0) {
 		abort_on_conflict6("Error: NAT64 prefix", ln, m6);
+		free(m);
 		return ERROR_REJECT;
 	}
 	return ERROR_NONE;
@@ -435,42 +448,46 @@ static int config_map(int ln, int arg_count, char **args)
 	m = alloc_map_static(ln);
 	if(!m) return ERROR_REJECT;
 
-	char *slash;
-	slash = strchr(args[0], '/');
-	unsigned int prefix4 = 32;
-	if (slash) {
-		prefix4 = atoi(slash+1);
-		slash[0] = '\0';
-	}
-
-	if (!inet_pton(AF_INET, args[0], &m->map4.addr)) {
+	if (strchr(args[0], '/')) {
+		if (parse_prefix(AF_INET, args[0], &m->map4.addr, &m->map4.prefix_len) ||
+		    calc_ip4_mask(&m->map4.mask, &m->map4.addr, m->map4.prefix_len)) {
+			slog(LOG_CRIT, "Expected a valid IPv4 subnet with zero host bits but found \"%s\" on line %d\n", args[0], ln);
+			free(m);
+			return ERROR_REJECT;
+		}
+	} else if (!inet_pton(AF_INET, args[0], &m->map4.addr)) {
 		slog(LOG_CRIT, "Expected an IPv4 subnet but found \"%s\" on "
 		     "line %d\n", args[0], ln);
+		free(m);
 		return ERROR_REJECT;
-	}
-	m->map4.prefix_len = prefix4;
-	calc_ip4_mask(&m->map4.mask, NULL, prefix4);
-
-	unsigned int prefix6 = 128;
-	slash = strchr(args[1], '/');
-	if (slash) {
-		prefix6 = atoi(slash+1);
-		slash[0] = '\0';
+	} else {
+		m->map4.prefix_len = 32;
+		calc_ip4_mask(&m->map4.mask, &m->map4.addr, 32);
 	}
 
-	if ((32 - prefix4) != (128 - prefix6)) {
-		slog(LOG_CRIT, "IPv4 and IPv6 subnet must be of the same size, but found"
-				" %s and %s on line %d\n", args[0], args[1], ln);
-		return ERROR_REJECT;
-	}
-
-	if (!inet_pton(AF_INET6, args[1], &m->map6.addr)) {
+	if (strchr(args[1], '/')) {
+		if (parse_prefix(AF_INET6, args[1], &m->map6.addr, &m->map6.prefix_len) ||
+		    calc_ip6_mask(&m->map6.mask, &m->map6.addr, m->map6.prefix_len)) {
+			slog(LOG_CRIT, "Expected a valid IPv6 subnet with zero host bits but found \"%s\" on line %d\n", args[1], ln);
+			free(m);
+			return ERROR_REJECT;
+		}
+	} else if (!inet_pton(AF_INET6, args[1], &m->map6.addr)) {
 		slog(LOG_CRIT, "Expected an IPv6 subnet but found \"%s\" on "
 				"line %d\n", args[1], ln);
+		free(m);
+		return ERROR_REJECT;
+	} else {
+		m->map6.prefix_len = 128;
+		calc_ip6_mask(&m->map6.mask, &m->map6.addr, 128);
+	}
+
+	if ((32 - m->map4.prefix_len) != (128 - m->map6.prefix_len)) {
+		slog(LOG_CRIT, "IPv4 and IPv6 subnet must be of the same size, but found"
+				" %s and %s on line %d\n", args[0], args[1], ln);
+		free(m);
 		return ERROR_REJECT;
 	}
-	m->map6.prefix_len = prefix6;
-	calc_ip6_mask(&m->map6.mask, NULL, prefix6);
     int ret = validate_ip4_addr(&m->map4.addr);
 	if (ret == ERROR_LOCAL) {
 		slog(LOG_WARNING, "Using link-local address %s in map "
