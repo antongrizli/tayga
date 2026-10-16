@@ -128,8 +128,9 @@ int is_private_ip4_addr(const struct in_addr *a)
 	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xcb007100))
 		return ERROR_REJECT;
 
-	/* 192.0.0.0/24 RFC6890 IETF Protocol Assignments */
-	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0000000))
+	/* 192.0.0.0/24 RFC6890 IETF Protocol Assignments (excluding 192.0.0.0/29 DS-Lite/CLAT per RFC 6877/6890) */
+	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0000000) &&
+	    (a->s_addr & htonl(0xfffffff8)) != htonl(0xc0000000))
 		return ERROR_REJECT;
 
 	/* 240.0.0.0/4 RFC1112 Reserved (Class E) */
