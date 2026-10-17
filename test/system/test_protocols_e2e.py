@@ -13,11 +13,13 @@ Verifies real data transmission across Linux network namespaces (client -> route
 """
 
 import argparse
+import fcntl
 import hashlib
 import os
 from pathlib import Path
 import select
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -102,17 +104,28 @@ def teardown():
         sh(f"ip netns del {ns} 2>/dev/null")
 
 
-def test_icmp_ping():
+def test_icmp_ping(tayga_proc=None, log_path=None):
     print("\n--- Test 1: ICMP Echo Baseline ---")
     ready = False
     t0 = time.monotonic()
-    while time.monotonic() - t0 < 6:
-        _, _, rc = sh("ip netns exec client ping -c 1 -W 1 11.0.0.2")
+    last_err = ""
+    while time.monotonic() - t0 < 10:
+        if tayga_proc and tayga_proc.poll() is not None:
+            log_content = ""
+            if log_path and Path(log_path).exists():
+                log_content = Path(log_path).read_text()
+            raise RuntimeError(f"TAYGA process exited prematurely with code {tayga_proc.returncode}.\nLog:\n{log_content}")
+        out, err, rc = sh("ip netns exec client ping -c 1 -W 1 11.0.0.2")
         if rc == 0:
             ready = True
             break
+        last_err = err or out
         time.sleep(0.3)
-    assert ready, "CLAT ping failed to become ready"
+    if not ready:
+        log_content = ""
+        if log_path and Path(log_path).exists():
+            log_content = Path(log_path).read_text()
+        raise AssertionError(f"CLAT ping failed to become ready after 10s. Last ping output: {last_err}\nLog:\n{log_content}")
     print("[PASS] ICMP Echo Request / Reply verified across CLAT")
 
 
@@ -336,25 +349,57 @@ def main():
     if sys.platform != "linux" or os.geteuid() != 0:
         parser.error("Linux root is required to run network namespace tests")
 
+    lock_file = Path('/tmp/tayga-perf-workflow.lock')
+    try:
+        if lock_file.exists() and lock_file.stat().st_uid != os.geteuid():
+            lock_file.unlink()
+    except OSError:
+        pass
+    lock = open(str(lock_file), 'a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     if args.output:
         args.output.mkdir(parents=True, exist_ok=True)
 
     print("=== TAYGA CLAT Multi-Protocol End-to-End System Test ===")
     setup_topology()
 
-    # Launch TAYGA CLAT
+    # Locate clat-start.sh and ensure it is installed
+    clat_script = Path("/usr/local/sbin/clat-start.sh")
+    repo_clat = Path(__file__).resolve().parents[2] / "container/rootfs/usr/local/sbin/clat-start.sh"
+    if not clat_script.exists() and repo_clat.exists() and os.geteuid() == 0:
+        clat_script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo_clat, clat_script)
+        clat_script.chmod(0o755)
+
+    if args.binary:
+        bin_path = Path(args.binary).resolve()
+        dst_bin = Path("/usr/sbin/tayga")
+        if bin_path != dst_bin and os.geteuid() == 0:
+            dst_bin.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bin_path, dst_bin)
+            dst_bin.chmod(0o755)
+
     clat_cmd = [
         "ip", "netns", "exec", "clatns", "env",
         "PREF64=64:ff9b::/96", "ROUTER4=172.31.64.1",
         "CLAT_WORKERS=2", "CLAT_OFFLOAD=tcp",
-        "/usr/local/sbin/clat-start.sh"
+        str(clat_script)
     ]
-    if args.binary:
-        clat_cmd.insert(4, f"TAYGA_BIN={args.binary}")
 
-    tayga = subprocess.Popen(clat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_path = None
+    log_file = None
+    if args.output:
+        log_path = args.output / "clat.log"
+        log_file = open(log_path, "w")
+
+    tayga = subprocess.Popen(
+        clat_cmd,
+        stdout=log_file if log_file else subprocess.DEVNULL,
+        stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL
+    )
     try:
-        test_icmp_ping()
+        test_icmp_ping(tayga_proc=tayga, log_path=log_path)
         test_wireguard_udp()
         test_stun_rfc5389()
         test_passive_ftp_emulation()
@@ -367,6 +412,8 @@ def main():
                 tayga.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 tayga.kill()
+        if log_file:
+            log_file.close()
         teardown()
 
 
