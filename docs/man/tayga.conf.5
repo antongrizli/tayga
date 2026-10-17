@@ -41,6 +41,16 @@ packets.
 All worker queues use the same negotiated capabilities and verified
 virtual header framing.
 Startup fails if a safe state cannot be established.
+.TP
+\f[B]tun\-steering\f[R] \f[I]kernel|groups|flows\f[R]
+Defaults to \f[B]kernel\f[R].
+On Linux with multiqueue TUN devices, configures packet queue steering.
+\f[B]kernel\f[R] relies on default Linux kernel steering;
+\f[B]groups\f[R] enables opt\-in eBPF 2\-tuple L3 address\-group
+steering; \f[B]flows\f[R] enables opt\-in eBPF 4\-tuple flow steering
+for unfragmented TCP and UDP traffic, distributing parallel client flows
+evenly across all worker queues in NAT44 and single\-IP CLAT
+environments while preserving 2\-tuple steering for fragmented packets.
 \f[B]tcp\f[R] requires checksum and TCP segmentation.
 \f[B]udp\f[R] requires checksum, TCP and UDP segmentation.
 Explicit modes fail when unavailable; \f[B]off\f[R] disables offload.
@@ -111,7 +121,7 @@ Enabled by default
 .RE
 .TP
 \f[B]map\f[R] \f[I]ipv4_address[/length] ipv6_address[/length]\f[R]
-Creates a static mapping between RFC 7577 compliant hosts or subnets
+Creates a static mapping between RFC 7757 compliant hosts or subnets
 \f[I]ipv4_address[/length]\f[R] and \f[I]ipv6_address[/length]\f[R] to
 be used when translating IPv4 packets to IPv6 or IPv6 packets to IPv4.
 If \f[I]/length\f[R] is not present, the \f[I]/length\f[R] after
@@ -119,6 +129,21 @@ If \f[I]/length\f[R] is not present, the \f[I]/length\f[R] after
 \f[I]ipv6_address\f[R] as \[lq]/128\[rq].
 Multiple \f[B]map\f[R] directives are permitted in the tayga.conf file.
 .RS
+.PP
+The IPv6 prefix must leave enough bits for the IPv4 suffix.
+Suffix bits follow the IPv6 prefix immediately; remaining IPv6 bits are
+zero on IPv4\-to\-IPv6 translation and discarded in the reverse
+direction.
+Existing equal\-width mappings retain their representation.
+For example, \f[CR]map 198.51.100.0/24 2001:db8:aaaa::/48\f[R] maps
+\f[CR]198.51.100.90\f[R] to \f[CR]2001:db8:aaaa:5a00::\f[R].
+Prefixes must have zero host bits.
+.PP
+IPv4 mappings use longest\-prefix matching.
+A narrower IPv4 mapping may override a broader one, but that can make
+reverse translations asymmetric; choose such overrides deliberately.
+Identical IPv4 prefixes and overlapping IPv6 prefixes are rejected in
+fixed configuration.
 .PP
 \f[I]ipv4_address\f[R] is permitted to overlap with the prefix specified
 in the \f[B]dynamic\-pool\f[R] directive, in which case
