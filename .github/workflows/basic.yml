@@ -34,7 +34,7 @@ jobs:
           - arch: arm64
             os: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ver || github.ref }}
       - name: run build gcc
@@ -68,7 +68,7 @@ jobs:
         arch:
           - amd64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ver || github.ref }}
       - name: test on FreeBSD 15
@@ -101,7 +101,7 @@ jobs:
             platform: linux/amd64
             desc: "x86_64"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ver || github.ref }}
       - name: Set up QEMU
