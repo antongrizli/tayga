@@ -76,3 +76,9 @@ system-test: tayga fault-shims
 -include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d)
 
 .SECONDARY: $(TEST_OBJS) $(addprefix $(TESTOBJDIR)/,$(addsuffix .o,$(UNIT_TESTS)))
+
+# On-demand fixture for the independent TCP checksum-completion wire gate.
+$(TESTOBJDIR)/tcp_split_tail.o: test/system/tcp_split_tail.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -MMD -MP -c -o $@ $<
+$(TESTBINDIR)/tcp_split_tail: $(TESTOBJDIR)/tcp_split_tail.o $(TEST_LIB) | $(TESTBINDIR)
+	$(CC) -o $@ $^ $(TEST_LDFLAGS) $(LDLIBS)

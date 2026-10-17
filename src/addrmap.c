@@ -544,6 +544,9 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 			if (off + bits > 32)
 				addr6->s6_addr32[word + 1] |= htonl((uint32_t)shifted);
 		}
+		/* Host outputs were validated at admission. insert_map6 rejects
+		 * overlapping IPv6 ranges, including /32-to-shorter-v6 EAMs;
+		 * config/reload also exclude self mappings. Keep those invariants. */
 		if (unlikely(bits > 0)) {
 			if (validate_ip6_addr(addr6) < 0 || IN6_ARE_ADDR_EQUAL(&gcfg.local_addr6, addr6)) {
 				if (!gcfg.maps_immutable)
@@ -720,6 +723,9 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 			suffix = (uint32_t)((raw >> (64 - off - bits)) & (UINT64_MAX >> (64 - bits)));
 		}
 		addr4->s_addr = s->map4.addr.s_addr | htonl(suffix);
+		/* Host outputs were validated at admission. insert_map6 rejects
+		 * overlapping IPv6 ranges, including /32-to-shorter-v6 EAMs;
+		 * config/reload also exclude self mappings. Keep those invariants. */
 		if (unlikely(bits > 0)) {
 			if (validate_ip4_addr(addr4) < 0 || gcfg.local_addr4.s_addr == addr4->s_addr) {
 				if (!gcfg.maps_immutable)

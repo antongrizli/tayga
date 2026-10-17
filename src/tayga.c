@@ -72,7 +72,7 @@ void usage(int code) {
 			"--rmtun            : Remove the persistent TUN interface\n"
 			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
-			"--tun-steering MODE: kernel (default) or experimental groups (fresh disposable Linux TUN only)\n"
+			"--tun-steering MODE: kernel (default), groups or flows (eBPF requires a fresh disposable Linux TUN)\n"
 			"--dispatch MODE   : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
 			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
 			"--runtime-dir DIR : Runtime files directory (default /run; TAYGA_RUNTIME_DIR)\n"

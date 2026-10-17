@@ -29,10 +29,20 @@ executable and `TAYGA_TEST_OUT` for reports, packet captures and configuration.
 Defaults come from the selected Make build directory. Individual system suites
 own disposable namespaces and reserve `/tmp/tayga-perf-workflow.lock`. The
 `system-test` target runs the self-contained negotiation, persistence, rollback,
-burst, NAPI, UDP wire and lifecycle gates. Historical installed-environment tests
+burst, NAPI, UDP/TCP wire, recovery-port allocation, direct groups/flows BPF and
+lifecycle gates. Historical installed-environment tests
 such as preflight/PMTUD require the prepared benchmark environment separately.
 
 `python3 scripts/ci/check-build.py` checks clean helper/default builds, incremental
 header tracking and static/dynamic/compiler transitions in a temporary build tree.
 `make check-docs` checks local Markdown links. Man verification is described in
 [release.md](release.md). FreeBSD, ARMv7 and RouterOS validation need their own hosts.
+
+Direct eBPF checks support `--steering groups` and `--steering flows` on
+`test/system/test_tun_steering.py`. They require a capable Linux root environment
+and fail visibly if the program cannot load. Userspace `--dispatch=flows` is a
+separate backend. `test_tcp_split_tail_kernel.py` builds a source-linked fixture
+and verifies checksum completion after kernel segmentation on disposable veth
+links. Payload integrity/PMTUD can additionally exercise unmodified production
+startup with `run-steering-integrity.py --production-startup --steering flows` in
+the prepared benchmark VM; that runner restores the installed files afterwards.

@@ -13,10 +13,10 @@ summary = importlib.import_module("taygabench.summarize.summarize_tun_steering_s
 class StudyTest(unittest.TestCase):
  def test_startup_preserves_daemon_pid_and_waits_for_negotiation(self):
   script=study.startup((ROOT/'container/rootfs/usr/local/sbin/clat-start.sh').read_text())
-  self.assertNotIn('--mktun',script)
-  self.assertIn('parent=$$',script)
-  self.assertIn('TUN offload negotiated:',script)
-  self.assertIn('exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d --tun-steering=groups',script)
+  self.assertIn('TAYGA_STEERING="${TAYGA_STEERING_MODE:-kernel}"',script)
+  self.assertIn('tun-up on',script)
+  self.assertEqual(script.count('--mktun'),1)
+  self.assertEqual(script.count('exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d'),1)
   self.assertEqual(subprocess.run(['sh','-n'],input=script,text=True,capture_output=True).returncode,0)
  def test_unknown_startup_rejected(self):
   with self.assertRaises(ValueError):study.startup('exit 0\n')

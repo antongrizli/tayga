@@ -209,8 +209,8 @@ fi
 
 # Set up TUN adapter and routes
 echo "==> Setting up TUN device $TUN and routing table..."
-/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun || [ "$TAYGA_STEERING_VAL" = "groups" ] || [ "$TAYGA_STEERING_VAL" = "flows" ]
 if [ "$TAYGA_STEERING_VAL" != "groups" ] && [ "$TAYGA_STEERING_VAL" != "flows" ]; then
+  /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun
   ip link set "$TUN" up
   ip addr replace "$V4_HOST/32" dev "$TUN"
   ip -6 addr replace "$V6_HOST/128" dev "$TUN"

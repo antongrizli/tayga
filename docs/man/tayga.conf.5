@@ -41,16 +41,6 @@ packets.
 All worker queues use the same negotiated capabilities and verified
 virtual header framing.
 Startup fails if a safe state cannot be established.
-.TP
-\f[B]tun\-steering\f[R] \f[I]kernel|groups|flows\f[R]
-Defaults to \f[B]kernel\f[R].
-On Linux with multiqueue TUN devices, configures packet queue steering.
-\f[B]kernel\f[R] relies on default Linux kernel steering;
-\f[B]groups\f[R] enables opt\-in eBPF 2\-tuple L3 address\-group
-steering; \f[B]flows\f[R] enables opt\-in eBPF 4\-tuple flow steering
-for unfragmented TCP and UDP traffic, distributing parallel client flows
-evenly across all worker queues in NAT44 and single\-IP CLAT
-environments while preserving 2\-tuple steering for fragmented packets.
 \f[B]tcp\f[R] requires checksum and TCP segmentation.
 \f[B]udp\f[R] requires checksum, TCP and UDP segmentation.
 Explicit modes fail when unavailable; \f[B]off\f[R] disables offload.
@@ -62,6 +52,25 @@ previous UP state.
 A namespace/device ownership lock prevents concurrent TAYGA processes;
 other software must not share the device.
 On FreeBSD, \f[B]auto\f[R] uses the ordinary TUN path.
+.TP
+\f[B]tun\-steering\f[R] \f[I]kernel|groups|flows\f[R]
+Defaults to \f[B]kernel\f[R].
+On Linux with multiqueue TUN devices, configures packet queue steering.
+\f[B]kernel\f[R] relies on default Linux kernel steering;
+\f[B]groups\f[R] enables opt\-in eBPF 2\-tuple L3 address\-group
+steering; \f[B]flows\f[R] enables opt\-in eBPF 4\-tuple flow steering
+for unfragmented TCP and UDP traffic, retaining 2\-tuple steering for
+fragments and IPv6 extension headers.
+Each of 65,536 hash buckets retains its first assigned queue for the
+disposable device lifetime, including across SIGHUP.
+Hash collisions co\-locate traffic, including collisions between address
+families; there is no eviction or packet\-size promotion.
+Per\-family admission counters distribute new buckets, but flow counts
+and byte shares need not be equal.
+This avoids queue migration; it cannot guarantee end\-to\-end packet
+order or throughput.
+Experimental eBPF modes require a fresh disposable TUN; kernel
+capability failure is reported with the effective fallback policy.
 .TP
 \f[B]ipv4\-addr\f[R] \f[I]ipv4_address\f[R]
 IPv4 address that \f[B]tayga\f[R] will use as the source address for

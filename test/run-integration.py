@@ -18,7 +18,7 @@ def main():
     ip = os.environ.get('IP', 'ip')
     subprocess.run([ip, 'netns', 'add', namespace], check=True)
     try:
-        names = ['mapfile', 'addressing', 'mapping', 'translate', 'segment']
+        names = ['mapfile', 'addressing', 'mapping', 'translate', 'segment', 'protocols']
         if args.big_endian:
             names.append('bigendian')
         for name in names:

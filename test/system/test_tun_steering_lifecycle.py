@@ -14,10 +14,11 @@ import json
 def main():
     binary=Path(sys.argv[1]).resolve()
     flags=sys.argv[2:] or ["--tun-steering=groups"]
-    groups=flags==["--tun-steering=groups"]
     selected=dict(flag[2:].split("=",1) for flag in flags)
-    readiness="requested=groups effective=groups" if groups else "Packet I/O: dispatch="+selected.get("dispatch","kernel")+" transmit="+selected.get("packet-io","sync")
-    lock=open('/tmp/tayga-perf-workflow.lock','r')
+    steering=selected.get("tun-steering","kernel")
+    experimental=steering in ("groups","flows")
+    readiness=f"requested={steering} effective={steering}" if experimental else "Packet I/O: dispatch="+selected.get("dispatch","kernel")+" transmit="+selected.get("packet-io","sync")
+    lock=open('/tmp/tayga-perf-workflow.lock','a')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     ns='tayga-lifecycle-'+str(os.getpid())
     def run(*args,**kwargs):
@@ -48,6 +49,10 @@ def main():
                             for _ in range(100):
                                 data=json.loads(path.read_text()) if path.exists() else {}
                                 if data.get('pid')==child.pid and data.get('snapshot_sequence',0)>previous and data.get('workers_synced'):
+                                    assert data['steering_requested']==steering and data['steering_effective']==steering,data
+                                    assert data['dispatch_mode']==selected.get('dispatch','kernel'),data
+                                    assert data['packet_io']==selected.get('packet-io','sync'),data
+                                    assert len([w for w in data['workers'] if w['slot']>0])==3,data
                                     return [w['rx_packets_v4'] for w in data['workers'] if w['slot']>0]
                                 time.sleep(.05)
                             raise AssertionError('no synchronized worker snapshot')
@@ -69,7 +74,7 @@ def main():
                         if child.poll() is None:child.kill();child.wait()
                 assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
             assert run(str(binary),'-c',str(conf),'--mktun',stdout=subprocess.DEVNULL).returncode==0
-            fresh_required = groups or selected.get('dispatch') == 'flows'
+            fresh_required = experimental or selected.get('dispatch') == 'flows'
             if fresh_required:
                 rejected=run(str(binary),'-c',str(conf),'-d',*flags,capture_output=True,text=True,timeout=5)
                 assert rejected.returncode!=0 and 'fresh disposable' in rejected.stdout+rejected.stderr
@@ -83,7 +88,7 @@ def main():
                     if accepted.poll() is None: accepted.kill(); accepted.wait()
             assert run('ip','link','show','tgdaemon',stdout=subprocess.DEVNULL).returncode==0
             run(str(binary),'-c',str(conf),'--rmtun',check=True,stdout=subprocess.DEVNULL)
-            if not groups:
+            if not experimental:
                 print("PASS: reload, TERM/KILL cleanup and policy-specific existing-device handling")
                 return
             # Remove both privilege alternatives while retaining TUN capability.
@@ -91,7 +96,7 @@ def main():
                 child=subprocess.Popen(['ip','netns','exec',ns,'setpriv','--bounding-set=-bpf,-sys_admin',str(binary),'-c',str(conf),'-d',*flags],stdout=output,stderr=subprocess.STDOUT)
                 try:
                     for _ in range(100):
-                        if 'requested=groups effective=kernel' in (Path(folder)/'fallback').read_text():break
+                        if f'requested={steering} effective=kernel' in (Path(folder)/'fallback').read_text():break
                         assert child.poll() is None,(Path(folder)/'fallback').read_text()
                         time.sleep(.05)
                     else: raise AssertionError('fallback missing')

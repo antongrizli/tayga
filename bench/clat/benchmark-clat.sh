@@ -10,6 +10,8 @@ DURATION=${DURATION:-60}
 WARMUP=${WARMUP:-10}
 FLOWS=${FLOWS:-1}
 CLIENTS=${CLIENTS:-20}
+CLIENT_PORT_BASE=${CLIENT_PORT_BASE:-0}
+export CLIENT_PORT_BASE
 WORKERS=${WORKERS:-3}
 DIRECTIONS=${DIRECTIONS:-"upload download"}
 PROTOCOL=${PROTOCOL:-tcp}
@@ -71,12 +73,13 @@ BENCH_LIB_DIR="${BENCH_LIB_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/lib
 . "$BENCH_LIB_DIR/iperf.sh"
 
 case "$SENDER_FQ" in off|on) ;; *) echo 'SENDER_FQ must be off or on' >&2; exit 64;; esac
-for numeric in "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT" "$SENDER_FQ_LIMIT" "$VETH_QUEUES"; do
+for numeric in "$CLIENT_PORT_BASE" "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT" "$SENDER_FQ_LIMIT" "$VETH_QUEUES"; do
   case "$numeric" in ''|*[!0-9]*) echo 'pacing/buffer/sampling values must be non-negative integers' >&2; exit 64;; esac
 done
 [ "$SENDER_FQ_FLOW_LIMIT" -gt 0 ] && [ "$SENDER_FQ_FLOW_LIMIT" -le 10000 ] || { echo 'SENDER_FQ_FLOW_LIMIT must be between 1 and 10000' >&2; exit 64; }
 [ "$SENDER_FQ_LIMIT" -gt 0 ] && [ "$SENDER_FQ_LIMIT" -le 1000000 ] || { echo 'SENDER_FQ_LIMIT must be between 1 and 1000000' >&2; exit 64; }
 [ "$SENDER_FQ_FLOW_LIMIT" -le "$SENDER_FQ_LIMIT" ] || { echo 'SENDER_FQ_FLOW_LIMIT cannot exceed SENDER_FQ_LIMIT' >&2; exit 64; }
+[ "$CLIENT_PORT_BASE" -eq 0 ] || { [ "$CLIENT_PORT_BASE" -ge 1024 ] && [ "$FLOWS" -le 1000 ] && [ "$((CLIENT_PORT_BASE + 3000 + (CLIENTS + 1) * FLOWS - 1))" -lt 65535 ]; } || { echo 'CLIENT_PORT_BASE requires at most 1000 streams and sufficient TCP port space' >&2; exit 64; }
 [ "$VETH_QUEUES" -le 64 ] || { echo 'VETH_QUEUES must be between 0 (unchanged) and 64' >&2; exit 64; }
 [ "$PACING_TIMER_US" -gt 0 ] || { echo 'PACING_TIMER_US must be positive' >&2; exit 64; }
 awk -v d="$RECEIVER_DRAIN_SECONDS" 'BEGIN { exit !(d ~ /^[0-9]+([.][0-9]+)?$/ && d >= 0) }' || {
@@ -192,6 +195,7 @@ ip -n client link set lan0 up
 for client_no in $(seq 1 "$CLIENTS"); do
   ip -n client addr add "192.168.88.$((client_no + 1))/24" dev lan0
 done
+reserve_client_ports client
 ip -n client route add default via 192.168.88.1
 
 ip -n router link set lo up

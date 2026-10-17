@@ -1,5 +1,22 @@
 #!/bin/sh
 # Sourced by benchmark-clat.sh; configuration is owned by the entrypoint.
+reserve_client_ports() {
+  [ "${CLIENT_PORT_BASE:-0}" -gt 0 ] || return 0
+  local port_ns=${1:-client} reserved existing offset first last
+  reserved=
+  for offset in 0 1000 2000 3000; do
+    first=$((CLIENT_PORT_BASE + offset + FLOWS))
+    last=$((CLIENT_PORT_BASE + offset + (CLIENTS + 1) * FLOWS - 1))
+    reserved="${reserved:+$reserved,}$first-$last"
+  done
+  # iperf's control socket uses an ephemeral port before binding its data
+  # socket. Keep it from taking a scheduled data/warmup port in this netns.
+  existing=$(ip netns exec "$port_ns" sysctl -n net.ipv4.ip_local_reserved_ports)
+  ip netns exec "$port_ns" sysctl -qw "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}$reserved"
+  ip netns exec "$port_ns" sysctl net.ipv4.ip_local_reserved_ports \
+    > "$ARTIFACT_DIR/client-reserved-ports.txt"
+}
+
 cleanup_iperf_servers() {
   for old_iperf_pid in $iperf_pids; do
     kill "$old_iperf_pid" 2>/dev/null || true
@@ -48,6 +65,12 @@ start_clients() {
   for client_no in $(seq 1 "$CLIENTS"); do
     client_addr="192.168.88.$((client_no + 1))"
     set -- -c 11.0.0.2 -p "$((5200 + client_no))" -B "$client_addr" -P "$FLOWS" -t "$duration" --connect-timeout 5000 -J
+    if [ "${CLIENT_PORT_BASE:-0}" -gt 0 ]; then
+      local port_offset=0
+      case "$run_dir" in */warmup-*) port_offset=2000;; esac
+      [ "$direction" != upload ] || port_offset=$((port_offset + 1000))
+      set -- "$@" --cport "$((CLIENT_PORT_BASE + port_offset + client_no * FLOWS))"
+    fi
     test "$direction" = download && set -- "$@" -R
     test "$direction" = bidir && set -- "$@" --bidir
     test "$PROTOCOL" = udp && set -- "$@" -u -l "$DATAGRAM_SIZE"
@@ -891,6 +914,7 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               router_interface_packets_per_second=(router_packets / elapsed if router_packets is not None else None),
               router_rclat_delta=router_delta, clat_tun_delta=clat_delta, tun_drops=tun_drops,
               tun_tx_drop_percent=tun_tx_drop_pct,
+              client_port_base=int(os.environ.get("CLIENT_PORT_BASE", "0")),
               retransmits_per_gbyte=(retransmits / (received_bytes / 1_000_000_000) if received_bytes else None),
               elapsed_s=elapsed, workload_protocol=protocol,
               measurement_window=dict(monotonic_start_ns=int(mono_before),
