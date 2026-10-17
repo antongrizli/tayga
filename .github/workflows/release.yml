@@ -291,14 +291,14 @@ jobs:
           fetch-depth: 0
 
       - name: Download static binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           path: release-assets
           merge-multiple: true
 
       - name: Download container TAR archives
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: container-tar-*
           path: release-assets
