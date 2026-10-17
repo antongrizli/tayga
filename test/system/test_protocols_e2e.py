@@ -302,6 +302,9 @@ def test_tcp_stream_integrity():
     print("\n--- Test 5: TCP Stream Integrity & Checksum Verification ---")
     payload = os.urandom(64 * 1024)  # 64 KB
     expected_hash = hashlib.sha256(payload).hexdigest()
+    payload_file = "/tmp/tayga_tcp_stream_test.bin"
+    with open(payload_file, "wb") as f:
+        f.write(payload)
 
     server_script = r"""
 import socket, hashlib, sys
@@ -325,15 +328,22 @@ print(h)
                            stdout=subprocess.PIPE, text=True)
     time.sleep(0.3)
 
-    client_script = f"""
+    client_script = r"""
 import socket, sys
+with open("/tmp/tayga_tcp_stream_test.bin", "rb") as f:
+    data = f.read()
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.connect(("11.0.0.2", 9999))
-s.sendall({repr(payload)})
+s.sendall(data)
 s.close()
 """
     cli = subprocess.run(["ip", "netns", "exec", "client", sys.executable, "-c", client_script])
     srv_out, _ = srv.communicate(timeout=5)
+    if os.path.exists(payload_file):
+        try:
+            os.unlink(payload_file)
+        except OSError:
+            pass
     assert cli.returncode == 0, "TCP client failed"
     assert srv.returncode == 0, "TCP server failed"
     assert srv_out.strip() == expected_hash, f"Hash mismatch: got {srv_out.strip()}, expected {expected_hash}"
