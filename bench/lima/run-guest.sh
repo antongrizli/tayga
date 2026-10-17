@@ -51,7 +51,7 @@ sudo sysctl -w kernel.kptr_restrict=0 >/dev/null 2>&1 || true
 
 mkdir -p "$BUILD_ROOT"
 tar -C "$REPO" \
-  --exclude='./build' --exclude='./improvenments' --exclude='./.git' --exclude='./perf-sessions' --exclude='./dist' \
+  --exclude='./build' --exclude='./build-*' --exclude='__pycache__' --exclude='./improvenments' --exclude='./.git' --exclude='./perf-sessions' --exclude='./dist' \
   --exclude='./.codex' --exclude='./.agents' --exclude='./tayga' \
   --exclude='./unit_conffile' --exclude='./unit_checksum' --exclude='./unit_udp_checksum' \
   --exclude='./unit_ip4_id' --exclude='./unit_tun' --exclude='./unit_gso' \
@@ -84,7 +84,7 @@ sha256sum "$SESSION_ROOT/source-snapshot.tar.gz" > "$SESSION_ROOT/source-snapsho
 BUILD_CFLAGS="-O3 -flto -g -fno-omit-frame-pointer -ffile-prefix-map=$BUILD_ROOT=."
 BUILD_LDFLAGS='-flto -Wl,--build-id'
 BUILD_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || printf detached)"
-make -B CC=gcc VERSION="${TAYGA_VERSION:-0.9.12}" COMMIT="$GIT_REVISION" BRANCH="$BUILD_BRANCH" CFLAGS="$BUILD_CFLAGS" LDFLAGS="$BUILD_LDFLAGS"
+make -B CC=gcc VERSION="${TAYGA_VERSION:-$(cat VERSION)}" COMMIT="$GIT_REVISION" BRANCH="$BUILD_BRANCH" CFLAGS="$BUILD_CFLAGS" LDFLAGS="$BUILD_LDFLAGS"
 make udp-drain-tools iperf-start-tools CC=gcc
 sudo install -Dm0755 tools/udp-drain-control /usr/local/libexec/tayga-perf/udp-drain-control
 sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drain-guard.so
@@ -112,6 +112,7 @@ run_case() {
   mkdir -p "$case_dir"
   echo "Starting PERF_MODE=$mode; artifacts: $case_dir"
   sudo env ARTIFACT_DIR="$case_dir" PERF_MODE="$mode" \
+    CLIENT_PORT_BASE="${CLIENT_PORT_BASE:-0}" \
     CLIENTS="${CLIENTS:-20}" FLOWS="${FLOWS:-1}" WORKERS="${WORKERS:-3}" \
     CLAT_OFFLOAD="${CLAT_OFFLOAD:-auto}" CLAT_OFFLINK_MTU="${CLAT_OFFLINK_MTU:-1280}" \
     CLAT_STEERING="${CLAT_STEERING:-}" \

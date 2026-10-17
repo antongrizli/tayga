@@ -91,6 +91,8 @@ static void check_pair(const char *v4, const char *v6)
 static void test_eam(void)
 {
     const struct { const char *mapping, *v6; } cases[] = {
+        {"map 198.51.100.90/32 2001:db8:aaaa::/128\n", "2001:db8:aaaa::"},
+        {"map 198.51.100.90/32 2001:db8:aaaa::/64\n", "2001:db8:aaaa::"},
         {"map 198.51.100.0/24 2001:db8:aaaa::/48\n", "2001:db8:aaaa:5a00::"},
         {"map 198.51.100.0/24 2001:db8:aaaa:bbbb::/64\n", "2001:db8:aaaa:bbbb:5a00::"},
         {"map 198.51.100.0/24 2001:db8:aaaa:bbb8::/61\n", "2001:db8:aaaa:bbba:d000::"},
@@ -145,7 +147,29 @@ static void test_eam(void)
         assert(map_ip6_to_ip4(&test_v4, &overshadowed, 0) == ERROR_DROP);
     }
     reclaim();
-    puts("PASS: /48, /64, /61 and legacy EAM, reload and LPM override");
+    configure("map 198.51.100.90/32 2001:db8:aaaa::/64\n");
+    /* Overlapping IPv6 entries cannot bypass the host-map fast path's
+     * invariant, even when the IPv4 mapping has no suffix bits. */
+    FILE *overlap = fopen("mapping-invalid.conf", "w"); assert(overlap);
+    fputs("map 198.51.100.91 2001:db8:aaaa::1\n", overlap); fclose(overlap);
+    assert(config_read("mapping-invalid.conf") == ERROR_REJECT);
+    unlink("mapping-invalid.conf");
+    check_pair("198.51.100.90", "2001:db8:aaaa::");
+    strcpy(gcfg.map_file,"mapping-reload.conf");gcfg.maps_immutable=0;
+    overlap=fopen(gcfg.map_file,"w");assert(overlap);
+    fputs("map 198.51.100.91 2001:db8:aaaa::2\nmap 192.0.2.254 2001:db8:bbbb::1\n",overlap);fclose(overlap);
+    assert(addrmap_reload()==0); /* Conflicting fixed/self entries are skipped. */
+    check_pair("198.51.100.90", "2001:db8:aaaa::");
+    struct in_addr local;struct in6_addr unused;
+    inet_pton(AF_INET,"192.0.2.254",&local);
+    assert(map_ip4_to_ip6(&unused,&local)==0);
+    assert(IN6_ARE_ADDR_EQUAL(&unused,&gcfg.local_addr6));
+    overlap=fopen(gcfg.map_file,"w");assert(overlap);
+    fputs("map 127.0.0.1 2001:db8:bbbb::1\n",overlap);fclose(overlap);
+    assert(addrmap_reload()==ERROR_REJECT);
+    check_pair("198.51.100.90", "2001:db8:aaaa::");
+    unlink(gcfg.map_file);reclaim();
+    puts("PASS: host/subnet EAM, reload, self/IPv6 overlap invariants and LPM override");
 }
 
 int main(void)

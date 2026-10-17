@@ -14,22 +14,23 @@ import subprocess
 from taygabench.studies import run_tun_steering_study as study
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',required=True,type=Path);p.add_argument('--output',required=True,type=Path);p.add_argument('--steering',choices=('kernel','groups','flows'),default='groups');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',required=True,type=Path);p.add_argument('--output',required=True,type=Path);p.add_argument('--steering',choices=('kernel','groups','flows'),default='groups');p.add_argument('--production-startup',action='store_true',help='exercise the unmodified production startup');a=p.parse_args()
     if os.geteuid()!=0:p.error('Linux root required')
     lock=open('/tmp/tayga-perf-workflow.lock','a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     root=a.output;root.mkdir(parents=True,exist_ok=False)
     daemon=Path('/usr/sbin/tayga');start=Path('/usr/local/sbin/clat-start.sh')
     shutil.copy2(daemon,root/'original-tayga');shutil.copy2(start,root/'original-startup.sh')
-    generated=study.startup(start.read_text())
+    generated=start.read_text() if a.production_startup else study.startup(start.read_text())
     before="while ! grep -q 'TUN offload negotiated:' \"$ARTIFACT_DIR/clat.log\"; do"
     after='''while ! python3 -c 'import json,sys,os; d=json.load(open(os.environ.get("TAYGA_STATUS_FILE", "/run/tayga-status.json"))); sys.exit(not(d.get("pid")==int(sys.argv[1]) and d.get("offload_negotiation_complete")))' "$parent" 2>/dev/null; do'''
-    assert before in generated
-    (root/'experimental-startup.sh').write_text(generated.replace(before,after))
+    if not a.production_startup:
+        generated=generated.replace(before,after)
+    (root/'experimental-startup.sh').write_text(generated)
     def interrupted(signum,frame):raise KeyboardInterrupt(signum)
     signal.signal(signal.SIGTERM,interrupted)
     try:
         study.install(a.binary,daemon);study.install(root/'experimental-startup.sh',start);start.chmod(0o755)
-        env=dict(os.environ,TAYGA_STEERING_MODE=a.steering,TEST_SIZE_MB='4')
+        env=dict(os.environ,TAYGA_STEERING_MODE=a.steering,TAYGA_STEERING=a.steering,TEST_SIZE_MB='4')
         for name in ('test_correctness.py','test_pmtud.py'):
             test_path=Path(__file__).resolve().parents[3]/"test/system"/name
             (root/name).write_bytes(test_path.read_bytes())

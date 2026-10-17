@@ -355,6 +355,18 @@ static int gso_map_4to6_with_icmp(struct pkt *p, struct ip4 *ip4, uint32_t ip4_h
 	return 0;
 }
 
+/* A single TCP packet must not be submitted for segmentation. With TCP
+ * options, virtio's minimum-header size check can retain GSO on a one-MSS
+ * packet; tcp_gso_segment() then rejects it with EINVAL during forwarding.
+ * Keep CHECKSUM_PARTIAL and its offsets so checksum offload still applies. */
+static void gso_normalize_tcp_output(struct virtio_net_hdr_raw *vhdr, uint32_t payload_len)
+{
+	if (payload_len <= vhdr->gso_size) {
+		vhdr->gso_type = VIRTIO_NET_HDR_GSO_NONE;
+		vhdr->gso_size = 0;
+	}
+}
+
 int gso_translate_tcp_6to4(struct pkt *p)
 {
 	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV6)
@@ -471,6 +483,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 			out_vhdr.hdr_len = (uint16_t)head_out_len;
 		out_vhdr.csum_start -= (sizeof(struct ip6) - sizeof(struct ip4));
 		out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+		gso_normalize_tcp_output(&out_vhdr, head_payload_len);
 
 		ssize_t ret_head = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, head_ip4, head_out_len);
 		if (ret_head > 0) {
@@ -503,26 +516,26 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		tail_ip4->cksum = 0;
 		tail_ip4->cksum = ip4_header_checksum(tail_ip4);
 
-		/* Full TCP checksum calculation for software tail zero-copy */
-		tail_tcp->cksum = 0;
-		uint16_t data_csum = tail_len > 0 ? ip_checksum(tail_payload, tail_len) : 0;
-		uint16_t tcp_hdr_csum = ip_checksum(tail_tcp, tcp_hdr_len);
-		tail_tcp->cksum = ones_add(ones_add(tcp_hdr_csum, data_csum),
-		                           ip4_checksum(tail_ip4, tail_tcp_total_len, IPPROTO_TCP));
-
 		size_t tail_out_len = sizeof(struct ip4) + tail_tcp_total_len;
 		ssize_t ret_tail;
 		if (gcfg.vnet_hdr_sz > 0) {
+			/* Negotiated vnet framing includes TUN_F_CSUM. Let the kernel
+			 * complete this ordinary packet, as it does for the GSO head. */
+			tail_tcp->cksum = htons(gso_calc_tcp_pseudo4(&src4, &dst4, tail_tcp_total_len));
 			struct virtio_net_hdr_raw tail_vhdr = {
-				.flags = 0,
+				.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM,
 				.gso_type = VIRTIO_NET_HDR_GSO_NONE,
-				.hdr_len = 0,
-				.gso_size = 0,
-				.csum_start = 0,
-				.csum_offset = 0,
+				.hdr_len = sizeof(struct ip4) + tcp_hdr_len,
+				.csum_start = sizeof(struct ip4),
+				.csum_offset = 16,
 			};
 			ret_tail = tun_write_vnet_inplace(p->tun_fd, &tail_vhdr, tail_ip4, tail_out_len);
 		} else {
+			tail_tcp->cksum = 0;
+			uint16_t data_csum = ip_checksum(tail_payload, tail_len);
+			uint16_t tcp_hdr_csum = ip_checksum(tail_tcp, tcp_hdr_len);
+			tail_tcp->cksum = ones_add(ones_add(tcp_hdr_csum, data_csum),
+			                           ip4_checksum(tail_ip4, tail_tcp_total_len, IPPROTO_TCP));
 			ret_tail = tun_write(p->tun_fd, tail_ip4, tail_out_len);
 		}
 		if (ret_tail > 0) {
@@ -568,6 +581,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	out_vhdr.hdr_len -= (sizeof(struct ip6) - sizeof(struct ip4));
 	out_vhdr.csum_start -= (sizeof(struct ip6) - sizeof(struct ip4));
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	gso_normalize_tcp_output(&out_vhdr, payload_len);
 
 	size_t out_len = sizeof(struct ip4) + tcp_len;
 	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, ip4, out_len);
@@ -670,6 +684,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	out_vhdr.hdr_len = (uint16_t)((int)out_vhdr.hdr_len + header_delta);
 	out_vhdr.csum_start = (uint16_t)((int)out_vhdr.csum_start + header_delta);
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	gso_normalize_tcp_output(&out_vhdr, payload_len);
 
 	size_t out_len = sizeof(struct ip6) + tcp_len;
 	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, out, out_len);
@@ -682,18 +697,38 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	return 0;
 }
 
+/* Reserve only IDs that the emitter will use for non-atomic datagrams.
+ * Empty aggregates still emit one header-only packet. A short single segment
+ * must use its actual payload size, not the advertised maximum segment size. */
+static uint16_t gso_df0_segments(uint32_t payload_len, uint32_t gso_size,
+                               uint32_t header_len)
+{
+	if (!payload_len)
+		return 1;
+	if (header_len + gso_size <= 1260)
+		return (uint16_t)((payload_len + gso_size - 1) / gso_size);
+	uint32_t tail = payload_len % gso_size;
+	return tail && header_len + tail <= 1260 ? 1 : 0;
+}
+
 int gso_software_segment_and_send_6to4(struct pkt *p)
 {
+	/* Public software entry points require a matching nonzero GSO type/MSS.
+	 * TCP may carry a full checksum; partial metadata must match the transport. */
+	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV6 ||
+	    gso_validate_header(p) <= 0)
+		return -1;
 	stats_gso_fallback();
 	stats_gso_sw_seg();
 
-	if (p->data_len < sizeof(struct ip6) + sizeof(struct tcp_hdr) ||
-	    gso_validate_header(p) <= 0) {
+	if (p->data_len < sizeof(struct ip6) + sizeof(struct tcp_hdr)) {
 		stats_gso_invalid();
 		return -1;
 	}
 	struct ip6 *ip6 = (struct ip6 *)p->data;
-	if (validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest)) {
+	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_TCP ||
+	    ntohs(ip6->payload_length) != p->data_len - sizeof(struct ip6) ||
+	    validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest)) {
 		stats_gso_invalid();
 		return -1;
 	}
@@ -704,6 +739,10 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		stats_gso_invalid();
 		return -1;
 	}
+	if (p->vhdr.hdr_len < sizeof(struct ip6) + tcp_hdr_len ||
+	    ((p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+	     gso_validate_transport_vnet(p, sizeof(struct ip6), tcp_hdr_len, 16) < 0))
+		return -1;
 	uint8_t *payload = p->data + sizeof(struct ip6) + tcp_hdr_len;
 	uint32_t payload_len = p->data_len - sizeof(struct ip6) - tcp_hdr_len;
 	uint32_t gso_size = p->vhdr.gso_size;
@@ -741,15 +780,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
-	uint32_t num_segments = payload_len ? (payload_len + gso_size - 1) / gso_size : 1;
-	uint16_t df0_segments = 0;
-	if (sizeof(struct ip4) + tcp_hdr_len + gso_size <= 1260) {
-		df0_segments = (uint16_t)num_segments;
-	} else {
-		uint32_t rem = payload_len % gso_size;
-		if (rem > 0 && sizeof(struct ip4) + tcp_hdr_len + rem <= 1260)
-			df0_segments = 1;
-	}
+	uint16_t df0_segments = gso_df0_segments(payload_len, gso_size, sizeof(struct ip4) + tcp_hdr_len);
 	uint16_t next_id = df0_segments ? reserve_ip4_ident(df0_segments) : 0;
 
 	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
@@ -838,21 +869,22 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 int gso_software_segment_and_send_4to6(struct pkt *p)
 {
+	/* Public software entry points require a matching nonzero GSO type/MSS.
+	 * TCP may carry a full checksum; partial metadata must match the transport. */
+	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_TCPV4 ||
+	    gso_validate_header(p) <= 0)
+		return -1;
 	stats_gso_fallback();
 	stats_gso_sw_seg();
 
-	if (p->data_len < sizeof(struct ip4) + sizeof(struct tcp_hdr) ||
-	    gso_validate_header(p) <= 0) {
+	if (p->data_len < sizeof(struct ip4) + sizeof(struct tcp_hdr)) {
 		stats_gso_invalid();
 		return -1;
 	}
 	struct ip4 *ip4 = (struct ip4 *)p->data;
-	uint32_t ip4_hdr_len = (ip4->ver_ihl & 0x0f) * 4;
-	if (ip4_hdr_len < sizeof(struct ip4) || p->data_len < ip4_hdr_len + sizeof(struct tcp_hdr)) {
-		stats_gso_invalid();
-		return -1;
-	}
-	if (validate_ip4_addr(&ip4->src) || validate_ip4_addr(&ip4->dest)) {
+	uint32_t ip4_hdr_len;
+	if (gso_validate_ipv4_header(p, IPPROTO_TCP, &ip4_hdr_len) < 0 ||
+	    p->data_len < ip4_hdr_len + sizeof(struct tcp_hdr)) {
 		stats_gso_invalid();
 		return -1;
 	}
@@ -862,6 +894,10 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		stats_gso_invalid();
 		return -1;
 	}
+	if (p->vhdr.hdr_len < ip4_hdr_len + tcp_hdr_len ||
+	    ((p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+	     gso_validate_transport_vnet(p, ip4_hdr_len, tcp_hdr_len, 16) < 0))
+		return -1;
 	uint8_t *payload = p->data + ip4_hdr_len + tcp_hdr_len;
 	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
 	uint32_t gso_size = p->vhdr.gso_size;
@@ -971,12 +1007,16 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 
 int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 {
+	/* Public software entry points require a matching nonzero GSO type/MSS.
+	 * TCP may carry a full checksum; partial metadata must match the transport. */
+	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_UDP_L4 ||
+	    gso_validate_header(p) <= 0)
+		return -1;
 	stats_gso_fallback();
 	stats_udp_gso_sw_fallback();
 	stats_gso_sw_seg();
 
 	if (p->data_len < sizeof(struct ip6) + sizeof(struct udp_hdr) ||
-	    gso_validate_header(p) <= 0 ||
 	    gso_validate_transport_vnet(p, sizeof(struct ip6), sizeof(struct udp_hdr), 6) < 0)
 		return -1;
 	struct ip6 *ip6 = (struct ip6 *)p->data;
@@ -1033,15 +1073,7 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
-	uint32_t num_segments = payload_len ? (payload_len + gso_size - 1) / gso_size : 1;
-	uint16_t df0_segments = 0;
-	if (sizeof(struct ip4) + sizeof(struct udp_hdr) + gso_size <= 1260) {
-		df0_segments = (uint16_t)num_segments;
-	} else {
-		uint32_t rem = payload_len % gso_size;
-		if (rem > 0 && sizeof(struct ip4) + sizeof(struct udp_hdr) + rem <= 1260)
-			df0_segments = 1;
-	}
+	uint16_t df0_segments = gso_df0_segments(payload_len, gso_size, sizeof(struct ip4) + sizeof(struct udp_hdr));
 	uint16_t next_id = df0_segments ? reserve_ip4_ident(df0_segments) : 0;
 
 	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
@@ -1119,6 +1151,11 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 
 int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 {
+	/* Public software entry points require a matching nonzero GSO type/MSS.
+	 * TCP may carry a full checksum; partial metadata must match the transport. */
+	if (!p->has_vhdr || (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_UDP_L4 ||
+	    gso_validate_header(p) <= 0)
+		return -1;
 	stats_gso_fallback();
 	stats_udp_gso_sw_fallback();
 	stats_gso_sw_seg();

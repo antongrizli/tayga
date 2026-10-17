@@ -123,6 +123,9 @@ int gso_translate_udp_6to4(struct pkt *p);
 int gso_translate_udp_4to6(struct pkt *p);
 
 /* Fallback software segmentation: segments aggregate into MSS-sized chunks and sends individually */
+/* Software emitters require has_vhdr, a matching GSO type, nonzero MSS,
+ * consistent IP/transport lengths and valid partial-checksum offsets when set.
+ * TCP full-checksum input is also supported; emitted packets are checksummed. */
 int gso_software_segment_and_send_6to4(struct pkt *p);
 int gso_software_segment_and_send_4to6(struct pkt *p);
 int gso_software_segment_and_send_udp_6to4(struct pkt *p);

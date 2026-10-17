@@ -24,10 +24,14 @@ static int steering_map(unsigned entries)
 	attr.max_entries = entries;
 	return steering_bpf(BPF_MAP_CREATE, &attr);
 }
-struct steering_builder { struct bpf_insn code[512]; unsigned n; };
+struct steering_builder { struct bpf_insn code[512]; unsigned n; int overflow; };
 static unsigned steering_emit(struct steering_builder *b, unsigned code,
 	unsigned dst, unsigned src, int off, int imm)
 {
+	if (b->n == sizeof(b->code) / sizeof(b->code[0])) {
+		b->overflow = 1;
+		return 0;
+	}
 	unsigned n = b->n++;
 	b->code[n] = (struct bpf_insn){ .code=code, .dst_reg=dst,
 		.src_reg=src, .off=off, .imm=imm };
@@ -37,7 +41,6 @@ static unsigned steering_emit(struct steering_builder *b, unsigned code,
 #define MOVI(d,i) SE(BPF_ALU64|BPF_MOV|BPF_K,d,0,0,i)
 #define MOVR(d,s) SE(BPF_ALU64|BPF_MOV|BPF_X,d,s,0,0)
 #define ALUI(op,d,i) SE(BPF_ALU64|op|BPF_K,d,0,0,i)
-#define ALU32I(op,d,i) SE(BPF_ALU|op|BPF_K,d,0,0,i)
 #define LOADMAP(d,fd) do { SE(BPF_LD|BPF_DW|BPF_IMM,d,BPF_PSEUDO_MAP_FD,0,fd); SE(0,0,0,0,0); } while(0)
 #define CALL(i) SE(BPF_JMP|BPF_CALL,0,0,0,i)
 #define PATCH(n,to) (b.code[n].off=(to)-(n)-1)
@@ -50,10 +53,9 @@ static int steering_program_ext(unsigned queues, int flow_aware, char *log, size
 	if (!queues || queues > 128) { errno=EINVAL; return -1; }
 	buckets=steering_map(65536);
 	if (buckets<0) goto done;
-	/* 4 counter slots in 1 map FD:
-	 * [0] = IPv4 initial/group counter, [1] = IPv6 initial/group counter,
-	 * [2] = IPv4 bulk-flow counter,     [3] = IPv6 bulk-flow counter. */
-	counter=steering_map(4);
+	/* Independent admission counters for IPv4 and IPv6. Ownership is permanent
+	 * from the first packet: changing queues cannot drain an old worker. */
+	counter=steering_map(2);
 	if (counter<0) goto done;
 	MOVR(6,1);
 	/* Load first 20 bytes (covers entire basic IPv4 header + IPv6 version & next_header). */
@@ -131,74 +133,24 @@ static int steering_program_ext(unsigned queues, int flow_aware, char *log, size
 	LOADMAP(1,buckets); MOVR(2,10); ALUI(BPF_ADD,2,-4); CALL(BPF_FUNC_map_lookup_elem);
 	fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
 	MOVR(8,0); SE(BPF_LDX|BPF_MEM|BPF_W,7,8,0,0);
-	if (!flow_aware) {
-		unsigned existing = SE(BPF_JMP|BPF_JNE|BPF_K,7,0,0,0);
-		SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
-		LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
-		fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
-		MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
-		ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1); MOVI(0,0);
-		SE(BPF_STX|BPF_ATOMIC|BPF_W,8,1,0,BPF_CMPXCHG);
-		unsigned won = SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
-		MOVR(0,1);
-		PATCH(won,b.n);
-		MOVR(7,0);
-		PATCH(existing,b.n);
-		MOVR(0,7); ALUI(BPF_SUB,0,1);
-		SE(BPF_JMP|BPF_EXIT,0,0,0,0);
-	} else {
-		/* In flow_aware mode:
-		 * - Permanent bulk assignment: 1..queues (bit 31 == 0)
-		 * - Provisional small-pkt assignment: (1..queues) | 0x80000000 (bit 31 == 1)
-		 * Check if already permanently assigned (r7 != 0 && (r7 & 0x80000000) == 0): */
-		unsigned is_zero = SE(BPF_JMP|BPF_JEQ|BPF_K,7,0,0,0);
-		MOVR(1,7); ALU32I(BPF_RSH,1,31);
-		unsigned done_perm = SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,0);
-		/* Here r7 is provisional (bit 31 == 1). Check if skb->len >= 256 to promote to bulk: */
-		SE(BPF_LDX|BPF_MEM|BPF_W,1,6,0,0);
-		unsigned keep_prov = SE(BPF_JMP|BPF_JLT|BPF_K,1,0,0,256);
-		unsigned alloc_bulk = SE(BPF_JMP|BPF_JA,0,0,0,0);
-		PATCH(is_zero, b.n);
-		/* Bucket is 0 (unassigned). Check if skb->len >= 256: */
-		SE(BPF_LDX|BPF_MEM|BPF_W,1,6,0,0);
-		unsigned first_is_bulk = SE(BPF_JMP|BPF_JGE|BPF_K,1,0,0,256);
-		/* Small packet on unassigned bucket: allocate provisional (bit 31 = 1) from counter[r9] */
-		SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
-		LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
-		fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
-		MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
-		ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1);
-		MOVR(2,1); ALU32I(BPF_OR,2,(int)0x80000000U);
-		MOVI(0,0);
-		SE(BPF_STX|BPF_ATOMIC|BPF_W,8,2,0,BPF_CMPXCHG);
-		unsigned won_prov = SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
-		MOVR(0,2);
-		PATCH(won_prov, b.n);
-		MOVR(7,0);
-		unsigned done_prov = SE(BPF_JMP|BPF_JA,0,0,0,0);
-		/* Bulk allocation / promotion from counter[r9 + 2]: */
-		PATCH(alloc_bulk, b.n);
-		PATCH(first_is_bulk, b.n);
-		ALUI(BPF_ADD,9,2);
-		SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
-		LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
-		fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
-		MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
-		ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1);
-		MOVR(0,7); /* expected old value: 0 or provisional r7 */
-		SE(BPF_STX|BPF_ATOMIC|BPF_W,8,1,0,BPF_CMPXCHG);
-		unsigned won_bulk = SE(BPF_JMP|BPF_JNE|BPF_X,0,7,0,0);
-		MOVR(0,1);
-		PATCH(won_bulk, b.n);
-		MOVR(7,0);
-		PATCH(done_perm, b.n);
-		PATCH(keep_prov, b.n);
-		PATCH(done_prov, b.n);
-		MOVR(0,7); ALU32I(BPF_AND,0,0x7fffffff); ALU32I(BPF_SUB,0,1);
-		SE(BPF_JMP|BPF_EXIT,0,0,0,0);
-	}
+	unsigned existing = SE(BPF_JMP|BPF_JNE|BPF_K,7,0,0,0);
+	SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
+	LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
+	fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
+	MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
+	ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1); MOVI(0,0);
+	SE(BPF_STX|BPF_ATOMIC|BPF_W,8,1,0,BPF_CMPXCHG);
+	/* A losing contender must use the published winner, never its candidate. */
+	unsigned won = SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
+	MOVR(0,1);
+	PATCH(won,b.n);
+	MOVR(7,0);
+	PATCH(existing,b.n);
+	MOVR(0,7); ALUI(BPF_SUB,0,1);
+	SE(BPF_JMP|BPF_EXIT,0,0,0,0);
 	for (unsigned i=0;i<nf;i++) PATCH(fail[i],b.n);
 	MOVI(0,0); SE(BPF_JMP|BPF_EXIT,0,0,0,0);
+	if (b.overflow) { errno=E2BIG; goto done; }
 	attr.prog_type=BPF_PROG_TYPE_SOCKET_FILTER;
 	attr.insn_cnt=b.n; attr.insns=(uintptr_t)b.code;
 	attr.license=(uintptr_t)"GPL";
@@ -220,7 +172,6 @@ static inline int steering_program(unsigned queues, char *log, size_t log_size)
 #undef MOVI
 #undef MOVR
 #undef ALUI
-#undef ALU32I
 #undef LOADMAP
 #undef CALL
 #undef PATCH

@@ -33,9 +33,13 @@ collect_network_counters() {
   local counter_dir=$1 counter_phase=$2 counter_ns
   uptime_seconds > "$counter_dir/network-counters.$counter_phase.uptime"
   sysctl -n net.core.rmem_max net.core.wmem_max > "$counter_dir/buffer-limits.$counter_phase"
+  sysctl net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs \
+    > "$counter_dir/kernel-network-settings.$counter_phase"
   for counter_ns in client router clatns server; do
     ip netns exec "$counter_ns" cat /proc/net/snmp > "$counter_dir/$counter_ns.snmp.$counter_phase"
     ip netns exec "$counter_ns" cat /proc/net/snmp6 > "$counter_dir/$counter_ns.snmp6.$counter_phase"
+    # Retain TCP loss/reordering/DSACK diagnostics outside the timed workload.
+    ip netns exec "$counter_ns" cat /proc/net/netstat > "$counter_dir/$counter_ns.netstat.$counter_phase"
     ip -n "$counter_ns" -j -s link show > "$counter_dir/$counter_ns.links.$counter_phase.json"
     ip netns exec "$counter_ns" tc -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase"
     ip netns exec "$counter_ns" tc -j -s qdisc show > "$counter_dir/$counter_ns.qdisc.$counter_phase.json"

@@ -39,6 +39,12 @@ def startup(source):
     before='/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun'
     after='exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d'
     if source.count(before)!=1 or source.count(after)!=1:raise ValueError('unknown startup structure')
+    if 'TAYGA_STEERING_VAL' in source and 'tun-up on' in source:
+        # Modern production startup owns disposable TUN setup. Select its
+        # public configuration instead of slicing through shell conditionals.
+        lines=source.splitlines(keepends=True)
+        lines.insert(1, 'TAYGA_STEERING="${TAYGA_STEERING_MODE:-kernel}"\nexport TAYGA_STEERING\n')
+        return ''.join(lines)
     launch="""parent=$$
 (
 trap 'status=$?; if [ "$status" -ne 0 ]; then kill -TERM "$parent"; fi' EXIT

@@ -37,15 +37,6 @@ tayga.conf.
     If UDP is unavailable, retain TCP; if TCP is unavailable, use ordinary
     packets. All worker queues use the same negotiated capabilities and verified
     virtual header framing. Startup fails if a safe state cannot be established.
-
-**tun-steering** *kernel|groups|flows*
-:   Defaults to **kernel**. On Linux with multiqueue TUN devices, configures
-    packet queue steering. **kernel** relies on default Linux kernel steering;
-    **groups** enables opt-in eBPF 2-tuple L3 address-group steering;
-    **flows** enables opt-in eBPF 4-tuple flow steering for unfragmented
-    TCP and UDP traffic, distributing parallel client flows evenly across
-    all worker queues in NAT44 and single-IP CLAT environments while preserving
-    2-tuple steering for fragmented packets.
     **tcp** requires checksum and TCP segmentation. **udp** requires checksum,
     TCP and UDP segmentation. Explicit modes fail when unavailable; **off**
     disables offload. Packet-level software fallback remains active.
@@ -54,6 +45,22 @@ tayga.conf.
     down during negotiation and restores its previous UP state. A namespace/device
     ownership lock prevents concurrent TAYGA processes; other software must not
     share the device. On FreeBSD, **auto** uses the ordinary TUN path.
+
+**tun-steering** *kernel|groups|flows*
+:   Defaults to **kernel**. On Linux with multiqueue TUN devices, configures
+    packet queue steering. **kernel** relies on default Linux kernel steering;
+    **groups** enables opt-in eBPF 2-tuple L3 address-group steering;
+    **flows** enables opt-in eBPF 4-tuple flow steering for unfragmented
+    TCP and UDP traffic, retaining 2-tuple steering for fragments and IPv6
+    extension headers. Each of 65,536 hash buckets retains its first assigned
+    queue for the disposable device lifetime, including across SIGHUP. Hash
+    collisions co-locate traffic, including collisions between address families;
+    there is no eviction or packet-size promotion. Per-family admission counters
+    distribute new buckets, but flow counts and byte shares need not be equal.
+    This avoids queue migration; it cannot guarantee end-to-end packet order
+    or throughput. Experimental eBPF modes require a fresh disposable TUN;
+    kernel capability failure is reported with the effective fallback policy.
+
 
 **ipv4-addr** *ipv4_address*
 :   IPv4 address that **tayga** will use as the source address for

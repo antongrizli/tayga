@@ -46,12 +46,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Documentation generator output
-html/*
-latex/*
-
-# Working directories / proposals
 improvements/
-improvenments/
+improvenments/*
+!improvenments/network-protocols-compatibility-and-testing-guide.md
+
 # Unit sources are tracked even though compatibility binaries use unit_* names.
 !test/unit/unit_mapping.c

@@ -6,12 +6,20 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Fixed
 
+- Keep eBPF flow buckets on their first worker across packet sizes and reloads.
+- Reserve IPv4 IDs for empty software GSO output and offload split-tail TCP checksums.
+- Clear segmentation metadata on single TCP packets, preventing kernel forwarding drops with TCP options.
+- Validate direct software GSO inputs and avoid expected startup errors for disposable TUNs.
+
 - Complete circular dynamic-pool allocation before reclaiming dormant leases.
 - Restore the default build, header dependencies, build-flag tracking and static linkage transitions.
 - Repair paths after the source, benchmark and test directory migration.
 - Make man-page drift checks fail on generator errors and preserve build metadata.
 
 ### Added
+
+- Direct groups/flows BPF, lifecycle and TCP checksum-completion wire regressions.
+- Alternating TCP recovery trials with deterministic data ports and fail-closed acceptance reports.
 
 - RFC 7757 explicit mappings with arbitrary IPv6 prefix lengths that can hold the IPv4 suffix.
 - Isolated unit outputs, a shared test library, benchmark and fault-shim build targets.
