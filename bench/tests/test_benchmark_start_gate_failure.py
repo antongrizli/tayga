@@ -38,7 +38,7 @@ exec /usr/bin/iperf3 "$@"
                          IPERF_START_GATE='on',CLAT_OFFLOAD='auto',FORWARDING_GRO='on',PERF_MODE='none')
                 start=time.monotonic()
                 with (root/'benchmark.log').open('w') as log:
-                    child=subprocess.Popen([str(ROOT/'benchmark-clat.sh')],env=env,stdout=log,stderr=subprocess.STDOUT)
+                    child=subprocess.Popen([str(ROOT/'bench/clat/benchmark-clat.sh')],env=env,stdout=log,stderr=subprocess.STDOUT)
                     try:status=child.wait(timeout=25)
                     except subprocess.TimeoutExpired:
                         child.terminate()

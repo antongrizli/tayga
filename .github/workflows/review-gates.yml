@@ -18,6 +18,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: make test-portable check-docs
+      - name: Verify man pages with the pinned generator
+        if: runner.os == 'Linux'
+        run: make check-man PANDOC=scripts/ci/pandoc-container.sh
       - name: Native packet ownership checks
         run: make unit_packet_io unit_packet_io_lifetime LDFLAGS='' && ./unit_packet_io && ./unit_packet_io_lifetime
   sanitizers:
@@ -29,13 +32,16 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0 # Legacy config fixtures retain maps.
       - name: New mapping fixtures must also pass leak detection
-        run: ASAN_OPTIONS=detect_leaks=1 ./unit_addrmap
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 ./build/test-bin/unit_addrmap
+          ASAN_OPTIONS=detect_leaks=1 ./build/test-bin/unit_mapping
       - name: Thread sanitizer on mapping and counters
         run: |
           make clean
-          make unit_addrmap unit_stats CC=gcc CFLAGS='-O1 -g -Wall -fsanitize=thread -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=thread -no-pie'
-          ./unit_addrmap
-          ./unit_stats
+          make unit_addrmap unit_mapping unit_stats CC=gcc CFLAGS='-O1 -g -Wall -fsanitize=thread -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=thread -no-pie'
+          ./build/test-bin/unit_addrmap
+          ./build/test-bin/unit_mapping
+          ./build/test-bin/unit_stats
         env:
           TSAN_OPTIONS: halt_on_error=1
   linux-kernel:
@@ -44,6 +50,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Dependencies and opt-in io_uring build
         run: sudo apt-get update && sudo apt-get install -y liburing-dev python3-scapy python3-pyroute2 iproute2 nftables tcpdump socat iputils-ping ethtool
+      - name: Shell script errors
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck --severity=error $(git ls-files '*.sh')
+      - name: Default build and incremental build regressions
+        run: python3 scripts/ci/check-build.py
       - run: make WITH_URING=1 all test
       - name: Kernel negotiation, rollback, wire and lifecycle
         run: |
@@ -62,7 +74,7 @@ jobs:
       - name: Async kernel wire gate when io_uring is available
         run: |
           sudo mkdir -p /tmp/review-results && sudo chown -R "$USER:$USER" /tmp/review-results
-          ./unit_async_tun 2>&1 | tee /tmp/review-results/uring-availability.log
+          ./build/test-bin/unit_async_tun 2>&1 | tee /tmp/review-results/uring-availability.log
           if grep -q '^SKIP:' /tmp/review-results/uring-availability.log; then
             echo '::notice::Kernel io_uring unavailable; build succeeded, runtime gate skipped'
           else

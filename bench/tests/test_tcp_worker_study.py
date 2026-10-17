@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-import importlib.util
+import importlib
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unittest
 
 ROOT=Path(__file__).resolve().parents[2]
 def module(name):
- spec=importlib.util.spec_from_file_location(name,(ROOT / 'bench/taygabench/studies' / f'{name}.py') if (ROOT / 'bench/taygabench/studies' / f'{name}.py').exists() else (ROOT / 'bench/taygabench/summarize' / f'{name}.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+    group = "summarize" if name.startswith("summarize-") else "studies"
+    return importlib.import_module("taygabench." + group + "." + name.replace("-", "_"))
 run=module('run-tcp-worker-study');summary=module('summarize-tcp-worker-study')
 class StudyTest(unittest.TestCase):
  def test_alternating_and_balanced_order(self):

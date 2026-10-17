@@ -3,9 +3,12 @@
 import ast
 import copy
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from taygabench.common import benchmark_source
 import unittest
 
-script = (Path(__file__).resolve().parents[2] / 'bench/clat/benchmark-clat.sh').read_text()
+script = benchmark_source(Path(__file__).resolve().parents[2] / 'bench/clat/benchmark-clat.sh')
 start = script.index('def negotiated_offload_mode(')
 end = script.index('\neffective_offload =', start)
 namespace = {}

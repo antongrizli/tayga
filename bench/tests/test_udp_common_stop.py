@@ -3,12 +3,15 @@
 import json
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from taygabench.common import benchmark_source
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-SOURCE=(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
+SOURCE=benchmark_source(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh')
 
 class CommonStopTest(unittest.TestCase):
     def test_udp_stops_before_wait_without_added_drain(self):

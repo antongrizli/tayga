@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-import importlib.util
+import importlib
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import subprocess
 import unittest
 import tempfile
 import copy
 ROOT=Path(__file__).resolve().parents[2]
-spec=importlib.util.spec_from_file_location('study',ROOT/'bench/taygabench/studies/run-tun-steering-study.py')
-study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
-spec=importlib.util.spec_from_file_location('summary',ROOT/'bench/taygabench/summarize/summarize-tun-steering-study.py')
-summary=importlib.util.module_from_spec(spec);spec.loader.exec_module(summary)
+study = importlib.import_module("taygabench.studies.run_tun_steering_study")
+summary = importlib.import_module("taygabench.summarize.summarize_tun_steering_study")
 class StudyTest(unittest.TestCase):
  def test_startup_preserves_daemon_pid_and_waits_for_negotiation(self):
   script=study.startup((ROOT/'container/rootfs/usr/local/sbin/clat-start.sh').read_text())

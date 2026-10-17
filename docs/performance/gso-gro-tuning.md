@@ -139,7 +139,7 @@ treatment independently of socket rate limiting:
 SENDER_FQ=on SENDER_FQ_LIMIT=4096 SENDER_FQ_FLOW_LIMIT=1024 \
 VETH_QUEUES=4 SENDER_FQ_TOPOLOGY=auto FQ_RATE=0 \
 PROTOCOL=udp RATE=0 DIRECTIONS="upload download" \
-tools/lima-perf/run-host.sh
+bench/lima/run-host.sh
 ```
 
 `RATE=0` leaves offered load unrestricted. `FQ_RATE=0` adds no socket pacing

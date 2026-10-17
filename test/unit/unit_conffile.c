@@ -35,6 +35,7 @@ static char *tun_route[100] = {0};
  * but do not need dyanmic
  */
 struct map6 *assign_dynamic(const struct in6_addr *addr6) {
+    (void)addr6;
     return NULL;
 }
 
@@ -99,6 +100,7 @@ void test_config_compare(void) {
     expectl(gcfg.dispatch_mode, tcfg.dispatch_mode, "dispatch_mode");
     expectl(gcfg.async_tun, tcfg.async_tun, "async_tun");
     expectl(gcfg.tun_steering_groups, tcfg.tun_steering_groups, "tun_steering_groups");
+    expectl(gcfg.tun_steering_flows, tcfg.tun_steering_flows, "tun_steering_flows");
     expectl(gcfg.tun_steering_effective, 0, "tun_steering_effective");
     expectl(gcfg.tun_steering_errno, 0, "tun_steering_errno");
 
@@ -301,7 +303,7 @@ void test_config_read(void) {
 
 
     /* Example config */
-    conffile = "packaging/tayga.conf.example";
+    conffile = TAYGA_TEST_ROOT "/packaging/tayga.conf.example";
     if(!print_fail_only) printf("TEST CASE: example conf file\n");
     config_init();
     expect(!config_read(conffile),"Passed");
@@ -517,12 +519,12 @@ void test_config_read(void) {
     config_init();
     expect(config_read(conffile),"Failed");
 
-    /* Test Case - map non-matching mask */
-    if(!print_fail_only) printf("TEST CASE: map non-matching mask\n");
+    /* Test Case - map insufficient IPv6 suffix space */
+    if(!print_fail_only) printf("TEST CASE: map insufficient IPv6 suffix space\n");
     fd = fopen(conffile,"w");
     expect((long)fd,"fopen");
     if(!fd) return;
-    testcase = "map 192.168.254.0/24 2001:db8::/116\n";
+    testcase = "map 192.168.254.0/24 2001:db8::/124\n";
     fwrite(testcase,strlen(testcase),1,fd);
     fclose(fd);
     

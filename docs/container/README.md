@@ -26,3 +26,8 @@ The CLAT container launch script is not yet completed.
 ## Base Container
 
 Using the base container, you must either override `/app/launch.sh` with your own, or set the `ENTRYPOINT` of the container to your own script. `tayga` is available at `/app/tayga`, and `iproute2` is also available. The script must enable IP forwarding, configure routes within the container, and start `tayga`. You must also provide a `tayga.conf` file or generate it using the launch script.
+
+The repository-root `.dockerignore` is authoritative for all Containerfiles;
+use the repository root as build context. It excludes build outputs and local
+benchmark/audit artifacts. Container-specific copies of the ignore list are not
+maintained.

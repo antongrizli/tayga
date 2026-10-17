@@ -19,11 +19,11 @@ $(GENDIR)/version.h: FORCE | $(GENDIR)
 		mv $(GENDIR)/version.h.tmp $(GENDIR)/version.h; \
 	fi
 
-$(GENDIR) $(OBJDIR):
+$(BUILDDIR) $(GENDIR) $(OBJDIR) $(TESTOBJDIR) $(TESTBINDIR) $(SHIMDIR):
 	@mkdir -p $@
 
-$(OBJDIR)/%.o: src/%.c $(GENDIR)/version.h | $(OBJDIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+$(OBJDIR)/%.o: src/%.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(OBJDIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 # Compile Tayga
 $(BUILDDIR)/tayga: $(OBJS)
@@ -31,7 +31,6 @@ $(BUILDDIR)/tayga: $(OBJS)
 
 # Compile Tayga (statically link)
 .PHONY: static
-static: LDFLAGS += -static
 static: tayga
 
 # Root-level symlink/copy for backward compatibility
@@ -43,11 +42,23 @@ taygabe: $(SOURCES) $(GENDIR)/version.h
 	s390x-linux-gnu-gcc $(CPPFLAGS) $(CFLAGS) -o $@ $(SOURCES) $(LDFLAGS) $(LDLIBS)
 
 # Helper tools
-$(BUILDDIR)/pref64-discover: src/helpers/pref64-discover.c | $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -o $@ $< $(LDFLAGS)
+$(BUILDDIR)/pref64-discover: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(BUILDDIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $(BUILDDIR)/pref64-discover.d -Isrc -o $@ $< $(LDFLAGS)
 
 pref64-discover: $(BUILDDIR)/pref64-discover
 	@cp $(BUILDDIR)/pref64-discover pref64-discover
 
-tools/probe-tun-offload: tools/probe-tun-offload.c
+$(BUILDDIR)/probe-tun-offload: tools/probe-tun-offload.c $(BUILDDIR)/build.flags | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $<
+
+.PHONY: tools/probe-tun-offload
+tools/probe-tun-offload: $(BUILDDIR)/probe-tun-offload
+	@cp $< $@
+
+
+# Compare before replacing so unchanged invocations remain incremental.
+$(BUILDDIR)/build.flags: FORCE | $(BUILDDIR)
+	@printf '%s\n' 'CC=$(CC)' 'CPPFLAGS=$(CPPFLAGS)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'LDLIBS=$(LDLIBS)' 'AR=$(AR)' 'TEST_CFLAGS=$(TEST_CFLAGS)' 'TEST_LDFLAGS=$(TEST_LDFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+-include $(OBJS:.o=.d) $(BUILDDIR)/pref64-discover.d

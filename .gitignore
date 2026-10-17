@@ -53,3 +53,5 @@ latex/*
 # Working directories / proposals
 improvements/
 improvenments/
+# Unit sources are tracked even though compatibility binaries use unit_* names.
+!test/unit/unit_mapping.c

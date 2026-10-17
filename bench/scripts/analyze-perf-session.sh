@@ -5,7 +5,7 @@
 # ==============================================================================
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
 export PERF_SESSION_ROOT REPO_DIR
 OUT_DIR="$PERF_SESSION_ROOT/profile-analysis-arm64"
@@ -30,9 +30,10 @@ make -B CC=gcc CFLAGS='-O3 -flto -g -fno-omit-frame-pointer' LDFLAGS='-flto -Wl,
 cp tayga "$OUT_DIR/tayga-stats-on"
 
 # Install benchmark scripts
-sudo install -Dm0755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
-sudo install -Dm0755 scripts/container/tayga-status.sh /usr/local/sbin/tayga-status
-sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
+sudo install -Dm0755 container/rootfs/usr/local/sbin/clat-start.sh /usr/local/sbin/clat-start.sh
+sudo install -Dm0755 container/rootfs/usr/local/sbin/tayga-status /usr/local/sbin/tayga-status
+make benchmark-script
+sudo install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
 
 run_perf_profile() {
     local candidate_bin="$1"

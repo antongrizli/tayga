@@ -33,6 +33,7 @@ int has_slogged = 0;
 int print_slog = 0;
 void slog_impl(int priority, const char *file, const char *line, const char *func, const char *format, ...)
 {
+    (void)priority;
     (void)file;
     (void)line;
     (void)func;
@@ -51,6 +52,7 @@ void slog_impl(int priority, const char *file, const char *line, const char *fun
 /* Capture exit events */
 void _exit(int status);
 void exit(int status) {
+    (void)status;
     /* Expected end, deal with it */
     if(at_end) {
         fflush(NULL);

@@ -1,4 +1,6 @@
 # Main Makefile for TAYGA
+.DEFAULT_GOAL := all
+export PYTHONDONTWRITEBYTECODE := 1
 include mk/config.mk
 include mk/tayga.mk
 include mk/test.mk
@@ -16,6 +18,8 @@ help:
 	@echo 'static          - Compile tayga with static linkage'
 	@echo 'test            - Run the C unit test suite'
 	@echo 'test-portable   - Run portable non-root Python tests'
+	@echo 'system-test     - Run Linux kernel acceptance tests (root)'
+	@echo 'bench-tools     - Build benchmark helpers and fault shims'
 	@echo 'integration     - Run integration tests (requires root/netns)'
 	@echo 'release         - Bump VERSION, commit and create git tag'
 	@echo 'man             - Generate man pages from markdown (requires pandoc)'
@@ -33,47 +37,27 @@ help:
 	@echo 'WITH_SYSTEMD    - Install systemd scripts'
 	@echo 'WITH_OPENRC     - Install OpenRC scripts and example config'
 
-# Create a local release: update VERSION, commit and tag
+# Release preparation deliberately requires an explicit version and notes.
 .PHONY: release
 release:
-	@if [ -z "$(strip $(VERSION))" ]; then \
-		echo "ERROR: Specify VERSION (e.g. make release VERSION=1.0.0)" >&2; \
-		exit 1; \
-	fi
-	@RAW_VER="$(VERSION)"; \
-	CLEAN_VER="$${RAW_VER#v}"; \
-	CLEAN_VER="$${CLEAN_VER#version-}"; \
-	CLEAN_VER="$${CLEAN_VER#version}"; \
-	TAG="v$${CLEAN_VER}"; \
-	echo "==> Preparing release $${TAG} (version $${CLEAN_VER})..."; \
-	printf '%s\n' "$${CLEAN_VER}" > VERSION; \
-	git add VERSION; \
-	git commit -m "chore(release): $${TAG}"; \
-	git tag -a "$${TAG}" -m "Release $${TAG}"; \
-	echo "============================================================"; \
-	echo "  Release $${TAG} created locally!"; \
-	echo "  To publish to GitHub, run:"; \
-	echo "    git push origin main --tags"; \
-	echo "============================================================"
+	@test "$(origin VERSION)" = 'command line' && test -n "$(strip $(VERSION))" || { echo 'Use make release VERSION=x.y.z' >&2; exit 1; }
+	python3 scripts/prepare-release.py "$(VERSION)"
 
-# Man pages
-RELEASE ?= $(shell cat VERSION 2>/dev/null || echo "dev")
-MAN_DATE ?= $(shell date '+%B %Y')
+RELEASE ?= $(DEFAULT_VERSION)
+# Fixed metadata; update deliberately when publishing a release.
+MAN_DATE ?= October 2026
 
-.PHONY: man
+.PHONY: man check-man
 man:
 	$(PANDOC) -s -t man -M footer="TAYGA $(RELEASE)" -M date="$(MAN_DATE)" docs/man/tayga.8.md -o docs/man/tayga.8
 	$(PANDOC) -s -t man -M footer="TAYGA $(RELEASE)" -M date="$(MAN_DATE)" docs/man/tayga.conf.5.md -o docs/man/tayga.conf.5
 
-.PHONY: check-man
 check-man:
-	@TMPDIR=$$(mktemp -d); \
-	$(PANDOC) -s -t man -M footer="TAYGA $(RELEASE)" -M date="$(MAN_DATE)" docs/man/tayga.8.md -o $$TMPDIR/tayga.8; \
-	$(PANDOC) -s -t man -M footer="TAYGA $(RELEASE)" -M date="$(MAN_DATE)" docs/man/tayga.conf.5.md -o $$TMPDIR/tayga.conf.5; \
-	diff -u docs/man/tayga.8 $$TMPDIR/tayga.8 || (echo "docs/man/tayga.8 is out of date; run 'make man'" && rm -rf $$TMPDIR && exit 1); \
-	diff -u docs/man/tayga.conf.5 $$TMPDIR/tayga.conf.5 || (echo "docs/man/tayga.conf.5 is out of date; run 'make man'" && rm -rf $$TMPDIR && exit 1); \
-	rm -rf $$TMPDIR; \
-	echo "Man pages are up to date."
+	@set -eu; task_man_dir=$$(mktemp -d); trap 'rm -rf "$$task_man_dir"' EXIT HUP INT TERM; \
+	for page in tayga.8 tayga.conf.5; do \
+	  $(PANDOC) -s -t man -M footer="TAYGA $(RELEASE)" -M date="$(MAN_DATE)" docs/man/$$page.md -o "$$task_man_dir/$$page"; \
+	  diff -u docs/man/$$page "$$task_man_dir/$$page"; \
+	done; echo 'Man pages are up to date.'
 
 .PHONY: check-docs
 check-docs:

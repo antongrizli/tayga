@@ -18,7 +18,7 @@ to this repeatable benchmark; the Lima Debian 13 template is used by default.
 From macOS, after reviewing the command, run:
 
 ```sh
-bash /Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tools/lima-perf/run-host.sh
+bash /Users/antongrizli/Documents/MikroTik/tayga-clat-perf/bench/lima/run-host.sh
 ```
 
 The default VM is named `tayga-perf`, uses 4 vCPUs, 4 GiB RAM, 24 GiB disk, and
@@ -49,7 +49,7 @@ reports the exact drop and retransmit counts and marks such a run degraded.
 Compare two exported sessions without rerunning traffic:
 
 ```sh
-bash /Users/antongrizli/Documents/MikroTik/tayga-clat-perf/tools/lima-perf/compare-session.sh \
+bash /Users/antongrizli/Documents/MikroTik/tayga-clat-perf/bench/lima/compare-session.sh \
   /path/to/baseline-session /path/to/candidate-session
 ```
 

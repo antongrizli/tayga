@@ -51,7 +51,7 @@ sudo sysctl -w kernel.kptr_restrict=0 >/dev/null 2>&1 || true
 
 mkdir -p "$BUILD_ROOT"
 tar -C "$REPO" \
-  --exclude='./.git' --exclude='./perf-sessions' --exclude='./dist' \
+  --exclude='./build' --exclude='./improvenments' --exclude='./.git' --exclude='./perf-sessions' --exclude='./dist' \
   --exclude='./.codex' --exclude='./.agents' --exclude='./tayga' \
   --exclude='./unit_conffile' --exclude='./unit_checksum' --exclude='./unit_udp_checksum' \
   --exclude='./unit_ip4_id' --exclude='./unit_tun' --exclude='./unit_gso' \
@@ -91,8 +91,9 @@ sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drai
 sudo install -Dm0755 tools/iperf-start-control /usr/local/libexec/tayga-perf/iperf-start-control
 sudo install -Dm0755 tools/iperf-start-gate.so /usr/local/lib/tayga-perf/iperf-start-gate.so
 sudo install -Dm0755 tayga /usr/sbin/tayga
-sudo install -Dm0755 "$BUILD_ROOT/scripts/container/clat-start.sh" /usr/local/sbin/clat-start.sh
-sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
+sudo install -Dm0755 "$BUILD_ROOT/container/rootfs/usr/local/sbin/clat-start.sh" /usr/local/sbin/clat-start.sh
+make benchmark-script
+sudo install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
 
 mkdir -p "$SESSION_ROOT"
 uname -a > "$SESSION_ROOT/uname.txt"
@@ -113,6 +114,7 @@ run_case() {
   sudo env ARTIFACT_DIR="$case_dir" PERF_MODE="$mode" \
     CLIENTS="${CLIENTS:-20}" FLOWS="${FLOWS:-1}" WORKERS="${WORKERS:-3}" \
     CLAT_OFFLOAD="${CLAT_OFFLOAD:-auto}" CLAT_OFFLINK_MTU="${CLAT_OFFLINK_MTU:-1280}" \
+    CLAT_STEERING="${CLAT_STEERING:-}" \
     FORWARDING_GRO="${FORWARDING_GRO:-off}" \
     PERF_SCOPE="${PERF_SCOPE:-process}" \
     PACING_TIMER_US="${PACING_TIMER_US:-1000}" \

@@ -37,6 +37,15 @@ tayga.conf.
     If UDP is unavailable, retain TCP; if TCP is unavailable, use ordinary
     packets. All worker queues use the same negotiated capabilities and verified
     virtual header framing. Startup fails if a safe state cannot be established.
+
+**tun-steering** *kernel|groups|flows*
+:   Defaults to **kernel**. On Linux with multiqueue TUN devices, configures
+    packet queue steering. **kernel** relies on default Linux kernel steering;
+    **groups** enables opt-in eBPF 2-tuple L3 address-group steering;
+    **flows** enables opt-in eBPF 4-tuple flow steering for unfragmented
+    TCP and UDP traffic, distributing parallel client flows evenly across
+    all worker queues in NAT44 and single-IP CLAT environments while preserving
+    2-tuple steering for fragmented packets.
     **tcp** requires checksum and TCP segmentation. **udp** requires checksum,
     TCP and UDP segmentation. Explicit modes fail when unavailable; **off**
     disables offload. Packet-level software fallback remains active.
@@ -93,12 +102,24 @@ tayga.conf.
     Enabled by default
 
 **map** *ipv4_address[/length] ipv6_address[/length]*
-:   Creates a static mapping between RFC 7577 compliant hosts or
+:   Creates a static mapping between RFC 7757 compliant hosts or
     subnets *ipv4_address[/length]* and *ipv6_address[/length]* to be
     used when translating IPv4 packets to IPv6 or IPv6 packets to IPv4.
     If */length* is not present, the */length* after *ipv4_address* is
     treated as "/32" and that of *ipv6_address* as "/128". Multiple
     **map** directives are permitted in the tayga.conf file.
+
+    The IPv6 prefix must leave enough bits for the IPv4 suffix. Suffix bits
+    follow the IPv6 prefix immediately; remaining IPv6 bits are zero on
+    IPv4-to-IPv6 translation and discarded in the reverse direction. Existing
+    equal-width mappings retain their representation. For example,
+    `map 198.51.100.0/24 2001:db8:aaaa::/48` maps `198.51.100.90` to
+    `2001:db8:aaaa:5a00::`. Prefixes must have zero host bits.
+
+    IPv4 mappings use longest-prefix matching. A narrower IPv4 mapping may
+    override a broader one, but that can make reverse translations asymmetric;
+    choose such overrides deliberately. Identical IPv4 prefixes and overlapping
+    IPv6 prefixes are rejected in fixed configuration.
 
     *ipv4_address* is permitted to overlap with the prefix specified in
     the **dynamic-pool** directive, in which case *ipv4_address* will be

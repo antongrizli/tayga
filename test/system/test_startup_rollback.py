@@ -16,7 +16,7 @@ def main():
     a = p.parse_args()
     binary = str(Path(a.binary).resolve())
     out = Path(a.output); out.mkdir(parents=True, exist_ok=False)
-    with open('/tmp/tayga-perf-workflow.lock', 'a') as lock, tempfile.TemporaryDirectory() as temp:
+    with open('/tmp/tayga-perf-workflow.lock', 'r') as lock, tempfile.TemporaryDirectory() as temp:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         tmp = Path(temp); shim = tmp/'fault.so'
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', str(Path(__file__).resolve().parents[1] / "fault/startup_fault.c"), '-o', str(shim), '-ldl'], check=True)

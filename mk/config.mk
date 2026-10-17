@@ -43,7 +43,30 @@ INSTALL_PROGRAM ?= $(INSTALL)
 DEFAULT_VERSION := $(shell cat $(TOPDIR)/VERSION 2>/dev/null || echo "0.9.13")
 VERSION ?= $(shell $(GIT) describe --tags --always --dirty 2>/dev/null || echo "$(DEFAULT_VERSION)")
 ifeq ($(strip $(VERSION)),)
-VERSION := $(DEFAULT_VERSION)
+override VERSION := $(DEFAULT_VERSION)
 endif
 BRANCH  ?= $(shell $(GIT) rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
 COMMIT  ?= $(shell $(GIT) rev-parse HEAD 2>/dev/null || echo "unknown")
+
+# Link mode is part of the configuration even for combined static/helper goals.
+ifneq ($(filter static,$(MAKECMDGOALS)),)
+override LDFLAGS += -static
+endif
+AR ?= ar
+TEST_CFLAGS ?= $(CFLAGS) -Werror
+TEST_LDFLAGS ?= $(LDFLAGS)
+ifeq ($(COVERAGE),1)
+override TEST_CFLAGS += --coverage
+override TEST_LDFLAGS += --coverage
+endif
+TESTOBJDIR := $(BUILDDIR)/test-obj
+TESTBINDIR := $(BUILDDIR)/test-bin
+TESTOUTDIR := $(BUILDDIR)/test-output
+SHIMDIR := $(BUILDDIR)/shims
+
+ifeq ($(strip $(BRANCH)),)
+override BRANCH := unknown
+endif
+ifeq ($(strip $(COMMIT)),)
+override COMMIT := unknown
+endif

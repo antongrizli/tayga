@@ -3,7 +3,7 @@ set -euo pipefail
 PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
 export PERF_SESSION_ROOT
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 touch /tmp/tayga-perf-workflow.lock 2>/dev/null || true
 exec 9</tmp/tayga-perf-workflow.lock
@@ -52,9 +52,10 @@ sudo install -Dm0755 tools/udp-drain-control /usr/local/libexec/tayga-perf/udp-d
 sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drain-guard.so
 sudo install -Dm0755 tools/iperf-start-control /usr/local/libexec/tayga-perf/iperf-start-control
 sudo install -Dm0755 tools/iperf-start-gate.so /usr/local/lib/tayga-perf/iperf-start-gate.so
-sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
+make benchmark-script
+sudo install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
 sudo install -D -m 0755 tayga /usr/sbin/tayga
-sudo install -D -m 0755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
+sudo install -D -m 0755 container/rootfs/usr/local/sbin/clat-start.sh /usr/local/sbin/clat-start.sh
 GIT_REVISION="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 SOURCE_TREE_SHA256="$(git ls-files -co --exclude-standard -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
 
