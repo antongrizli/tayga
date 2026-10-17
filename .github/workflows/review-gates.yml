@@ -81,7 +81,7 @@ jobs:
             sudo python3 test/system/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
             sudo python3 test/system/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
           fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: kernel-review-results
