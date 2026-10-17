@@ -121,7 +121,7 @@ jobs:
              cp pref64-discover dist-bin/pref64-discover-linux-${{ matrix.arch }}"
 
       - name: Upload static binaries
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
           path: dist-bin/*
@@ -184,7 +184,7 @@ jobs:
           ls -lh dist-tar/${{ matrix.tar_name }}
 
       - name: Upload Container TAR artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: container-tar-${{ matrix.arch }}
           path: dist-tar/*
