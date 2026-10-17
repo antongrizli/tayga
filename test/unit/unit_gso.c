@@ -1743,6 +1743,9 @@ static void test_gso_uint16_overflow_6to4(void)
 
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	int sock_buf_size = 256 * 1024;
+	setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
+	setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
 
 	/* Payload of 65500 + 20 (TCP) = 65520 <= 65535 in IPv6, but + 20 (IPv4) = 65540 > 65535 */
 	uint32_t payload_len = 65500;

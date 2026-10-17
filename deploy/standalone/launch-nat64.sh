@@ -1,3 +1,4 @@
+#!/bin/sh
 ## Launch tayga within a container
 
 # Enable Forwarding

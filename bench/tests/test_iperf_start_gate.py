@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import tempfile
 import time
 import unittest
 
-@unittest.skipUnless(sys.platform.startswith('linux'),'Linux iperf preload required')
+@unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('iperf3'), 'Linux iperf3 and preload required')
 class GateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
