@@ -1,50 +1,16 @@
-FROM alpine:edge@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000
-
-RUN apk add --no-cache \
-    build-base \
-    linux-headers \
-    iproute2 \
-    iperf3 \
-    nftables \
-    procps \
-    ethtool \
-    python3 \
-    py3-pip \
-    unbound
-
-RUN pip install --no-cache-dir --break-system-packages scapy==2.6.1 pyroute2==0.9.5
-
+FROM alpine:3.24
+RUN apk add --no-cache build-base linux-headers iproute2 iperf3 nftables procps ethtool python3 py3-scapy py3-pyroute2 socat unbound tini
 WORKDIR /src
-ARG TAYGA_SOURCE=tayga-clat-perf
+COPY . .
 ARG TAYGA_VERSION=local
 ARG TAYGA_BRANCH=local
 ARG TAYGA_COMMIT=unknown
-COPY ${TAYGA_SOURCE}/ /src/
-
-RUN printf '%s\n' \
-    '#ifndef __TAYGA_VERSION_H__' \
-    '#define __TAYGA_VERSION_H__' \
-    '#define TAYGA_VERSION "'"$TAYGA_VERSION"'"' \
-    '#define TAYGA_BRANCH "'"$TAYGA_BRANCH"'"' \
-    '#define TAYGA_COMMIT "'"$TAYGA_COMMIT"'"' \
-    '#endif' > version.h \
- && make -B CC=gcc CFLAGS='-O3 -flto -fno-plt -g -fno-omit-frame-pointer' LDFLAGS='-flto -Wl,--build-id' \
- && install -Dm0755 tayga /usr/sbin/tayga
-
-COPY telekom-nat64-minimal/start.sh /usr/local/sbin/start.sh
-COPY tayga-clat-perf/scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
-COPY telekom-nat64-minimal/tayga.conf /etc/tayga.conf
-COPY telekom-nat64-minimal/unbound.conf /etc/unbound/unbound.conf
-COPY telekom-nat64-minimal/benchmark/compare-nat64.sh /usr/local/sbin/compare-nat64.sh
-COPY tayga-clat-perf/benchmark-clat.sh /tmp/benchmark-clat.sh
-COPY tayga-clat-perf/benchmark-matrix.sh /tmp/benchmark-matrix.sh
-COPY telekom-nat64-minimal/test-464xlat-lab.sh /tmp/test-464xlat-lab.sh
-
-RUN mkdir -p /usr/local/sbin \
- && cp /tmp/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh \
- && cp /tmp/benchmark-matrix.sh /usr/local/sbin/benchmark-matrix.sh \
- && cp /tmp/test-464xlat-lab.sh /usr/local/sbin/test-464xlat-lab.sh \
- && chmod 0755 /usr/local/sbin/start.sh /usr/local/sbin/clat-start.sh /usr/local/sbin/compare-nat64.sh /usr/local/sbin/benchmark-clat.sh /usr/local/sbin/benchmark-matrix.sh /usr/local/sbin/test-464xlat-lab.sh \
- && unbound-checkconf /etc/unbound/unbound.conf
-
-ENTRYPOINT ["/usr/local/sbin/compare-nat64.sh"]
+RUN make all bench-tools benchmark-script VERSION="$TAYGA_VERSION" BRANCH="$TAYGA_BRANCH" COMMIT="$TAYGA_COMMIT" LDFLAGS='' \
+ && install -Dm0755 build/tayga /usr/sbin/tayga \
+ && install -Dm0755 container/rootfs/usr/local/sbin/clat-start.sh /usr/local/sbin/clat-start.sh \
+ && install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh \
+ && install -Dm0755 bench/clat/benchmark-matrix.sh /usr/local/sbin/benchmark-matrix.sh \
+ && install -d /usr/local/lib/tayga-perf /usr/local/libexec/tayga-perf \
+ && cp build/shims/*.so /usr/local/lib/tayga-perf/ \
+ && cp build/shims/*control /usr/local/libexec/tayga-perf/
+ENTRYPOINT ["/usr/local/sbin/benchmark-clat.sh"]

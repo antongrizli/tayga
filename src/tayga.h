@@ -432,6 +432,7 @@ struct config {
 	int dispatch_mode; /* bounded experimental software ingress dispatch */
 	int async_tun; /* explicit io_uring TX prototype */
 	int tun_steering_groups; /* opt-in, fresh nonpersistent interfaces only */
+	int tun_steering_flows;  /* opt-in 4-tuple flow steering */
 	int tun_steering_effective;
 	int tun_steering_errno;
 
@@ -582,6 +583,7 @@ int tun_process_frame(uint8_t *recv_buf, int ret, int tun_fd);
 void tun_read(uint8_t * recv_buf, int tun_fd);
 ssize_t tun_write(int tun_fd, const void *buf, size_t len);
 ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const void *buf, size_t len);
+ssize_t tun_write_vnet_inplace(int tun_fd, const struct virtio_net_hdr_raw *vhdr, void *buf, size_t len);
 ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt);
 ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const struct iovec *iov, int iovcnt);
 

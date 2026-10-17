@@ -110,7 +110,7 @@ struct map6 *assign_dynamic(const struct in6_addr *addr6)
 	struct dynamic_pool *pool;
 	struct list_head *entry;
 	struct free_addr *f;
-	uint32_t i, addr, base, max;
+	uint32_t i, base, max;
 	struct in_addr addr4;
 	struct map4 *m4;
 	struct map_dynamic *d;
@@ -137,55 +137,44 @@ struct map6 *assign_dynamic(const struct in6_addr *addr6)
 				(base >> (32 - pool->map4.prefix_len));
 	}
 
-	for (i = 0, entry = NULL; i <= max; ++i) {
-		addr = pool->free_head.addr | ((base + i) & max);
-		if (!entry || addr == pool->free_head.addr)
-			entry = pool->free_list.next;
-		while (entry != &pool->free_list) {
+	/* Search both halves of the circular range. Walk free runs rather than
+	 * individual addresses, and skip entire static overrides. Wide bounds
+	 * avoid wrapping at the end of the IPv4 address space. */
+	uint64_t first = pool->free_head.addr | (base & max);
+	for (int pass = 0; pass < 2; ++pass) {
+		uint64_t low = pass ? pool->free_head.addr : first;
+		uint64_t high = pass ? first : (uint64_t)pool->free_head.addr + max + 1;
+		list_for_each(entry, &pool->free_list) {
 			f = list_entry(entry, struct free_addr, list);
-			if (f->addr + f->count >= addr)
-				break;
-			entry = entry->next;
-		}
-		if (entry == &pool->free_list)
-			break;
-		if (f->addr >= addr) {
-			/* Skip directly over the contiguous allocated run [addr .. f->addr] */
-			uint32_t skip = f->addr - addr;
-			if (f->count == 0) {
-				/* Advance to the next free_addr block that actually has free addresses */
-				struct list_head *next_e = entry->next;
-				while (next_e != &pool->free_list) {
-					struct free_addr *nf = list_entry(next_e, struct free_addr, list);
-					if (nf->count > 0) {
-						skip = nf->addr - addr;
-						entry = next_e;
-						break;
-					}
-					next_e = next_e->next;
+			uint64_t addr = (uint64_t)f->addr + 1;
+			uint64_t end = (uint64_t)f->addr + f->count + 1;
+			if (addr < low) addr = low;
+			if (end > high) end = high;
+			while (addr < end) {
+				addr4.s_addr = htonl((uint32_t)addr);
+				m4 = find_map4(&addr4);
+				if (m4 == &pool->map4) {
+					d = alloc_map_dynamic(addr6, &addr4, f);
+					if (!d) return NULL;
+					print_dyn_change("assigned", d);
+					gcfg.map_write_pending = 1;
+					goto activate;
 				}
-				if (next_e == &pool->free_list)
-					break;
+				if (!m4) break;
+				addr = (uint64_t)(ntohl(m4->addr.s_addr) |
+						~ntohl(m4->mask.s_addr)) + 1;
 			}
-			i += skip;
-			continue;
-		}
-		addr4.s_addr = htonl(addr);
-		m4 = find_map4(&addr4);
-		if (m4 == &pool->map4) {
-			d = alloc_map_dynamic(addr6, &addr4, f);
-			if (!d)
-				return NULL;
-			print_dyn_change("assigned", d);
-			gcfg.map_write_pending = 1;
-			goto activate;
 		}
 	}
 
-	if (list_empty(&pool->dormant_list))
+	if (list_empty(&pool->dormant_list)) {
+		slog(LOG_WARNING, "Dynamic pool exhausted: no free or dormant addresses available\n");
 		return NULL;
+	}
 
 	d = list_entry(pool->dormant_list.prev, struct map_dynamic, list);
+	slog(LOG_NOTICE, "Dynamic pool exhausted: reassigning dormant lease (idle %ld s)\n",
+	     (long)(now - d->last_use));
 	d->map6.addr = *addr6;
 	print_dyn_change("reassigned", d);
 	gcfg.map_write_pending = 1;

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Study matrix ordering and finite/profile coverage without network side effects."""
-import importlib.util
+import importlib
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-spec=importlib.util.spec_from_file_location('batch_study',Path(__file__).resolve().parents[2]/'bench/taygabench/studies/run-udp-batch-study.py')
-study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
+study = importlib.import_module("taygabench.studies.run_udp_batch_study")
 
 class StudyTests(unittest.TestCase):
     def run_study(self,finite_only=False):

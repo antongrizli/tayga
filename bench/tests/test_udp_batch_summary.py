@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Capacity matrix validation and separate profile reporting."""
-import importlib.util
+import importlib
 import json
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tempfile
 import unittest
 
-spec=importlib.util.spec_from_file_location('batch_summary',Path(__file__).resolve().parents[2]/'bench/taygabench/summarize/summarize-udp-batch-study.py')
-study=importlib.util.module_from_spec(spec);spec.loader.exec_module(study)
+study = importlib.import_module("taygabench.summarize.summarize_udp_batch_study")
 
 class SummaryTests(unittest.TestCase):
     def fixture(self,root):

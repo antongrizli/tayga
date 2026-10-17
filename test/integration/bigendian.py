@@ -13,7 +13,7 @@
 from test_env import (
     test_env,
     test_result,
-    router,
+    router, REPO,
 )
 from random import randbytes
 from scapy.all import IP, ICMP, UDP, IPv6, Raw, TCP
@@ -26,6 +26,7 @@ from scapy.layers.inet import (
     UDPerror
 )
 import time
+import os
 
 ## Test Environment global
 test = test_env("test/bigendian")
@@ -384,7 +385,7 @@ def sec_5_5():
 #test.debug = True
 test.timeout = 0.1
 test.setup()
-test.tayga_bin = "./taygabe"
+test.tayga_bin = os.environ.get("TAYGA_BIG_ENDIAN_BIN", str(REPO / "taygabe"))
 
 # Call all tests
 sec_4_5()

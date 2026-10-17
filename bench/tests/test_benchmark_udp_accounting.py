@@ -6,9 +6,12 @@ import json
 import tempfile
 import subprocess
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from taygabench.common import benchmark_source
 import unittest
 
-script = (Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh").read_text()
+script = benchmark_source(Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh")
 start = script.index("def udp_packet_accounting(")
 end = script.index("\nfor path in sorted(", start)
 namespace = {}
@@ -177,7 +180,7 @@ class SenderQueueSetupTests(unittest.TestCase):
                 f"Pre-set maximums:\nRX: 4\nTX: 4\nCurrent hardware settings:\nRX: {channels}\nTX: {channels}\n")
             (root / "ip").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$QUEUE_LOG"\n')
             (root / "ip").chmod(0o755)
-            setup = script[script.index("configure_sender_fq() {"):script.index('\nif [ "$SENDER_FQ" = on ]; then')]
+            setup = (Path(__file__).resolve().parents[2] / "bench/clat/lib/offload.sh").read_text()
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        ARTIFACT_DIR=str(root), SENDER_FQ_TOPOLOGY="auto", SENDER_FQ_LIMIT=str(total_limit),
                        SENDER_FQ_FLOW_LIMIT="2000", FQ_RATE="0", QUEUE_LOG=str(root / "commands"))

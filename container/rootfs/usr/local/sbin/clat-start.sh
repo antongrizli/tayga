@@ -55,6 +55,8 @@ TAYGA_WORKERS_VAL=$(resolve_alias "TAYGA_WORKERS" "${TAYGA_WORKERS:-}" "CLAT_WOR
 TAYGA_OFFLOAD_VAL=$(resolve_alias "TAYGA_OFFLOAD" "${TAYGA_OFFLOAD:-}" "CLAT_OFFLOAD" "${CLAT_OFFLOAD:-}" "auto")
 TAYGA_OFFLINK_MTU_VAL=$(resolve_alias "TAYGA_OFFLINK_MTU" "${TAYGA_OFFLINK_MTU:-}" "CLAT_OFFLINK_MTU" "${CLAT_OFFLINK_MTU:-}" "1280")
 
+TAYGA_STEERING_VAL=$(resolve_alias "TAYGA_STEERING" "${TAYGA_STEERING:-}" "CLAT_STEERING" "${CLAT_STEERING:-}" "")
+
 validate_uint "TAYGA_WORKERS" "$TAYGA_WORKERS_VAL"
 validate_uint "TAYGA_OFFLINK_MTU" "$TAYGA_OFFLINK_MTU_VAL"
 
@@ -72,6 +74,14 @@ case "$TAYGA_OFFLOAD_VAL" in
   off|tcp|udp|auto) ;;
   *)
     echo "ERROR: TAYGA_OFFLOAD must be 'off', 'tcp', 'udp', or 'auto' (got '$TAYGA_OFFLOAD_VAL')" >&2
+    exit 64
+    ;;
+esac
+
+case "$TAYGA_STEERING_VAL" in
+  ''|kernel|groups|flows) ;;
+  *)
+    echo "ERROR: TAYGA_STEERING must be 'kernel', 'groups', or 'flows' (got '$TAYGA_STEERING_VAL')" >&2
     exit 64
     ;;
 esac
@@ -185,15 +195,29 @@ offlink-mtu ${TAYGA_OFFLINK_MTU_VAL}
 tun-offload ${TAYGA_OFFLOAD_VAL}
 CONF_EOF
 
+if [ -n "$TAYGA_STEERING_VAL" ]; then
+  echo "tun-steering ${TAYGA_STEERING_VAL}" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+fi
+
+if [ "$TAYGA_STEERING_VAL" = "groups" ] || [ "$TAYGA_STEERING_VAL" = "flows" ]; then
+  echo "tun-up on" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  echo "tun-ip ${V4_HOST}/32" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  echo "tun-ip ${V6_HOST}/128" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  echo "tun-route 0.0.0.0/0" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  echo "tun-route ${V6_CLIENT}/128" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+fi
+
 # Set up TUN adapter and routes
 echo "==> Setting up TUN device $TUN and routing table..."
-/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun
-ip link set "$TUN" up
-ip addr replace "$V4_HOST/32" dev "$TUN"
-ip -6 addr replace "$V6_HOST/128" dev "$TUN"
+/usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" --mktun || [ "$TAYGA_STEERING_VAL" = "groups" ] || [ "$TAYGA_STEERING_VAL" = "flows" ]
+if [ "$TAYGA_STEERING_VAL" != "groups" ] && [ "$TAYGA_STEERING_VAL" != "flows" ]; then
+  ip link set "$TUN" up
+  ip addr replace "$V4_HOST/32" dev "$TUN"
+  ip -6 addr replace "$V6_HOST/128" dev "$TUN"
+  ip -6 route replace "$V6_CLIENT/128" dev "$TUN"
+  ip route replace default dev "$TUN"
+fi
 ip route replace "$V4_CLIENT/32" via "$ROUTER4" dev "$UPLINK_IF"
-ip -6 route replace "$V6_CLIENT/128" dev "$TUN"
-ip route replace default dev "$TUN"
 
 enable_forwarding net.ipv4.ip_forward
 enable_forwarding net.ipv6.conf.all.forwarding

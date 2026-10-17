@@ -15,6 +15,10 @@ a=p.parse_args()
 with open('/tmp/tayga-perf-workflow.lock') as lock:
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     out=Path(a.output).resolve();out.mkdir(parents=True,exist_ok=False)
+    if b'Experimental TUN NAPI' not in Path(a.binary).resolve().read_bytes():
+        print('SKIP: binary was built without TAYGA_EXPERIMENTAL_NAPI')
+        (out / 'summary.json').write_text(json.dumps([{'skipped': True, 'reason': 'non-napi binary'}], indent=2) + '\n')
+        raise SystemExit(0)
     rows=[]
     with tempfile.TemporaryDirectory() as name:
         root=Path(name);shim=root/'fault.so'

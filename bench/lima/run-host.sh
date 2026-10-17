@@ -52,6 +52,7 @@ limactl shell "$INSTANCE" -- env \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
   "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
   "CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}" "CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}" \
+  "CLAT_STEERING=${CLAT_STEERING:-}" \
   "FORWARDING_GRO=${FORWARDING_GRO:-off}" \
   "PERF_SCOPE=${PERF_SCOPE:-process}" \
   "PACING_TIMER_US=${PACING_TIMER_US:-1000}" \
@@ -82,7 +83,7 @@ limactl shell "$INSTANCE" -- env \
     task_status=$?
     rm -f "$task_runner"
     exit "$task_status"
-  ' bash "$REPO/tools/lima-perf/run-guest.sh" < /dev/null || guest_status=$?
+  ' bash "$REPO/bench/lima/run-guest.sh" < /dev/null || guest_status=$?
 
 SESSION_DIR="$PERF_SESSION_ROOT/$SESSION_STAMP-lima-debian13-arm64"
 GUEST_SESSION="/tmp/tayga-perf-sessions/$SESSION_STAMP-lima-debian13-arm64"

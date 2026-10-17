@@ -18,9 +18,9 @@ permissions:
   packages: write
 
 jobs:
-  # 1. Synchronize version.h in Repository if not already updated
+  # 1. Synchronize VERSION in Repository if not already updated
   sync-version-file:
-    name: Sync version.h in Repository
+    name: Sync VERSION in Repository
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Update version.h and commit to main if needed
+      - name: Update VERSION and commit to main if needed
         run: |
           RAW_VER="${{ inputs.ver || github.ref_name }}"
           CLEAN_VER="${RAW_VER#v}"
@@ -36,20 +36,19 @@ jobs:
           CLEAN_VER="${CLEAN_VER#version}"
           COMMIT_SHA="$(git rev-parse HEAD)"
 
-          # Check if version.h is already synchronized
-          if ! grep -q "\"${CLEAN_VER}\"" version.h; then
-            echo "==> Updating version.h and release to ${CLEAN_VER} (Commit: ${COMMIT_SHA})..."
-            printf '#ifndef __TAYGA_VERSION_H__\n#define __TAYGA_VERSION_H__\n\n#define TAYGA_VERSION "%s"\n#define TAYGA_BRANCH  "main"\n#define TAYGA_COMMIT  "%s"\n\n#endif /* #ifndef __TAYGA_VERSION_H__ */\n' \
-              "${CLEAN_VER}" "${COMMIT_SHA}" > version.h
-            echo "RELEASE=${CLEAN_VER}" > release
+          # Check if VERSION file is already synchronized
+          CURRENT_VER="$(tr -d '\r\n' < VERSION 2>/dev/null || echo "")"
+          if [ "${CURRENT_VER}" != "${CLEAN_VER}" ]; then
+            echo "==> Updating VERSION to ${CLEAN_VER} (Commit: ${COMMIT_SHA})..."
+            printf '%s\n' "${CLEAN_VER}" > VERSION
 
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add version.h release
+            git add VERSION
             git commit -m "chore(release): synchronize version to ${RAW_VER} [skip ci]" || true
             git push origin HEAD:main || true
           else
-            echo "✅ version.h is already up-to-date with ${CLEAN_VER}"
+            echo "✅ VERSION is already up-to-date with ${CLEAN_VER}"
           fi
 
   # 2. Run Unit Tests & Build Verification

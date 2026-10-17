@@ -12,7 +12,7 @@ import tempfile
 import concurrent.futures
 import resource
 
-ROOT=Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 def sh(*args):
     subprocess.run(args,check=True,stdout=subprocess.DEVNULL)
@@ -120,12 +120,12 @@ def main():
     if len(os.sys.argv)>2 and os.sys.argv[1]=='inside':
         inside(os.sys.argv[2]); return
     if os.geteuid()!=0: raise SystemExit('Linux root required')
-    lock=open('/tmp/tayga-perf-workflow.lock','a')
+    lock=open('/tmp/tayga-perf-workflow.lock','r')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     with tempfile.TemporaryDirectory(prefix='tayga-steering-') as folder:
         source=Path(folder)/'loader.c'; library=Path(folder)/'loader.so'
         source.write_text('#include <sys/ioctl.h>\n#include <linux/if_tun.h>\n#include "tun_steering.h"\nint attach(int tun,int queues){char log[16384]={0};int p=steering_program(queues,log,sizeof(log));if(p<0)return -1;int r=ioctl(tun,TUNSETSTEERINGEBPF,&p);close(p);return r;}\n')
-        sh('gcc','-shared','-fPIC','-Wall','-O2','-I'+str(ROOT),str(source),'-o',str(library))
+        sh('gcc','-shared','-fPIC','-Wall','-O2','-I'+str(ROOT / 'src'),'-I'+str(ROOT),str(source),'-o',str(library))
         ns='tayga-steering-'+str(os.getpid())
         sh('ip','netns','add',ns)
         try: subprocess.run(['ip','netns','exec',ns,'python3',str(Path(__file__).resolve()),'inside',str(library)],check=True)

@@ -410,13 +410,12 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		return 0;
 	}
 
-	/* RFC 7915 §5.1 & RFC 6864 §4.3: check whether all segments get DF=1 */
+	/* RFC 7915 §5.1 & RFC 6864 §4.3: check whether all segments get DF=1 or DF=0 */
 	uint32_t full_seg_ip4_len = sizeof(struct ip4) + tcp_hdr_len + gso_size;
 	uint32_t tail_len = payload_len % gso_size;
 	uint32_t tail_ip4_len = tail_len > 0 ? (sizeof(struct ip4) + tcp_hdr_len + tail_len) : full_seg_ip4_len;
 
-	/* If even full segments are <= 1260 or there is only 1 segment which is <= 1260: fallback to software segmentation */
-	if (full_seg_ip4_len <= 1260 || (payload_len <= gso_size && tail_ip4_len <= 1260)) {
+	if (sizeof(struct ip4) + tcp_hdr_len + payload_len > UINT16_MAX) {
 		return gso_software_segment_and_send_6to4(p);
 	}
 
@@ -432,8 +431,8 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	struct in6_addr orig_ip6_src = ip6->src;
 	struct in6_addr orig_ip6_dst = ip6->dest;
 
-	/* Check if we have a short tail (tail_len > 0 && tail_ip4_len <= 1260) that needs to be split */
-	if (tail_len > 0 && tail_ip4_len <= 1260 && payload_len > gso_size) {
+	/* Case 1: Split GSO aggregate if full segments > 1260 (DF=1) but tail <= 1260 (DF=0) */
+	if (full_seg_ip4_len > 1260 && tail_len > 0 && tail_ip4_len <= 1260 && payload_len > gso_size) {
 		/* Split GSO aggregate: head has N full MSS segments; tail is sent separately */
 		uint32_t num_full = payload_len / gso_size;
 		uint32_t head_payload_len = num_full * gso_size;
@@ -473,7 +472,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		out_vhdr.csum_start -= (sizeof(struct ip6) - sizeof(struct ip4));
 		out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-		ssize_t ret_head = tun_write_vnet(p->tun_fd, &out_vhdr, head_ip4, head_out_len);
+		ssize_t ret_head = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, head_ip4, head_out_len);
 		if (ret_head > 0) {
 			stats_gso_tx(head_out_len);
 		} else {
@@ -481,19 +480,15 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		}
 
 		/* 2. Send Tail short segment separately (DF=0, unique ID) */
-		uint8_t tail_buf[HEADROOM + 2048];
-		uint8_t *tail_seg = tail_buf + HEADROOM;
-		struct ip4 *tail_ip4 = (struct ip4 *)tail_seg;
-		struct tcp_hdr *tail_tcp = (struct tcp_hdr *)(tail_seg + sizeof(struct ip4));
+		uint8_t *tail_payload = (uint8_t *)tcp + tcp_hdr_len + head_payload_len;
+		struct tcp_hdr *tail_tcp = (struct tcp_hdr *)(tail_payload - tcp_hdr_len);
+		struct ip4 *tail_ip4 = (struct ip4 *)((uint8_t *)tail_tcp - sizeof(struct ip4));
 
-		/* Copy TCP header and payload for tail */
-		memcpy(tail_tcp, tcp, tcp_hdr_len);
+		/* Copy TCP header in-place immediately before tail_payload */
+		memmove(tail_tcp, tcp, tcp_hdr_len);
 		tail_tcp->seq = htonl(orig_seq + head_payload_len);
 		/* RFC 3168 §6.1.5: CWR only on first segment; clear on tail while preserving FIN, PSH, ECE */
 		tail_tcp->flags = orig_flags & ~TCP_FLAG_CWR;
-		memcpy((uint8_t *)tail_tcp + tcp_hdr_len,
-		       (uint8_t *)tcp + tcp_hdr_len + head_payload_len,
-		       tail_len);
 
 		uint32_t tail_tcp_total_len = tcp_hdr_len + tail_len;
 		tail_ip4->ver_ihl = 0x45;
@@ -508,14 +503,30 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		tail_ip4->cksum = 0;
 		tail_ip4->cksum = ip4_header_checksum(tail_ip4);
 
-		/* Full TCP checksum calculation for software tail */
+		/* Full TCP checksum calculation for software tail zero-copy */
 		tail_tcp->cksum = 0;
-		tail_tcp->cksum = ones_add(ip_checksum(tail_tcp, tail_tcp_total_len),
+		uint16_t data_csum = tail_len > 0 ? ip_checksum(tail_payload, tail_len) : 0;
+		uint16_t tcp_hdr_csum = ip_checksum(tail_tcp, tcp_hdr_len);
+		tail_tcp->cksum = ones_add(ones_add(tcp_hdr_csum, data_csum),
 		                           ip4_checksum(tail_ip4, tail_tcp_total_len, IPPROTO_TCP));
 
-		ssize_t ret_tail = tun_write(p->tun_fd, tail_ip4, sizeof(struct ip4) + tail_tcp_total_len);
+		size_t tail_out_len = sizeof(struct ip4) + tail_tcp_total_len;
+		ssize_t ret_tail;
+		if (gcfg.vnet_hdr_sz > 0) {
+			struct virtio_net_hdr_raw tail_vhdr = {
+				.flags = 0,
+				.gso_type = VIRTIO_NET_HDR_GSO_NONE,
+				.hdr_len = 0,
+				.gso_size = 0,
+				.csum_start = 0,
+				.csum_offset = 0,
+			};
+			ret_tail = tun_write_vnet_inplace(p->tun_fd, &tail_vhdr, tail_ip4, tail_out_len);
+		} else {
+			ret_tail = tun_write(p->tun_fd, tail_ip4, tail_out_len);
+		}
 		if (ret_tail > 0) {
-			stats_gso_tx(sizeof(struct ip4) + tail_tcp_total_len);
+			stats_gso_tx(tail_out_len);
 		} else {
 			stats_gso_tun_write_error();
 		}
@@ -524,7 +535,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 		return 0;
 	}
 
-	/* Standard Fast-Path: Entire GSO aggregate has DF=1 and no small tail */
+	/* Case 2: Unified GSO Fast-Path (either all segments DF=1 when > 1260, or all segments DF=0 when <= 1260) */
 	uint32_t tcp_len = tcp_hdr_len + payload_len;
 	gso_update_csum_seed_6to4(tcp, &orig_ip6_src, &orig_ip6_dst, &src4, &dst4, tcp_len);
 
@@ -533,8 +544,17 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	ip4->ver_ihl = 0x45;
 	ip4->tos = tos;
 	ip4->length = htons((uint16_t)(sizeof(struct ip4) + tcp_len));
-	ip4->ident = 0; /* DF=1, atomic datagram per RFC 6864 */
-	ip4->flags_offset = htons(IP4_F_DF);
+	uint32_t max_seg_ip4_len = sizeof(struct ip4) + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	if (max_seg_ip4_len <= 1260) {
+		/* Linux TCP GSO increments the initial ID for every output segment when DF=0.
+		 * Reserve the entire block so concurrent workers/packets cannot overlap IDs. */
+		uint16_t segments = (uint16_t)(payload_len ? (payload_len + gso_size - 1) / gso_size : 1);
+		ip4->ident = htons(reserve_ip4_ident(segments));
+		ip4->flags_offset = 0; /* DF=0 per RFC 7915 §5.1 */
+	} else {
+		ip4->ident = 0; /* DF=1, atomic datagram per RFC 6864 */
+		ip4->flags_offset = htons(IP4_F_DF);
+	}
 	ip4->ttl = ttl;
 	ip4->proto = IPPROTO_TCP;
 	ip4->cksum = 0;
@@ -550,7 +570,7 @@ int gso_translate_tcp_6to4(struct pkt *p)
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
 	size_t out_len = sizeof(struct ip4) + tcp_len;
-	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip4, out_len);
+	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, ip4, out_len);
 	if (ret > 0) {
 		stats_gso_tx(out_len);
 		return 0;
@@ -652,7 +672,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
 	size_t out_len = sizeof(struct ip6) + tcp_len;
-	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, out, out_len);
+	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, out, out_len);
 	if (ret > 0) {
 		stats_gso_tx(out_len);
 		return 0;
@@ -667,7 +687,40 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 	stats_gso_fallback();
 	stats_gso_sw_seg();
 
+	if (p->data_len < sizeof(struct ip6) + sizeof(struct tcp_hdr) ||
+	    gso_validate_header(p) <= 0) {
+		stats_gso_invalid();
+		return -1;
+	}
 	struct ip6 *ip6 = (struct ip6 *)p->data;
+	if (validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest)) {
+		stats_gso_invalid();
+		return -1;
+	}
+
+	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip6));
+	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
+	if (tcp_hdr_len < sizeof(struct tcp_hdr) || p->data_len < sizeof(struct ip6) + tcp_hdr_len) {
+		stats_gso_invalid();
+		return -1;
+	}
+	uint8_t *payload = p->data + sizeof(struct ip6) + tcp_hdr_len;
+	uint32_t payload_len = p->data_len - sizeof(struct ip6) - tcp_hdr_len;
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0)
+		gso_size = payload_len > 0 ? payload_len : 1;
+
+	uint32_t max_seg_wire6 = sizeof(struct ip6) + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely(gcfg.mtu > 0 && max_seg_wire6 > gcfg.mtu)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_TCP;
+		log_pkt6(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp6_error(2, 0, gcfg.mtu, p);
+		return 0;
+	}
 
 	/* RFC 7915 §5.1: If Hop Limit <= 1, discard and send ICMPv6 Time Exceeded */
 	if (unlikely(ip6->hop_limit <= 1)) {
@@ -681,12 +734,6 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		return 0;
 	}
 
-	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip6));
-	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
-	uint8_t *payload = p->data + sizeof(struct ip6) + tcp_hdr_len;
-	uint32_t payload_len = p->data_len - sizeof(struct ip6) - tcp_hdr_len;
-	uint32_t gso_size = p->vhdr.gso_size;
-
 	struct in_addr src4, dst4;
 	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_TCP, &src4, &dst4);
 	if (map_rc != 0)
@@ -694,10 +741,20 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
+	uint32_t num_segments = payload_len ? (payload_len + gso_size - 1) / gso_size : 1;
+	uint16_t df0_segments = 0;
+	if (sizeof(struct ip4) + tcp_hdr_len + gso_size <= 1260) {
+		df0_segments = (uint16_t)num_segments;
+	} else {
+		uint32_t rem = payload_len % gso_size;
+		if (rem > 0 && sizeof(struct ip4) + tcp_hdr_len + rem <= 1260)
+			df0_segments = 1;
+	}
+	uint16_t next_id = df0_segments ? reserve_ip4_ident(df0_segments) : 0;
 
-	/* Buffer for individual segment */
-	uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];
-	uint8_t *seg_ip = seg_buf + HEADROOM;
+	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
+	uint8_t hdr_buf[HEADROOM + sizeof(struct ip4) + 60];
+	uint8_t *seg_ip = hdr_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
 		uint32_t seg_data_len = payload_len - offset;
@@ -706,15 +763,14 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 
 		uint32_t seg_tcp_total_len = tcp_hdr_len + seg_data_len;
 		uint32_t ip4_total = sizeof(struct ip4) + seg_tcp_total_len;
-		if (ip4_total > UINT16_MAX ||
-		    ip4_total > sizeof(seg_buf) - HEADROOM) {
+		if (ip4_total > UINT16_MAX) {
 			stats_gso_invalid();
 			return -1;
 		}
 
 		int is_last = (offset + seg_data_len == payload_len);
 
-		/* Form segment TCP header */
+		/* Form segment TCP header in hdr_buf */
 		struct tcp_hdr *seg_tcp = (struct tcp_hdr *)(seg_ip + sizeof(struct ip4));
 		memcpy(seg_tcp, orig_tcp, tcp_hdr_len);
 		seg_tcp->seq = htonl(orig_seq + offset);
@@ -728,12 +784,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 			seg_tcp->flags &= ~TCP_FLAG_CWR;
 		}
 
-		/* Copy payload */
-		if (seg_data_len > 0) {
-			memcpy((uint8_t *)seg_tcp + tcp_hdr_len, payload + offset, seg_data_len);
-		}
-
-		/* Form IPv4 header first so ip4_checksum can read src/dest/proto */
+		/* Form IPv4 header */
 		struct ip4 *ip4 = (struct ip4 *)seg_ip;
 		ip4->ver_ihl = 0x45;
 		ip4->tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
@@ -742,7 +793,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		/* DF & IPv4 ID policy (RFC 7915 §5.1, RFC 6864 §4.3) */
 		if (ip4_total <= 1260) {
 			ip4->flags_offset = 0; /* DF=0 */
-			ip4->ident = htons(next_ip4_ident());
+			ip4->ident = htons(next_id++);
 		} else {
 			ip4->flags_offset = htons(IP4_F_DF);
 			ip4->ident = 0;
@@ -755,13 +806,21 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		ip4->cksum = 0;
 		ip4->cksum = ip4_header_checksum(ip4);
 
-		/* Compute complete TCP checksum for this segment using standard TAYGA checksum logic */
+		/* Compute TCP checksum zero-copy across header and payload */
 		seg_tcp->cksum = 0;
-		seg_tcp->cksum = ones_add(ip_checksum(seg_tcp, seg_tcp_total_len),
+		uint16_t data_csum = seg_data_len > 0 ? ip_checksum(payload + offset, seg_data_len) : 0;
+		uint16_t tcp_hdr_csum = ip_checksum(seg_tcp, tcp_hdr_len);
+		seg_tcp->cksum = ones_add(ones_add(tcp_hdr_csum, data_csum),
 		                          ip4_checksum(ip4, seg_tcp_total_len, IPPROTO_TCP));
 
-		/* Send segment using tun_write */
-		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip4_total);
+		/* Send segment using zero-copy vectored writev */
+		struct iovec iov[2];
+		iov[0].iov_base = seg_ip;
+		iov[0].iov_len = sizeof(struct ip4) + tcp_hdr_len;
+		iov[1].iov_base = payload + offset;
+		iov[1].iov_len = seg_data_len;
+
+		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 		} else {
@@ -782,8 +841,45 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 	stats_gso_fallback();
 	stats_gso_sw_seg();
 
+	if (p->data_len < sizeof(struct ip4) + sizeof(struct tcp_hdr) ||
+	    gso_validate_header(p) <= 0) {
+		stats_gso_invalid();
+		return -1;
+	}
 	struct ip4 *ip4 = (struct ip4 *)p->data;
 	uint32_t ip4_hdr_len = (ip4->ver_ihl & 0x0f) * 4;
+	if (ip4_hdr_len < sizeof(struct ip4) || p->data_len < ip4_hdr_len + sizeof(struct tcp_hdr)) {
+		stats_gso_invalid();
+		return -1;
+	}
+	if (validate_ip4_addr(&ip4->src) || validate_ip4_addr(&ip4->dest)) {
+		stats_gso_invalid();
+		return -1;
+	}
+	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + ip4_hdr_len);
+	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
+	if (tcp_hdr_len < sizeof(struct tcp_hdr) || p->data_len < ip4_hdr_len + tcp_hdr_len) {
+		stats_gso_invalid();
+		return -1;
+	}
+	uint8_t *payload = p->data + ip4_hdr_len + tcp_hdr_len;
+	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0)
+		gso_size = payload_len > 0 ? payload_len : 1;
+
+	uint32_t max_seg_wire4 = ip4_hdr_len + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
+	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_TCP;
+		log_pkt4(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
+		return 0;
+	}
 
 	/* RFC 7915 §4.1: If TTL <= 1, discard and send ICMPv4 Time Exceeded */
 	if (unlikely(ip4->ttl <= 1)) {
@@ -797,12 +893,6 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		return 0;
 	}
 
-	struct tcp_hdr *orig_tcp = (struct tcp_hdr *)(p->data + ip4_hdr_len);
-	uint32_t tcp_hdr_len = (orig_tcp->doff_res >> 4) * 4;
-	uint8_t *payload = p->data + ip4_hdr_len + tcp_hdr_len;
-	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
-	uint32_t gso_size = p->vhdr.gso_size;
-
 	struct in6_addr src6, dst6;
 	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_TCP, &src6, &dst6);
 	if (map_rc != 0)
@@ -811,8 +901,9 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 	uint32_t offset = 0;
 	uint32_t orig_seq = ntohl(orig_tcp->seq);
 
-	uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];
-	uint8_t *seg_ip = seg_buf + HEADROOM;
+	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
+	uint8_t hdr_buf[HEADROOM + sizeof(struct ip6) + 60];
+	uint8_t *seg_ip = hdr_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
 		uint32_t seg_data_len = payload_len - offset;
@@ -821,7 +912,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 
 		uint32_t seg_tcp_total_len = tcp_hdr_len + seg_data_len;
 		uint32_t ip6_total = sizeof(struct ip6) + seg_tcp_total_len;
-		if (ip6_total > sizeof(seg_buf) - HEADROOM) {
+		if (ip6_total > sizeof(struct ip6) + UINT16_MAX) {
 			stats_gso_invalid();
 			return -1;
 		}
@@ -835,13 +926,8 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		if (!is_last) {
 			seg_tcp->flags &= ~(TCP_FLAG_FIN | TCP_FLAG_PSH);
 		}
-		/* RFC 3168 §6.1.5: CWR only on first segment */
 		if (offset > 0) {
 			seg_tcp->flags &= ~TCP_FLAG_CWR;
-		}
-
-		if (seg_data_len > 0) {
-			memcpy((uint8_t *)seg_tcp + tcp_hdr_len, payload + offset, seg_data_len);
 		}
 
 		/* IPv6 Header */
@@ -853,16 +939,26 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		ip6->src = src6;
 		ip6->dest = dst6;
 
-		/* Compute complete TCP checksum for this segment using standard TAYGA checksum logic */
+		/* Compute complete TCP checksum zero-copy across header and payload */
 		seg_tcp->cksum = 0;
-		seg_tcp->cksum = ones_add(ip_checksum(seg_tcp, seg_tcp_total_len),
+		uint16_t data_csum = seg_data_len > 0 ? ip_checksum(payload + offset, seg_data_len) : 0;
+		uint16_t tcp_hdr_csum = ip_checksum(seg_tcp, tcp_hdr_len);
+		seg_tcp->cksum = ones_add(ones_add(tcp_hdr_csum, data_csum),
 		                          ip6_checksum(ip6, seg_tcp_total_len, IPPROTO_TCP));
 
-		ssize_t ret = tun_write(p->tun_fd, seg_ip, sizeof(struct ip6) + seg_tcp_total_len);
+		/* Send segment using zero-copy vectored writev */
+		struct iovec iov[2];
+		iov[0].iov_base = seg_ip;
+		iov[0].iov_len = sizeof(struct ip6) + tcp_hdr_len;
+		iov[1].iov_base = payload + offset;
+		iov[1].iov_len = seg_data_len;
+
+		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 		} else {
 			stats_gso_tun_write_error();
+			return -1;
 		}
 
 		offset += seg_data_len;
@@ -884,6 +980,10 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 	    gso_validate_transport_vnet(p, sizeof(struct ip6), sizeof(struct udp_hdr), 6) < 0)
 		return -1;
 	struct ip6 *ip6 = (struct ip6 *)p->data;
+	if (validate_ip6_addr(&ip6->src) || validate_ip6_addr(&ip6->dest)) {
+		stats_gso_invalid();
+		return -1;
+	}
 	uint32_t udp_len = p->data_len - sizeof(struct ip6);
 	if ((ntohl(ip6->ver_tc_fl) >> 28) != 6 || ip6->next_header != IPPROTO_UDP ||
 	    ntohs(ip6->payload_length) != udp_len ||
@@ -892,6 +992,29 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 	struct udp_hdr *orig_udp = (struct udp_hdr *)(p->data + sizeof(struct ip6));
 	if (ntohs(orig_udp->length) != udp_len)
 		return -1;
+
+	uint8_t *payload = p->data + sizeof(struct ip6) + sizeof(struct udp_hdr);
+	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
+	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0)
+		gso_size = payload_len > 0 ? payload_len : 1;
+	if (gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
+	    gso_validate_udp_segment_count(payload_len, gso_size) < 0) {
+		stats_gso_invalid();
+		return -1;
+	}
+
+	uint32_t max_seg_wire6 = sizeof(struct ip6) + sizeof(struct udp_hdr) + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely(gcfg.mtu > 0 && max_seg_wire6 > gcfg.mtu)) {
+		p->ip6 = ip6;
+		p->header_len = 0;
+		p->data = (uint8_t *)ip6 + sizeof(struct ip6);
+		p->data_len -= sizeof(struct ip6);
+		p->data_proto = IPPROTO_UDP;
+		log_pkt6(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp6_error(2, 0, gcfg.mtu, p);
+		return 0;
+	}
 
 	if (unlikely(ip6->hop_limit <= 1)) {
 		p->ip6 = ip6;
@@ -904,23 +1027,26 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		return 0;
 	}
 
-	uint8_t *payload = p->data + sizeof(struct ip6) + sizeof(struct udp_hdr);
-	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
-	uint32_t gso_size = p->vhdr.gso_size;
-	if (gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
-	    gso_validate_udp_segment_count(payload_len, gso_size) < 0) {
-		stats_gso_invalid();
-		return -1;
-	}
-
 	struct in_addr src4, dst4;
 	int map_rc = gso_map_6to4_with_icmp(p, ip6, IPPROTO_UDP, &src4, &dst4);
 	if (map_rc != 0)
 		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
-	uint8_t seg_buf[HEADROOM + sizeof(struct ip4) + UINT16_MAX];
-	uint8_t *seg_ip = seg_buf + HEADROOM;
+	uint32_t num_segments = payload_len ? (payload_len + gso_size - 1) / gso_size : 1;
+	uint16_t df0_segments = 0;
+	if (sizeof(struct ip4) + sizeof(struct udp_hdr) + gso_size <= 1260) {
+		df0_segments = (uint16_t)num_segments;
+	} else {
+		uint32_t rem = payload_len % gso_size;
+		if (rem > 0 && sizeof(struct ip4) + sizeof(struct udp_hdr) + rem <= 1260)
+			df0_segments = 1;
+	}
+	uint16_t next_id = df0_segments ? reserve_ip4_ident(df0_segments) : 0;
+
+	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
+	uint8_t hdr_buf[HEADROOM + sizeof(struct ip4) + sizeof(struct udp_hdr)];
+	uint8_t *seg_ip = hdr_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
 		uint32_t seg_data_len = payload_len - offset;
@@ -929,8 +1055,7 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 
 		uint32_t seg_udp_total = sizeof(struct udp_hdr) + seg_data_len;
 		uint32_t ip4_total = sizeof(struct ip4) + seg_udp_total;
-		if (seg_udp_total > UINT16_MAX || ip4_total > UINT16_MAX ||
-		    ip4_total > sizeof(seg_buf) - HEADROOM) {
+		if (seg_udp_total > UINT16_MAX || ip4_total > UINT16_MAX) {
 			stats_gso_invalid();
 			return -1;
 		}
@@ -943,17 +1068,13 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		seg_udp->length = htons((uint16_t)seg_udp_total);
 		seg_udp->cksum = 0;
 
-		if (seg_data_len > 0) {
-			memcpy((uint8_t *)seg_udp + sizeof(struct udp_hdr), payload + offset, seg_data_len);
-		}
-
 		ip4->ver_ihl = 0x45;
 		ip4->tos = (uint8_t)((ntohl(ip6->ver_tc_fl) >> 20) & 0xff);
 		ip4->length = htons((uint16_t)ip4_total);
 
 		if (ip4_total <= 1260) {
 			ip4->flags_offset = 0;
-			ip4->ident = htons(next_ip4_ident());
+			ip4->ident = htons(next_id++);
 		} else {
 			ip4->flags_offset = htons(IP4_F_DF);
 			ip4->ident = 0;
@@ -966,12 +1087,20 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		ip4->cksum = 0;
 		ip4->cksum = ip4_header_checksum(ip4);
 
-		seg_udp->cksum = ones_add(ip_checksum(seg_udp, seg_udp_total),
+		uint16_t data_csum = seg_data_len > 0 ? ip_checksum(payload + offset, seg_data_len) : 0;
+		uint16_t udp_hdr_csum = ip_checksum(seg_udp, sizeof(struct udp_hdr));
+		seg_udp->cksum = ones_add(ones_add(udp_hdr_csum, data_csum),
 		                          ip4_checksum(ip4, seg_udp_total, IPPROTO_UDP));
 		if (seg_udp->cksum == 0)
 			seg_udp->cksum = 0xffff;
 
-		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip4_total);
+		struct iovec iov[2];
+		iov[0].iov_base = seg_ip;
+		iov[0].iov_len = sizeof(struct ip4) + sizeof(struct udp_hdr);
+		iov[1].iov_base = payload + offset;
+		iov[1].iov_len = seg_data_len;
+
+		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 			stats_udp_gso_sw_segment();
@@ -1020,10 +1149,25 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		return -1;
 	uint32_t payload_len = udp_len - sizeof(struct udp_hdr);
 	uint32_t gso_size = p->vhdr.gso_size;
+	if (gso_size == 0)
+		gso_size = payload_len > 0 ? payload_len : 1;
 	if (gso_size > UINT16_MAX - sizeof(struct udp_hdr) ||
 	    gso_validate_udp_segment_count(payload_len, gso_size) < 0) {
 		stats_gso_invalid();
 		return -1;
+	}
+
+	uint32_t max_seg_wire4 = ip4_hdr_len + sizeof(struct udp_hdr) + (payload_len > gso_size ? gso_size : payload_len);
+	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
+	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
+		p->ip4 = ip4;
+		p->header_len = ip4_hdr_len;
+		p->data = (uint8_t *)ip4 + ip4_hdr_len;
+		p->data_len -= ip4_hdr_len;
+		p->data_proto = IPPROTO_UDP;
+		log_pkt4(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
+		return 0;
 	}
 
 	struct in6_addr src6, dst6;
@@ -1032,8 +1176,9 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		return map_rc > 0 ? 0 : -1;
 
 	uint32_t offset = 0;
-	uint8_t seg_buf[HEADROOM + sizeof(struct ip6) + UINT16_MAX];
-	uint8_t *seg_ip = seg_buf + HEADROOM;
+	/* Compact 128-byte header buffer replacing 65 KB stack buffer */
+	uint8_t hdr_buf[HEADROOM + sizeof(struct ip6) + sizeof(struct udp_hdr)];
+	uint8_t *seg_ip = hdr_buf + HEADROOM;
 
 	while (offset < payload_len || (offset == 0 && payload_len == 0)) {
 		uint32_t seg_data_len = payload_len - offset;
@@ -1042,8 +1187,7 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 
 		uint32_t seg_udp_total = sizeof(struct udp_hdr) + seg_data_len;
 		uint32_t ip6_total = sizeof(struct ip6) + seg_udp_total;
-		if (ip6_total > sizeof(struct ip6) + UINT16_MAX ||
-		    ip6_total > sizeof(seg_buf) - HEADROOM) {
+		if (ip6_total > sizeof(struct ip6) + UINT16_MAX) {
 			stats_gso_invalid();
 			return -1;
 		}
@@ -1056,10 +1200,6 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		seg_udp->length = htons((uint16_t)seg_udp_total);
 		seg_udp->cksum = 0;
 
-		if (seg_data_len > 0) {
-			memcpy((uint8_t *)seg_udp + sizeof(struct udp_hdr), payload + offset, seg_data_len);
-		}
-
 		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
 		ip6->payload_length = htons((uint16_t)seg_udp_total);
 		ip6->next_header = IPPROTO_UDP;
@@ -1067,12 +1207,20 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		ip6->src = src6;
 		ip6->dest = dst6;
 
-		seg_udp->cksum = ones_add(ip_checksum(seg_udp, seg_udp_total),
+		uint16_t data_csum = seg_data_len > 0 ? ip_checksum(payload + offset, seg_data_len) : 0;
+		uint16_t udp_hdr_csum = ip_checksum(seg_udp, sizeof(struct udp_hdr));
+		seg_udp->cksum = ones_add(ones_add(udp_hdr_csum, data_csum),
 		                          ip6_checksum(ip6, seg_udp_total, IPPROTO_UDP));
 		if (seg_udp->cksum == 0)
 			seg_udp->cksum = 0xffff;
 
-		ssize_t ret = tun_write(p->tun_fd, seg_ip, ip6_total);
+		struct iovec iov[2];
+		iov[0].iov_base = seg_ip;
+		iov[0].iov_len = sizeof(struct ip6) + sizeof(struct udp_hdr);
+		iov[1].iov_base = payload + offset;
+		iov[1].iov_len = seg_data_len;
+
+		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 			stats_udp_gso_sw_segment();
@@ -1207,7 +1355,7 @@ int gso_translate_udp_6to4(struct pkt *p)
 	out_vhdr.csum_offset = 6;
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
-	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip4, out_ip4_len);
+	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, ip4, out_ip4_len);
 	if (ret > 0) {
 		stats_gso_tx(out_ip4_len);
 		stats_udp_gso_tx(out_ip4_len);
@@ -1312,7 +1460,7 @@ int gso_translate_udp_4to6(struct pkt *p)
 	out_vhdr.flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
 
 	size_t out_len = sizeof(struct ip6) + udp_len;
-	ssize_t ret = tun_write_vnet(p->tun_fd, &out_vhdr, ip6, out_len);
+	ssize_t ret = tun_write_vnet_inplace(p->tun_fd, &out_vhdr, ip6, out_len);
 	if (ret > 0) {
 		stats_gso_tx(out_len);
 		stats_udp_gso_tx(out_len);

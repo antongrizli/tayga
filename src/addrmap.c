@@ -491,6 +491,7 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 {
 	uint32_t hash = 0;
 	int ret;
+	int cache_pair = 1;
 	struct list_head *entry;
 	struct cache_entry *c;
 	struct map4 *map4;
@@ -528,8 +529,33 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 	case MAP_TYPE_STATIC:
 		s = container_of(map4, struct map_static, map4);
 		*addr6 = s->map6.addr;
-		if (map4->prefix_len < 32) {
-			addr6->s6_addr32[3] = s->map6.addr.s6_addr32[3] | (addr4->s_addr & ~map4->mask.s_addr);
+		uint32_t suffix = ntohl(addr4->s_addr) & ~ntohl(map4->mask.s_addr);
+		int bits = 32 - map4->prefix_len;
+		cache_pair = s->map6.prefix_len + bits == 128;
+		if (s->map6.prefix_len + bits == 128) {
+			/* Preserve the common equal-width mapping fast path. */
+			addr6->s6_addr32[3] |= htonl(suffix);
+		} else if (bits > 0) {
+			int pos = s->map6.prefix_len;
+			int word = pos / 32;
+			int off = pos % 32;
+			uint64_t shifted = (uint64_t)suffix << (64 - off - bits);
+			addr6->s6_addr32[word] |= htonl((uint32_t)(shifted >> 32));
+			if (off + bits > 32)
+				addr6->s6_addr32[word + 1] |= htonl((uint32_t)shifted);
+		}
+		if (unlikely(bits > 0)) {
+			if (validate_ip6_addr(addr6) < 0 || IN6_ARE_ADDR_EQUAL(&gcfg.local_addr6, addr6)) {
+				if (!gcfg.maps_immutable)
+					pthread_mutex_unlock(&gcfg.map_mutex);
+				return ERROR_DROP;
+			}
+			if (find_map6(addr6) != &s->map6) {
+				slog(LOG_DEBUG, "%s:%d Dropping packet due to hairpin condition", __FUNCTION__, __LINE__);
+				if (!gcfg.maps_immutable)
+					pthread_mutex_unlock(&gcfg.map_mutex);
+				return ERROR_DROP;
+			}
 		}
 		break;
 	case MAP_TYPE_RFC6052:
@@ -557,7 +583,7 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_DROP;
 	}
-	if (gcfg.cache_size) {		
+	if (gcfg.cache_size && cache_pair) {
 		pthread_mutex_lock(&gcfg.cache_mutex);
 #ifdef ADDRMAP_TEST_HOOK
 		extern void addrmap_test_before_publish(void);
@@ -640,6 +666,7 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 {
 	uint32_t hash = 0;
 	int ret = 0;
+	int cache_pair = 1;
 	struct list_head *entry;
 	struct cache_entry *c;
 	struct map6 *map6;
@@ -679,12 +706,33 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 	case MAP_TYPE_STATIC:
 		s = container_of(map6, struct map_static, map6);
 
-		if (map6->prefix_len < 128) {
-			addr4->s_addr = s->map4.addr.s_addr | (addr6->s6_addr32[3] & ~map6->mask.s6_addr32[3]);
-		} else {
-			*addr4 = s->map4.addr;
+		uint32_t suffix = 0;
+		int bits = 32 - s->map4.prefix_len;
+		cache_pair = map6->prefix_len + bits == 128;
+		if (map6->prefix_len + bits == 128) {
+			suffix = ntohl(addr6->s6_addr32[3]) & ~ntohl(s->map4.mask.s_addr);
+		} else if (bits > 0) {
+			int pos = map6->prefix_len;
+			int word = pos / 32;
+			int off = pos % 32;
+			uint64_t raw = ((uint64_t)ntohl(addr6->s6_addr32[word]) << 32) |
+			               (off + bits > 32 ? (uint64_t)ntohl(addr6->s6_addr32[word + 1]) : 0ULL);
+			suffix = (uint32_t)((raw >> (64 - off - bits)) & (UINT64_MAX >> (64 - bits)));
 		}
-
+		addr4->s_addr = s->map4.addr.s_addr | htonl(suffix);
+		if (unlikely(bits > 0)) {
+			if (validate_ip4_addr(addr4) < 0 || gcfg.local_addr4.s_addr == addr4->s_addr) {
+				if (!gcfg.maps_immutable)
+					pthread_mutex_unlock(&gcfg.map_mutex);
+				return ERROR_DROP;
+			}
+			if (find_map4(addr4) != &s->map4) {
+				slog(LOG_DEBUG, "%s:%d Dropping packet due to hairpin condition", __FUNCTION__, __LINE__);
+				if (!gcfg.maps_immutable)
+					pthread_mutex_unlock(&gcfg.map_mutex);
+				return ERROR_DROP;
+			}
+		}
 		break;
 	case MAP_TYPE_RFC6052:
 		ret = extract_from_prefix(addr4, addr6, map6->prefix_len);
@@ -721,7 +769,7 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_DROP;
 	}
-	if (gcfg.cache_size) {
+	if (gcfg.cache_size && cache_pair) {
 		pthread_mutex_lock(&gcfg.cache_mutex);
 #ifdef ADDRMAP_TEST_HOOK
 		extern void addrmap_test_before_publish(void);
@@ -805,13 +853,13 @@ static struct map_static *parse_map_entry(int line, char *v4, char *v6)
 			lengths[i] = (int)bits;
 		}
 	}
-	if (32 - lengths[0] != 128 - lengths[1] ||
+	if (32 - lengths[0] > 128 - lengths[1] ||
 		inet_pton(AF_INET, v4, &m->map4.addr) != 1 ||
 		inet_pton(AF_INET6, v6, &m->map6.addr) != 1 ||
 		calc_ip4_mask(&m->map4.mask, &m->map4.addr, lengths[0]) ||
 		calc_ip6_mask(&m->map6.mask, &m->map6.addr, lengths[1]) ||
-		validate_ip4_addr(&m->map4.addr) == ERROR_DROP ||
-		validate_ip6_addr(&m->map6.addr) < 0) goto bad;
+		(lengths[0] && validate_ip4_addr(&m->map4.addr) == ERROR_DROP) ||
+		(lengths[1] && validate_ip6_addr(&m->map6.addr) < 0)) goto bad;
 	m->map4.type = m->map6.type = MAP_TYPE_STATIC;
 	m->map4.prefix_len = lengths[0];
 	m->map6.prefix_len = lengths[1];

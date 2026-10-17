@@ -166,8 +166,8 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f,"  \"dispatch_mode\": \"%s\", \"packet_io\": \"%s\",\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 	fprintf(f,"  \"dispatch_drops\": %llu, \"dispatch_held\": %llu, \"dispatch_expired\": %llu,\n",(unsigned long long)atomic_load(&dispatch_drops),(unsigned long long)atomic_load(&dispatch_held),(unsigned long long)atomic_load(&dispatch_expired));
 	fprintf(f,"  \"async_accepted\": %llu, \"async_completed\": %llu, \"async_errors\": %llu, \"async_pressure\": %llu,\n",(unsigned long long)atomic_load(&async_accepted),(unsigned long long)atomic_load(&async_completed),(unsigned long long)atomic_load(&async_errors),(unsigned long long)atomic_load(&async_pressure));
-	fprintf(f, "  \"steering_requested\": \"%s\",\n", gcfg.tun_steering_groups ? "groups" : "kernel");
-	fprintf(f, "  \"steering_effective\": \"%s\",\n", gcfg.tun_steering_effective ? "groups" : "kernel");
+	fprintf(f, "  \"steering_requested\": \"%s\",\n", gcfg.tun_steering_flows ? "flows" : (gcfg.tun_steering_groups ? "groups" : "kernel"));
+	fprintf(f, "  \"steering_effective\": \"%s\",\n", gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
 	fprintf(f, "  \"steering_fallback_errno\": %d,\n", gcfg.tun_steering_errno);
 	fprintf(f, "  \"steering_buckets\": %u,\n", gcfg.tun_steering_effective ? 65536 : 0);
 	fprintf(f, "  \"offload_effective\": \"%s\",\n", tun_offload_name(gcfg.tun_offload_effective));

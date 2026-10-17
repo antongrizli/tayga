@@ -1,0 +1,17 @@
+name: Bug report
+description: Report a reproducible build or runtime defect
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and environment
+      description: Include commit, OS/kernel, architecture and build flags.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproducer and observed behavior
+      description: Include expected behavior, minimal configuration and relevant logs. Remove secrets. Use private reporting for vulnerabilities.
+    validations:
+      required: true

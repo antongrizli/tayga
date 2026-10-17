@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Exercise study ordering, invalid-workload handling and summary isolation."""
-import importlib.util
+import importlib
 import json
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tempfile
 import unittest
 from unittest.mock import patch
 import subprocess
 
-spec = importlib.util.spec_from_file_location('affinity_study', Path(__file__).resolve().parents[2] / 'bench/taygabench/studies/run-affinity-study.py')
-study = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(study)
+study = importlib.import_module("taygabench.studies.run_affinity_study")
 
 
 class StudyTests(unittest.TestCase):

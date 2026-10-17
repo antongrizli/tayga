@@ -348,11 +348,13 @@ int netlink_route_dev_modify(int ifidx,
 	rtm->rtm_dst_len  = prefixlen;
 
 	/* Destination */
-	rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
-	rta->rta_type = RTA_DST;
-	rta->rta_len  = RTA_LENGTH(addrlen);
-	memcpy(RTA_DATA(rta), dst, addrlen);
-	nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + rta->rta_len;
+	if (prefixlen > 0) {
+		rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
+		rta->rta_type = RTA_DST;
+		rta->rta_len  = RTA_LENGTH(addrlen);
+		memcpy(RTA_DATA(rta), dst, addrlen);
+		nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + rta->rta_len;
+	}
 
 	/* Output interface */
 	rta = (struct rtattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
@@ -582,7 +584,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	int created_persistent = 0;
 	/* No existing interface/BPF attachment is replaced. On last close this
 	 * disposable device and its maps disappear, including after SIGKILL. */
-	if ((gcfg.tun_steering_groups || gcfg.dispatch_mode) && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
+	if ((gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
 		slog(LOG_CRIT, "Experimental steering/dispatch requires a fresh disposable TUN device\n");
 		return ERROR_REJECT;
 	}
@@ -614,7 +616,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 	/* Atomic creation guard: the name check above alone cannot exclude a
 	 * device created by another owner between the check and TUNSETIFF. */
-	if (gcfg.tun_steering_groups || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
+	if (gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 	if (want_vnet) {
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	}
@@ -628,7 +630,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			want_vnet = 0;
 			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
-			if (gcfg.tun_steering_groups || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
+			if (gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
@@ -832,9 +834,10 @@ int tun_setup(int do_mktun, int do_rmtun)
 		ifr.ifr_flags = IFF_DETACH_QUEUE;
 		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, &ifr) < 0) goto setup_fail;
 	}
-	if (gcfg.tun_steering_groups) {
+	if (gcfg.tun_steering_groups || gcfg.tun_steering_flows) {
 		char verifier[16384] = {0};
-		int program = steering_program(gcfg.workers > 0 ? gcfg.workers : 1, verifier, sizeof(verifier));
+		int flow_aware = gcfg.tun_steering_flows;
+		int program = steering_program_ext(gcfg.workers > 0 ? gcfg.workers : 1, flow_aware, verifier, sizeof(verifier));
 		int active_fd = gcfg.workers > 0 ? gcfg.tun_fd_addl[0] : gcfg.tun_fd;
 		if (program >= 0) {
 			if (!ioctl(active_fd, TUNSETSTEERINGEBPF, &program)) gcfg.tun_steering_effective = 1;
@@ -842,9 +845,12 @@ int tun_setup(int do_mktun, int do_rmtun)
 			close(program);
 		} else gcfg.tun_steering_errno = errno;
 		if (!gcfg.tun_steering_effective)
-			slog(LOG_WARNING, "Group steering unavailable; retaining kernel steering: %s; verifier: %.400s\n", strerror(gcfg.tun_steering_errno), verifier);
+			slog(LOG_WARNING, "%s steering unavailable; retaining kernel steering: %s; verifier: %.400s\n",
+				flow_aware ? "Flow" : "Group", strerror(gcfg.tun_steering_errno), verifier);
 	}
-	slog(LOG_INFO, "TUN steering requested=%s effective=%s\n", gcfg.tun_steering_groups ? "groups" : "kernel", gcfg.tun_steering_effective ? "groups" : "kernel");
+	slog(LOG_INFO, "TUN steering requested=%s effective=%s\n",
+		gcfg.tun_steering_flows ? "flows" : (gcfg.tun_steering_groups ? "groups" : "kernel"),
+		gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
 	/* Bring tun device up */
 	if(gcfg.tun_up || restore_up) {
 		if(netlink_set_if_flags(ifidx,IFF_UP,IFF_UP)) goto setup_fail;
@@ -1060,6 +1066,62 @@ ssize_t tun_write_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const 
 		return tun_writev(tun_fd, iov, 2);
 	}
 	return tun_write(tun_fd, buf, len);
+}
+
+/* tun_write_vnet_inplace: Prepend virtio-net header directly into the reserved headroom
+ * immediately preceding buf and transmit as a single contiguous datagram buffer,
+ * avoiding the 2-element writev syscall and kernel import_iovec overhead.
+ */
+ssize_t tun_write_vnet_inplace(int tun_fd, const struct virtio_net_hdr_raw *vhdr, void *buf, size_t len)
+{
+	if (!buf || len == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	void *write_ptr = buf;
+	size_t total_len = len;
+
+	if (gcfg.vnet_hdr_sz > 0) {
+		write_ptr = (uint8_t *)buf - gcfg.vnet_hdr_sz;
+		total_len += gcfg.vnet_hdr_sz;
+		if (vhdr)
+			memcpy(write_ptr, vhdr, gcfg.vnet_hdr_sz);
+		else
+			memset(write_ptr, 0, gcfg.vnet_hdr_sz);
+	}
+#ifndef __linux__
+	else {
+		return tun_write(tun_fd, buf, len);
+	}
+#endif
+
+	if (gcfg.async_tun) {
+		struct iovec iov = {write_ptr, total_len};
+		ssize_t result = async_tun_submit(tun_fd, &iov, 1);
+		if (result < 0)
+			stats_tx_failure(errno, (uint32_t)len, false);
+		return result;
+	}
+
+	ssize_t ret = -1;
+	for (int attempt = 0; attempt < 5; attempt++) {
+		ret = write(tun_fd, write_ptr, total_len);
+		if (likely(ret == (ssize_t)total_len)) {
+			uint8_t ver = ((const uint8_t *)buf)[0] >> 4;
+			if (ver == 4)
+				stats_tx4((uint32_t)len);
+			else if (ver == 6)
+				stats_tx6((uint32_t)len);
+			return ret;
+		}
+		if (ret < 0 && errno == EINTR)
+			continue;
+		break;
+	}
+	int saved_errno = ret < 0 ? errno : EIO;
+	stats_tx_failure(saved_errno, (uint32_t)len, ret >= 0);
+	errno = saved_errno;
+	return -1;
 }
 
 /* tun_writev: Write vectored buffers to the TUN device.

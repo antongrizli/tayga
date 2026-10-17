@@ -65,7 +65,7 @@ def inside(binary,output):
 def main():
     if sys.argv[1]=='inside':inside(sys.argv[2],sys.argv[3]);return
     binary=str(Path(sys.argv[1]).resolve());root=Path(sys.argv[2]).resolve();root.mkdir(exist_ok=False)
-    lock=open('/tmp/tayga-perf-workflow.lock','a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    lock=open('/tmp/tayga-perf-workflow.lock','r');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     ns='dispatch-fragments-'+str(os.getpid())
     subprocess.run(['ip','netns','add',ns],check=True)
     try:subprocess.run(['ip','netns','exec',ns,sys.executable,__file__,'inside',binary,str(root)],check=True)

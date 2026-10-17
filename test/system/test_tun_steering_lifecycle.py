@@ -17,7 +17,7 @@ def main():
     groups=flags==["--tun-steering=groups"]
     selected=dict(flag[2:].split("=",1) for flag in flags)
     readiness="requested=groups effective=groups" if groups else "Packet I/O: dispatch="+selected.get("dispatch","kernel")+" transmit="+selected.get("packet-io","sync")
-    lock=open('/tmp/tayga-perf-workflow.lock','a')
+    lock=open('/tmp/tayga-perf-workflow.lock','r')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     ns='tayga-lifecycle-'+str(os.getpid())
     def run(*args,**kwargs):

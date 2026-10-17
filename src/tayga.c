@@ -48,7 +48,8 @@ static void tun_io_fail(const char *where, int error)
 }
 
 void usage(int code) {
-	fprintf(stderr,
+	FILE *out = code == 0 ? stdout : stderr;
+	fprintf(out,
 			"TAYGA version %s\n"
 			"Usage:\n"
 			"%s [-c|--config CONFIGFILE] [-d|--debug] [-n|--nodetach]\n"
@@ -446,9 +447,18 @@ int main(int argc, char **argv)
 #ifndef __linux__
 			if (strcmp(optarg, "kernel")) die("Experimental steering requires Linux");
 #endif
-			if (!strcmp(optarg, "kernel")) gcfg.tun_steering_groups = 0;
-			else if (!strcmp(optarg, "groups")) gcfg.tun_steering_groups = 1;
-			else die("Invalid --tun-steering: use kernel or groups");
+			if (!strcmp(optarg, "kernel")) {
+				gcfg.tun_steering_groups = 0;
+				gcfg.tun_steering_flows = 0;
+			} else if (!strcmp(optarg, "groups")) {
+				gcfg.tun_steering_groups = 1;
+				gcfg.tun_steering_flows = 0;
+			} else if (!strcmp(optarg, "flows")) {
+				gcfg.tun_steering_groups = 0;
+				gcfg.tun_steering_flows = 1;
+			} else {
+				die("Invalid --tun-steering: use kernel, groups, or flows");
+			}
 			break;
 		case 1002:
 			return tun_check_offload_support();
@@ -516,7 +526,7 @@ int main(int argc, char **argv)
 			pidfile = optarg;
 			break;
 		case 'h':
-			usage(1);
+			usage(0);
 			break;
 		default:
 			die("Try `%s --help' for more information (got %c)", argv[0],c);
@@ -731,7 +741,7 @@ int main(int argc, char **argv)
 		gcfg.workers = cpu_cores;
 	}
 
-	if(gcfg.dispatch_mode && (gcfg.workers<1 || gcfg.workers>8 || gcfg.tun_steering_groups || gcfg.dynamic_pool || gcfg.map_file[0]))
+	if(gcfg.dispatch_mode && (gcfg.workers<1 || gcfg.workers>8 || gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dynamic_pool || gcfg.map_file[0]))
 		die("Experimental dispatch requires 1..8 workers, static inline mappings and kernel steering");
 	if(gcfg.async_tun && gcfg.workers>8)die("Experimental io_uring supports at most 8 workers");
 	/* Load dynamic maps if configured */

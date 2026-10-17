@@ -487,13 +487,13 @@ static int config_map(int ln, int arg_count, char **args)
 		calc_ip6_mask(&m->map6.mask, &m->map6.addr, 128);
 	}
 
-	if ((32 - m->map4.prefix_len) != (128 - m->map6.prefix_len)) {
-		slog(LOG_CRIT, "IPv4 and IPv6 subnet must be of the same size, but found"
+	if ((32 - m->map4.prefix_len) > (128 - m->map6.prefix_len)) {
+		slog(LOG_CRIT, "IPv6 prefix has insufficient space for the IPv4 suffix in"
 				" %s and %s on line %d\n", args[0], args[1], ln);
 		free(m);
 		return ERROR_REJECT;
 	}
-    int ret = validate_ip4_addr(&m->map4.addr);
+    int ret = m->map4.prefix_len ? validate_ip4_addr(&m->map4.addr) : ERROR_NONE;
 	if (ret == ERROR_LOCAL) {
 		slog(LOG_WARNING, "Using link-local address %s in map "
 			"directive, use with caution\n", args[0]);
@@ -503,7 +503,7 @@ static int config_map(int ln, int arg_count, char **args)
 		free(m);
 		return ERROR_REJECT;
 	}
-	if (validate_ip6_addr(&m->map6.addr) < 0) {
+	if (m->map6.prefix_len && validate_ip6_addr(&m->map6.addr) < 0) {
 		slog(LOG_CRIT, "Cannot use reserved address %s in map "
 				"directive, aborting...\n", args[1]);
 		free(m);
@@ -753,6 +753,25 @@ static int config_tun_offload(int ln, int arg_count, char **args)
 	return 0;
 }
 
+static int config_tun_steering(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	if (strcasecmp(args[0], "kernel") == 0) {
+		gcfg.tun_steering_groups = 0;
+		gcfg.tun_steering_flows = 0;
+	} else if (strcasecmp(args[0], "groups") == 0) {
+		gcfg.tun_steering_groups = 1;
+		gcfg.tun_steering_flows = 0;
+	} else if (strcasecmp(args[0], "flows") == 0) {
+		gcfg.tun_steering_groups = 0;
+		gcfg.tun_steering_flows = 1;
+	} else {
+		slog(LOG_CRIT, "Error: invalid value for tun-steering on line %d (must be kernel, groups, or flows)\n", ln);
+		return ERROR_REJECT;
+	}
+	return 0;
+}
+
 static int config_runtime_dir(int ln, int argc, char **argv)
 {
 	(void)argc;
@@ -792,6 +811,7 @@ struct {
 	{ "offlink-mtu"	,  	config_offlink_mtu,		1 },
 	{ "workers"	,  		config_workers,			1 },
 	{ "tun-offload"	,	config_tun_offload,		1 },
+	{ "tun-steering",	config_tun_steering,	1 },
 	{ NULL, NULL, 0 }
 };
 

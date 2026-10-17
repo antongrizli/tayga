@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <assert.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "tayga.h"
 #include "gso.h"
 
@@ -567,13 +569,56 @@ static void test_icmp6_param_problem_negative_ptr(void)
 	printf("PASS: ICMPv6 Parameter Problem negative pointer safely dropped\n");
 }
 
+static void setup_quote_maps(void)
+{
+    memset(&gcfg, 0, sizeof(gcfg));
+    INIT_LIST_HEAD(&gcfg.map4_list); INIT_LIST_HEAD(&gcfg.map6_list);
+    gcfg.maps_immutable = 1; gcfg.udp_cksum_mode = UDP_CKSUM_FWD;
+    inet_pton(AF_INET, "192.0.0.254", &gcfg.local_addr4);
+    inet_pton(AF_INET6, "fd9b:64:1:ff::fe", &gcfg.local_addr6);
+    static struct map_static maps[2]; memset(maps, 0, sizeof(maps));
+    for (int i = 0; i < 2; ++i) {
+        maps[i].map4.type = maps[i].map6.type = i ? MAP_TYPE_STATIC : MAP_TYPE_RFC6052;
+        maps[i].map4.prefix_len = i ? 32 : 0;
+        maps[i].map6.prefix_len = i ? 128 : 96;
+        inet_pton(AF_INET, i ? "192.0.0.1" : "0.0.0.0", &maps[i].map4.addr);
+        inet_pton(AF_INET6, i ? "fd9b:64:1:ff::10" : "64:ff9b::", &maps[i].map6.addr);
+        calc_ip4_mask(&maps[i].map4.mask, NULL, maps[i].map4.prefix_len);
+        calc_ip6_mask(&maps[i].map6.mask, NULL, maps[i].map6.prefix_len);
+        INIT_LIST_HEAD(&maps[i].map4.list); INIT_LIST_HEAD(&maps[i].map6.list);
+        assert(insert_map4(&maps[i].map4, NULL) == 0); assert(insert_map6(&maps[i].map6, NULL) == 0);
+    }
+}
+
+static void test_tcp_zero_checksum_preserved(void)
+{
+    struct ip4 ip4 = {0}; struct ip6 ip6 = {0};
+    inet_pton(AF_INET, "192.0.0.1", &ip4.src); inet_pton(AF_INET, "8.8.8.8", &ip4.dest);
+    inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6.src); inet_pton(AF_INET6, "64:ff9b::808:808", &ip6.dest);
+    uint8_t storage[32] = {0};
+    struct pkt p = {.ip4 = &ip4, .ip6 = &ip6, .data = storage + 1, .data_len = 20, .data_proto = IPPROTO_TCP};
+    for (int direction = 0; direction < 2; ++direction) {
+        int found = 0;
+        for (unsigned value = 0; value <= UINT16_MAX; ++value) {
+            uint16_t checksum = htons(value); memcpy(p.data + 16, &checksum, 2);
+            assert((direction ? xlate_payload_6to4(&p, &ip4, 0) : xlate_payload_4to6(&p, &ip6, 0)) == 0);
+            memcpy(&checksum, p.data + 16, 2);
+            if (!checksum) { found = 1; break; }
+        }
+        assert(found);
+    }
+    puts("PASS: TCP zero checksum preserved in both directions at odd transport offsets");
+}
+
 static void test_icmp6_error_truncated_fragment_quote(void)
 {
 	printf("Testing ICMPv6 error with truncated inner fragment ([RFC-02])...\n");
 	/* Construct an ICMPv6 Time Exceeded (Type 3, Code 0) containing an inner IPv6
 	 * header + Fragment Header (MF=1, offset=0) + 12 bytes of truncated payload
 	 * (12 is not divisible by 8). Verify parse_ip6(&p_em, 1) accepts it. */
-	uint8_t buf[HEADROOM + 256];
+	setup_quote_maps();
+	int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(4) uint8_t buf[HEADROOM + 256];
 	memset(buf, 0, sizeof(buf));
 	uint8_t *pkt_start = buf + HEADROOM;
 
@@ -608,17 +653,116 @@ static void test_icmp6_error_truncated_fragment_quote(void)
 	                        ip6_checksum(ip6, ntohs(ip6->payload_length), 58));
 
 	struct pkt p = {
-		.tun_fd = -1,
+		.tun_fd = sv[0],
 		.data = pkt_start,
 		.data_len = sizeof(struct ip6) + ntohs(ip6->payload_length),
 	};
 	handle_ip6(&p);
+	alignas(4) uint8_t captured[256];
+	ssize_t length = recv(sv[1], captured, sizeof(captured), MSG_DONTWAIT);
+#ifdef __linux__
+	unsigned offset = 0;
+#else
+	unsigned offset = sizeof(struct tun_pi);
+#endif
+	assert(length == (ssize_t)(offset + 20 + 8 + 20 + 12));
+	struct ip4 *out = (struct ip4 *)(captured + offset);
+	struct icmp *error = (struct icmp *)(out + 1);
+	struct ip4 *quote = (struct ip4 *)(error + 1);
+	assert(out->proto == IPPROTO_ICMP && error->type == 11);
+	assert(ntohs(quote->flags_offset) & IP4_F_MF);
+	assert(ntohs(quote->ident) == 0x5678 && ntohs(quote->length) == 1420);
+	assert(ip_checksum(out, 20) == 0 && ip_checksum(error, 40) == 0);
+	close(sv[0]); close(sv[1]);
 	printf("PASS: ICMPv6 error with truncated inner fragment handled\n");
+}
+
+static void test_icmp4_error_fragment_quote(void)
+{
+    setup_quote_maps(); gcfg.mtu = 1500;
+    int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    alignas(4) uint8_t buffer[HEADROOM + 256] = {0}, captured[256];
+    struct ip4 *ip = (struct ip4 *)(buffer + HEADROOM);
+    struct icmp *error = (struct icmp *)(ip + 1);
+    struct ip4 *quote = (struct ip4 *)(error + 1);
+    ip->ver_ihl = quote->ver_ihl = 0x45; ip->ttl = quote->ttl = 64;
+    ip->proto = IPPROTO_ICMP; ip->length = htons(60);
+    inet_pton(AF_INET, "8.8.8.8", &ip->src); inet_pton(AF_INET, "192.0.0.1", &ip->dest);
+    quote->src = ip->dest; quote->dest = ip->src;
+    quote->length = htons(1420); quote->flags_offset = htons(IP4_F_MF);
+    quote->ident = htons(0x1234); quote->proto = IPPROTO_UDP;
+    quote->cksum = ip4_header_checksum(quote);
+    error->type = 11; error->cksum = ip_checksum(error, 40);
+    ip->cksum = ip4_header_checksum(ip);
+    struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 60};
+    handle_ip4(&p);
+#ifdef __linux__
+    unsigned offset = 0;
+#else
+    unsigned offset = sizeof(struct tun_pi);
+#endif
+    assert(recv(sv[1], captured, sizeof(captured), MSG_DONTWAIT) == (ssize_t)(offset + 108));
+    struct ip6 *out = (struct ip6 *)(captured + offset);
+    struct icmp *out_error = (struct icmp *)(out + 1);
+    struct ip6 *inner = (struct ip6 *)(out_error + 1);
+    struct ip6_frag *frag = (struct ip6_frag *)(inner + 1);
+    assert(out_error->type == 3 && inner->next_header == 44 && ntohs(inner->payload_length) == 1408);
+    assert((ntohs(frag->offset_flags) & IP6_F_MF) && ntohl(frag->ident) == 0x1234);
+    assert(ones_add(ip_checksum(out_error, 68), ip6_checksum(out, 68, IPPROTO_ICMPV6)) == 0);
+    close(sv[0]); close(sv[1]);
+    puts("PASS: ICMPv4 truncated fragment quote gains a verified IPv6 Fragment Header");
+}
+
+static void test_embedded_routing_and_extension_limit(void)
+{
+    setup_quote_maps(); gcfg.mtu = 1500;
+    int sv[2], inner_fd[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, inner_fd) == 0);
+    alignas(4) uint8_t buffer[HEADROOM + 256] = {0}, response[256];
+    struct ip6 *ip = (struct ip6 *)(buffer + HEADROOM);
+    struct icmp *error = (struct icmp *)(ip + 1);
+    struct ip6 *inner = (struct ip6 *)(error + 1);
+    ip->ver_tc_fl = inner->ver_tc_fl = htonl(0x60000000);
+    ip->hop_limit = inner->hop_limit = 64;
+    ip->next_header = IPPROTO_ICMPV6; inner->next_header = 43;
+    ip->payload_length = htons(64); inner->payload_length = htons(16);
+    inet_pton(AF_INET6, "64:ff9b::808:808", &ip->src);
+    inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip->dest);
+    inner->src = ip->dest; inner->dest = ip->src;
+    uint8_t *routing = (uint8_t *)(inner + 1); routing[0] = IPPROTO_UDP; routing[3] = 1;
+    error->type = 3;
+    error->cksum = ones_add(ip_checksum(error, 64), ip6_checksum(ip, 64, IPPROTO_ICMPV6));
+    int saved_stdin = dup(STDIN_FILENO); assert(saved_stdin >= 0);
+    assert(dup2(inner_fd[0], STDIN_FILENO) == STDIN_FILENO);
+    struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 104};
+    handle_ip6(&p);
+    assert(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO); close(saved_stdin);
+    assert(recv(inner_fd[1], response, sizeof(response), MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    assert(recv(sv[1], response, sizeof(response), MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    close(inner_fd[0]); close(inner_fd[1]);
+    for (unsigned count = 8; count <= 9; ++count) {
+        memset(buffer, 0, sizeof(buffer)); ip = (struct ip6 *)(buffer + HEADROOM);
+        ip->ver_tc_fl = htonl(0x60000000); ip->hop_limit = 64;
+        ip->next_header = 60; ip->payload_length = htons(count * 8 + 8);
+        inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip->src);
+        inet_pton(AF_INET6, "64:ff9b::808:808", &ip->dest);
+        uint8_t *extension = (uint8_t *)(ip + 1);
+        for (unsigned n = 0; n < count; ++n) extension[n * 8] = n + 1 == count ? IPPROTO_UDP : 60;
+        p = (struct pkt){.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 40 + count * 8 + 8};
+        handle_ip6(&p);
+        ssize_t received = recv(sv[1], response, sizeof(response), MSG_DONTWAIT);
+        if (count == 8) assert(received > 0);
+        else assert(received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    }
+    close(sv[0]); close(sv[1]);
+    puts("PASS: embedded routing errors produce no output, extension-header cap accepts 8 and rejects 9");
 }
 
 int main(void)
 {
 	printf("=== Running unit_udp_checksum test suite ===\n");
+	test_tcp_zero_checksum_preserved();
 	test_metadata_bounds();
 	test_complete_checksum_translation();
 	test_zero_checksum_boundary();
@@ -627,6 +771,8 @@ int main(void)
 	test_icmp_embedded_truncated();
 	test_icmp6_param_problem_negative_ptr();
 	test_icmp6_error_truncated_fragment_quote();
+	test_icmp4_error_fragment_quote();
+	test_embedded_routing_and_extension_limit();
 	printf("=== All unit_udp_checksum tests passed successfully! ===\n");
 	return 0;
 }

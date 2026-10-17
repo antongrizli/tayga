@@ -1,4 +1,8 @@
 import os, signal
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+OUTPUT_ROOT = Path(os.environ.get("TAYGA_TEST_OUT", str(REPO / "build/test-output/integration"))).resolve()
 import subprocess
 import sys
 from pyroute2 import IPRoute
@@ -114,7 +118,10 @@ class test_result:
     
 #tayga conf file generator
 class confgen:
-    def __init__(self):
+    def __init__(self, output_dir=None):
+        self.output_dir = Path(output_dir or OUTPUT_ROOT / "default")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = str(self.output_dir / "tayga.conf")
         self.default()
 
     def default(self):
@@ -124,7 +131,7 @@ class confgen:
         self.prefix = "3fff:6464::/96"
         self.wkpf_strict = False
         self.dynamic_pool = "172.16.0.0/24"
-        self.data_dir = os.getcwd()
+        self.data_dir = str(self.output_dir)
         self.map = []
         self.map.append("172.16.0.1 2001:db8::1")
         self.map.append("172.16.0.2 2001:db8::2")
@@ -132,11 +139,11 @@ class confgen:
         self.offlink_mtu = 0
         self.udp_cksum_mode = None
         self.map_file_entries = []
-        self.map_file_path = "test/tayga.map"
+        self.map_file_path = str(self.output_dir / "tayga.map")
         self.map_file_created = False
 
     def generate(self):
-        with open("test/tayga.conf", 'w') as conf_file:
+        with open(self.config_file, 'w') as conf_file:
             conf_file.write("tun-device "+self.device+"\n")
             conf_file.write("ipv4-addr "+self.ipv4_addr+"\n")
             if self.ipv6_addr is not None:
@@ -307,7 +314,7 @@ class test_env:
     def __init__(self,test_name):
         #These are the default values for the test environment
         self.debug = False
-        self.tayga_bin = "./tayga"
+        self.tayga_bin = os.environ.get("TAYGA_BIN", str(REPO / "build/tayga"))
         self.mtu = 1500
         self.tayga_pool4 = ipaddress.ip_network("172.16.0.0/24")
         self.tayga_prefix = ipaddress.ip_network("3fff:6464::/96")
@@ -323,17 +330,18 @@ class test_env:
         self.icmp_router_ipv6 = ipaddress.ip_address("2001:db8:f00f::1")
         self.tayga_ipv4 = ipaddress.ip_address("172.16.0.3")
         self.tayga_ipv6 = ipaddress.ip_address("3fff:6464::172.16.0.3")
-        self.tayga_conf_file = "test/tayga.conf"
-        self.pcap_file = test_name + ".pcap"
+        output_dir = OUTPUT_ROOT / Path(test_name).name
+        self.tayga_conf = confgen(output_dir)
+        self.tayga_conf_file = self.tayga_conf.config_file
+        self.pcap_file = str(output_dir / "packets.pcap")
         self.pcap_test_env = False
-        self.tayga_log_file = test_name + ".log"
+        self.tayga_log_file = str(output_dir / "tayga.log")
         self.test_name = test_name
-        self.file_path = test_name + ".rpt"
+        self.file_path = str(output_dir / "results.rpt")
         self.test_results = []
         self.test_passed = 0
         self.test_failed = 0
         self.timeout = 1 # seconds
-        self.tayga_conf = confgen()
         # Valgrind
         self.use_valgrind = False
         self.valgrind_opts = ["valgrind", "--tool=callgrind","--dump-instr=yes","--simulate-cache=yes","--collect-jumps=yes"]
@@ -371,8 +379,9 @@ class test_env:
                 print("tayga process not found, skipping process termination")
 
         # Delete dynamic.map if it exists
-        if os.path.exists("dynamic.map"):
-            os.remove("dynamic.map")
+        dynamic_map = Path(self.tayga_conf.data_dir) / "dynamic.map"
+        if dynamic_map.exists():
+            dynamic_map.unlink()
         # Reset link MTU
         ifi = ipr.link_lookup(ifname='nat64')[0]
         ipr.link("set", index=ifi, mtu=self.mtu)

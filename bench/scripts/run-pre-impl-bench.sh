@@ -5,7 +5,7 @@
 # ==============================================================================
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PERF_SESSION_ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
 export PERF_SESSION_ROOT REPO_DIR
 OUT_DIR="$PERF_SESSION_ROOT/pre-impl-saturation-arm64"
@@ -24,8 +24,9 @@ make clean
 make -B CC=gcc CFLAGS='-O3 -flto -g -fno-omit-frame-pointer' LDFLAGS='-flto -Wl,--build-id'
 
 sudo install -Dm0755 tayga /usr/sbin/tayga
-sudo install -Dm0755 scripts/container/clat-start.sh /usr/local/sbin/clat-start.sh
-sudo install -Dm0755 benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
+sudo install -Dm0755 container/rootfs/usr/local/sbin/clat-start.sh /usr/local/sbin/clat-start.sh
+make benchmark-script
+sudo install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
 
 # Record system metadata
 uname -a > "$OUT_DIR/uname.txt"

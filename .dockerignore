@@ -14,3 +14,10 @@ dist/
 release/
 perf-sessions/
 docs/
+
+build/
+improvenments/
+improvements/
+perf-comparisons/
+__pycache__/
+*.pyc

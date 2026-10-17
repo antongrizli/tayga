@@ -47,7 +47,7 @@ s=s.replace(old, 'exec env '+shlex.quote('LD_PRELOAD='+library)+' '+shlex.quote(
 p.write_text(s)
 PY
   fi
-  python3 "$REPO/tools/sample-process-memory.py" --seconds "$((2 * MEMORY_DURATION + 40))" --output "$OUTPUT/$allocator/memory.jsonl" &
+  python3 "$REPO/bench/taygabench/memory.py" --seconds "$((2 * MEMORY_DURATION + 40))" --output "$OUTPUT/$allocator/memory.jsonl" &
   sampler=$!
   if ! env WORKERS=1 CLIENTS=2 FLOWS=1 CLAT_OFFLOAD=auto FORWARDING_GRO=on \
       WARMUP=0 DURATION="$MEMORY_DURATION" DIRECTIONS='upload download' PROTOCOL=udp RATE="$MEMORY_RATE" \

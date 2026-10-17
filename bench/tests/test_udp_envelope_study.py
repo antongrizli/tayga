@@ -1,8 +1,9 @@
-import importlib.util
+import importlib
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unittest
-spec=importlib.util.spec_from_file_location('envelope',Path(__file__).resolve().parents[2]/'bench/taygabench/studies/run-udp-envelope-study.py')
-m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+m = importlib.import_module("taygabench.studies.run_udp_envelope_study")
 class EnvelopeTests(unittest.TestCase):
     def rows(self):
         return [dict(case=f'{d}-{r}',direction=d,finite=False,requested_rate_mbps=r,rate='paced' if r else 'unrestricted',sender=dict(rate_mbps=r,packets=100,bytes=120000),receiver=dict(packets=100,bytes=120000,invalid=0,duplicates=0),capture_valid=True,workload_valid=True,acceptance_pass=True,offered_mbps=r or 10000,received_mbps=r or 10000,loss_percent=0,pressure_deltas={}) for d in ('upload','download') for r in (1000,0)]

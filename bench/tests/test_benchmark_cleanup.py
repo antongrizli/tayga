@@ -2,13 +2,16 @@
 """Run the benchmark's exact owned-child cleanup helper on Linux processes."""
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from taygabench.common import benchmark_source
 import signal
 import subprocess
 import sys
 import time
 import unittest
 
-text = (Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
+text = benchmark_source(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh')
 start = text.index('  python3 - $clat_pid ')
 helper = text[text.index('\n', start)+1:].split('\nPY\n', 1)[0]
 

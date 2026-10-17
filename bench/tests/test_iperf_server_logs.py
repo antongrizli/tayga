@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Server evidence must survive warmup and both measured directions."""
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from taygabench.common import benchmark_source
 import subprocess
 import tempfile
 import unittest
 
 class ServerLogTest(unittest.TestCase):
     def test_phase_logs_are_retained(self):
-        source=(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh').read_text()
+        source=benchmark_source(Path(__file__).resolve().parents[2]/'bench/clat/benchmark-clat.sh')
         start=source.index('start_iperf_servers() {')
         function=source[start:source.index('\n}\n',start)+3]
         with tempfile.TemporaryDirectory() as temp:

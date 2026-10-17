@@ -142,10 +142,31 @@ void log_pkt6(int err, struct pkt *p, const char *msg)
 
 uint16_t ip_checksum(void *d, uint32_t c)
 {
-	uint32_t sum = 0xffff;
+	uint64_t sum = 0xffff;
 	const uint8_t *p = (const uint8_t *)d;
 
-	while (c > 1) {
+	while (c >= 8) {
+		uint64_t word;
+		memcpy(&word, p, sizeof(word));
+		sum += word;
+		if (sum < word)
+			sum++;
+		p += 8;
+		c -= 8;
+	}
+
+	sum = (sum & 0xffffffff) + (sum >> 32);
+	sum = (sum & 0xffffffff) + (sum >> 32);
+
+	if (c >= 4) {
+		uint32_t word;
+		memcpy(&word, p, sizeof(word));
+		sum += word;
+		p += 4;
+		c -= 4;
+	}
+
+	if (c >= 2) {
 		uint16_t word;
 		memcpy(&word, p, sizeof(word));
 		sum += word;
@@ -500,7 +521,7 @@ static void xlate_4to6_data(struct pkt *p)
 	   1456 bytes of payload == 1504 bytes.) */
 	if ((off & (IP4_F_MASK | IP4_F_MF)) == 0) {
 		if (off & IP4_F_DF) {
-			if (gcfg.mtu - MTU_ADJ < p->header_len + p->data_len) {
+			if (sizeof(struct ip6) + p->data_len > gcfg.mtu) {
 				log_pkt4(LOG_OPT_ICMP,p,"Packet Too Big");
 				host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
 				return;
@@ -531,9 +552,9 @@ static void xlate_4to6_data(struct pkt *p)
 			out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
 			out_vhdr.csum_start = sizeof(struct ip6);
 			out_vhdr.csum_offset = p->data_proto == IPPROTO_UDP ? 6 : 16;
-			tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip6) + p->data_len);
+			tun_write_vnet_inplace(p->tun_fd, &out_vhdr, out, sizeof(struct ip6) + p->data_len);
 		} else {
-			tun_write(p->tun_fd, out, sizeof(struct ip6) + p->data_len);
+			tun_write_vnet_inplace(p->tun_fd, NULL, out, sizeof(struct ip6) + p->data_len);
 		}
 #else
 		iov[0].iov_base = &header;
@@ -911,7 +932,7 @@ void handle_ip4(struct pkt *p)
 			host_handle_icmp4(p);
 		else {
 			log_pkt4(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Unknown protocol to self");
-			host_send_icmp4_error(3, 2, 4, p);
+			host_send_icmp4_error(3, 2, 0, p);
 		}
 	} else {
 		if (unlikely(p->ip4->ttl == 1)) {
@@ -1241,7 +1262,7 @@ static void xlate_6to4_data(struct pkt *p)
 		return;
 	}
 
-	if (sizeof(struct ip6) + p->header_len + p->data_len > gcfg.mtu) {
+	if (sizeof(struct ip6) + p->data_len > gcfg.mtu) {
 		log_pkt6(LOG_OPT_ICMP,p,"Packet Too Big");
 		host_send_icmp6_error(2, 0, gcfg.mtu, p);
 		return;
@@ -1266,9 +1287,9 @@ static void xlate_6to4_data(struct pkt *p)
 		out_vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
 		out_vhdr.csum_start = sizeof(struct ip4);
 		out_vhdr.csum_offset = p->data_proto == IPPROTO_UDP ? 6 : 16;
-		tun_write_vnet(p->tun_fd, &out_vhdr, out, sizeof(struct ip4) + p->data_len);
+		tun_write_vnet_inplace(p->tun_fd, &out_vhdr, out, sizeof(struct ip4) + p->data_len);
 	} else {
-		tun_write(p->tun_fd, out, sizeof(struct ip4) + p->data_len);
+		tun_write_vnet_inplace(p->tun_fd, NULL, out, sizeof(struct ip4) + p->data_len);
 	}
 #else
 	iov[0].iov_base = &header;
@@ -1436,6 +1457,8 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			header.icmp.code = 1; /* Host Unreachable */
 			break;
 		case 1: /* Administratively prohibited */
+		case 5: /* Source address failed ingress/egress policy (RFC 7915 §5.2) */
+		case 6: /* Reject route to destination (RFC 7915 §5.2) */
 			header.icmp.code = 10; /* Administratively prohibited */
 			break;
 		case 4: /* Port Unreachable */
@@ -1449,8 +1472,8 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		header.icmp.type = 3; /* Destination Unreachable */
 		header.icmp.code = 4; /* Fragmentation needed */
 		mtu = ntohl(p->icmp->word);
-		if (mtu < 68) {
-			log_pkt6(LOG_OPT_DROP,p,"No MTU in Packet Too Big");
+		if (mtu < 68 + MTU_ADJ) {
+			log_pkt6(LOG_OPT_DROP,p,"MTU below minimum in Packet Too Big");
 			return;
 		}
 		if (mtu > gcfg.mtu)

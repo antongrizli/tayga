@@ -23,7 +23,7 @@ class EndpointTests(unittest.TestCase):
         subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'bench/shims/udp-batch-endpoint.c'),'-o',str(cls.binary)],check=True)
 
         cls.fault=cls.root/'fault.so'
-        subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parent/'udp_endpoint_fault.c'),'-ldl','-o',str(cls.fault)],check=True)
+        subprocess.run(['cc','-shared','-fPIC','-Wall','-Wextra','-Werror',str(Path(__file__).resolve().parents[2]/'test/fault/udp_endpoint_fault.c'),'-ldl','-o',str(cls.fault)],check=True)
 
     @classmethod
     def tearDownClass(cls): cls.temp.cleanup()
