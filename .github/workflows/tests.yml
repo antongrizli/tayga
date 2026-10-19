@@ -42,7 +42,7 @@ jobs:
         run: sudo apt-get install -y python3-pyroute2 python3-scapy
       - name: run test
         run: sudo make integration
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.arch }}
           path: build/test-output/integration/
