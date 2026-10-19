@@ -96,6 +96,15 @@ def teardown():
     for ns in ["client", "router", "clatns", "server"]:
         sh(f"ip netns del {ns} 2>/dev/null")
 
+def wait_for_clat(timeout=10):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        _, _, rc = sh("ip netns exec client ping -c 1 -W 1 11.0.0.2")
+        if rc == 0:
+            return True
+        time.sleep(0.15)
+    return False
+
 def test_tcp_data_integrity():
     print("\n--- 1. TCP 20 MB Integrity Test (MTU 1280 Path) ---")
     setup_topology(mtu_rwan=1280)
@@ -113,7 +122,7 @@ def test_tcp_data_integrity():
          "CLAT_WORKERS=2", "CLAT_OFFLOAD=tcp",
          "/usr/local/sbin/clat-start.sh"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.5)
+    assert wait_for_clat(15), "TAYGA CLAT did not establish end-to-end connectivity in 15s!"
 
     srv = subprocess.Popen(
         ["ip", "netns", "exec", "server", "socat", "-u",
@@ -148,30 +157,52 @@ def test_ptb_translation():
          "CLAT_WORKERS=1", "CLAT_OFFLOAD=tcp",
          "/usr/local/sbin/clat-start.sh"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.5)
-
-    # Ping to warm up routing/NDP
-    sh("ip netns exec client ping -c 1 -W 1 11.0.0.2 >/dev/null 2>&1")
+    assert wait_for_clat(15), "TAYGA CLAT did not establish end-to-end connectivity in 15s!"
 
     # Start server listener
     srv = subprocess.Popen(["ip", "netns", "exec", "server", "socat", "-u",
                             "TCP6-LISTEN:8088,reuseaddr,bind=[64:ff9b::b00:2]", "/dev/null"])
-    time.sleep(0.2)
+    srv_ready = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        if srv.poll() is not None:
+            raise RuntimeError("Server socat listener exited prematurely")
+        out, _, rc = sh("ip netns exec server ss -H -ltn6 'sport = :8088'")
+        if rc == 0 and ":8088" in out:
+            srv_ready = True
+            break
+        time.sleep(0.05)
+    assert srv_ready, "Server listener on port 8088 did not become ready!"
 
     server0_mac = get_mac("server0", "server")
     rwan_mac    = get_mac("rwan", "router")
 
     cap_client = "/tmp/cap_pmtud_verify.pcap"
+    if os.path.exists(cap_client):
+        try: os.remove(cap_client)
+        except OSError: pass
     td = subprocess.Popen(
-        ["ip", "netns", "exec", "client", "tcpdump", "-i", "lan0",
-         "-w", cap_client, "-n", "icmp"], stderr=subprocess.DEVNULL)
-    time.sleep(0.2)
+        ["ip", "netns", "exec", "client", "tcpdump", "-U", "--immediate-mode", "-i", "lan0",
+         "-w", cap_client, "-n", "icmp"], stderr=subprocess.PIPE)
+    time.sleep(0.3)
+    if td.poll() is not None:
+        raise RuntimeError(f"tcpdump failed to start: {td.stderr.read()}")
 
     # Establish TCP NAT connection from client
     client_conn = subprocess.Popen(
         ["ip", "netns", "exec", "client", "socat", "-u", "-",
-         "TCP4:11.0.0.2:8088,sourceport=55555"], stdin=subprocess.PIPE)
-    time.sleep(0.2)
+         "TCP4:11.0.0.2:8088,sourceport=55555"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    conn_ready = False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5:
+        if client_conn.poll() is not None:
+            raise RuntimeError(f"Client socat exited prematurely: {client_conn.stderr.read()}")
+        out, _, rc = sh("ip netns exec client ss -H -tan4 'sport = :55555'")
+        if rc == 0 and "ESTAB" in out:
+            conn_ready = True
+            break
+        time.sleep(0.05)
+    assert conn_ready, "Client connection did not reach ESTABLISHED state!"
 
     # Inject ICMPv6 PTB from server
     emb = IPv6(src="fd9b:64:1:ff::10", dst="64:ff9b::b00:2", nh=6, hlim=63) / \
@@ -184,18 +215,19 @@ def test_ptb_translation():
     with open(pkt_bin, "wb") as f:
         f.write(bytes(ptb))
 
-    sh(f"""ip netns exec server python3 -c "
+    out, err, rc = sh(f"""ip netns exec server python3 -c "
 import sys; sys.path.insert(0,'/usr/lib/python3/dist-packages')
 import logging; logging.getLogger('scapy.runtime').setLevel(logging.ERROR)
 from scapy.all import sendp, Ether
 with open('{pkt_bin}','rb') as f: raw = f.read()
 sendp(Ether(raw), iface='server0', verbose=0)
 " """)
+    assert rc == 0, f"Scapy sendp failed: {err}\n{out}"
 
-    time.sleep(0.5)
+    time.sleep(0.8)
 
     td.terminate()
-    try: td.wait(timeout=2)
+    try: td.wait(timeout=3)
     except: td.kill(); td.wait()
 
     client_conn.kill()
