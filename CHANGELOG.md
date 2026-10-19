@@ -4,6 +4,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-10-19
+
 ### Fixed
 
 - Reject a missing configuration path before calling libc, avoiding a static musl amd64 crash.
