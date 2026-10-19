@@ -6,6 +6,7 @@ export PERF_SESSION_ROOT
 INSTANCE="${INSTANCE:-tayga-perf}"
 PROJECT="${PROJECT:-/Users/antongrizli/Documents/MikroTik}"
 REPO="${REPO:-$PROJECT/tayga-clat-perf}"
+HARNESS_REPO="${HARNESS_REPO:-$REPO}"
 ISO="${ISO:-/Users/antongrizli/Downloads/debian-13.7.0-arm64-netinst.iso}"
 CPUS="${CPUS:-4}"
 MEMORY_GB="${MEMORY_GB:-4}"
@@ -26,6 +27,10 @@ if [ ! -d "$REPO" ]; then
   echo "Repository not found: $REPO" >&2
   exit 1
 fi
+if [ ! -f "$HARNESS_REPO/bench/lima/run-guest.sh" ]; then
+  echo "Harness runner not found: $HARNESS_REPO" >&2
+  exit 64
+fi
 if [ -f "$ISO" ]; then
   echo "Found Debian installer ISO: $ISO"
   echo "Lima uses the signed Debian cloud template for unattended setup; the ISO is retained for a manual UTM install."
@@ -45,16 +50,26 @@ elif [ "$status" != "Running" ]; then
 fi
 
 echo "Running guest perf workflow"
+host_power_before=
+host_power_settings_before=
+host_power_enabled=no
+if command -v pmset >/dev/null 2>&1; then
+  host_power_enabled=yes
+  host_power_before="$(pmset -g batt 2>/dev/null | head -1 || true)"
+  host_power_settings_before="$(pmset -g custom 2>/dev/null || true)"
+fi
 # This workflow is noninteractive. Preserve stdin for any calling matrix script.
 guest_status=0
 limactl shell "$INSTANCE" -- env \
-  "REPO=$REPO" "PROJECT=$PROJECT" \
+  "REPO=$REPO" "HARNESS_REPO=$HARNESS_REPO" "PROJECT=$PROJECT" \
+  "EXPERIMENT_ID=${EXPERIMENT_ID:-}" "PAIR_ID=${PAIR_ID:-}" "ARM_ID=${ARM_ID:-}" \
   "SESSION_STAMP=$SESSION_STAMP" "GIT_REVISION=$GIT_REVISION" \
   "CLIENT_PORT_BASE=${CLIENT_PORT_BASE:-0}" \
   "CLIENTS=${CLIENTS:-20}" "FLOWS=${FLOWS:-1}" "WORKERS=${WORKERS:-3}" \
   "CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}" "CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}" \
   "CLAT_STEERING=${CLAT_STEERING:-}" \
   "FORWARDING_GRO=${FORWARDING_GRO:-off}" \
+  "CLAT_INGRESS_RPS_CPUS=${CLAT_INGRESS_RPS_CPUS:-unchanged}" \
   "PERF_SCOPE=${PERF_SCOPE:-process}" \
   "PACING_TIMER_US=${PACING_TIMER_US:-1000}" \
   "FQ_RATE=${FQ_RATE:-0}" \
@@ -67,6 +82,7 @@ limactl shell "$INSTANCE" -- env \
   "TAYGA_CPUSET=${TAYGA_CPUSET:-all}" \
   "CLIENT_CPUSET=${CLIENT_CPUSET:-all}" \
   "SERVER_CPUSET=${SERVER_CPUSET:-all}" \
+  "ENDPOINT_AFFINITY=${ENDPOINT_AFFINITY:-off}" \
   "SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}" \
   "IPERF_START_GATE=${IPERF_START_GATE:-on}" \
   "RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}" \
@@ -84,7 +100,13 @@ limactl shell "$INSTANCE" -- env \
     task_status=$?
     rm -f "$task_runner"
     exit "$task_status"
-  ' bash "$REPO/bench/lima/run-guest.sh" < /dev/null || guest_status=$?
+  ' bash "$HARNESS_REPO/bench/lima/run-guest.sh" < /dev/null || guest_status=$?
+host_power_after=
+host_power_settings_after=
+if command -v pmset >/dev/null 2>&1; then
+  host_power_after="$(pmset -g batt 2>/dev/null | head -1 || true)"
+  host_power_settings_after="$(pmset -g custom 2>/dev/null || true)"
+fi
 
 SESSION_DIR="$PERF_SESSION_ROOT/$SESSION_STAMP-lima-debian13-arm64"
 GUEST_SESSION="/tmp/tayga-perf-sessions/$SESSION_STAMP-lima-debian13-arm64"
@@ -95,6 +117,15 @@ trap 'rm -f -- "$session_archive"' EXIT
 if limactl shell "$INSTANCE" -- tar -C "$GUEST_SESSION" -cf - . < /dev/null > "$session_archive" \
     && mkdir -p "$SESSION_DIR" && tar -xf "$session_archive" -C "$SESSION_DIR"; then
   printf 'requested_revision=%s\nguest_exit_status=%s\n' "$GIT_REVISION" "$guest_status" > "$SESSION_DIR/host-request.txt"
+  if [ "$host_power_enabled" = yes ]; then
+    python3 - "$SESSION_DIR/host-power.json" "$host_power_before" "$host_power_after" \
+      "$host_power_settings_before" "$host_power_settings_after" <<'PY'
+import json, pathlib, sys
+path, before, after, settings_before, settings_after = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps(dict(before=before, after=after,
+    settings_before=settings_before, settings_after=settings_after), indent=2)+'\n')
+PY
+  fi
   echo "Perf session saved on host: $SESSION_DIR"
   limactl shell "$INSTANCE" -- rm -rf -- "$GUEST_SESSION" < /dev/null || echo "Guest copy retained: $GUEST_SESSION" >&2
 else

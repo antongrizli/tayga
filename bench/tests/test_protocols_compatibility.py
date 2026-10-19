@@ -2,6 +2,28 @@
 """Portable protocol compatibility & translation invariant tests for TAYGA."""
 import struct
 import unittest
+import importlib.util
+from pathlib import Path
+
+
+class ProtocolPayloadOracleTests(unittest.TestCase):
+    def test_wire_boundaries_and_corruption(self):
+        path = Path(__file__).resolve().parents[2] / 'test/integration/protocol_payload.py'
+        spec = importlib.util.spec_from_file_location('protocol_payload', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        payload = b'\x12\x34\x01\x00structured DNS application bytes'
+        udp = struct.pack('!HHHH', 53000, 53, len(payload) + 8, 1234) + payload
+        tcp = bytearray(32)
+        tcp[12] = 8 << 4
+        self.assertEqual(module.protocol_payload(17, udp), payload)
+        self.assertEqual(module.protocol_payload(6, bytes(tcp) + payload), payload)
+        # An inner transport/Raw decoder must not strip opaque tunnel headers.
+        self.assertEqual(module.protocol_payload(47, udp), udp)
+        self.assertNotEqual(module.protocol_payload(17, udp[:-1] + b'!'), payload)
+        for protocol, data in ((17, b'x' * 7), (6, b'x' * 19), (6, bytes(20))):
+            with self.assertRaises(ValueError):
+                module.protocol_payload(protocol, data)
 
 
 def crc32c(data: bytes) -> int:
@@ -280,12 +302,19 @@ class ProtocolCompatibilityTests(unittest.TestCase):
         hash_tcp2 = flow_hash_bytes(key_tcp2)
         self.assertNotEqual(hash_tcp1, hash_tcp2)
 
-        # SCTP (132): flow dispatch uses 2-tuple (ports are zeroed in key)
+        # TCP (6), UDP (17), DCCP (33), SCTP (132), UDP-Lite (136) all hash 4-tuple (ports included)
+        for proto in (6, 17, 33, 132, 136):
+            key1 = bytes([4, proto]) + min(src4, dst4) + max(src4, dst4)
+            key2 = bytes([4, proto]) + min(src4_alt, dst4) + max(src4_alt, dst4)
+            self.assertNotEqual(flow_hash_bytes(key1), flow_hash_bytes(key2))
+
+        # Opaque protocols like GRE (47) and ESP (50) use 2-tuple (ports zeroed in key)
         src4_no_ports = src4[:16] + bytes([0, 0])
         dst4_no_ports = dst4[:16] + bytes([0, 0])
-        key_sctp1 = bytes([4, 132]) + min(src4_no_ports, dst4_no_ports) + max(src4_no_ports, dst4_no_ports)
-        key_sctp2 = bytes([4, 132]) + min(src4_no_ports, dst4_no_ports) + max(src4_no_ports, dst4_no_ports)
-        self.assertEqual(flow_hash_bytes(key_sctp1), flow_hash_bytes(key_sctp2))
+        for proto in (47, 50):
+            key_p1 = bytes([4, proto]) + min(src4_no_ports, dst4_no_ports) + max(src4_no_ports, dst4_no_ports)
+            key_p2 = bytes([4, proto]) + min(src4_no_ports, dst4_no_ports) + max(src4_no_ports, dst4_no_ports)
+            self.assertEqual(flow_hash_bytes(key_p1), flow_hash_bytes(key_p2))
 
 
 if __name__ == "__main__":

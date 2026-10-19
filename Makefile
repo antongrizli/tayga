@@ -21,7 +21,7 @@ help:
 	@echo 'system-test     - Run Linux kernel acceptance tests (root)'
 	@echo 'bench-tools     - Build benchmark helpers and fault shims'
 	@echo 'integration     - Run integration tests (requires root/netns)'
-	@echo 'release         - Bump VERSION, commit and create git tag'
+	@echo 'release         - Prepare VERSION and dated changelog for review'
 	@echo 'man             - Generate man pages from markdown (requires pandoc)'
 	@echo 'check-man       - Check that committed man pages match markdown sources'
 	@echo 'check-docs      - Verify markdown documentation links'

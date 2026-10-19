@@ -3,10 +3,12 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import subprocess
 import shutil
+import sys
 import tarfile
 import unittest
 from taygabench import acceptance, compare
@@ -242,6 +244,165 @@ class RecoveryTests(unittest.TestCase):
     def test_different_paired_flow_schedule_fails(self):
         self.change('result.json',lambda d:d.update(client_port_base=40200))
         self.assertFalse(self.report()['passed'])
+
+    def experiments(self, roots=None, pair='1'):
+        roots=roots or {'baseline':[self.base],'candidate':[self.candidate]}
+        harness=self.root/'harness.tar.gz'
+        if not harness.exists():self.archive(harness,b'frozen harness\n')
+        for arm,sessions in roots.items():
+            for session in sessions:
+                shutil.copyfile(harness,session/'harness-snapshot.tar.gz')
+                digest=hashlib.sha256(harness.read_bytes()).hexdigest()
+                (session/'harness-snapshot.sha256').write_text(digest+'\n')
+                (session/'experiment.json').write_text(json.dumps(dict(experiment_id='study',pair_id=pair,arm_id=arm,
+                    steering='kernel' if arm=='baseline' else 'flows',client_port_base=40100,harness_archive_sha256=digest)))
+
+    def test_explicit_pair_and_harness_validated(self):
+        self.experiments()
+        self.assertTrue(self.report()['passed'])
+        p=self.candidate/'experiment.json';d=json.loads(p.read_text())
+        d['pair_id']='2';p.write_text(json.dumps(d))
+        self.assertIn('download: mismatched pair identities',self.report()['errors'])
+        d['pair_id']='1';d['arm_id']='baseline';p.write_text(json.dumps(d))
+        self.assertIn('experiment arm mismatch: candidate',self.report()['errors'])
+
+    def test_harness_archive_tampering_and_mixed_harness_fail(self):
+        self.experiments()
+        p=self.candidate/'harness-snapshot.tar.gz';p.write_bytes(b'changed')
+        self.assertFalse(self.report()['passed'])
+        digest=hashlib.sha256(p.read_bytes()).hexdigest()
+        (self.candidate/'harness-snapshot.sha256').write_text(digest)
+        p=self.candidate/'experiment.json';d=json.loads(p.read_text());d['harness_archive_sha256']=digest
+        p.write_text(json.dumps(d))
+        self.assertIn('mixed harness identities',self.report()['errors'])
+
+    def test_same_policy_diagnostic_never_accepts_product(self):
+        self.experiments()
+        p=self.candidate/'experiment.json';d=json.loads(p.read_text());d['steering']='kernel';p.write_text(json.dumps(d))
+        for direction in ('download','upload'):
+            for phase in ('before','after'):
+                p=self.candidate/'none'/direction/f'tayga-status.{phase}.json'
+                d=json.loads(p.read_text());d.update(steering_requested='kernel',steering_effective='kernel');p.write_text(json.dumps(d))
+        self.change('tayga-status.after.json',lambda d:d['traffic'].update(dropped_packets=5))
+        report=self.report(diagnostic=True,candidate_steering='kernel')
+        self.assertTrue(report['passed'],report['errors'])
+        self.assertFalse(report['product_accepted'])
+        self.assertIn('daemon interval drops/errors',report['samples']['candidate'][0]['quality_errors'])
+        self.assertFalse(self.report(candidate_steering='kernel')['passed'])
+        (self.path/'client-1.json').unlink()
+        self.assertFalse(self.report(diagnostic=True,candidate_steering='kernel')['passed'])
+
+    def test_diagnostic_requires_explicit_provenance(self):
+        report=self.report(diagnostic=True)
+        self.assertIn('missing experiment/harness manifest',report['errors'])
+
+    def test_rps_treatment_difference_cannot_pass_product_acceptance(self):
+        for direction in ('download','upload'):
+            path=self.candidate/'none'/direction/'result.json'
+            result=json.loads(path.read_text())
+            result['clat_ingress_rps_cpus']='f'
+            path.write_text(json.dumps(result))
+        report=self.report()
+        self.assertFalse(report['passed'])
+        self.assertIn('download: arm mismatch clat_ingress_rps_cpus',report['errors'])
+
+    def test_explicit_rps_requires_matching_readback_evidence(self):
+        for session in (self.base,self.candidate):
+            for direction in ('download','upload'):
+                path=session/'none'/direction/'result.json'
+                result=json.loads(path.read_text());result['clat_ingress_rps_cpus']='f'
+                path.write_text(json.dumps(result))
+            evidence=dict(
+                namespace='clatns',interface='veth-nat64',requested='f',
+                queues=[dict(queue='rx-0',before='0',after='0000000f')])
+            (session/'none/clat-ingress-rps.json').write_text(json.dumps(evidence))
+        self.assertTrue(self.report()['passed'],self.report()['errors'])
+        path=self.candidate/'none/clat-ingress-rps.json'
+        evidence=json.loads(path.read_text());evidence['queues'][0]['after']='0'
+        path.write_text(json.dumps(evidence))
+        report=self.report()
+        self.assertFalse(report['passed'])
+        self.assertTrue(any('RPS readback mismatch' in error for error in report['errors']))
+
+    def test_invalid_harness_digest_type_is_rejected_without_crashing(self):
+        self.experiments()
+        p=self.candidate/'experiment.json';d=json.loads(p.read_text());d['harness_archive_sha256']={'invalid':'digest'}
+        p.write_text(json.dumps(d))
+        report=self.report(diagnostic=True)
+        self.assertFalse(report['passed'])
+        self.assertTrue(any('invalid harness digest' in e for e in report['errors']))
+
+    def test_endpoint_policy_requires_actual_matching_process_masks(self):
+        for session in (self.base,self.candidate):
+            for direction in ('download','upload'):
+                path=session/'none'/direction;p=path/'result.json';d=json.loads(p.read_text())
+                d.update(endpoint_affinity='per-client',client_endpoint_cpus='0,1',server_endpoint_cpus='0,1');p.write_text(json.dumps(d))
+                (path/'endpoint-affinity.before').write_text(''.join(f'pid={100+i}\nName:\tiperf3\nCpus_allowed_list:\t{i%2}\n' for i in range(8)))
+        self.assertTrue(self.report()['passed'],self.report()['errors'])
+        p=self.path/'endpoint-affinity.before';p.write_text(p.read_text().replace('Cpus_allowed_list:\t0','Cpus_allowed_list:\t0-3',1))
+        self.assertFalse(self.report()['passed'])
+        p.unlink();self.assertFalse(self.report()['passed'])
+
+    @unittest.skipUnless(sys.platform=='linux','Linux CPU-affinity API')
+    def test_endpoint_cpu_selection_applies_only_to_child(self):
+        repo=Path(__file__).resolve().parents[2]
+        before=os.sched_getaffinity(0);expected=sorted(before)[1%len(before)]
+        script='. "$1"; . "$2"; CLIENT_CPUSET=all; SERVER_CPUSET=all; ENDPOINT_AFFINITY=per-client; prepare_endpoint_affinity; selected=$(select_endpoint_cpu "$CLIENT_ENDPOINT_CPUS" 2); exec_with_affinity "$selected" python3 -c "import json,os; print(json.dumps(sorted(os.sched_getaffinity(0))))"'
+        run=subprocess.run(['sh','-c',script,'sh',str(repo/'bench/clat/lib/netns.sh'),str(repo/'bench/clat/lib/iperf.sh')],check=True,capture_output=True,text=True)
+        self.assertEqual(json.loads(run.stdout),[expected]);self.assertEqual(os.sched_getaffinity(0),before)
+
+    def test_power_transition_or_mismatched_power_invalidates_evidence(self):
+        self.experiments()
+        power=dict(before="Now drawing from 'AC Power'",after="Now drawing from 'AC Power'",
+                   settings_before='AC lowpowermode 0',settings_after='AC lowpowermode 0')
+        for root in (self.base,self.candidate):(root/'host-power.json').write_text(json.dumps(power))
+        self.assertTrue(self.report(diagnostic=True)['passed'])
+        power['after']="Now drawing from 'Battery Power'"
+        p=self.candidate/'host-power.json';p.write_text(json.dumps(power))
+        self.assertFalse(self.report(diagnostic=True)['passed'])
+        power['before']=power['after'];p.write_text(json.dumps(power))
+        self.assertIn('download: arm mismatch host_power_source',self.report(diagnostic=True)['errors'])
+        power['settings_after']='AC lowpowermode 1';p.write_text(json.dumps(power))
+        self.assertFalse(self.report(diagnostic=True)['passed'])
+
+    def test_explicit_pairs_match_independent_of_root_order(self):
+        roots={'baseline':[],'candidate':[]}
+        for trial in ('1','2'):
+            current={}
+            for arm in roots:
+                target=self.root/f'{arm}-{trial}';shutil.copytree(self.root/arm,target)
+                roots[arm].append(target);current[arm]=[target]
+            self.experiments(current,pair=trial)
+        report=acceptance.evaluate(roots['baseline'],list(reversed(roots['candidate'])),repeats=2)
+        self.assertTrue(report['passed'],report['errors'])
+        self.experiments({arm:[paths[1]] for arm,paths in roots.items()},pair='1')
+        self.assertFalse(acceptance.evaluate(roots['baseline'],roots['candidate'],repeats=2)['passed'])
+
+    def test_runner_separates_sources_policies_and_harness(self):
+        harness=self.root/'frozen-harness';runner=harness/'bench/lima/run-host.sh';runner.parent.mkdir(parents=True)
+        runner.write_text('#!/bin/sh\nprintf "%s|%s|%s|%s|%s|%s\\n" "$REPO" "$HARNESS_REPO" "$ARM_ID" "$PAIR_ID" "$CLAT_STEERING" "$GIT_REVISION" >> "$RUNNER_LOG"\n')
+        runner.chmod(0o755)
+        commands=self.root/'commands';commands.mkdir()
+        python=commands/'python3';python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$EVALUATOR_ARGS"\n');python.chmod(0o755)
+        log=self.root/'calls';args=self.root/'args'
+        env=dict(os.environ,REPO=str(self.root),HARNESS_REPO=str(harness),BASELINE_REPO=str(self.base),
+                 CANDIDATE_REPO=str(self.candidate),BASELINE_REVISION='original',CANDIDATE_REVISION='main',
+                 BASELINE_STEERING='kernel',CANDIDATE_STEERING='kernel',RECOVERY_PURPOSE='diagnostic',RECOVERY_MODE='build',
+                 RECOVERY_STAMP='fixed-study',REPEATS='5',PERF_SESSION_ROOT=str(self.root/'sessions'),
+                 RUNNER_LOG=str(log),EVALUATOR_ARGS=str(args),PATH=str(commands)+os.pathsep+os.environ['PATH'])
+        script=Path(__file__).resolve().parents[1]/'lima/run-recovery.sh'
+        subprocess.run(['bash',str(script)],env=env,check=True,capture_output=True,text=True)
+        rows=[line.split('|') for line in log.read_text().splitlines()]
+        self.assertEqual(len(rows),10)
+        self.assertEqual([r[2] for r in rows[:4]],['baseline','candidate','candidate','baseline'])
+        for source,actual_harness,arm,pair,policy,revision in rows:
+            self.assertEqual(source,str(self.base if arm=='baseline' else self.candidate))
+            self.assertEqual(actual_harness,str(harness));self.assertEqual(policy,'kernel')
+            self.assertEqual(revision,'original' if arm=='baseline' else 'main')
+            self.assertIn(pair,('1','2','3','4','5'))
+        self.assertIn('--diagnostic',args.read_text())
+        env['RECOVERY_PURPOSE']='acceptance'
+        self.assertEqual(subprocess.run(['bash',str(script)],env=env,capture_output=True).returncode,64)
 
 
 if __name__=='__main__':unittest.main()

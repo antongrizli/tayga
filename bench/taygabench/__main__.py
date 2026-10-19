@@ -12,7 +12,7 @@ STUDIES = {
         ('steering-integrity', 'run_steering_integrity'), ('tcp-flow', 'run_tcp_flow_study'),
         ('tcp-worker', 'run_tcp_worker_study'), ('tun-steering', 'run_tun_steering_study'),
         ('udp-batch', 'run_udp_batch_study'), ('udp-envelope', 'run_udp_envelope_study'),
-        ('controlled-ab', 'run_controlled_ab'))
+        ('controlled-ab', 'run_controlled_ab'), ('steering-ablation', 'prepare_steering_ablation'))
 }
 SUMMARIES = {name: 'taygabench.summarize.summarize_' + name.replace('-', '_') + '_study'
              for name in ('tcp-flow', 'tcp-placement', 'tcp-worker', 'tun-steering', 'udp-batch')}
@@ -20,7 +20,7 @@ SUMMARIES = {name: 'taygabench.summarize.summarize_' + name.replace('-', '_') + 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('study', 'summarize', 'compare', 'acceptance', 'memory'))
+    parser.add_argument('command', choices=('study', 'summarize', 'compare', 'acceptance', 'memory', 'diagnostics', 'sequence'))
     raw = sys.argv[1:]
     args = parser.parse_args(raw[:1])
     remaining = raw[1:]

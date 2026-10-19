@@ -160,9 +160,34 @@ class InterfaceCounterTests(unittest.TestCase):
 
 
 class QueueValidationTests(unittest.TestCase):
+    def rps_setup(self, requested, controls=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            queues=Path(tmp)/'queues'
+            if controls:
+                (queues/'rx-0').mkdir(parents=True)
+                (queues/'rx-0/rps_cpus').write_text('00000000\n')
+            source=script.split('python3 - "$CLAT_INGRESS_RPS_CPUS"',1)[1].split("<<'PY'\n",1)[1].split('\nPY',1)[0]
+            source=source.replace("'/sys/class/net/veth-nat64/queues'",repr(str(queues)))
+            run=subprocess.run([sys.executable,'-',requested],input=source,capture_output=True,text=True)
+            return run,json.loads(run.stdout)
+
+    def test_rps_readback_and_default_without_kernel_controls(self):
+        run,report=self.rps_setup('F')
+        self.assertEqual(run.returncode,0,run.stderr)
+        self.assertEqual(int(report['queues'][0]['after'],16),15)
+        run,report=self.rps_setup('unchanged',controls=False)
+        self.assertEqual(run.returncode,0,run.stderr)
+        self.assertFalse(report['available'])
+
+    def test_explicit_rps_fails_without_kernel_controls(self):
+        run,report=self.rps_setup('f',controls=False)
+        self.assertNotEqual(run.returncode,0)
+        self.assertIn('no ingress RPS queue controls',report['error'])
+
     def test_invalid_queue_settings_fail_before_topology_setup(self):
         harness = Path(__file__).resolve().parents[2] / "bench/clat/benchmark-clat.sh"
         for updates in (dict(SENDER_FQ_LIMIT="0"), dict(VETH_QUEUES="65"),
+                        dict(CLAT_INGRESS_RPS_CPUS="f; echo unsafe"),
                         dict(SENDER_FQ_LIMIT="100", SENDER_FQ_FLOW_LIMIT="101")):
             with self.subTest(updates=updates):
                 env = dict(os.environ, PROTOCOL="udp", SENDER_FQ="on", FQ_RATE="0",
@@ -247,6 +272,7 @@ esac
             (root / "empty").mkdir()
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        REPO=str(root), ISO=str(root / "absent.iso"), INSTANCE="tayga-perf",
+                       HARNESS_REPO=str(Path(__file__).resolve().parents[2]),
                        SESSION_STAMP="stdin-test", LIMA_STDIN=str(root / "stdin"),
                        LIMA_EMPTY_DIR=str(root / "empty"), PERF_SESSION_ROOT=str(root / "results"))
             runner = Path(__file__).resolve().parents[2] / "bench/lima/run-host.sh"
@@ -355,6 +381,42 @@ class WorkerCounterTests(unittest.TestCase):
         self.assertEqual(res[0]["dropped_packets"], 1)
         self.assertEqual(res[1]["rx_packets_v4"], 300)
         self.assertEqual(res[1]["tx_packets_v4"], 250)
+
+    def test_worker_bytes_legacy_and_shared_worker_id(self):
+        before, after = self.make_snapshot(seq=1), self.make_snapshot(seq=2)
+        fields = ("rx_bytes_v4", "tx_bytes_v4", "rx_bytes_v6", "tx_bytes_v6")
+        legacy = namespace["worker_counter_deltas"](before, after)
+        self.assertFalse(legacy[0]["byte_counters_available"])
+        self.assertIsNone(legacy[0]["rx_bytes_v4"])
+        for snap in (before, after):
+            for w in snap["workers"]:
+                w["worker_id"] = 0  # Main and worker zero share this label.
+                w.update(dict.fromkeys(fields, 1000))
+        after["workers"][0]["rx_bytes_v4"] = 1100
+        after["workers"][1]["rx_bytes_v4"] = 100000
+        rows = namespace["worker_counter_deltas"](before, after)
+        self.assertEqual([r["rx_bytes_v4"] for r in rows], [100, 99000])
+        self.assertTrue(all(r["byte_counters_available"] for r in rows))
+
+    def test_worker_byte_reset_partial_invalid_and_duplicate_slots(self):
+        import copy
+        before, after = self.make_snapshot(seq=1), self.make_snapshot(seq=2)
+        for snap in (before, after):
+            for w in snap["workers"]:
+                w.update(dict.fromkeys(("rx_bytes_v4", "tx_bytes_v4", "rx_bytes_v6", "tx_bytes_v6"), 100))
+        for value in (99, True, -1, 1.5, None):
+            bad = copy.deepcopy(after)
+            bad["workers"][1]["rx_bytes_v4"] = value
+            with self.assertRaises(ValueError):
+                namespace["worker_counter_deltas"](before, bad)
+        bad = copy.deepcopy(after)
+        del bad["workers"][1]["rx_bytes_v4"]
+        with self.assertRaises(ValueError):
+            namespace["worker_counter_deltas"](before, bad)
+        bad = copy.deepcopy(after)
+        bad["workers"].append(copy.deepcopy(bad["workers"][0]))
+        with self.assertRaises(ValueError):
+            namespace["worker_counter_deltas"](before, bad)
 
     def test_worker_counter_identity_and_freshness_checks(self):
         worker_deltas = namespace["worker_counter_deltas"]

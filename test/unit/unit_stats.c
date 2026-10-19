@@ -296,7 +296,7 @@ int main(void)
 
 	FILE *f = fopen(test_json, "r");
 	assert(f != NULL);
-	char buf[4096];
+	char buf[16384];
 	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
 	fclose(f);
 	buf[n] = '\0';
@@ -316,6 +316,14 @@ int main(void)
 	assert(strstr(buf, "\"active_mappings\": 42") != NULL);
 	assert(strstr(buf, "\"dormant_mappings\": 7") != NULL);
 	assert(strstr(buf, "\"free_addresses\": 100") != NULL);
+	/* Worker bytes must describe the slot, rather than the aggregate traffic
+	 * above. Main sent different amounts in each direction before the writers. */
+	const char *workers_json = strstr(buf, "\"workers\": [");
+	assert(workers_json != NULL);
+	assert(strstr(workers_json, "\"rx_bytes_v4\": 2000") != NULL);
+	assert(strstr(workers_json, "\"tx_bytes_v4\": 1400") != NULL);
+	assert(strstr(workers_json, "\"rx_bytes_v6\": 1520") != NULL);
+	assert(strstr(workers_json, "\"tx_bytes_v6\": 1520") != NULL);
 	unlink(test_json);
 	printf("PASS: stats_write_json generates valid structured JSON with dynamic pool\n");
 

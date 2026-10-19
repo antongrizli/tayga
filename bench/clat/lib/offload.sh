@@ -1,5 +1,34 @@
 #!/bin/sh
 # Sourced by benchmark-clat.sh; configuration is owned by the entrypoint.
+configure_clat_ingress_rps() {
+  # Only this disposable namespace/interface is touched, before traffic starts.
+  # Preserve readback evidence even when the kernel rejects a requested mask.
+  ip netns exec clatns python3 - "$CLAT_INGRESS_RPS_CPUS" > "$ARTIFACT_DIR/clat-ingress-rps.json" <<'PY'
+import json, sys
+from pathlib import Path
+requested = sys.argv[1]
+report = dict(interface='veth-nat64', namespace='clatns', requested=requested, queues=[])
+try:
+    paths = sorted(Path('/sys/class/net/veth-nat64/queues').glob('rx-*/rps_cpus'))
+    report['available'] = bool(paths)
+    if not paths and requested != 'unchanged': raise RuntimeError('no ingress RPS queue controls')
+    for path in paths:
+        row = dict(queue=path.parent.name, before=path.read_text().strip())
+        report['queues'].append(row)
+        if requested != 'unchanged': path.write_text(requested+'\n')
+        row['after'] = path.read_text().strip()
+        if requested != 'unchanged' and int(row['after'].replace(',', ''), 16) != int(requested.replace(',', ''), 16):
+            raise RuntimeError('RPS mask readback mismatch')
+except (OSError, ValueError, RuntimeError) as exc:
+    report['error'] = str(exc)
+finally:
+    print(json.dumps(report, indent=2))
+if 'error' in report:
+    print(report['error'], file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 configure_sender_fq() {
   local sender_ns=$1 sender_dev=$2 tx_count topology queue_no queue_limit flow_limit
   tx_count=$(awk '/Current hardware settings:/ { current=1; next } current && /^TX:/ { print $2; exit }'     "$ARTIFACT_DIR/channels-$sender_ns-$sender_dev.after.txt")

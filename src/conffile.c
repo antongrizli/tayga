@@ -815,6 +815,69 @@ struct {
 	{ NULL, NULL, 0 }
 };
 
+void config_free(void)
+{
+	struct list_head *entry, *next;
+
+	if (gcfg.map4_list.next && gcfg.map4_list.next != &gcfg.map4_list) {
+		list_for_each_safe(entry, next, &gcfg.map4_list) {
+			struct map4 *m = list_entry(entry, struct map4, list);
+			if (m->type == MAP_TYPE_STATIC || m->type == MAP_TYPE_RFC6052) {
+				struct map_static *s = container_of(m, struct map_static, map4);
+				list_del(&s->map4.list);
+				list_del(&s->map6.list);
+				free(s);
+			} else {
+				list_del(&m->list);
+			}
+		}
+	}
+	if (gcfg.map6_list.next && gcfg.map6_list.next != &gcfg.map6_list) {
+		list_for_each_safe(entry, next, &gcfg.map6_list) {
+			struct map6 *m = list_entry(entry, struct map6, list);
+			if (m->type == MAP_TYPE_STATIC || m->type == MAP_TYPE_RFC6052) {
+				struct map_static *s = container_of(m, struct map_static, map6);
+				list_del(&s->map6.list);
+				free(s);
+			} else {
+				list_del(&m->list);
+			}
+		}
+	}
+	if (gcfg.dynamic_pool) {
+		free(gcfg.dynamic_pool);
+		gcfg.dynamic_pool = NULL;
+	}
+	if (gcfg.tun_ip4_list.next && gcfg.tun_ip4_list.next != &gcfg.tun_ip4_list) {
+		list_for_each_safe(entry, next, &gcfg.tun_ip4_list) {
+			struct tun_ip4 *ip4 = list_entry(entry, struct tun_ip4, list);
+			list_del(&ip4->list);
+			free(ip4);
+		}
+	}
+	if (gcfg.tun_ip6_list.next && gcfg.tun_ip6_list.next != &gcfg.tun_ip6_list) {
+		list_for_each_safe(entry, next, &gcfg.tun_ip6_list) {
+			struct tun_ip6 *ip6 = list_entry(entry, struct tun_ip6, list);
+			list_del(&ip6->list);
+			free(ip6);
+		}
+	}
+	if (gcfg.tun_rt4_list.next && gcfg.tun_rt4_list.next != &gcfg.tun_rt4_list) {
+		list_for_each_safe(entry, next, &gcfg.tun_rt4_list) {
+			struct tun_ip4 *ip4 = list_entry(entry, struct tun_ip4, list);
+			list_del(&ip4->list);
+			free(ip4);
+		}
+	}
+	if (gcfg.tun_rt6_list.next && gcfg.tun_rt6_list.next != &gcfg.tun_rt6_list) {
+		list_for_each_safe(entry, next, &gcfg.tun_rt6_list) {
+			struct tun_ip6 *ip6 = list_entry(entry, struct tun_ip6, list);
+			list_del(&ip6->list);
+			free(ip6);
+		}
+	}
+}
+
 int config_init(void)
 {
 	/* Initialize configuration structure to defaults */
@@ -854,6 +917,12 @@ int config_read(char *conffile)
 
 	/* Has conf file failed validation, should we exit? */
 	int willexit = 0;
+
+	/* Reject an absent path before calling libc: fopen(NULL, ...) is undefined. */
+	if (!conffile) {
+		slog(LOG_CRIT, "No configuration file path supplied\n");
+		return ERROR_REJECT;
+	}
 
 	/* Read in conf file */
 	in = fopen(conffile, "r");
@@ -981,6 +1050,7 @@ int config_validate(void)
 	m->origin = MAP_ORIGIN_SELF;
 	if (insert_map4(&m->map4, &m4) < 0) {
 		abort_on_conflict4("Error: ipv4-addr", 0, m4);
+		free(m);
 		return ERROR_REJECT;
 	}
 
@@ -993,6 +1063,8 @@ int config_validate(void)
 		slog(LOG_CRIT, "Error: ipv6-addr directive cannot contain an "
 				"address in the Well-Known Prefix "
 				"(64:ff9b::/96)\n");
+		list_del(&m->map4.list);
+		free(m);
 		return ERROR_REJECT;
 	/* ipv6-addr is configured but not within the well known prefix */
 	} else if (gcfg.local_addr6.s6_addr32[0]) {
@@ -1005,11 +1077,12 @@ int config_validate(void)
 						"within configured prefix "
 						"%s/%d\n", addrbuf,
 						m6->prefix_len);
-				return ERROR_REJECT;
 			} else {
 				abort_on_conflict6("Error: ipv6-addr", 0, m6);
-				return ERROR_REJECT;
 			}
+			list_del(&m->map4.list);
+			free(m);
+			return ERROR_REJECT;
 		}
 	/* ipv6-addr is zero (not set), generate from ipv4-addr and prefix */
 	} else {
@@ -1018,6 +1091,8 @@ int config_validate(void)
 			slog(LOG_CRIT, "Error: ipv6-addr directive must be "
 					"specified if no NAT64 prefix is "
 					"configured\n");
+			list_del(&m->map4.list);
+			free(m);
 			return ERROR_REJECT;
 		}
 		if (append_to_prefix(&gcfg.local_addr6, &gcfg.local_addr4,
@@ -1028,6 +1103,8 @@ int config_validate(void)
 						"specified if prefix is 64:ff9b::/96 "
 						"and ipv4-addr is a non-global "
 						"(RFC 1918) address\n");
+				list_del(&m->map4.list);
+				free(m);
 				return ERROR_REJECT;
 			}
 		}

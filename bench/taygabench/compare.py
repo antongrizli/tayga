@@ -16,8 +16,9 @@ WORKLOAD_KEYS = ("direction", "clients", "expected_clients", "workload_protocol"
 BUILD_KEYS = ("git_revision", "source_tree_sha256", "clat_start_sha256", "tayga_sha256")
 IDENTITY_KEYS = WORKLOAD_KEYS + BUILD_KEYS
 TREATMENT_KEYS = ("offload_requested", "offload_effective", "workers", "tun_txqlen", "forwarding_gro",
+                  "clat_ingress_rps_cpus",
                   "pacing_timer_us", "fq_rate", "socket_buffer_bytes", "sender_fq", "sender_fq_flow_limit", "sender_fq_limit", "veth_queues", "sender_fq_topology",
-                  "tayga_cpuset", "client_cpuset", "server_cpuset")
+                  "tayga_cpuset", "client_cpuset", "server_cpuset", "endpoint_affinity", "client_endpoint_cpus", "server_endpoint_cpus")
 METRICS = ("received_mbps", "tayga_cpu_cores", "tayga_core_per_gbps",
            "system_busy_cores", "system_softirq_cores", "tun_drops",
            "tun_tx_drop_percent", "udp_loss_percent", "udp_sender_receiver_gap_percent", "ping_loss_percent",
@@ -49,6 +50,7 @@ def results(root: Path):
         # enabled it. Preserve comparisons with those saved results.
         doc.setdefault("perf_scope", "process")
         doc.setdefault("forwarding_gro", "off")
+        doc.setdefault("clat_ingress_rps_cpus", "unchanged")
         for key, default in (("pacing_timer_us", 1000), ("fq_rate", "0"),
                              ("socket_buffer_bytes", 0), ("sender_fq", "off"), ("sender_fq_flow_limit", 100),
                              ("sender_fq_limit", 10000), ("veth_queues", 0), ("sender_fq_topology", "single"),
@@ -56,6 +58,9 @@ def results(root: Path):
                              ("socket_sample_interval", 0), ("receiver_drain_seconds", 0.0)):
             doc.setdefault(key, default)
         doc.setdefault("receiver_drain_method", "legacy" if doc["receiver_drain_seconds"] else "none")
+        doc.setdefault("endpoint_affinity", "off")
+        doc.setdefault("client_endpoint_cpus", doc["client_cpuset"])
+        doc.setdefault("server_endpoint_cpus", doc["server_cpuset"])
         doc["valid"] = bool(doc.get("capture_valid", False) and doc.get("workload_valid", False))
         if doc["receiver_drain_method"] == "udp-write-eagain-v1" and not doc.get("receiver_drain_guard_sha256"):
             doc["valid"] = False

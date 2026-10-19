@@ -1,5 +1,10 @@
 name: Correctness and review gates
 on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   pull_request:
   push:
     branches: [main]
@@ -14,6 +19,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -27,6 +35,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - name: Address and undefined behavior
         run: make test CC=clang CFLAGS='-O1 -g -Wall -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
         env:
@@ -48,6 +59,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - name: Dependencies and opt-in io_uring build
         run: sudo apt-get update && sudo apt-get install -y liburing-dev python3-scapy python3-pyroute2 iproute2 nftables tcpdump socat iputils-ping ethtool
       - name: Shell script errors

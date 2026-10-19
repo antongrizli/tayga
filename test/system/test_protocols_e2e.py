@@ -13,6 +13,7 @@ Verifies real data transmission across Linux network namespaces (client -> route
 """
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import os
@@ -24,7 +25,31 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+
+
+@contextmanager
+def selected_binary(source, destination):
+    """Keep the installed daemon intact even when a test/startup raises."""
+    if source is None or source.resolve() == destination.resolve():
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix='tayga-protocol-binary-') as name:
+        backup = Path(name)/'tayga'
+        existed = destination.exists()
+        if existed:
+            shutil.copy2(destination, backup)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            destination.chmod(0o755)
+            yield
+        finally:
+            if existed:
+                shutil.copy2(backup, destination)
+            else:
+                destination.unlink(missing_ok=True)
 
 
 def sh(cmd):
@@ -382,14 +407,6 @@ def main():
         shutil.copy2(repo_clat, clat_script)
         clat_script.chmod(0o755)
 
-    if args.binary:
-        bin_path = Path(args.binary).resolve()
-        dst_bin = Path("/usr/sbin/tayga")
-        if bin_path != dst_bin and os.geteuid() == 0:
-            dst_bin.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(bin_path, dst_bin)
-            dst_bin.chmod(0o755)
-
     clat_cmd = [
         "ip", "netns", "exec", "clatns", "env",
         "PREF64=64:ff9b::/96", "ROUTER4=172.31.64.1",
@@ -403,25 +420,30 @@ def main():
         log_path = args.output / "clat.log"
         log_file = open(log_path, "w")
 
-    tayga = subprocess.Popen(
-        clat_cmd,
-        stdout=log_file if log_file else subprocess.DEVNULL,
-        stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL
-    )
+    tayga = None
     try:
-        test_icmp_ping(tayga_proc=tayga, log_path=log_path)
-        test_wireguard_udp()
-        test_stun_rfc5389()
-        test_passive_ftp_emulation()
-        test_tcp_stream_integrity()
-        print("\nAll End-to-End Protocol Tests PASSED Successfully!")
-    finally:
-        if tayga.poll() is None:
-            tayga.terminate()
+        with selected_binary(Path(args.binary) if args.binary else None, Path('/usr/sbin/tayga')):
             try:
-                tayga.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                tayga.kill()
+                tayga = subprocess.Popen(
+                    clat_cmd,
+                    stdout=log_file if log_file else subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL
+                )
+                test_icmp_ping(tayga_proc=tayga, log_path=log_path)
+                test_wireguard_udp()
+                test_stun_rfc5389()
+                test_passive_ftp_emulation()
+                test_tcp_stream_integrity()
+                print("\nAll End-to-End Protocol Tests PASSED Successfully!")
+            finally:
+                if tayga is not None and tayga.poll() is None:
+                    tayga.terminate()
+                    try:
+                        tayga.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        tayga.kill()
+                        tayga.wait()
+    finally:
         if log_file:
             log_file.close()
         teardown()

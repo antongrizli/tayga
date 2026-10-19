@@ -2,6 +2,11 @@ name: Basic Test
 
 # Controls when the action will run. Workflow runs when triggered by push to main, PR, or manual dispatch
 on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   push:
     branches: [main]
   pull_request:
@@ -36,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ver || github.ref }}
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
       - name: run build gcc
         run: make clean && make CC=gcc CFLAGS="-Werror -Wall -O2"
       - name: run test gcc
@@ -70,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ver || github.ref }}
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
       - name: test on FreeBSD 15
         uses: vmactions/freebsd-vm@v1
         id: freebsd-test
@@ -103,7 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ver || github.ref }}
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
       - name: Build static binary inside Alpine (${{ matrix.desc }})

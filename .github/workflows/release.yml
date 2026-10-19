@@ -1,482 +1,202 @@
-name: Build, Package & Publish Release
+name: Build, Verify & Publish Release
 
 on:
   push:
-    tags:
-      - 'v*'
-      - 'version*'
-      - '[0-9]*'
+    tags: ['v*', 'version*', '[0-9]*']
   workflow_dispatch:
     inputs:
       ver:
-        description: 'Release version tag (e.g. v1.0.0)'
-        required: false
+        description: 'Existing prepared release tag (e.g. v0.9.14)'
+        required: true
         type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+# Serialize releases so two successful candidates cannot race on latest.
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
 
 jobs:
-  # 1. Synchronize VERSION in Repository if not already updated
-  sync-version-file:
-    name: Sync VERSION in Repository
+  resolve:
+    name: Resolve and validate release source
     runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      version: ${{ steps.source.outputs.version }}
+      repository: ${{ steps.source.outputs.repository }}
+      prerelease: ${{ steps.source.outputs.prerelease }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve existing tag and verify committed metadata
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.ver }}
+        run: python3 scripts/ci/release_metadata.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-source
+          path: release-source.json
+          if-no-files-found: error
 
-      - name: Update VERSION and commit to main if needed
-        run: |
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          COMMIT_SHA="$(git rev-parse HEAD)"
+  compiler-platform-gates:
+    needs: resolve
+    uses: ./.github/workflows/basic.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
 
-          # Check if VERSION file is already synchronized
-          CURRENT_VER="$(tr -d '\r\n' < VERSION 2>/dev/null || echo "")"
-          if [ "${CURRENT_VER}" != "${CLEAN_VER}" ]; then
-            echo "==> Updating VERSION to ${CLEAN_VER} (Commit: ${COMMIT_SHA})..."
-            printf '%s\n' "${CLEAN_VER}" > VERSION
+  correctness-gates:
+    needs: resolve
+    uses: ./.github/workflows/review-gates.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
 
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add VERSION
-            git commit -m "chore(release): synchronize version to ${RAW_VER} [skip ci]" || true
-            git push origin HEAD:main || true
-          else
-            echo "✅ VERSION is already up-to-date with ${CLEAN_VER}"
-          fi
-
-  # 2. Run Unit Tests & Build Verification
-  test-suite:
-    name: Run Unit Tests
-    needs: sync-version-file
+  integration:
+    needs: resolve
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y python3-pyroute2 python3-scapy iproute2
+      - run: sudo make integration VERSION="$RELEASE_VERSION" COMMIT="$RELEASE_SHA" BRANCH="$RELEASE_TAG"
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: release-integration-results
+          path: build/test-output/integration/
+          if-no-files-found: warn
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc make libpthread-stubs0-dev python3-pyroute2 python3-scapy
-
-      - name: Run C Test Suite & Netns Integration Tests
-        run: |
-          make test CC=gcc LDFLAGS=""
-          sudo make integration
-
-  # 3. Build Standalone Static Linux Binaries
-  build-static-binaries:
-    name: Build Static Binaries (${{ matrix.arch }})
-    needs: test-suite
+  prepare-artifacts:
+    name: Prepare and smoke-test ${{ matrix.arch }} artifacts
+    needs: resolve
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: arm64
-            platform: linux/arm64
-            desc: "ARM64 (RB5009, Chateau, CCR2004/2116, hAP ax3)"
-          - arch: armv7
-            platform: linux/arm/v7
-            desc: "ARMv7 32-bit (hAP ac2/ac3/ax2, RB4011)"
           - arch: amd64
             platform: linux/amd64
-            desc: "x86_64 (MikroTik CHR, PC)"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Determine Version Info
-        id: meta
-        run: |
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
-          echo "raw_ver=${RAW_VER}" >> $GITHUB_OUTPUT
-          echo "clean_ver=${CLEAN_VER}" >> $GITHUB_OUTPUT
-          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Compile and extract static binaries
-        run: |
-          mkdir -p dist-bin
-          docker run --rm --platform ${{ matrix.platform }} -v "$PWD":/src -w /src alpine:3.20 sh -c \
-            "apk add --no-cache gcc make musl-dev linux-headers binutils && \
-             make clean && \
-             make static pref64-discover VERSION='${{ steps.meta.outputs.clean_ver }}' COMMIT='${{ steps.meta.outputs.sha }}' BRANCH='${{ steps.meta.outputs.raw_ver }}' && \
-             strip tayga pref64-discover && \
-             cp tayga dist-bin/tayga-linux-${{ matrix.arch }} && \
-             cp pref64-discover dist-bin/pref64-discover-linux-${{ matrix.arch }}"
-
-      - name: Upload static binaries
-        uses: actions/upload-artifact@v6
-        with:
-          name: binaries-${{ matrix.arch }}
-          path: dist-bin/*
-          if-no-files-found: error
-
-  # 3. Build MikroTik Container TAR Archives
-  build-container-tars:
-    name: Build Container TAR (${{ matrix.arch }})
-    needs: test-suite
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
           - arch: arm64
             platform: linux/arm64
-            tar_name: tayga-arm64.tar
           - arch: armv7
             platform: linux/arm/v7
-            tar_name: tayga-armv7.tar
-          - arch: amd64
-            platform: linux/amd64
-            tar_name: tayga-amd64.tar
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-
-      - name: Determine Version Info
-        id: meta
-        run: |
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
-          echo "raw_ver=${RAW_VER}" >> $GITHUB_OUTPUT
-          echo "clean_ver=${CLEAN_VER}" >> $GITHUB_OUTPUT
-          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and Export Container Image TAR
-        run: |
-          mkdir -p dist-tar
-          docker buildx build \
-            --platform ${{ matrix.platform }} \
-            --target production \
-            --build-arg TAYGA_VERSION="${{ steps.meta.outputs.clean_ver }}" \
-            --build-arg TAYGA_COMMIT="${{ steps.meta.outputs.sha }}" \
-            --build-arg TAYGA_BRANCH="${{ steps.meta.outputs.raw_ver }}" \
-            -t tayga:${{ matrix.arch }} \
-            -f container/Containerfile --load .
-          docker save tayga:${{ matrix.arch }} -o dist-tar/${{ matrix.tar_name }}
-          ls -lh dist-tar/${{ matrix.tar_name }}
-
-      - name: Upload Container TAR artifact
-        uses: actions/upload-artifact@v6
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
         with:
-          name: container-tar-${{ matrix.arch }}
-          path: dist-tar/*
+          name: release-source
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build static binaries, verify staged install, test all image profiles
+        env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          bash scripts/ci/release-build.sh "$RELEASE_ARCH" "$RELEASE_PLATFORM" release-source.json "candidate-$RELEASE_ARCH"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: candidate-${{ matrix.arch }}
+          path: candidate-${{ matrix.arch }}/
+          compression-level: 0
           if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: release-build-failure-${{ matrix.arch }}
+          path: candidate-${{ matrix.arch }}/
+          compression-level: 0
+          if-no-files-found: warn
 
-  # 4. Build & Push Multi-Arch Images to GitHub Container Registry (GHCR)
-  publish-ghcr:
-    name: Build & Push Multi-Arch Container Images (GHCR)
-    needs: test-suite
+  verify-assets:
+    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts]
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-source
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Verify all hashes and source identities; prepare pinned RouterOS assets
+        run: |
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets
+          cd release-assets
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: verified-release-assets
+          path: release-assets/
+          compression-level: 0
+          if-no-files-found: error
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+  publish:
+    name: Publish verified artifacts without rebuilding
+    needs: [resolve, verify-assets]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: verified-release-assets
+          path: release-assets
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Determine Version Metadata
-        id: meta
+      - name: Verify and promote saved images; record registry digests
+        env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
-          REPO_LC="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
-          echo "repo=${REPO_LC}" >> $GITHUB_OUTPUT
-          echo "raw_ver=${RAW_VER}" >> $GITHUB_OUTPUT
-          echo "clean_ver=${CLEAN_VER}" >> $GITHUB_OUTPUT
-          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Build & Push Unified Base Image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./container/Containerfile
-          target: production
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          build-args: |
-            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
-            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
-            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.clean_ver }}
-
-      - name: Build & Push Explicit CLAT Image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./container/Containerfile
-          target: clat
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          build-args: |
-            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
-            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
-            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}-clat:${{ steps.meta.outputs.clean_ver }}
-
-      - name: Build & Push Explicit NAT64 Image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./container/Containerfile
-          target: nat64
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          build-args: |
-            TAYGA_VERSION=${{ steps.meta.outputs.clean_ver }}
-            TAYGA_COMMIT=${{ steps.meta.outputs.sha }}
-            TAYGA_BRANCH=${{ steps.meta.outputs.raw_ver }}
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:latest
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.raw_ver }}
-            ghcr.io/${{ steps.meta.outputs.repo }}-nat64:${{ steps.meta.outputs.clean_ver }}
-
-  # 5. Assemble All Assets, Verify Version Match, Calculate SHA256, and Publish GitHub Release
-  publish-release:
-    name: Publish GitHub Release & MikroTik Deploy Package
-    needs: [build-static-binaries, build-container-tars, publish-ghcr]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Download static binaries
-        uses: actions/download-artifact@v7
-        with:
-          pattern: binaries-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Download container TAR archives
-        uses: actions/download-artifact@v7
-        with:
-          pattern: container-tar-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Verify Binary Version Integrity Gate
-        run: |
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          
-          echo "==> Verifying compiled version against expected release version: ${CLEAN_VER}..."
-          chmod +x release-assets/tayga-linux-amd64
-          
-          # Check embedded version string in the compiled binary
-          if strings release-assets/tayga-linux-amd64 | grep -q "${CLEAN_VER}"; then
-            echo "✅ Binary version verified: contains '${CLEAN_VER}'"
-          else
-            echo "❌ ERROR: Binary version mismatch! Could not find '${CLEAN_VER}' in compiled binary strings." >&2
-            exit 1
-          fi
-
-      - name: Package RouterOS scripts and generate metadata
-        run: |
-          RAW_VER="${{ inputs.ver || github.ref_name }}"
-          CLEAN_VER="${RAW_VER#v}"
-          CLEAN_VER="${CLEAN_VER#version-}"
-          CLEAN_VER="${CLEAN_VER#version}"
-          REPO_LC="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-
-          echo "==> Preparing RouterOS scripts for release ${RAW_VER} (Repo: ${REPO_LC})..."
-          mkdir -p release-staging
-          cp deploy/mikrotik/*.rsc deploy/mikrotik/README.md release-staging/
-
-          # Update container image tags and GitHub release URLs to pinned release version
-          ./scripts/update-image-tags.sh "${RAW_VER}" "${REPO_LC}" release-staging
-
-          # Verify that all target scripts have been pinned to the release tag and no ':latest' image remains
-          echo "==> Verifying image versions in release scripts..."
-          if grep -q "tayga-clat:latest" release-staging/*.rsc || grep -q "tayga-nat64:latest" release-staging/*.rsc; then
-            echo "❌ ERROR: Found unpinned ':latest' container image tag in release scripts!" >&2
-            exit 1
-          fi
-
-          if ! grep -q "ghcr.io/${REPO_LC}-clat:${RAW_VER}" release-staging/routeros-install-clat.rsc; then
-            echo "❌ ERROR: routeros-install-clat.rsc did not get updated to ghcr.io/${REPO_LC}-clat:${RAW_VER}!" >&2
-            exit 1
-          fi
-
-          if ! grep -q "ghcr.io/${REPO_LC}-nat64:${RAW_VER}" release-staging/routeros-install-nat64.rsc; then
-            echo "❌ ERROR: routeros-install-nat64.rsc did not get updated to ghcr.io/${REPO_LC}-nat64:${RAW_VER}!" >&2
-            exit 1
-          fi
-
-          if ! grep -q "ghcr.io/${REPO_LC}-clat:${RAW_VER}" release-staging/routeros-upgrade.rsc; then
-            echo "❌ ERROR: routeros-upgrade.rsc did not get updated to ghcr.io/${REPO_LC}-clat:${RAW_VER}!" >&2
-            exit 1
-          fi
-
-          echo "✅ Release scripts verified: pinned to ghcr.io/${REPO_LC}-*:${RAW_VER}"
-
-          # Copy pinned individual RouterOS .rsc scripts to release assets
-          cp release-staging/*.rsc release-assets/
-
-          # Create a single ZIP package of all RouterOS management scripts (with release-pinned image tags)
-          (cd release-staging && zip -r ../release-assets/tayga-routeros-scripts.zip *.rsc README.md)
-          rm -rf release-staging
-
-          # Generate SHA256 checksums file
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           cd release-assets
-          sha256sum tayga-*.tar tayga-linux-* pref64-discover-linux-* *.rsc *.zip > SHA256SUMS
-          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
           cd ..
-
-          # Create detailed Release Notes Markdown
-          cat << 'EOF' > release_body.md
-          ## 🚀 TAYGA Unified Release TAG_PLACEHOLDER for MikroTik RouterOS 7 & Linux
-
-          High-performance, stateless **464XLAT (RFC 6877 / RFC 7050)** and **NAT64 / DNS64 (RFC 6146 / RFC 6147)** translator containerized and optimized for MikroTik RouterOS 7 and embedded Linux devices.
-
-          ---
-
-          ### ⚡ One-Liner Quick Deploy on MikroTik (Directly from this Release)
-
-          Paste one of these commands directly into your **RouterOS Terminal** (fetches verified scripts directly from this release):
-
-          #### 1. Deploy CLAT (Customer-Side 464XLAT Translator RFC 6877):
-          ```routeros
-          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-clat.rsc" dst-path=install-clat.rsc; /import install-clat.rsc
-          ```
-
-          #### 2. Deploy NAT64 + DNS64 (Server-Side Translator RFC 6146 / 6147):
-          ```routeros
-          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-nat64.rsc" dst-path=install-nat64.rsc; /import install-nat64.rsc
-          ```
-
-          #### 3. Atomic A/B Upgrade with Automatic Rollback (Minimal interruption window, verified probe):
-          ```routeros
-          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-upgrade.rsc" dst-path=upgrade.rsc; /import upgrade.rsc
-          ```
-
-          #### 4. Instant Rollback to Last Known Good Slot:
-          ```routeros
-          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-rollback.rsc" dst-path=rollback.rsc; /import rollback.rsc
-          ```
-
-          #### 5. Safe Removal (Cleans up project without affecting router interfaces):
-          ```routeros
-          /tool/fetch url="https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-remove.rsc" dst-path=remove.rsc; /import remove.rsc
-          ```
-
-          ---
-
-          ### 💻 Or Deploy Remotely via SSH from Mac / Linux:
-          ```bash
-          curl -fsSL https://github.com/REPO_PLACEHOLDER/releases/download/TAG_PLACEHOLDER/routeros-install-clat.rsc | ssh admin@<router-ip>
-          ```
-
-          ---
-
-          ### 📦 Published Container Images (GitHub Container Registry)
-
-          | Image | Description | Architectures |
-          |---|---|---|
-          | `ghcr.io/REPO_PLACEHOLDER:TAG_PLACEHOLDER` | **Unified Multi-Arch Base** (Default `MODE=clat`, customizable to `nat64` or `diagnose`) | `linux/arm64`, `linux/arm/v7`, `linux/amd64` |
-          | `ghcr.io/REPO_PLACEHOLDER-clat:TAG_PLACEHOLDER` | **Explicit CLAT Profile** (Customer-Side Translator RFC 6877) | `linux/arm64`, `linux/arm/v7`, `linux/amd64` |
-          | `ghcr.io/REPO_PLACEHOLDER-nat64:TAG_PLACEHOLDER` | **Explicit NAT64 Profile** (Server-Side NAT64 + Unbound DNS64) | `linux/arm64`, `linux/arm/v7`, `linux/amd64` |
-
-          ---
-
-          ### 🛠️ Offline / Manual TAR File Installation Guide
-
-          For air-gapped or isolated routers without internet access:
-          1. Download the container archive for your architecture from the release assets below:
-             - **ARM64** (`tayga-arm64.tar`): RB5009, Chateau 5G/ax, CCR2004, CCR2116, hAP ax3, L009.
-             - **ARMv7** (`tayga-armv7.tar`): hAP ac2, hAP ac3, hAP ax2, RB4011.
-             - **AMD64** (`tayga-amd64.tar`): Cloud Hosted Router (CHR), x86 PC.
-          2. Download the installation script (`routeros-install-clat.rsc` or `routeros-install-nat64.rsc`).
-          3. Upload both the `.tar` file and `.rsc` script to your RouterOS `Files`.
-          4. Run in RouterOS Terminal:
-             ```routeros
-             /import routeros-install-clat.rsc
-             ```
-
-          ---
-
-          ### 📋 Downloadable Assets & Architecture Matrix
-
-          | Asset | Description | Target Hardware / Environment |
-          |---|---|---|
-          | `tayga-arm64.tar` | MikroTik Container Image | ARM64 RouterOS 7 (RB5009, Chateau, CCR2004/2116, hAP ax3) |
-          | `tayga-armv7.tar` | MikroTik Container Image | ARMv7 RouterOS 7 (hAP ac2, hAP ac3, hAP ax2, RB4011) |
-          | `tayga-amd64.tar` | MikroTik Container Image | x86_64 RouterOS 7 (CHR, x86 hardware) |
-          | `tayga-routeros-scripts.zip` | All RouterOS Scripts Bundle | Install, upgrade, rollback, remove scripts |
-          | `routeros-install-clat.rsc` | CLAT Installer | RouterOS 7 CLAT auto-installer |
-          | `routeros-install-nat64.rsc` | NAT64 Installer | RouterOS 7 NAT64 + DNS64 installer |
-          | `routeros-upgrade.rsc` | A/B Upgrader | State-driven zero-downtime upgrader |
-          | `routeros-rollback.rsc` | Instant Rollback | Zero-extraction instant rollback |
-          | `routeros-remove.rsc` | Safe Uninstaller | Clean removal without touching host bridge |
-          | `tayga-linux-*` | Standalone Static Binaries | Linux standalone hosts & embedded systems |
-          | `pref64-discover-linux-*` | RFC 7050 Discovery Helper | Standalone prefix discovery tool |
-          | `SHA256SUMS` | Integrity Checksums | SHA256 hashes of all release files |
-
-          EOF
-
-          # Replace placeholders in release body
-          sed -i "s|REPO_PLACEHOLDER|${REPO_LC}|g" release_body.md
-          sed -i "s|TAG_PLACEHOLDER|${RAW_VER}|g" release_body.md
-
-      - name: Create or Update GitHub Release
+          python3 scripts/ci/release_publish.py release-assets
+      - name: Publish GitHub release with exact asset checksums and changelog notes
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.ver || github.ref_name }}
-          name: TAYGA ${{ inputs.ver || github.ref_name }}
-          body_path: release_body.md
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          target_commitish: ${{ needs.resolve.outputs.sha }}
+          name: TAYGA ${{ needs.resolve.outputs.tag }}
+          body_path: release-assets/release-notes.md
           draft: false
-          prerelease: false
-          files: |
-            release-assets/*
+          prerelease: ${{ needs.resolve.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: release-assets/*
           generate_release_notes: false
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: release-publication-evidence
+          path: release-assets/
+          compression-level: 0
+          if-no-files-found: error

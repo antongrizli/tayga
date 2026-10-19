@@ -18,6 +18,9 @@
 #include "unit.h"
 #include "tayga.h"
 
+/* In tests, free previous config allocations before reinitializing */
+#define config_init() do { config_free(); (config_init)(); } while(0)
+
 /* Test copy of gcfg */
 static struct config tcfg;
 
@@ -258,7 +261,7 @@ void test_config_init(void) {
     memset(&gcfg,0xbeefcafe,sizeof(struct config));
 
     /* Call config_init */
-    config_init();
+    (config_init)();
 
     /* Setup expected outputs */
     tcfg.dyn_min_lease = 7440;
@@ -1445,6 +1448,7 @@ void test_config_validate() {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     /* Test function or config_init */
     test_config_init();
 
@@ -1453,6 +1457,9 @@ int main(void) {
 
     /* Test function for config_validate */
     test_config_validate();
+
+    /* Clean up all configuration allocations before exit */
+    config_free();
 
     /* Return final status */
     return overall();

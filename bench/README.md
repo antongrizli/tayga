@@ -59,9 +59,45 @@ The default compares configurations of the same source/build. For an original
 source versus a corrected source comparison, set `RECOVERY_MODE=build`,
 `BASELINE_REPO=/absolute/baseline/tree` and
 `CANDIDATE_REPO=/absolute/candidate/tree`. Both trees must be available at those
-paths inside Lima and contain the current benchmark harness; preserve the
-original production sources when preparing a baseline. The archived sources,
-compiler identity and flags identify the actual builds, including local edits.
+paths inside Lima. Set `HARNESS_REPO=/absolute/frozen/harness` to use the same
+runner, benchmark, startup script and helper tools for both daemon builds.
+The daemon source archive is preserved independently of `harness-snapshot.tar.gz`;
+the harness archive digest and explicit experiment/pair/arm IDs are recorded in
+`experiment.json`. Use `BASELINE_REVISION` and `CANDIDATE_REVISION` for extracted
+archives that have no Git metadata of their own. Compiler identity and flags
+identify the actual builds, including local edits.
+
+Build mode still compares a kernel baseline with a flows candidate. To isolate
+source changes with identical policies, select a diagnostic study explicitly:
+
+```sh
+HARNESS_REPO=/absolute/frozen/harness \
+BASELINE_REPO=/absolute/original CANDIDATE_REPO=/absolute/main \
+BASELINE_REVISION=original-revision CANDIDATE_REVISION=main-revision \
+BASELINE_STEERING=kernel CANDIDATE_STEERING=kernel \
+RECOVERY_PURPOSE=diagnostic RECOVERY_MODE=build \
+RECOVERY_STAMP=original-vs-main REPEATS=5 bench/lima/run-recovery.sh
+```
+
+Diagnostic reports validate workload, source/harness identity and pair matching,
+while retaining drop/error/worker-share findings as quality failures. They show
+throughput and retransmissions without requiring the product improvement gates.
+`VALID DIAGNOSTIC; PRODUCT NOT ACCEPTED` means usable diagnostic evidence only.
+Missing clients, errors, missing manifests and counter resets still invalidate
+the evidence. Product acceptance retains all original gates and requires a
+kernel baseline and flows candidate.
+On macOS the host runner also saves `host-power.json` before/after each session.
+Changed power sources/settings invalidate the session; differing power settings
+between arms invalidate the comparison. Legacy sessions without this evidence
+cannot establish that host power stayed constant.
+
+`ENDPOINT_AFFINITY=per-client` is an optional diagnostic setting; the default is
+`off`. It assigns each client and its matching server to one allowed CPU in
+ordinal round-robin order, respecting `CLIENT_CPUSET` and `SERVER_CPUSET`.
+The effective CPU pools and each endpoint PID's affinity are recorded. Recovery
+comparisons require the same policy and pools in both arms and verify the actual
+singleton masks. This changes the test environment: keep such studies separate
+from measurements with movable endpoints. It does not pin translator workers.
 
 The runner writes acceptance JSON and Markdown beside the sessions and returns
 nonzero for failed or missing evidence. To re-evaluate existing paired sessions:
@@ -73,7 +109,11 @@ PYTHONPATH=bench python3 -m taygabench acceptance \
   --json /tmp/recovery.json --markdown /tmp/recovery.md
 ```
 
-Inputs are paired in supplied order. The gate checks synchronized process/worker
+New sessions are paired by explicit experiment/pair IDs regardless of input
+order; duplicate pairs, mixed harnesses and incorrect arm IDs are rejected.
+Legacy sessions without experiment manifests retain supplied-order pairing
+for re-evaluation; they cannot be used as a new diagnostic study.
+The gate checks synchronized process/worker
 identities, effective steering, raw client reports, source/archive identities,
 interface and daemon errors, worker activity, medians/ranges and paired deltas.
 Default throughput floors are the saved original result, **76.178/70.639 Gbps**
@@ -95,3 +135,11 @@ Packet shares do not establish exact flow counts. Retransmissions are reported
 even when daemon drops are zero. The earlier `retransmits_per_gbyte` summary
 field retains its historical received-byte denominator; acceptance computes its
 sent-byte metric from raw reports.
+
+## Directional byte, GSO and sequence diagnostics
+
+Result schema 7 preserves worker byte deltas, explicitly marks legacy bytes as
+unavailable and rejects partial counters, slot duplication and resets. The
+packet-share acceptance gate is unchanged. Offline summaries, bounded multi-stage
+TCP tracing and reproducible one-factor steering sources are documented in
+[throughput diagnostics](../docs/performance/throughput-diagnostics.md).

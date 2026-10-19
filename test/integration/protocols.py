@@ -17,6 +17,7 @@ from test_env import (
 )
 from scapy.all import IP, IPv6, TCP, UDP, ICMP, Raw
 from scapy.layers.inet6 import IPv6ExtHdrHopByHop
+from protocol_payload import protocol_payload
 
 # Initialize test environment for protocols integration suite
 test = test_env("test/protocols")
@@ -126,7 +127,7 @@ def proto_ip6_val(pkt):
     res.compare("Dest", pkt[IPv6].dst, str(expect_da))
     res.compare("NH", pkt[IPv6].nh, expect_nh)
     if expect_payload is not None:
-        raw_load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else bytes(pkt[IPv6].payload)
+        raw_load = protocol_payload(pkt[IPv6].nh, bytes(pkt[IPv6].payload))
         res.compare("Payload", raw_load, expect_payload)
     if expect_csum >= 0:
         if pkt.haslayer(TCP):
@@ -151,7 +152,7 @@ def proto_ip4_val(pkt):
     elif expect_id == 1:
         res.check("ID Nonzero", pkt[IP].id != 0)
     if expect_payload is not None:
-        raw_load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else bytes(pkt[IP].payload)
+        raw_load = protocol_payload(pkt[IP].proto, bytes(pkt[IP].payload))
         res.compare("Payload", raw_load, expect_payload)
     if expect_csum >= 0:
         if pkt.haslayer(TCP):
@@ -236,13 +237,15 @@ def sec_l4_udplite_dccp():
     test.tayga_conf.default()
     test.reload()
 
+    payload_body = randbytes(64)
+
     # 1. UDP-Lite (136) 4->6
     # UDP-Lite Header: sport(2), dport(2), cov(2, min 8), csum(2)
-    raw_udplite = struct.pack("!HHHH", 50000, 50001, 8, 0x1234) + randbytes(64)
+    raw_udplite = struct.pack("!HHHH", 50000, 50001, 8, 0x1234) + payload_body
     expect_sa = test.public_ipv4_xlate
     expect_da = test.public_ipv6
     expect_nh = 136
-    expect_payload = raw_udplite
+    expect_payload = payload_body
     expect_csum = -1
     pkt4 = IP(src=str(test.public_ipv4), dst=str(test.public_ipv6_xlate), proto=136) / Raw(raw_udplite)
     test.send_and_check(pkt4, proto_ip6_val, "UDP-Lite 4->6 Payload Pass")
@@ -251,17 +254,18 @@ def sec_l4_udplite_dccp():
     expect_sa = test.public_ipv6_xlate
     expect_da = test.public_ipv4
     expect_nh = 136
-    expect_payload = raw_udplite
+    expect_payload = payload_body
     pkt6 = IPv6(src=str(test.public_ipv6), dst=str(test.public_ipv4_xlate), nh=136) / Raw(raw_udplite)
     test.send_and_check(pkt6, proto_ip4_val, "UDP-Lite 6->4 Payload Pass")
 
     # 3. DCCP (33) 4->6
-    # DCCP Generic Header: sport(2), dport(2), data_offset(1), ccval_cscov(1), csum(2)
-    raw_dccp = struct.pack("!BBBBH", 0x1F, 0x90, 0x1F, 0x91, 0x04) + struct.pack("!BB", 0x00, 0x00) + randbytes(64)
+    # DCCP Header (16 bytes, X=1): sport(2), dport(2), doff=4(1), ccval_cscov(1), csum(2), type_x=1(1), res(1), seq(6)
+    dccp_hdr = struct.pack("!HHBBHBBHI", 8080, 8081, 4, 0, 0x1234, 1, 0, 0, 100)
+    raw_dccp = dccp_hdr + payload_body
     expect_sa = test.public_ipv4_xlate
     expect_da = test.public_ipv6
     expect_nh = 33
-    expect_payload = raw_dccp
+    expect_payload = payload_body
     pkt4 = IP(src=str(test.public_ipv4), dst=str(test.public_ipv6_xlate), proto=33) / Raw(raw_dccp)
     test.send_and_check(pkt4, proto_ip6_val, "DCCP 4->6 Payload Pass")
 
@@ -269,7 +273,7 @@ def sec_l4_udplite_dccp():
     expect_sa = test.public_ipv6_xlate
     expect_da = test.public_ipv4
     expect_nh = 33
-    expect_payload = raw_dccp
+    expect_payload = payload_body
     pkt6 = IPv6(src=str(test.public_ipv6), dst=str(test.public_ipv4_xlate), nh=33) / Raw(raw_dccp)
     test.send_and_check(pkt6, proto_ip4_val, "DCCP 6->4 Payload Pass")
 
@@ -319,8 +323,10 @@ def sec_l4_mptcp_extended_tcp():
     expect_sa = test.public_ipv6_xlate
     expect_da = test.public_ipv4
     expect_nh = 6
-    expect_flags = "DF"
-    expect_id = 0
+    # This small SYN is below the 1260-byte IPv4 DF threshold, like the
+    # corresponding boundary cases in translate.py. Preserve a fragment ID.
+    expect_flags = 0
+    expect_id = 1
     pkt6 = IPv6(src=str(test.public_ipv6), dst=str(test.public_ipv4_xlate)) / TCP(
         sport=12345, dport=80, flags="S", seq=1000, options=tcp_opts_40b
     )

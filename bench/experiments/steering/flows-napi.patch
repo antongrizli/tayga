@@ -1,0 +1,16 @@
+--- a/src/tun.c
++++ b/src/tun.c
+@@ -41,10 +41,12 @@
+ /* Build-only research candidate; normal builds keep existing TUN semantics.
+  * IFF_NAPI must be identical on initial, fallback and worker attachments.
+  * Unsupported kernels fail initialization; this is never silently enabled. */
++#define TAYGA_EXPERIMENTAL_NAPI 1
+ #ifdef TAYGA_EXPERIMENTAL_NAPI
+-#define TAYGA_TUN_BASE_FLAGS (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_NAPI)
++#define TAYGA_TUN_BASE_FLAGS (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | (gcfg.tun_steering_flows ? IFF_NAPI : 0))
+ static int tun_verify_napi(int fd, int queue)
+ {
++ if (!gcfg.tun_steering_flows) return 0;
+ 	struct ifreq actual;
+ 	memset(&actual, 0, sizeof(actual));
+ 	if (ioctl(fd, TUNGETIFF, &actual) < 0 || !(actual.ifr_flags & IFF_NAPI)) {

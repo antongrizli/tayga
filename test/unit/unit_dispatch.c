@@ -24,6 +24,16 @@ int main(void)
 	memcpy(reverse,b,sizeof(b));memcpy(reverse+HEADROOM+12,b+HEADROOM+16,4);memcpy(reverse+HEADROOM+16,b+HEADROOM+12,4);
 	memcpy(reverse+HEADROOM+20,b+HEADROOM+22,2);memcpy(reverse+HEADROOM+22,b+HEADROOM+20,2);
 	assert(!flow_parse(reverse+HEADROOM,36,&r) && r.flow_hash==f.flow_hash);
+	/* Verify SCTP (132), DCCP (33), and UDP-Lite (136) 4-tuple hashing and symmetry */
+	const uint8_t test_protos[] = { 33, 132, 136 };
+	for (size_t i = 0; i < sizeof(test_protos)/sizeof(test_protos[0]); i++) {
+		b[HEADROOM+9] = test_protos[i];
+		reverse[HEADROOM+9] = test_protos[i];
+		assert(!flow_parse(b+HEADROOM, 36, &f) && f.transport);
+		assert(!flow_parse(reverse+HEADROOM, 36, &r) && r.flow_hash == f.flow_hash);
+	}
+	b[HEADROOM+9] = 17;
+	reverse[HEADROOM+9] = 17;
 	assert(flow_parse(b+HEADROOM,19,&r)<0);
 	assert(dispatch_init(2)==0);
 	gcfg.vnet_hdr_sz=0;

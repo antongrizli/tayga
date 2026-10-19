@@ -452,6 +452,24 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 			return ERROR_NONE;
 		}
 		break;
+	/* UDP-Lite (RFC 3828) & DCCP (RFC 4340) */
+	case IPPROTO_DCCP:
+	case IPPROTO_UDPLITE:
+		if (p->data_len < (p->data_proto == IPPROTO_DCCP ? 12 : 8)) {
+			if (em) return ERROR_NONE;
+			log_pkt4(LOG_OPT_DROP, p, "Insufficient payload length for transport header");
+			return ERROR_DROP;
+		}
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			log_pkt4(LOG_OPT_DROP, p, "Unsupported protocol for checksum offload");
+			return ERROR_DROP;
+		}
+		if (p->data_proto == IPPROTO_UDPLITE && get_u16(p->data + 6) == 0) {
+			if (em) return ERROR_NONE;
+			log_pkt4(LOG_OPT_DROP, p, "Zero checksum in UDP-Lite header");
+			return ERROR_DROP;
+		}
+		break;
 	/* Any other protocol */
 	default:
 		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
@@ -461,9 +479,9 @@ int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6, int em)
 		return ERROR_NONE;
 	}
 	/* Calculate checksum adjustment (RFC 1624 incremental update) */
-	uint32_t csum_off = (p->data_proto == IPPROTO_UDP) ? 6 : 16;
+	uint32_t csum_off = (p->data_proto == IPPROTO_TCP) ? 16 : 6;
 	uint16_t adj_ck = ones_add(get_u16(p->data + csum_off), ~convert_cksum(ip6, p->ip4));
-	if (p->data_proto == IPPROTO_UDP && adj_ck == 0)
+	if ((p->data_proto == IPPROTO_UDP || p->data_proto == IPPROTO_UDPLITE) && adj_ck == 0)
 		adj_ck = 0xffff;
 	put_u16(p->data + csum_off, adj_ck);
 	return ERROR_NONE;
@@ -1209,6 +1227,24 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 			return ERROR_NONE;
 		}
 		break;
+	/* UDP-Lite (RFC 3828) & DCCP (RFC 4340) */
+	case IPPROTO_DCCP:
+	case IPPROTO_UDPLITE:
+		if (p->data_len < (p->data_proto == IPPROTO_DCCP ? 12 : 8)) {
+			if (em) return ERROR_NONE;
+			log_pkt6(LOG_OPT_DROP, p, "Insufficient payload length for transport header");
+			return ERROR_DROP;
+		}
+		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+			log_pkt6(LOG_OPT_DROP, p, "Unsupported protocol for checksum offload");
+			return ERROR_DROP;
+		}
+		if (p->data_proto == IPPROTO_UDPLITE && get_u16(p->data + 6) == 0) {
+			if (em) return ERROR_NONE;
+			log_pkt6(LOG_OPT_DROP, p, "Zero checksum in UDP-Lite header");
+			return ERROR_DROP;
+		}
+		break;
 	/* Other */
 	default:
 		if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
@@ -1218,9 +1254,9 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 		return ERROR_NONE;
 	}
 	/* Adjust checksum (RFC 1624 incremental update) */
-	uint32_t csum_off = (p->data_proto == IPPROTO_UDP) ? 6 : 16;
+	uint32_t csum_off = (p->data_proto == IPPROTO_TCP) ? 16 : 6;
 	uint16_t adj_ck = ones_add(get_u16(p->data + csum_off), convert_cksum(p->ip6, ip4));
-	if (p->data_proto == IPPROTO_UDP && adj_ck == 0)
+	if ((p->data_proto == IPPROTO_UDP || p->data_proto == IPPROTO_UDPLITE) && adj_ck == 0)
 		adj_ck = 0xffff;
 	put_u16(p->data + csum_off, adj_ck);
 	return ERROR_NONE;

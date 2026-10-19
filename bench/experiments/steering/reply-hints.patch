@@ -1,0 +1,210 @@
+--- a/src/tun.c
++++ b/src/tun.c
+@@ -26,6 +26,8 @@
+ #include <sys/file.h>
+ #include <sys/stat.h>
+ #include "tun_steering.h"
++static int tun_reply_hint_fd = -1;
++
+ static int tun_owner_lock = -1;
+ struct tun_saved_config {
+ 	struct tun_saved_config *next;
+@@ -567,6 +569,8 @@
+ 	gcfg.tun_fd = -1;
+ 	if (tun_owner_lock >= 0) close(tun_owner_lock);
+ 	tun_owner_lock = -1;
++ if (tun_reply_hint_fd>=0) close(tun_reply_hint_fd);
++ tun_reply_hint_fd=-1;
+ 	gcfg.tun_offload_complete = gcfg.tun_steering_effective = 0;
+ 	errno = saved_errno;
+ }
+@@ -578,6 +582,8 @@
+ 	int ifidx = 0;
+ 	int restore_up = 0;
+ 	struct tun_saved_config *saved = NULL;
++ if (tun_reply_hint_fd>=0) close(tun_reply_hint_fd);
++ tun_reply_hint_fd=-1;
+ 	memset(&tun_transaction, 0, sizeof(tun_transaction));
+ 	gcfg.tun_fd = -1;
+ 	int attached_queues = 0;
+@@ -837,13 +843,17 @@
+ 	if (gcfg.tun_steering_groups || gcfg.tun_steering_flows) {
+ 		char verifier[16384] = {0};
+ 		int flow_aware = gcfg.tun_steering_flows;
+-		int program = steering_program_ext(gcfg.workers > 0 ? gcfg.workers : 1, flow_aware, verifier, sizeof(verifier));
++		int program = steering_program_ext_hints(gcfg.workers > 0 ? gcfg.workers : 1,
++   flow_aware, verifier, sizeof(verifier), flow_aware ? &tun_reply_hint_fd : NULL);
+ 		int active_fd = gcfg.workers > 0 ? gcfg.tun_fd_addl[0] : gcfg.tun_fd;
+ 		if (program >= 0) {
+ 			if (!ioctl(active_fd, TUNSETSTEERINGEBPF, &program)) gcfg.tun_steering_effective = 1;
+ 			else gcfg.tun_steering_errno = errno;
+ 			close(program);
+ 		} else gcfg.tun_steering_errno = errno;
++  if (!gcfg.tun_steering_effective && tun_reply_hint_fd>=0) {
++   close(tun_reply_hint_fd);tun_reply_hint_fd=-1;
++  }
+ 		if (!gcfg.tun_steering_effective)
+ 			slog(LOG_WARNING, "%s steering unavailable; retaining kernel steering: %s; verifier: %.400s\n",
+ 				flow_aware ? "Flow" : "Group", strerror(gcfg.tun_steering_errno), verifier);
+@@ -1049,6 +1059,47 @@
+  * as each write syscall represents a separate network packet to the kernel.
+  * Handles EINTR interrupts safely and detects truncated writes.
+  */
++#ifdef __linux__
++/* Publish only a preference for a not-yet-admitted reply bucket, before the
++ * SYN can elicit that reply. The BPF primary owner remains CAS-once forever. */
++static void tun_reply_hint(int fd, const struct iovec *iov, int count, int skip)
++{
++ if (tun_reply_hint_fd<0 || count<=skip) return;
++ const unsigned char *ip=iov[skip].iov_base;
++ size_t length=iov[skip].iov_len;
++ if (length<20) return;
++ unsigned family=ip[0]>>4,offset;
++ if (family==4) {
++  uint16_t fragment;memcpy(&fragment,ip+6,2);
++  offset=(ip[0]&15)*4;
++  if (offset<20 || ip[9]!=6 || (ntohs(fragment)&0x3fff)) return;
++ } else if (family==6) {
++  if (length<40 || ip[6]!=6) return;
++  offset=40;
++ } else return;
++ const unsigned char *tcp;
++ if (length>=offset+20) tcp=ip+offset;
++ else if (length==offset && skip+1<count && iov[skip+1].iov_len>=20) tcp=iov[skip+1].iov_base;
++ else return;
++ if (!(tcp[13]&2)) return;
++ unsigned queue=0;
++ if (gcfg.workers>0) {
++  int worker;
++  for(worker=0;worker<gcfg.workers;worker++) if(gcfg.tun_fd_addl[worker]==fd) break;
++  if(worker==gcfg.workers)return;
++  /* Detaching setup queue 0 swaps the last worker into active queue 0. */
++  queue=worker==gcfg.workers-1 ? 0 : (unsigned)worker+1;
++ }
++ uint32_t key=steering_reply_bucket(ip,tcp),value=queue+1;
++ union bpf_attr attr={0};attr.map_fd=tun_reply_hint_fd;
++ attr.key=(uintptr_t)&key;attr.value=(uintptr_t)&value;attr.flags=BPF_ANY;
++ if(steering_bpf(BPF_MAP_UPDATE_ELEM,&attr)<0) {
++  static atomic_bool warned;
++  if(!atomic_exchange_explicit(&warned,true,memory_order_relaxed))
++   slog(LOG_WARNING,"Reply admission hint failed: %s\n",strerror(errno));
++ }
++}
++#endif
+ ssize_t tun_write(int tun_fd, const void *buf, size_t len)
+ {
+ 	struct iovec iov = {(void *)buf, len};
+@@ -1095,6 +1146,11 @@
+ 	}
+ #endif
+ 
++#ifdef __linux__
++ if (tun_reply_hint_fd>=0) {
++  struct iovec hint={(void *)buf,len};tun_reply_hint(tun_fd,&hint,1,0);
++ }
++#endif
+ 	if (gcfg.async_tun) {
+ 		struct iovec iov = {write_ptr, total_len};
+ 		ssize_t result = async_tun_submit(tun_fd, &iov, 1);
+@@ -1143,6 +1199,9 @@
+ 	if (gcfg.vnet_hdr_sz && total_len >= (size_t)gcfg.vnet_hdr_sz) ip_bytes -= gcfg.vnet_hdr_sz;
+ #ifndef __linux__
+ 	else if (iov[0].iov_len == sizeof(struct tun_pi)) ip_bytes -= sizeof(struct tun_pi);
++#endif
++#ifdef __linux__
++ if (tun_reply_hint_fd>=0) tun_reply_hint(tun_fd,iov,iovcnt,gcfg.vnet_hdr_sz ? 1 : 0);
+ #endif
+ 	if (gcfg.async_tun) {
+ 		ssize_t result = async_tun_submit(tun_fd, iov, iovcnt);
+--- a/src/tun_steering.h
++++ b/src/tun_steering.h
+@@ -44,9 +44,10 @@
+ #define LOADMAP(d,fd) do { SE(BPF_LD|BPF_DW|BPF_IMM,d,BPF_PSEUDO_MAP_FD,0,fd); SE(0,0,0,0,0); } while(0)
+ #define CALL(i) SE(BPF_JMP|BPF_CALL,0,0,0,i)
+ #define PATCH(n,to) (b.code[n].off=(to)-(n)-1)
+-static int steering_program_ext(unsigned queues, int flow_aware, char *log, size_t log_size)
+-{
+-	int buckets=-1, counter=-1, program=-1, saved;
++static int steering_program_ext_hints(unsigned queues, int flow_aware, char *log, size_t log_size, int *hints_fd)
++{
++	int buckets=-1, counter=-1, hints=-1, program=-1, saved;
++ if (hints_fd) *hints_fd=-1;
+ 	struct steering_builder b = {0};
+ 	unsigned fail[16], nf=0, ipv6, hash_done;
+ 	union bpf_attr attr = {0};
+@@ -57,8 +58,12 @@
+ 	 * from the first packet: changing queues cannot drain an old worker. */
+ 	counter=steering_map(2);
+ 	if (counter<0) goto done;
+-	MOVR(6,1);
+-	/* Load first 20 bytes (covers entire basic IPv4 header + IPv6 version & next_header). */
++	if (flow_aware && hints_fd) {
++  hints=steering_map(65536);
++  if (hints<0) goto done;
++ }
++ MOVR(6,1);
++ /* Load first 20 bytes (covers entire basic IPv4 header + IPv6 version & next_header). */
+ 	MOVI(2,0); MOVR(3,10); ALUI(BPF_ADD,3,-64); MOVI(4,20);
+ 	CALL(BPF_FUNC_skb_load_bytes);
+ 	fail[nf++]=SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
+@@ -134,11 +139,23 @@
+ 	fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
+ 	MOVR(8,0); SE(BPF_LDX|BPF_MEM|BPF_W,7,8,0,0);
+ 	unsigned existing = SE(BPF_JMP|BPF_JNE|BPF_K,7,0,0,0);
++ unsigned from_hint=0;
++ if (hints>=0) {
++  LOADMAP(1,hints); MOVR(2,10); ALUI(BPF_ADD,2,-4); CALL(BPF_FUNC_map_lookup_elem);
++  unsigned missing=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
++  SE(BPF_LDX|BPF_MEM|BPF_W,1,0,0,0);
++  unsigned empty=SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,0);
++  unsigned invalid=SE(BPF_JMP|BPF_JGT|BPF_K,1,0,0,queues);
++  from_hint=SE(BPF_JMP|BPF_JA,0,0,0,0);
++  PATCH(missing,b.n); PATCH(empty,b.n); PATCH(invalid,b.n);
++ }
+ 	SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
+ 	LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
+ 	fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
+ 	MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
+-	ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1); MOVI(0,0);
++ ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1);
++ if (hints>=0) PATCH(from_hint,b.n);
++ MOVI(0,0);
+ 	SE(BPF_STX|BPF_ATOMIC|BPF_W,8,1,0,BPF_CMPXCHG);
+ 	/* A losing contender must use the published winner, never its candidate. */
+ 	unsigned won = SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
+@@ -160,9 +177,34 @@
+  done:
+ 	saved=errno;
+ 	if (buckets>=0) close(buckets);
+-	if (counter>=0) close(counter);
++ if (counter>=0) close(counter);
++ if (program>=0 && hints_fd && hints>=0) { *hints_fd=hints; hints=-1; }
++ if (hints>=0) close(hints);
+ 	errno=saved;
+ 	return program;
++}
++static int steering_program_ext(unsigned queues, int flow_aware, char *log, size_t log_size)
++{
++ return steering_program_ext_hints(queues,flow_aware,log,log_size,NULL);
++}
++/* Exact current bucket hash for the reversed translated TCP tuple. Hints
++ * never replace primary owners, including under collisions/concurrent SYNs. */
++static inline uint32_t steering_reply_bucket(const unsigned char *ip, const unsigned char *tcp)
++{
++ uint64_t h; uint32_t a,b,ports;
++ if ((ip[0]>>4)==4) {
++  memcpy(&a,ip+12,4);memcpy(&b,ip+16,4);h=a^b^4;
++ } else {
++  h=6;
++  for (int i=0;i<4;i++) {
++   memcpy(&a,ip+8+4*i,4);memcpy(&b,ip+24+4*i,4);
++   h=(uint64_t)((uint32_t)h^a^b)*16777619;
++  }
++ }
++ memcpy(&ports,tcp,4);ports=(ports<<16)|(ports>>16);
++ h=(uint64_t)((uint32_t)h^ports)*16777619;
++ h=(uint32_t)(h^(h>>16));h*=0x45d9f3b;
++ return (h^(h>>16))&65535;
+ }
+ static inline int steering_program(unsigned queues, char *log, size_t log_size)
+ {

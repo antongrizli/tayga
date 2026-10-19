@@ -5,6 +5,8 @@ export PERF_SESSION_ROOT
 
 PROJECT="${PROJECT:-/Users/antongrizli/Documents/MikroTik}"
 REPO="${REPO:-$PROJECT/tayga-clat-perf}"
+HARNESS_REPO="${HARNESS_REPO:-$REPO}"
+HARNESS_BUILD_ROOT="$(mktemp -d /tmp/tayga-perf-harness.XXXXXX)"
 STAMP="${SESSION_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 if [ -z "${SESSION_ROOT:-}" ]; then
   SESSION_ROOT="/tmp/tayga-perf-sessions/$STAMP-lima-debian13-arm64"
@@ -24,6 +26,7 @@ exec 9</tmp/tayga-perf-workflow.lock
 flock -n 9 || { echo "Another TAYGA workflow is active in this guest." >&2; exit 75; }
 
 cleanup_build_root() {
+  rm -rf -- "$HARNESS_BUILD_ROOT"
   if [ "$REMOVE_BUILD_ROOT" = yes ]; then
     rm -rf -- "$BUILD_ROOT"
   fi
@@ -57,6 +60,14 @@ tar -C "$REPO" \
   --exclude='./unit_ip4_id' --exclude='./unit_tun' --exclude='./unit_gso' \
   --exclude='./tools/iperf-start-gate.so' --exclude='./tools/iperf-start-control' --exclude='./tools/udp-drain-guard.so' --exclude='./tools/udp-drain-control' --exclude='./unit_pref64' --exclude='./unit_stats' --exclude='./tools/probe-tun-offload' \
   -cf - . | tar -C "$BUILD_ROOT" -xf -
+# Harness and daemon sources have independent archives. Historical daemon
+# sources never supply benchmark scripts, helper tools or startup policy.
+tar -C "$HARNESS_REPO" \
+  --exclude='./build' --exclude='./build-*' --exclude='__pycache__' --exclude='./improvenments' --exclude='./.git' --exclude='./perf-sessions' --exclude='./dist' \
+  --exclude='./.codex' --exclude='./.agents' --exclude='./tayga' --exclude='./unit_*' \
+  --exclude='./tools/iperf-start-gate.so' --exclude='./tools/iperf-start-control' \
+  --exclude='./tools/udp-drain-guard.so' --exclude='./tools/udp-drain-control' \
+  --exclude='./tools/probe-tun-offload' -cf - . | tar -C "$HARNESS_BUILD_ROOT" -xf -
 cd "$BUILD_ROOT"
 GIT_REVISION="${GIT_REVISION:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf unknown)}"
 SOURCE_TREE_SHA256="$(python3 - "$BUILD_ROOT" "$SESSION_ROOT" <<'PY'
@@ -81,19 +92,32 @@ printf '%s\n' "$SOURCE_TREE_SHA256" > "$SESSION_ROOT/source-tree.sha256"
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   -C "$BUILD_ROOT" -cf - . | gzip -n > "$SESSION_ROOT/source-snapshot.tar.gz"
 sha256sum "$SESSION_ROOT/source-snapshot.tar.gz" > "$SESSION_ROOT/source-snapshot.sha256"
+tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+  -C "$HARNESS_BUILD_ROOT" -cf - . | gzip -n > "$SESSION_ROOT/harness-snapshot.tar.gz"
+sha256sum "$SESSION_ROOT/harness-snapshot.tar.gz" > "$SESSION_ROOT/harness-snapshot.sha256"
+python3 - "$SESSION_ROOT" <<'PY'
+import json, os, pathlib
+session = pathlib.Path(__import__('sys').argv[1])
+identity = dict(experiment_id=os.environ.get('EXPERIMENT_ID', ''),
+                pair_id=os.environ.get('PAIR_ID', ''), arm_id=os.environ.get('ARM_ID', ''),
+                steering=os.environ.get('CLAT_STEERING', ''),
+                client_port_base=int(os.environ.get('CLIENT_PORT_BASE', '0')),
+                harness_archive_sha256=(session/'harness-snapshot.sha256').read_text().split()[0])
+(session/'experiment.json').write_text(json.dumps(identity, indent=2)+'\n')
+PY
 BUILD_CFLAGS="-O3 -flto -g -fno-omit-frame-pointer -ffile-prefix-map=$BUILD_ROOT=."
 BUILD_LDFLAGS='-flto -Wl,--build-id'
 BUILD_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || printf detached)"
 make -B CC=gcc VERSION="${TAYGA_VERSION:-$(cat VERSION)}" COMMIT="$GIT_REVISION" BRANCH="$BUILD_BRANCH" CFLAGS="$BUILD_CFLAGS" LDFLAGS="$BUILD_LDFLAGS"
-make udp-drain-tools iperf-start-tools CC=gcc
-sudo install -Dm0755 tools/udp-drain-control /usr/local/libexec/tayga-perf/udp-drain-control
-sudo install -Dm0755 tools/udp-drain-guard.so /usr/local/lib/tayga-perf/udp-drain-guard.so
-sudo install -Dm0755 tools/iperf-start-control /usr/local/libexec/tayga-perf/iperf-start-control
-sudo install -Dm0755 tools/iperf-start-gate.so /usr/local/lib/tayga-perf/iperf-start-gate.so
+make -C "$HARNESS_BUILD_ROOT" udp-drain-tools iperf-start-tools CC=gcc
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/tools/udp-drain-control" /usr/local/libexec/tayga-perf/udp-drain-control
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/tools/udp-drain-guard.so" /usr/local/lib/tayga-perf/udp-drain-guard.so
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/tools/iperf-start-control" /usr/local/libexec/tayga-perf/iperf-start-control
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/tools/iperf-start-gate.so" /usr/local/lib/tayga-perf/iperf-start-gate.so
 sudo install -Dm0755 tayga /usr/sbin/tayga
-sudo install -Dm0755 "$BUILD_ROOT/container/rootfs/usr/local/sbin/clat-start.sh" /usr/local/sbin/clat-start.sh
-make benchmark-script
-sudo install -Dm0755 build/benchmark-clat.sh /usr/local/sbin/benchmark-clat.sh
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/container/rootfs/usr/local/sbin/clat-start.sh" /usr/local/sbin/clat-start.sh
+make -C "$HARNESS_BUILD_ROOT" benchmark-script
+sudo install -Dm0755 "$HARNESS_BUILD_ROOT/build/benchmark-clat.sh" /usr/local/sbin/benchmark-clat.sh
 
 mkdir -p "$SESSION_ROOT"
 uname -a > "$SESSION_ROOT/uname.txt"
@@ -102,6 +126,7 @@ gcc --version > "$SESSION_ROOT/compiler.txt"
 perf --version > "$SESSION_ROOT/perf-version.txt"
 perf list > "$SESSION_ROOT/perf-list.txt" 2>&1 || true
 sha256sum tayga > "$SESSION_ROOT/tayga.sha256"
+install -m0755 tayga "$SESSION_ROOT/tayga.elf"
 readelf -n tayga > "$SESSION_ROOT/tayga-build-id.txt" 2>&1 || true
 printf 'CC=gcc\nCFLAGS=%s\nLDFLAGS=%s\n' "$BUILD_CFLAGS" "$BUILD_LDFLAGS" > "$SESSION_ROOT/build-flags.txt"
 git -C "$REPO" diff --binary > "$SESSION_ROOT/source.patch" 2>/dev/null || true
@@ -117,6 +142,7 @@ run_case() {
     CLAT_OFFLOAD="${CLAT_OFFLOAD:-auto}" CLAT_OFFLINK_MTU="${CLAT_OFFLINK_MTU:-1280}" \
     CLAT_STEERING="${CLAT_STEERING:-}" \
     FORWARDING_GRO="${FORWARDING_GRO:-off}" \
+    CLAT_INGRESS_RPS_CPUS="${CLAT_INGRESS_RPS_CPUS:-unchanged}" \
     PERF_SCOPE="${PERF_SCOPE:-process}" \
     PACING_TIMER_US="${PACING_TIMER_US:-1000}" \
     FQ_RATE="${FQ_RATE:-0}" \
@@ -129,6 +155,7 @@ run_case() {
     TAYGA_CPUSET="${TAYGA_CPUSET:-all}" \
     CLIENT_CPUSET="${CLIENT_CPUSET:-all}" \
     SERVER_CPUSET="${SERVER_CPUSET:-all}" \
+    ENDPOINT_AFFINITY="${ENDPOINT_AFFINITY:-off}" \
     SOCKET_SAMPLE_INTERVAL="${SOCKET_SAMPLE_INTERVAL:-1}" \
     IPERF_START_GATE="${IPERF_START_GATE:-on}" \
     RECEIVER_DRAIN_SECONDS="${RECEIVER_DRAIN_SECONDS:-0.5}" \

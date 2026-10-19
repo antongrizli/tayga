@@ -1,0 +1,99 @@
+--- a/src/tun_steering.h
++++ b/src/tun_steering.h
+@@ -46,7 +46,7 @@
+ #define PATCH(n,to) (b.code[n].off=(to)-(n)-1)
+ static int steering_program_ext_hints(unsigned queues, int flow_aware, char *log, size_t log_size, int *hints_fd)
+ {
+-	int buckets=-1, counter=-1, hints=-1, program=-1, saved;
++	int buckets=-1, counter=-1, hints=-1, groups=-1, program=-1, saved;
+  if (hints_fd) *hints_fd=-1;
+ 	struct steering_builder b = {0};
+ 	unsigned fail[16], nf=0, ipv6, hash_done;
+@@ -61,6 +61,10 @@
+ 	if (flow_aware && hints_fd) {
+   hints=steering_map(65536);
+   if (hints<0) goto done;
++  union bpf_attr group_attr={0};group_attr.map_type=BPF_MAP_TYPE_ARRAY;
++  group_attr.key_size=4;group_attr.value_size=8;group_attr.max_entries=65536;
++  groups=steering_bpf(BPF_MAP_CREATE,&group_attr);
++  if(groups<0)goto done;
+  }
+  MOVR(6,1);
+  /* Load first 20 bytes (covers entire basic IPv4 header + IPv6 version & next_header). */
+@@ -149,12 +153,68 @@
+   from_hint=SE(BPF_JMP|BPF_JA,0,0,0,0);
+   PATCH(missing,b.n); PATCH(empty,b.n); PATCH(invalid,b.n);
+  }
++ unsigned from_group=0;
++ if(groups>=0) {
++  unsigned flat[16],nflat=0;
++  SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
++  MOVR(1,6);MOVI(2,0);MOVR(3,10);ALUI(BPF_ADD,3,-64);MOVI(4,20);
++  CALL(BPF_FUNC_skb_load_bytes);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
++  unsigned group6=SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,1);
++  SE(BPF_LDX|BPF_MEM|BPF_B,1,10,-55,0);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,6);
++  SE(BPF_LDX|BPF_MEM|BPF_H,1,10,-58,0);ALUI(BPF_AND,1,(uint16_t)htons(0x3fff));
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,0);
++  SE(BPF_LDX|BPF_MEM|BPF_W,7,10,-52,0);SE(BPF_LDX|BPF_MEM|BPF_W,1,10,-48,0);
++  SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0);ALUI(BPF_XOR,7,4);
++  SE(BPF_LDX|BPF_MEM|BPF_B,2,10,-64,0);ALUI(BPF_AND,2,15);
++  flat[nflat++]=SE(BPF_JMP|BPF_JLT|BPF_K,2,0,0,5);
++  ALUI(BPF_LSH,2,2);ALUI(BPF_ADD,2,2);
++  MOVR(1,6);MOVR(3,10);ALUI(BPF_ADD,3,-32);MOVI(4,2);
++  CALL(BPF_FUNC_skb_load_bytes);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
++  unsigned group_hash=SE(BPF_JMP|BPF_JA,0,0,0,0);
++  PATCH(group6,b.n);
++  SE(BPF_LDX|BPF_MEM|BPF_B,1,10,-58,0);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,6);
++  MOVR(1,6);MOVI(2,8);MOVR(3,10);ALUI(BPF_ADD,3,-64);MOVI(4,32);
++  CALL(BPF_FUNC_skb_load_bytes);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
++  MOVI(7,6);
++  for(int i=0;i<4;i++) {
++   SE(BPF_LDX|BPF_MEM|BPF_W,1,10,-64+4*i,0);SE(BPF_LDX|BPF_MEM|BPF_W,2,10,-48+4*i,0);
++   SE(BPF_ALU|BPF_XOR|BPF_X,1,2,0,0);SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0);ALUI(BPF_MUL,7,16777619);
++  }
++  MOVR(1,6);MOVI(2,42);MOVR(3,10);ALUI(BPF_ADD,3,-32);MOVI(4,2);
++  CALL(BPF_FUNC_skb_load_bytes);
++  flat[nflat++]=SE(BPF_JMP|BPF_JNE|BPF_K,0,0,0,0);
++  PATCH(group_hash,b.n);
++  SE(BPF_LDX|BPF_MEM|BPF_H,1,10,-32,0);SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0);
++  ALUI(BPF_MUL,7,16777619);MOVR(1,7);ALUI(BPF_RSH,1,16);SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0);
++  ALUI(BPF_MUL,7,0x45d9f3b);MOVR(1,7);ALUI(BPF_RSH,1,16);SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0);ALUI(BPF_AND,7,65535);
++  SE(BPF_STX|BPF_MEM|BPF_W,10,7,-24,0);
++  LOADMAP(1,groups);MOVR(2,10);ALUI(BPF_ADD,2,-24);CALL(BPF_FUNC_map_lookup_elem);
++  flat[nflat++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
++  MOVR(7,0);SE(BPF_LDX|BPF_MEM|BPF_DW,1,7,0,0);
++  unsigned group_ready=SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,0);
++  LOADMAP(1,counter);MOVR(2,10);ALUI(BPF_ADD,2,-8);CALL(BPF_FUNC_map_lookup_elem);
++  fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
++  MOVI(1,1);SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
++  ALUI(BPF_MOD,1,queues);ALUI(BPF_ADD,1,1);MOVI(0,0);
++  SE(BPF_STX|BPF_ATOMIC|BPF_DW,7,1,0,BPF_CMPXCHG);
++  PATCH(group_ready,b.n);
++  MOVI(1,1);SE(BPF_STX|BPF_ATOMIC|BPF_DW,7,1,0,BPF_ADD|BPF_FETCH);
++  ALUI(BPF_SUB,1,1);ALUI(BPF_MOD,1,queues);ALUI(BPF_ADD,1,1);
++  from_group=SE(BPF_JMP|BPF_JA,0,0,0,0);
++  for(unsigned i=0;i<nflat;i++)PATCH(flat[i],b.n);
++ }
+ 	SE(BPF_STX|BPF_MEM|BPF_W,10,9,-8,0);
+ 	LOADMAP(1,counter); MOVR(2,10); ALUI(BPF_ADD,2,-8); CALL(BPF_FUNC_map_lookup_elem);
+ 	fail[nf++]=SE(BPF_JMP|BPF_JEQ|BPF_K,0,0,0,0);
+ 	MOVI(1,1); SE(BPF_STX|BPF_ATOMIC|BPF_W,0,1,0,BPF_ADD|BPF_FETCH);
+  ALUI(BPF_MOD,1,queues); ALUI(BPF_ADD,1,1);
+  if (hints>=0) PATCH(from_hint,b.n);
++ if(groups>=0)PATCH(from_group,b.n);
+  MOVI(0,0);
+ 	SE(BPF_STX|BPF_ATOMIC|BPF_W,8,1,0,BPF_CMPXCHG);
+ 	/* A losing contender must use the published winner, never its candidate. */
+@@ -178,6 +238,7 @@
+ 	saved=errno;
+ 	if (buckets>=0) close(buckets);
+  if (counter>=0) close(counter);
++ if(groups>=0)close(groups);
+  if (program>=0 && hints_fd && hints>=0) { *hints_fd=hints; hints=-1; }
+  if (hints>=0) close(hints);
+ 	errno=saved;

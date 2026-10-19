@@ -56,6 +56,16 @@
 #include "list.h"
 #include "gso.h"
 
+#ifndef IPPROTO_DCCP
+#define IPPROTO_DCCP 33
+#endif
+#ifndef IPPROTO_UDPLITE
+#define IPPROTO_UDPLITE 136
+#endif
+#ifndef IPPROTO_SCTP
+#define IPPROTO_SCTP 132
+#endif
+
 #ifdef COVERAGE_TESTING
 //for coverage testing
 inline static void dummy()
@@ -518,6 +528,7 @@ int addrmap_reload(void);
 
 /* conffile.c */
 int config_init(void);
+void config_free(void);
 int config_read(char *conffile);
 int config_validate(void);
 

@@ -72,7 +72,7 @@ static inline int flow_parse_depth(const uint8_t *p, size_t n, struct flow_packe
 		out->fragment_hash=flow_hash_bytes(out->fragment_key,sizeof(out->fragment_key));
 		if(!out->first) return 0;
 	}
-	if(proto==6 || proto==17) {
+	if(proto==6 || proto==17 || proto==33 || proto==132 || proto==136) {
 		if(off+4>n) return -1;
 		memcpy(src+16,p+off,2);memcpy(dst+16,p+off+2,2);out->transport=1;
 	} else if((proto==1 || proto==58) && off+8<=n) {

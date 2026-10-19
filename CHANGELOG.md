@@ -6,6 +6,12 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Fixed
 
+- Reject a missing configuration path before calling libc, avoiding a static musl amd64 crash.
+
+- Resolve release tags to one verified source commit and reject unprepared or mismatched version metadata.
+- Require compiler, platform, sanitizer and kernel gates before publishing saved, smoke-tested release artifacts.
+- Parse supported release tag prefixes consistently and keep prereleases from updating `latest`.
+
 - Keep eBPF flow buckets on their first worker across packet sizes and reloads.
 - Reserve IPv4 IDs for empty software GSO output and offload split-tail TCP checksums.
 - Clear segmentation metadata on single TCP packets, preventing kernel forwarding drops with TCP options.

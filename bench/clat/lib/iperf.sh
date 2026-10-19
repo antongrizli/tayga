@@ -1,5 +1,21 @@
 #!/bin/sh
 # Sourced by benchmark-clat.sh; configuration is owned by the entrypoint.
+prepare_endpoint_affinity() {
+  CLIENT_ENDPOINT_CPUS=$CLIENT_CPUSET
+  SERVER_ENDPOINT_CPUS=$SERVER_CPUSET
+  if [ "${ENDPOINT_AFFINITY:-off}" = per-client ]; then
+    CLIENT_ENDPOINT_CPUS=$(exec_with_affinity "$CLIENT_CPUSET" python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))') || return
+    SERVER_ENDPOINT_CPUS=$(exec_with_affinity "$SERVER_CPUSET" python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))') || return
+    [ -n "$CLIENT_ENDPOINT_CPUS" ] && [ -n "$SERVER_ENDPOINT_CPUS" ] || return 64
+  fi
+  export CLIENT_ENDPOINT_CPUS SERVER_ENDPOINT_CPUS
+}
+
+select_endpoint_cpu() {
+  case "$1" in ''|*[!0-9,]*) echo 'endpoint CPU list must contain numeric CPU IDs' >&2; return 64;; esac
+  printf '%s\n' "$1" | awk -F, -v client="$2" '{ position=(client-1)%NF+1; print $position }'
+}
+
 reserve_client_ports() {
   [ "${CLIENT_PORT_BASE:-0}" -gt 0 ] || return 0
   local port_ns=${1:-client} reserved existing offset first last
@@ -28,11 +44,15 @@ cleanup_iperf_servers() {
 }
 
 start_iperf_servers() {
-  local server_log_dir=${1:-$ARTIFACT_DIR}
+  local server_log_dir=${1:-$ARTIFACT_DIR} endpoint_cpuset
   mkdir -p "$server_log_dir"
   cleanup_iperf_servers
   for client_no in $(seq 1 "$CLIENTS"); do
-    exec_with_affinity "$SERVER_CPUSET" ip netns exec server env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
+    endpoint_cpuset=$SERVER_CPUSET
+    if [ "${ENDPOINT_AFFINITY:-off}" = per-client ]; then
+      endpoint_cpuset=$(select_endpoint_cpu "$SERVER_ENDPOINT_CPUS" "$client_no") || return
+    fi
+    exec_with_affinity "$endpoint_cpuset" ip netns exec server env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 -s -6 -B 64:ff9b::b00:2 -p "$((5200 + client_no))" \
       >"$server_log_dir/iperf-server-$client_no.log" 2>&1 &
     iperf_pids="$iperf_pids $!"
   done
@@ -61,7 +81,7 @@ start_clients() {
   local gated=$4
   : > "$run_dir/pids"
   : > "$run_dir/gates"
-  local client_no client_addr gate
+  local client_no client_addr gate endpoint_cpuset
   for client_no in $(seq 1 "$CLIENTS"); do
     client_addr="192.168.88.$((client_no + 1))"
     set -- -c 11.0.0.2 -p "$((5200 + client_no))" -B "$client_addr" -P "$FLOWS" -t "$duration" --connect-timeout 5000 -J
@@ -79,15 +99,19 @@ start_clients() {
     test "$SOCKET_BUFFER_BYTES" -gt 0 && set -- "$@" -w "$SOCKET_BUFFER_BYTES"
     test -n "$BLOCK_SIZE" && set -- "$@" -l "$BLOCK_SIZE"
     test -n "$RATE" && set -- "$@" -b "$RATE"
+    endpoint_cpuset=$CLIENT_CPUSET
+    if [ "${ENDPOINT_AFFINITY:-off}" = per-client ]; then
+      endpoint_cpuset=$(select_endpoint_cpu "$CLIENT_ENDPOINT_CPUS" "$client_no") || return
+    fi
     if test "$gated" = yes; then
       gate="$run_dir/gate-$client_no"
       rm -f "$gate"
       mkfifo "$gate"
       printf '%s\n' "$gate" >> "$run_dir/gates"
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" \
+      exec_with_affinity "$endpoint_cpuset" ip netns exec client sh -c 'read -r _ < "$1"; shift; exec "$@"' sh "$gate" env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" \
         >"$run_dir/client-$client_no.json" 2>"$run_dir/client-$client_no.stderr" &
     else
-      exec_with_affinity "$CLIENT_CPUSET" ip netns exec client env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" >"$run_dir/client-$client_no.json" \
+      exec_with_affinity "$endpoint_cpuset" ip netns exec client env "LD_PRELOAD=${iperf_start_library:+$iperf_start_library:}${udp_drain_guard:-}" "TAYGA_IPERF_START_CONTROL=${iperf_start_control:-}" "TAYGA_UDP_DRAIN_CONTROL=${udp_drain_control:-}" iperf3 "$@" >"$run_dir/client-$client_no.json" \
         2>"$run_dir/client-$client_no.stderr" &
     fi
     printf '%s\n' "$!" >> "$run_dir/pids"
@@ -517,15 +541,26 @@ def worker_counter_deltas(before, after):
         raise ValueError("worker list missing from status")
     old = {w["slot"]: w for w in before["workers"]}
     new = {w["slot"]: w for w in after["workers"]}
+    if len(old) != len(before["workers"]) or len(new) != len(after["workers"]):
+        raise ValueError("duplicate worker slot in snapshot")
     if old.keys() != new.keys():
         raise ValueError("worker slot set changed during measurement")
     deltas = []
     fields = ("rx_packets_v4", "tx_packets_v4", "rx_packets_v6", "tx_packets_v6", "dropped_packets", "error_packets")
+    byte_fields = ("rx_bytes_v4", "tx_bytes_v4", "rx_bytes_v6", "tx_bytes_v6")
+    # Old snapshots lack all byte counters. A partially populated capture is
+    # malformed, not a legacy capture and not an observed zero-byte interval.
+    bytes_available = any(k in w for w in (*old.values(), *new.values()) for k in byte_fields)
     for slot in sorted(new.keys()):
         b = old[slot]
         a = new[slot]
-        d = dict(slot=slot, worker_id=a.get("worker_id", slot))
-        for field in fields:
+        if a.get("worker_id", slot) != b.get("worker_id", slot):
+            raise ValueError(f"worker slot {slot} identity changed")
+        d = dict(slot=slot, worker_id=a.get("worker_id", slot),
+                 byte_counters_available=bytes_available)
+        if not bytes_available:
+            d.update(dict.fromkeys(byte_fields))
+        for field in fields + (byte_fields if bytes_available else ()):
             if field not in b or field not in a:
                 raise ValueError(f"worker slot {slot} missing field {field}")
             b_val, a_val = b[field], a[field]
@@ -854,7 +889,7 @@ else:
 
 result = dict(direction=direction, clients=len(reports), expected_clients=expected_clients,
               capture_valid=not capture_errors, workload_valid=True, acceptance_pass=True,
-              schema_version=6, guest_cpu_count=os.cpu_count(),
+              schema_version=7, guest_cpu_count=os.cpu_count(),
               degraded_reasons=list(capture_errors),
               perf_mode=perf_mode, perf_scope=os.environ["PERF_SCOPE"],
               thread_metrics=thread_metrics, thread_counter_error=thread_counter_error,
@@ -883,6 +918,7 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               workers=int(workers), flows_per_client=int(flows), tun_txqlen=(int(txqlen) if txqlen else None),
               offlink_mtu=int(offlink_mtu),
               forwarding_gro=os.environ.get("FORWARDING_GRO", "off"),
+              clat_ingress_rps_cpus=os.environ.get("CLAT_INGRESS_RPS_CPUS", "unchanged"),
               pacing_timer_us=int(os.environ["PACING_TIMER_US"]), fq_rate=os.environ["FQ_RATE"],
               socket_buffer_bytes=int(os.environ["SOCKET_BUFFER_BYTES"]), sender_fq=os.environ["SENDER_FQ"],
               sender_fq_flow_limit=int(os.environ["SENDER_FQ_FLOW_LIMIT"]),
@@ -890,6 +926,9 @@ result = dict(direction=direction, clients=len(reports), expected_clients=expect
               sender_fq_topology=os.environ["SENDER_FQ_TOPOLOGY"],
               tayga_cpuset=os.environ["TAYGA_CPUSET"], client_cpuset=os.environ["CLIENT_CPUSET"],
               server_cpuset=os.environ["SERVER_CPUSET"],
+              endpoint_affinity=os.environ.get("ENDPOINT_AFFINITY", "off"),
+              client_endpoint_cpus=os.environ.get("CLIENT_ENDPOINT_CPUS", os.environ["CLIENT_CPUSET"]),
+              server_endpoint_cpus=os.environ.get("SERVER_ENDPOINT_CPUS", os.environ["SERVER_CPUSET"]),
               qdisc_deltas=qdisc_deltas, interface_deltas=interface_deltas,
               socket_sample_interval=int(os.environ["SOCKET_SAMPLE_INTERVAL"]) if protocol == "udp" else 0,
               network_udp_counters=network_udp_counters, network_counter_errors=network_counter_errors,

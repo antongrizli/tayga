@@ -21,3 +21,9 @@ improvements/
 perf-comparisons/
 __pycache__/
 *.pyc
+
+# Release CI transport artifacts are never build inputs.
+candidate-*/
+candidates/
+release-assets/
+release-source.json

@@ -52,7 +52,7 @@ def delta(before, after, keys):
     return values
 
 
-def sample(path, steering):
+def sample(path, steering, diagnostic=False):
     """Retain every rejected sample with reasons; never select only good runs."""
     errors=[]; out={'path':str(path), 'passed':False}
     try:
@@ -73,6 +73,26 @@ def sample(path, steering):
         if not isinstance(out['client_port_base'],int) or not 1024<=out['client_port_base']<=62530:
             errors.append('valid deterministic client port base required')
         parent=path.parent
+        requested_rps=doc.get('clat_ingress_rps_cpus','unchanged')
+        if requested_rps!='unchanged':
+            try:
+                mask_pattern=r'[0-9a-fA-F]{1,8}(,[0-9a-fA-F]{8})*'
+                if not re.fullmatch(mask_pattern,requested_rps):raise ValueError('invalid RPS mask')
+                evidence=load(parent.parent/'clat-ingress-rps.json')
+                if (evidence.get('error') or evidence['namespace']!='clatns' or
+                        evidence['interface']!='veth-nat64' or evidence['requested']!=requested_rps or
+                        not evidence['queues']):
+                    raise ValueError('RPS setup identity/error')
+                requested_mask=int(requested_rps.replace(',',''),16)
+                queues=evidence['queues']
+                if len({q['queue'] for q in queues})!=len(queues):raise ValueError('duplicate RPS queue')
+                for queue in queues:
+                    if not re.fullmatch(r'rx-\d+',queue['queue']):raise ValueError('invalid RPS queue')
+                    if not re.fullmatch(mask_pattern,queue['after']):raise ValueError('invalid RPS readback mask')
+                    if int(queue['after'].replace(',',''),16)!=requested_mask:
+                        raise ValueError('RPS readback mismatch')
+            except (OSError,KeyError,TypeError,ValueError,AttributeError) as exc:
+                errors.append('invalid/missing ingress RPS readback evidence: '+str(exc))
         network=[]
         network_keys={'net.core.netdev_max_backlog','net.core.netdev_budget','net.core.netdev_budget_usecs'}
         for phase in ('before','after'):
@@ -143,6 +163,20 @@ def sample(path, steering):
         if not math.isfinite(mbps) or abs(mbps-doc['received_mbps'])>max(1,mbps*.001):errors.append('raw/summary throughput mismatch')
         # Require recorded content identities, not just a revision from a dirty tree.
         session=parent.parent.parent
+        if (session/'experiment.json').exists():
+            experiment=load(session/'experiment.json')
+            for key in ('experiment_id','pair_id','arm_id'):
+                if not isinstance(experiment[key],str) or not experiment[key].strip():
+                    raise ValueError('missing experiment identity: '+key)
+            if not isinstance(experiment['harness_archive_sha256'],str) or not re.fullmatch(r'[0-9a-f]{64}',experiment['harness_archive_sha256']):
+                raise ValueError('invalid harness digest')
+            if experiment['steering']!=steering or experiment['client_port_base']!=out['client_port_base']:
+                errors.append('experiment steering/port schedule mismatch')
+            harness=session/'harness-snapshot.tar.gz'
+            digest=hashlib.sha256(harness.read_bytes()).hexdigest()
+            if digest!=experiment['harness_archive_sha256'] or digest!=(session/'harness-snapshot.sha256').read_text().split()[0]:
+                errors.append('harness archive identity mismatch')
+            out['experiment']=experiment
         for key,file in (('source_tree_sha256','source-tree.sha256'),('tayga_sha256','tayga.sha256')):
             recorded=(session/file).read_text().split()[0]
             if not recorded or recorded!=doc[key]:errors.append(key+' manifest mismatch')
@@ -155,6 +189,36 @@ def sample(path, steering):
         normalized=next(r for r in compare.results(parent) if r['path']==str(path))
         out['identity']={k:normalized.get(k) for k in compare.WORKLOAD_KEYS+compare.BUILD_KEYS+compare.TREATMENT_KEYS}
         out['identity']['kernel_network_settings']=network[0]
+        if normalized['endpoint_affinity'] not in ('off','per-client'):
+            errors.append('unknown endpoint affinity policy')
+        if normalized['endpoint_affinity']=='per-client':
+            expected=[]
+            for role in ('client','server'):
+                cpus=[int(value) for value in normalized[role+'_endpoint_cpus'].split(',')]
+                if not cpus or len(cpus)!=len(set(cpus)) or any(cpu<0 for cpu in cpus):
+                    raise ValueError('invalid endpoint CPU list')
+                expected.extend(str(cpus[i%len(cpus)]) for i in range(4))
+            actors=[];current=None
+            for line in (parent/'endpoint-affinity.before').read_text().splitlines():
+                if line.startswith('pid='):
+                    if current is not None:actors.append(current)
+                    current={'pid':int(line[4:])}
+                elif line.startswith('Cpus_allowed_list:') and current is not None:
+                    current['cpus']=line.split(':',1)[1].strip()
+            if current is not None:actors.append(current)
+            if len(actors)!=8 or len({actor['pid'] for actor in actors})!=8 or any(actor['pid']<=0 for actor in actors):
+                raise ValueError('missing/duplicate endpoint processes')
+            if [actor['cpus'] for actor in actors]!=expected:
+                errors.append('actual endpoint CPU masks differ from policy')
+            out['endpoint_affinity_verified']=not any('endpoint' in error for error in errors)
+        if (session/'host-power.json').exists():
+            power=load(session/'host-power.json')
+            if not power['before'] or power['before']!=power['after']:
+                errors.append('host power changed or unavailable during session')
+            if not power['settings_before'] or power['settings_before']!=power['settings_after']:
+                errors.append('host power settings changed or unavailable during session')
+            out['identity']['host_power_source']=power['before']
+            out['identity']['host_power_settings']=power['settings_before']
         compiler=(session/'compiler.txt').read_text().strip()
         flags=(session/'build-flags.txt').read_text().strip()
         if compiler.lower() in ('','unknown','n/a') or not flags:
@@ -162,18 +226,38 @@ def sample(path, steering):
         out['identity']['compiler']=compiler
         # The runner remaps its randomized temporary source root to '.'.
         out['identity']['build_flags']=re.sub(r'-f(file|debug|macro)-prefix-map=[^\s=]+=',r'-f\1-prefix-map=<build-root>=',flags)
-        out['passed']=not errors
     except (OSError,ValueError,KeyError,IndexError,TypeError,ZeroDivisionError,tarfile.TarError) as exc:
         errors.append(str(exc))
+    quality={'daemon interval drops/errors','interface drops/errors in measured window',
+             'directional worker share below 20%'}
+    out['quality_errors']=[e for e in errors if e in quality]
+    if diagnostic:
+        errors=[e for e in errors if e not in quality]
+    out['passed']=not errors
     out['errors']=errors
     return out
 
 
 def evaluate(baselines, candidates, mode='configuration', repeats=5,
-             download=INITIAL_DOWNLOAD_MBPS, upload=INITIAL_UPLOAD_MBPS, reduction=.45):
-    arms={name:[sample(p,steering) for root in roots for p in sorted(root.rglob('result.json'))]
-          for name,roots,steering in (('baseline',baselines,'kernel'),('candidate',candidates,'flows'))}
+             download=INITIAL_DOWNLOAD_MBPS, upload=INITIAL_UPLOAD_MBPS, reduction=.45,
+             diagnostic=False, baseline_steering='kernel', candidate_steering='flows'):
+    arms={name:[sample(p,steering,diagnostic) for root in roots for p in sorted(root.rglob('result.json'))]
+          for name,roots,steering in (('baseline',baselines,baseline_steering),('candidate',candidates,candidate_steering))}
     errors=[];groups=[]
+    if not diagnostic and (baseline_steering,candidate_steering)!=('kernel','flows'):
+        errors.append('product acceptance requires kernel baseline and flows candidate')
+    rows=[r for rows in arms.values() for r in rows]
+    explicit=diagnostic or any('experiment' in r for r in rows)
+    if explicit:
+        if any('experiment' not in r for r in rows):errors.append('missing experiment/harness manifest')
+        experiments={r['experiment']['experiment_id'] for r in rows if 'experiment' in r}
+        harnesses={r['experiment']['harness_archive_sha256'] for r in rows if 'experiment' in r}
+        if len(experiments)!=1:errors.append('mixed experiment identities')
+        if len(harnesses)!=1:errors.append('mixed harness identities')
+        for name,rows in arms.items():
+            if any(r.get('experiment',{}).get('arm_id')!=name for r in rows):
+                errors.append('experiment arm mismatch: '+name)
+            rows.sort(key=lambda r:(r.get('experiment',{}).get('pair_id',''),r.get('direction','')))
     paths=[Path(row['path']).resolve() for rows in arms.values() for row in rows]
     if len(paths)!=len(set(paths)):
         errors.append('duplicate samples cannot count as independent trials')
@@ -186,6 +270,11 @@ def evaluate(baselines, candidates, mode='configuration', repeats=5,
             if not row['passed']:errors.append(arm+': '+row['path']+': '+', '.join(row['errors']))
     for direction,threshold in (('download',download),('upload',upload)):
         pair={arm:[r for r in rows if r.get('direction')==direction] for arm,rows in arms.items()}
+        if explicit:
+            ids={arm:[r.get('experiment',{}).get('pair_id') for r in rows] for arm,rows in pair.items()}
+            if ids['baseline']!=ids['candidate']:errors.append(direction+': mismatched pair identities')
+            if any(len(values)!=len(set(values)) for values in ids.values()):
+                errors.append(direction+': duplicate pair identity')
         group={'direction':direction,'threshold_mbps':threshold};groups.append(group)
         if any(len(rows)<repeats for rows in pair.values()):errors.append(direction+': insufficient paired repeats')
         if len(pair['baseline'])!=len(pair['candidate']):errors.append(direction+': unpaired sample counts')
@@ -203,18 +292,18 @@ def evaluate(baselines, candidates, mode='configuration', repeats=5,
                         'median_retransmits_per_sent_gb':statistics.median(r['retransmits_per_sent_gb'] for r in rows)}
         if not all(k in group for k in ('baseline','candidate')):continue
         b,c=pair['baseline'][0]['identity'],pair['candidate'][0]['identity']
-        for key in compare.WORKLOAD_KEYS+compare.TREATMENT_KEYS+('kernel_network_settings','compiler','build_flags')+(compare.BUILD_KEYS if mode=='configuration' else ()):
+        for key in compare.WORKLOAD_KEYS+compare.TREATMENT_KEYS+('kernel_network_settings','compiler','build_flags','host_power_source','host_power_settings')+(compare.BUILD_KEYS if mode=='configuration' else ()):
             if b.get(key)!=c.get(key):errors.append(direction+': arm mismatch '+key)
         base,candidate=group['baseline'],group['candidate']
-        if candidate['median_mbps']<threshold:errors.append(direction+': historical throughput threshold failed')
-        if candidate['median_mbps']<=base['median_mbps']:
+        if not diagnostic and candidate['median_mbps']<threshold:errors.append(direction+': historical throughput threshold failed')
+        if not diagnostic and candidate['median_mbps']<=base['median_mbps']:
             errors.append(direction+': no same-environment throughput improvement')
-        if candidate['median_retransmits_per_sent_gb']>base['median_retransmits_per_sent_gb']*(1-reduction):
+        if not diagnostic and candidate['median_retransmits_per_sent_gb']>base['median_retransmits_per_sent_gb']*(1-reduction):
             errors.append(direction+': retransmissions/GB reduction failed')
         if any(b.get('client_port_base')!=c.get('client_port_base') for b,c in zip(pair['baseline'],pair['candidate'])):
             errors.append(direction+': paired flow schedules differ')
         group['paired_mbps_deltas']=[c['received_mbps']-b['received_mbps'] for b,c in zip(pair['baseline'],pair['candidate'])]
-        if group['paired_mbps_deltas'] and statistics.median(group['paired_mbps_deltas'])<=0:
+        if not diagnostic and group['paired_mbps_deltas'] and statistics.median(group['paired_mbps_deltas'])<=0:
             errors.append(direction+': no median paired throughput improvement')
         # An exact one-sided sign test guards against declaring random run-to-run
         # variation an improvement. Ties count against improvement. Five pairs
@@ -223,9 +312,10 @@ def evaluate(baselines, candidates, mode='configuration', repeats=5,
         if changes:
             positive=sum(value>0 for value in changes)
             group['paired_improvement_sign_p']=sum(math.comb(len(changes),k) for k in range(positive,len(changes)+1))/2**len(changes)
-            if repeats>=5 and group['paired_improvement_sign_p']>.05:
+            if not diagnostic and repeats>=5 and group['paired_improvement_sign_p']>.05:
                 errors.append(direction+': paired improvement not established above run-to-run variation')
-    return dict(passed=not errors,mode=mode,required_repeats=repeats,groups=groups,samples=arms,errors=sorted(set(errors)),
+    return dict(passed=not errors,purpose='diagnostic' if diagnostic else 'product-acceptance',
+                product_accepted=not diagnostic and not errors,mode=mode,required_repeats=repeats,groups=groups,samples=arms,errors=sorted(set(errors)),
                 formulas={'received_mbps':'sum(receiver bits_per_second) / 1e6','retransmissions_per_sent_gb':'sum(sender retransmits) / (sum(sender bytes) / 1e9)'})
 
 
@@ -234,22 +324,30 @@ def main():
     p.add_argument('--baseline',nargs='+',type=Path,required=True)
     p.add_argument('--candidate',nargs='+',type=Path,required=True)
     p.add_argument('--mode',choices=('configuration','build'),default='configuration')
+    p.add_argument('--diagnostic',action='store_true',help='Validate matched evidence; never accept product performance')
+    p.add_argument('--baseline-steering',choices=('kernel','groups','flows'),default='kernel')
+    p.add_argument('--candidate-steering',choices=('kernel','groups','flows'),default='flows')
     p.add_argument('--min-repeats',type=int,default=5)
     p.add_argument('--download-mbps',type=float,default=INITIAL_DOWNLOAD_MBPS)
     p.add_argument('--upload-mbps',type=float,default=INITIAL_UPLOAD_MBPS)
     p.add_argument('--retransmission-reduction',type=float,default=.45)
     p.add_argument('--json',type=Path,required=True);p.add_argument('--markdown',type=Path,required=True)
     a=p.parse_args()
-    report=evaluate(a.baseline,a.candidate,a.mode,a.min_repeats,a.download_mbps,a.upload_mbps,a.retransmission_reduction)
+    report=evaluate(a.baseline,a.candidate,a.mode,a.min_repeats,a.download_mbps,a.upload_mbps,a.retransmission_reduction,
+                    a.diagnostic,a.baseline_steering,a.candidate_steering)
     a.json.parent.mkdir(parents=True,exist_ok=True);a.json.write_text(json.dumps(report,indent=2)+'\n')
-    rows=['# TCP recovery acceptance','', '**'+('PASS' if report['passed'] else 'FAIL')+'**','',
-          '| Direction | Kernel median Mbps | Flows median Mbps | Target Mbps |','|---|---:|---:|---:|']
+    status=('VALID DIAGNOSTIC; PRODUCT NOT ACCEPTED' if a.diagnostic else 'PASS') if report['passed'] else 'FAIL'
+    rows=['# TCP recovery '+('diagnostic' if a.diagnostic else 'acceptance'),'', '**'+status+'**','',
+          f'| Direction | Baseline ({a.baseline_steering}) median Mbps | Candidate ({a.candidate_steering}) median Mbps | Historical reference Mbps |','|---|---:|---:|---:|']
     for g in report['groups']:
         rows.append(f"| {g['direction']} | {g.get('baseline',{}).get('median_mbps','missing')} | {g.get('candidate',{}).get('median_mbps','missing')} | {g['threshold_mbps']} |")
     rows+=['','Samples, ranges, paired deltas and identities: `'+a.json.name+'`.','','Failures:','']
     rows+=['- '+e for e in report['errors']] or ['- None']
+    rows+=['','Quality findings (retained even in a valid diagnostic):','']
+    rows += [f"- {arm}: {r['path']}: {', '.join(r['quality_errors'])}" for arm,samples in report['samples'].items()
+             for r in samples if r['quality_errors']] or ['- None']
     a.markdown.parent.mkdir(parents=True,exist_ok=True);a.markdown.write_text('\n'.join(rows)+'\n')
-    print('PASS' if report['passed'] else 'FAIL',a.markdown)
+    print(status,a.markdown)
     return 0 if report['passed'] else 1
 
 

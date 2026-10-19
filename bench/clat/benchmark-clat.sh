@@ -30,6 +30,8 @@ CLAT_OFFLOAD=${CLAT_OFFLOAD:-auto}
 CLAT_STEERING=${CLAT_STEERING:-}
 CLAT_OFFLINK_MTU=${CLAT_OFFLINK_MTU:-1280}
 FORWARDING_GRO=${FORWARDING_GRO:-off}
+CLAT_INGRESS_RPS_CPUS=${CLAT_INGRESS_RPS_CPUS:-unchanged}
+export CLAT_INGRESS_RPS_CPUS
 PACING_TIMER_US=${PACING_TIMER_US:-1000}
 FQ_RATE=${FQ_RATE:-0}
 SOCKET_BUFFER_BYTES=${SOCKET_BUFFER_BYTES:-0}
@@ -41,6 +43,8 @@ SENDER_FQ_TOPOLOGY=${SENDER_FQ_TOPOLOGY:-auto}
 TAYGA_CPUSET=${TAYGA_CPUSET:-all}
 CLIENT_CPUSET=${CLIENT_CPUSET:-all}
 SERVER_CPUSET=${SERVER_CPUSET:-all}
+ENDPOINT_AFFINITY=${ENDPOINT_AFFINITY:-off}
+export ENDPOINT_AFFINITY
 SOCKET_SAMPLE_INTERVAL=${SOCKET_SAMPLE_INTERVAL:-1}
 RECEIVER_DRAIN_SECONDS=${RECEIVER_DRAIN_SECONDS:-0.5}
 IPERF_START_GATE=${IPERF_START_GATE:-on}
@@ -56,6 +60,11 @@ case "$CLAT_STEERING" in ''|kernel|groups|flows) ;; *) echo 'CLAT_STEERING must 
 case "$PERF_SCOPE" in process|system) ;; *) echo 'PERF_SCOPE must be process or system' >&2; exit 64;; esac
 case "$PERF_MODE" in none|stat|record) ;; *) echo 'PERF_MODE must be none, stat or record' >&2; exit 64;; esac
 case "$FORWARDING_GRO" in off|on) ;; *) echo 'FORWARDING_GRO must be off or on' >&2; exit 64;; esac
+if [ "$CLAT_INGRESS_RPS_CPUS" != unchanged ]; then
+  printf '%s\n' "$CLAT_INGRESS_RPS_CPUS" | grep -Eq '^[0-9a-fA-F]{1,8}(,[0-9a-fA-F]{8})*$' || {
+    echo 'CLAT_INGRESS_RPS_CPUS must be unchanged or a hexadecimal Linux CPU mask' >&2; exit 64;
+  }
+fi
 case "$SENDER_FQ_TOPOLOGY" in auto|single|mq) ;; *) echo 'SENDER_FQ_TOPOLOGY must be auto, single or mq' >&2; exit 64;; esac
 for cpuset in "$TAYGA_CPUSET" "$CLIENT_CPUSET" "$SERVER_CPUSET"; do
   [ "$cpuset" != all ] || continue
@@ -73,6 +82,7 @@ BENCH_LIB_DIR="${BENCH_LIB_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/lib
 . "$BENCH_LIB_DIR/iperf.sh"
 
 case "$SENDER_FQ" in off|on) ;; *) echo 'SENDER_FQ must be off or on' >&2; exit 64;; esac
+case "$ENDPOINT_AFFINITY" in off|per-client) ;; *) echo 'ENDPOINT_AFFINITY must be off or per-client' >&2; exit 64;; esac
 for numeric in "$CLIENT_PORT_BASE" "$PACING_TIMER_US" "$SOCKET_BUFFER_BYTES" "$SOCKET_SAMPLE_INTERVAL" "$SENDER_FQ_FLOW_LIMIT" "$SENDER_FQ_LIMIT" "$VETH_QUEUES"; do
   case "$numeric" in ''|*[!0-9]*) echo 'pacing/buffer/sampling values must be non-negative integers' >&2; exit 64;; esac
 done
@@ -105,6 +115,7 @@ case "$TUN_TXQLEN" in
 esac
 [ "$DURATION" -gt 0 ] || { echo 'DURATION must be positive' >&2; exit 64; }
 mkdir -p "$ARTIFACT_DIR"
+prepare_endpoint_affinity
 
 # The topology uses fixed namespace and link names. Serialize benchmark runs
 # and refuse to remove namespaces that may belong to another test.
@@ -222,6 +233,7 @@ EOF
 
 ip -n clatns link set lo up
 ip -n clatns link set veth-nat64 up
+configure_clat_ingress_rps
 ip -n clatns addr add 172.31.64.2/24 dev veth-nat64
 ip -n clatns -6 addr add fd9b:64:1:fe::2/64 dev veth-nat64
 ip -n clatns -6 route add default via fd9b:64:1:fe::1

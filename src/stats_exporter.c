@@ -230,9 +230,13 @@ void stats_write_json(const char *path, const char *state)
 		fprintf(f, "      \"slot\": %d,\n", i);
 		fprintf(f, "      \"worker_id\": %d,\n", i == 0 ? 0 : i - 1);
 		fprintf(f, "      \"rx_packets_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_pkts_v4, memory_order_relaxed));
+		fprintf(f, "      \"rx_bytes_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_bytes_v4, memory_order_relaxed));
 		fprintf(f, "      \"tx_packets_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_pkts_v4, memory_order_relaxed));
+		fprintf(f, "      \"tx_bytes_v4\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_bytes_v4, memory_order_relaxed));
 		fprintf(f, "      \"rx_packets_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_pkts_v6, memory_order_relaxed));
+		fprintf(f, "      \"rx_bytes_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->rx_bytes_v6, memory_order_relaxed));
 		fprintf(f, "      \"tx_packets_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_pkts_v6, memory_order_relaxed));
+		fprintf(f, "      \"tx_bytes_v6\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->tx_bytes_v6, memory_order_relaxed));
 		fprintf(f, "      \"dropped_packets\": %llu,\n", (unsigned long long)atomic_load_explicit(&p->dropped_pkts, memory_order_relaxed));
 		fprintf(f, "      \"error_packets\": %llu\n", (unsigned long long)atomic_load_explicit(&p->error_pkts, memory_order_relaxed));
 		fprintf(f, "    }%s\n", (i == num_workers || i == STATS_MAX_SLOTS - 1) ? "" : ",");

@@ -27,7 +27,10 @@ with open('/tmp/tayga-perf-workflow.lock') as lock:
             for workers in (0,3):
                 for fault in ('unsupported-main','unsupported-worker','unverified-main','unverified-worker'):
                     if workers==0 and 'worker' in fault: continue
-                    cfg=root/'tayga.conf';cfg.write_text(f'tun-device napitest\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\nprefix 64:ff9b::/96\nworkers {workers}\ntun-offload {mode}\n')
+                    # Research candidates can enable NAPI only for flows. Test
+                    # the policy that requests NAPI rather than an unrelated
+                    # kernel-policy startup which correctly remains running.
+                    cfg=root/'tayga.conf';cfg.write_text(f'tun-device napitest\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\nprefix 64:ff9b::/96\nworkers {workers}\ntun-offload {mode}\ntun-steering flows\n')
                     env=dict(os.environ,LD_PRELOAD=str(shim),TAYGA_TEST_NAPI_FAIL=fault)
                     case=f'{mode}-w{workers}-{fault}'
                     proc=subprocess.run(['unshare','-n',str(Path(a.binary).resolve()),'-d','-c',str(cfg)],env=env,capture_output=True,text=True,timeout=5)

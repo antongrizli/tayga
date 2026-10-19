@@ -15,7 +15,7 @@ MODULES = (
     "test_udp_batch_summary", "test_udp_common_stop", "test_udp_envelope_study",
     "test_lima_retention", "test_benchmark_cleanup", "test_udp_batch_endpoint",
     "test_udp_drain_guard", "test_iperf_start_gate", "test_iperf_read_diagnostic",
-    "test_protocols_compatibility",
+    "test_protocols_compatibility", "test_throughput_diagnostics", "test_release_pipeline",
 )
 if __name__ == "__main__":
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(MODULES))
