@@ -38,7 +38,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.ver }}
         run: python3 scripts/ci/release_metadata.py
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-source
           path: release-source.json
@@ -70,7 +70,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: release-integration-results
@@ -109,13 +109,13 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           bash scripts/ci/release-build.sh "$RELEASE_ARCH" "$RELEASE_PLATFORM" release-source.json "candidate-$RELEASE_ARCH"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: candidate-${{ matrix.arch }}
           path: candidate-${{ matrix.arch }}/
           compression-level: 0
           if-no-files-found: error
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: release-build-failure-${{ matrix.arch }}
@@ -143,7 +143,7 @@ jobs:
           python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets
           cd release-assets
           sha256sum -c SHA256SUMS
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: verified-release-assets
           path: release-assets/
@@ -193,7 +193,7 @@ jobs:
           fail_on_unmatched_files: true
           files: release-assets/*
           generate_release_notes: false
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: release-publication-evidence
