@@ -63,7 +63,7 @@
 :local useRegistry false
 :if ($UseRegistry = true) do={ :set useRegistry true }
 
-:local remoteImage "ghcr.io/antongrizli/tayga-nat64:0.9.11"
+:local remoteImage "ghcr.io/antongrizli/tayga-nat64:v0.9.14"
 :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
@@ -85,7 +85,7 @@
 :if ([:len [/file/find where name=$preflightToRun]] = 0) do={
     :put "--> Fetching preflight audit script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/v0.9.14/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
         :log info "[tayga-installer] Downloaded preflight script to routeros-preflight.rsc"
     } on-error={}
 }
@@ -131,15 +131,7 @@
 }
 :put ("--> WAN interface detected: " . $wanIf . " (Gateway: " . $wanGw . ")")
 
-# --- 4. Check Required Image Archive on Storage ---
-:local imageFound [:len [/file/find where name=$imagePath]]
-:if ($imageFound = 0) do={
-    :put (" [FAIL] Required image archive '" . $imagePath . "' not found on storage drive.")
-    :put (" Upload the image first: scp dist/tayga-arm64.tar admin@<router-ip>:" . $imagePath)
-    :error "Aborted: missing container image archive"
-}
-
-# --- 3. Collision Check: Ensure Interface Names are not Claimed by Other Projects ---
+# --- 4. Collision Check: Ensure Interface Names are not Claimed by Other Projects ---
 :local existingBridge [/interface/bridge/find where name="bridge-nat64"]
 :if ([:len $existingBridge] > 0) do={
     :local bComm [/interface/bridge/get $existingBridge comment]
@@ -158,7 +150,7 @@
     }
 }
 
-# --- 4. Create Dedicated Bridge for Container Transport ---
+# --- 5. Create Dedicated Bridge for Container Transport ---
 :if ([:len [/interface/bridge/find where name="bridge-nat64"]] = 0) do={
     :put "--> Creating bridge-nat64..."
     /interface/bridge/add name=bridge-nat64 comment="[tayga-unified:nat64] Transport Bridge"
@@ -166,7 +158,15 @@
     :put "--> bridge-nat64 already exists with project ownership (reusing)"
 }
 
-# --- 5. Configure RouterOS Gateway IP Addresses on Bridge ---
+# Ensure bridge-nat64 is in interface list LAN so default firewall allows traffic
+:if ([:len [/interface/list/find where name="LAN"]] > 0) do={
+    :if ([:len [/interface/list/member/find where list="LAN" and interface="bridge-nat64"]] = 0) do={
+        :put "--> Adding bridge-nat64 to interface list LAN..."
+        /interface/list/member/add list=LAN interface=bridge-nat64 comment="[tayga-unified:nat64] Transport Bridge in LAN"
+    }
+}
+
+# --- 6. Configure RouterOS Gateway IP Addresses on Bridge ---
 :if ([:len [/ip/address/find where comment="[tayga-unified:nat64] RouterOS IPv4 gateway"]] = 0) do={
     :put "--> Assigning IPv4 gateway 192.168.238.1/30 to bridge-nat64..."
     /ip/address/add address=192.168.238.1/30 interface=bridge-nat64 comment="[tayga-unified:nat64] RouterOS IPv4 gateway"
@@ -177,7 +177,7 @@
     /ipv6/address/add address=fc68::1/126 interface=bridge-nat64 advertise=no comment="[tayga-unified:nat64] RouterOS IPv6 gateway"
 }
 
-# --- 6. Create VETH Interface for Container ---
+# --- 7. Create VETH Interface for Container ---
 :if ([:len [/interface/veth/find where name="veth-nat64"]] = 0) do={
     :put "--> Creating veth-nat64 interface..."
     /interface/veth/add name=veth-nat64 \
@@ -188,10 +188,25 @@
         comment="[tayga-unified:nat64] Container VETH"
 }
 
-# --- 7. Attach VETH to Bridge ---
+# --- 8. Attach VETH to Bridge ---
 :if ([:len [/interface/bridge/port/find where interface="veth-nat64"]] = 0) do={
     :put "--> Attaching veth-nat64 to bridge-nat64..."
     /interface/bridge/port/add bridge=bridge-nat64 interface=veth-nat64 comment="[tayga-unified:nat64] VETH bridge port"
+}
+
+# --- 8b. Add Static IPv6 Neighbor for Container VETH ---
+:local vethList [/interface/veth/find where name="veth-nat64"]
+:if ([:len $vethList] > 0) do={
+    :local vethMac [/interface/veth/get ($vethList->0) mac-address]
+    :if ([:len $vethMac] > 0) do={
+        :local existingNeigh [/ipv6/neighbor/find where address="fc68::2" and interface="bridge-nat64"]
+        :if ([:len $existingNeigh] = 0) do={
+            :put ("--> Adding static IPv6 neighbor for container (" . $vethMac . ")...")
+            /ipv6/neighbor/add address=fc68::2 mac-address=$vethMac interface=bridge-nat64 comment="[tayga-unified:nat64] Container Neighbor"
+        } else={
+            /ipv6/neighbor/set ($existingNeigh->0) mac-address=$vethMac comment="[tayga-unified:nat64] Container Neighbor"
+        }
+    }
 }
 
 # --- 8. Configure Container Environment Variables (key-by-key with list= / key= / value=) ---
@@ -404,7 +419,7 @@
 :if ([:len [/file/find where name=$controllerToRun]] = 0) do={
     :put "--> Fetching controller script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/v0.9.14/routeros-controller.rsc" dst-path="routeros-controller.rsc"
         :log info "[tayga-installer] Downloaded controller script to routeros-controller.rsc"
     } on-error={}
 }

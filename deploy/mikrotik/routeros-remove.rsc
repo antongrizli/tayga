@@ -217,6 +217,15 @@
     /container/envs/remove [find where list="tayga-nat64-envs"]
     /container/envs/remove [find where list="tayga-policy-envs"]
 
+    # 5b. Remove Static IPv6 Neighbors & Interface List Memberships owned by this project
+    :put "--> Removing static IPv6 neighbors and interface list memberships..."
+    :do {
+        /ipv6/neighbor/remove [find where comment~"^\\[tayga-unified"]
+    } on-error={}
+    :do {
+        /interface/list/member/remove [find where comment~"^\\[tayga-unified"]
+    } on-error={}
+
     # 6. Remove Bridge Ports and VETH Interfaces owned by this project
     :put "--> Removing bridge ports and VETH interfaces..."
     /interface/bridge/port/remove [find where comment~"^\\[tayga-unified"]

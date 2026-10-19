@@ -27,6 +27,20 @@ except (OSError, ValueError, KeyError, IndexError):
 PY_STATUS
 )
 fi
+if [ -z "$TAYGA_PID" ] && [ -f "$STATUS_FILE" ]; then
+  CANDIDATE_PID=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$STATUS_FILE" 2>/dev/null | head -n 1)
+  if [ -n "$CANDIDATE_PID" ] && kill -0 "$CANDIDATE_PID" 2>/dev/null; then
+    TAYGA_PID="$CANDIDATE_PID"
+  elif command -v pidof >/dev/null 2>&1; then
+    PIDS=$(pidof tayga 2>/dev/null || true)
+    for p in $PIDS; do
+      if kill -0 "$p" 2>/dev/null; then
+        TAYGA_PID="$p"
+        break
+      fi
+    done
+  fi
+fi
 DAEMON_RUNNING=false
 if [ -n "$TAYGA_PID" ] && kill -0 "$TAYGA_PID" 2>/dev/null; then
   DAEMON_RUNNING=true

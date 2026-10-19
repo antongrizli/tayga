@@ -47,7 +47,7 @@ scp scripts/mikrotik/*.rsc admin@192.168.88.1:usb1/telekom-xlat/scripts/
 
 Alternatively, you can pull the multi-arch image directly from GitHub Container Registry:
 ```text
-ghcr.io/antongrizli/tayga:0.9.11
+ghcr.io/antongrizli/tayga:v0.9.14
 ```
 
 ---

@@ -48,7 +48,7 @@
 :local useRegistry false
 :if ($UseRegistry = true) do={ :set useRegistry true }
 
-:local remoteImage "ghcr.io/antongrizli/tayga-clat:0.9.11"
+:local remoteImage "ghcr.io/antongrizli/tayga-clat:v0.9.14"
 :if ([:len $RemoteImage] > 0) do={ :set remoteImage $RemoteImage }
 
 :local registryUrl "https://ghcr.io"
@@ -84,7 +84,7 @@
 :if ([:len [/file/find where name=$preflightToRun]] = 0) do={
     :put "--> Fetching preflight audit script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/v0.9.14/routeros-preflight.rsc" dst-path="routeros-preflight.rsc"
         :log info "[tayga-installer] Downloaded preflight script to routeros-preflight.rsc"
     } on-error={}
 }
@@ -146,6 +146,14 @@
     :put "--> bridge-clat already exists with project ownership (reusing)"
 }
 
+# Ensure bridge-clat is in interface list LAN so default firewall allows traffic
+:if ([:len [/interface/list/find where name="LAN"]] > 0) do={
+    :if ([:len [/interface/list/member/find where list="LAN" and interface="bridge-clat"]] = 0) do={
+        :put "--> Adding bridge-clat to interface list LAN..."
+        /interface/list/member/add list=LAN interface=bridge-clat comment="[tayga-unified:clat] Transport Bridge in LAN"
+    }
+}
+
 # --- 7. Configure RouterOS Gateway IP Addresses on Bridge ---
 :if ([:len [/ip/address/find where comment="[tayga-unified:clat] RouterOS IPv4 gateway"]] = 0) do={
     :put "--> Assigning IPv4 gateway 172.31.64.1/24 to bridge-clat..."
@@ -172,6 +180,21 @@
 :if ([:len [/interface/bridge/port/find where interface="veth-clat"]] = 0) do={
     :put "--> Attaching veth-clat to bridge-clat..."
     /interface/bridge/port/add bridge=bridge-clat interface=veth-clat comment="[tayga-unified:clat] VETH bridge port"
+}
+
+# --- 9b. Add Static IPv6 Neighbor for Container VETH ---
+:local vethList [/interface/veth/find where name="veth-clat"]
+:if ([:len $vethList] > 0) do={
+    :local vethMac [/interface/veth/get ($vethList->0) mac-address]
+    :if ([:len $vethMac] > 0) do={
+        :local existingNeigh [/ipv6/neighbor/find where address="fd9b:64:1:fe::2" and interface="bridge-clat"]
+        :if ([:len $existingNeigh] = 0) do={
+            :put ("--> Adding static IPv6 neighbor for container (" . $vethMac . ")...")
+            /ipv6/neighbor/add address=fd9b:64:1:fe::2 mac-address=$vethMac interface=bridge-clat comment="[tayga-unified:clat] Container Neighbor"
+        } else={
+            /ipv6/neighbor/set ($existingNeigh->0) mac-address=$vethMac comment="[tayga-unified:clat] Container Neighbor"
+        }
+    }
 }
 
 # --- 10. Configure Container Environment Variables & DNS ---
@@ -440,7 +463,7 @@
 :if ([:len [/file/find where name=$controllerToRun]] = 0) do={
     :put "--> Fetching controller script..."
     :do {
-        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/0.9.11/routeros-controller.rsc" dst-path="routeros-controller.rsc"
+        /tool/fetch url="https://github.com/antongrizli/tayga/releases/download/v0.9.14/routeros-controller.rsc" dst-path="routeros-controller.rsc"
         :log info "[tayga-installer] Downloaded controller script to routeros-controller.rsc"
     } on-error={}
 }

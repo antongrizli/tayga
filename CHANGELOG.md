@@ -4,6 +4,14 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- MikroTik RouterOS deployment: add `bridge-clat` and `bridge-nat64` to interface list `LAN` so default firewall allows forwarded container traffic.
+- MikroTik RouterOS deployment: register static IPv6 neighbor for container VETH interface, resolving RouterOS 7 neighbor discovery drops on secondary bridges.
+- MikroTik RouterOS deployment: remove duplicate blocking container image archive check in `routeros-install-nat64.rsc` to allow registry pulls (`useRegistry=true`).
+- MikroTik RouterOS removal: clean up project-owned static IPv6 neighbors and interface list memberships in `routeros-remove.rsc`.
+- Observability: add portable POSIX shell/sed fallback for `TAYGA_PID` detection in `tayga-status` when `python3` is not present in minimal container environments.
+
 ## [0.9.14] - 2026-10-19
 
 ### Fixed
