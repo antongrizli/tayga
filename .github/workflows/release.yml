@@ -29,7 +29,7 @@ jobs:
       repository: ${{ steps.source.outputs.repository }}
       prerelease: ${{ steps.source.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -60,7 +60,7 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -92,7 +92,7 @@ jobs:
           - arch: armv7
             platform: linux/arm/v7
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -127,7 +127,7 @@ jobs:
     needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -158,7 +158,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
