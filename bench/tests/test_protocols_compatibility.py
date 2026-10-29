@@ -31,9 +31,13 @@ class Dns64RegressionTests(unittest.TestCase):
             tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp.bind(("127.0.0.1", port))
             tcp.listen(1)
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("127.0.0.1", port))
+            probe.close()
         except OSError as exc:
             if 'udp' in locals(): udp.close()
             if 'tcp' in locals(): tcp.close()
+            if 'probe' in locals(): probe.close()
             self.skipTest(f"loopback sockets unavailable: {exc}")
         udp.settimeout(5)
         tcp.settimeout(5)

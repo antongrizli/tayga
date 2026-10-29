@@ -378,6 +378,7 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
             done += (size_t)n;
         }
         size_t length = ((size_t)frame[0] << 8) | frame[1];
+        if (length > sizeof(resp)) goto tcp_fail;
         done = 0;
         while (done < length) {
             ssize_t n = recv(fd, resp + done, length - done, 0);
