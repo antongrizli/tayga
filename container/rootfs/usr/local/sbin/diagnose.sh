@@ -15,6 +15,7 @@ echo "MODE                : ${MODE:-clat (default)}"
 echo "TAYGA_WORKERS       : ${TAYGA_WORKERS:-not set}"
 echo "TAYGA_OFFLOAD       : ${TAYGA_OFFLOAD:-not set}"
 echo "TAYGA_OFFLINK_MTU   : ${TAYGA_OFFLINK_MTU:-not set}"
+echo "DNS64_DNSSEC        : ${DNS64_DNSSEC:-validate}"
 echo "PREF64              : ${PREF64:-not set}"
 echo "ROUTER4             : ${ROUTER4:-not set}"
 
@@ -65,6 +66,15 @@ for f in "$TAYGA_RUNTIME_DIR/clat.conf" "$TAYGA_RUNTIME_DIR/tayga.conf" "$TAYGA_
 done
 
 echo ""
+if [ -f "$TAYGA_RUNTIME_DIR/unbound.conf" ]; then
+  echo "--- DNS64 validation ---"
+  if command -v unbound-checkconf >/dev/null 2>&1; then
+    unbound-checkconf "$TAYGA_RUNTIME_DIR/unbound.conf" || true
+  fi
+  anchor=${DNS64_TRUST_ANCHOR_FILE:-/usr/share/dnssec-root/trusted-key.key}
+  if [ -r "$anchor" ]; then echo "Trust anchor readable: $anchor"; else echo "Trust anchor unavailable: $anchor"; fi
+fi
+
 echo "--- 9. Offload / Ethtool Interface Statistics ---"
 if command -v ethtool >/dev/null 2>&1; then
   for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do

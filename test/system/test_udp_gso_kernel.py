@@ -166,8 +166,12 @@ def ns_command(ns, *args):
 
 
 def gso_stats(log):
-    lines = re.findall(r"GSO Stats: ([^\n]+)", log.read_text())
-    return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", lines[-1])} if lines else {}
+    lines = re.findall(r"GSO Stats: ([^\n]+)\n", log.read_text())
+    for line in reversed(lines):
+        parsed = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)}
+        if "udp_sw_segments" in parsed:
+            return parsed
+    return {}
 
 
 def run_group(args, mode, workers, mtu, direction, root):
@@ -270,12 +274,20 @@ def run_group(args, mode, workers, mtu, direction, root):
             if mode != "off":
                 daemon.send_signal(signal.SIGUSR2)
                 deadline = time.monotonic() + 3
+                mixed_df = any(n + 28 <= 1260 for n in lengths) and any(n + 28 > 1260 for n in lengths)
+                aggregate_expected = mode in ("udp", "auto") and segmented and len(lengths) > 1
                 while time.monotonic() < deadline:
                     after = gso_stats(log)
-                    aggregate_expected = mode in ("udp", "auto") and segmented and len(lengths) > 1
-                    if after and (after.get("udp_rx_aggregates", 0) > before.get("udp_rx_aggregates", 0)
-                                  if aggregate_expected else True):
-                        break
+                    if after and "udp_sw_segments" in after:
+                        if not aggregate_expected:
+                            break
+                        rx_ok = after.get("udp_rx_aggregates", 0) > before.get("udp_rx_aggregates", 0)
+                        if direction == "download" and mixed_df:
+                            tx_ok = after.get("udp_sw_segments", 0) > before.get("udp_sw_segments", 0)
+                        else:
+                            tx_ok = after.get("udp_tx_aggregates", 0) > before.get("udp_tx_aggregates", 0)
+                        if rx_ok and tx_ok:
+                            break
                     time.sleep(0.05)
                     # Worker counters publish on their interval; refresh the log
                     # snapshot rather than re-reading a pre-publication line.

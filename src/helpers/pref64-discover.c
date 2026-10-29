@@ -19,7 +19,15 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <strings.h>
 
+#define DNS_ERR_TRUNCATED (-2)
+#ifndef PREF64_DNS_PORT
+#define PREF64_DNS_PORT "53"
+#endif
 #define DEFAULT_DOMAIN "ipv4only.arpa"
 #define IPV4_WKA1_HEX 0xC00000AA /* 192.0.0.170 */
 #define IPV4_WKA2_HEX 0xC00000AB /* 192.0.0.171 */
@@ -47,9 +55,19 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     uint8_t res[16];
     memcpy(res, b, 16);
 
+    /* Exclude unspecified/IPv4-compatible, multicast and link-local space. */
+    static const uint8_t zero80[10] = {0};
+    static const uint8_t zero_prefix[16] = {0};
+    if ((memcmp(b, zero80, sizeof(zero80)) == 0 &&
+         ((b[10] == 0 && b[11] == 0) || (b[10] == 0xff && b[11] == 0xff))) ||
+        b[0] == 0xff || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80))
+        return -1;
+
     /* /96: IPv4 at bytes 12..15 */
     if (match_v4(&b[12], &b[13], &b[14], &b[15])) {
         res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 96;
         memcpy(out->s6_addr, res, 16);
         return 96;
@@ -58,6 +76,8 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     /* /64: byte 8 is u-octet (0), IPv4 at bytes 9..12, bytes 13..15 are 0 */
     if (match_v4(&b[9], &b[10], &b[11], &b[12])) {
         res[8] = res[9] = res[10] = res[11] = res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 64;
         memcpy(out->s6_addr, res, 16);
         return 64;
@@ -66,6 +86,8 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     /* /56: IPv4 byte 0 at byte 7; byte 8 is u-octet (0); IPv4 bytes 1..3 at bytes 9..11 */
     if (match_v4(&b[7], &b[9], &b[10], &b[11])) {
         res[7] = res[8] = res[9] = res[10] = res[11] = res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 56;
         memcpy(out->s6_addr, res, 16);
         return 56;
@@ -74,6 +96,8 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     /* /48: IPv4 bytes 0..1 at bytes 6..7; byte 8 is u-octet (0); IPv4 bytes 2..3 at bytes 9..10 */
     if (match_v4(&b[6], &b[7], &b[9], &b[10])) {
         res[6] = res[7] = res[8] = res[9] = res[10] = res[11] = res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 48;
         memcpy(out->s6_addr, res, 16);
         return 48;
@@ -82,6 +106,8 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     /* /40: IPv4 bytes 0..2 at bytes 5..7; byte 8 is u-octet (0); IPv4 byte 3 at byte 9 */
     if (match_v4(&b[5], &b[6], &b[7], &b[9])) {
         res[5] = res[6] = res[7] = res[8] = res[9] = res[10] = res[11] = res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 40;
         memcpy(out->s6_addr, res, 16);
         return 40;
@@ -90,6 +116,8 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     /* /32: IPv4 bytes 0..3 at bytes 4..7; byte 8 is u-octet (0) */
     if (match_v4(&b[4], &b[5], &b[6], &b[7])) {
         res[4] = res[5] = res[6] = res[7] = res[8] = res[9] = res[10] = res[11] = res[12] = res[13] = res[14] = res[15] = 0;
+        if (memcmp(res, zero_prefix, sizeof(res)) == 0)
+            return -1;
         *prefix_len = 32;
         memcpy(out->s6_addr, res, 16);
         return 32;
@@ -98,14 +126,27 @@ int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_
     return -1;
 }
 
-#include <fcntl.h>
-#include <strings.h>
+/* Skip a wire-format DNS name without following compression pointers. */
+static ssize_t skip_dns_name(const uint8_t *resp, size_t rlen, size_t pos)
+{
+    size_t length = 0;
+    while (pos < rlen) {
+        uint8_t b = resp[pos++];
+        if (!b) return (ssize_t)pos;
+        if ((b & 0xc0) == 0xc0)
+            return pos < rlen ? (ssize_t)(pos + 1) : -1;
+        if ((b & 0xc0) || pos + b > rlen || (length += b + 1) > 255)
+            return -1;
+        pos += b;
+    }
+    return -1;
+}
 
 /*
  * Parses and validates DNS response packet for RFC 7050 discovery.
  * Validates transaction ID, QR=1, TC=0, RCODE=0, QNAME, QTYPE=AAAA, QCLASS=IN,
  * and extracts synthesized IPv6 NAT64 prefix from AAAA answers.
- * Returns 0 on success (with out and prefix_len filled), or -1 on error/mismatch.
+ * Returns 0 on success, DNS_ERR_TRUNCATED for TC=1, or -1 on error/mismatch.
  */
 int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
                        const char *expected_domain, struct in6_addr *out, int *prefix_len)
@@ -121,9 +162,9 @@ int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
     if (!(resp[2] & 0x80))
         return -1;
 
-    /* TC must be 0 (not truncated) */
+    /* A truncated response may omit the question and answers. */
     if (resp[2] & 0x02)
-        return -1;
+        return DNS_ERR_TRUNCATED;
 
     /* RCODE must be 0 (NoError) */
     if ((resp[3] & 0x0F) != 0)
@@ -175,15 +216,9 @@ int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
 
     /* Skip any remaining questions if qdcount > 1 */
     for (uint16_t q = 1; q < qdcount; q++) {
-        while (pos < rlen && resp[pos] != 0) {
-            if ((resp[pos] & 0xC0) == 0xC0) {
-                pos += 2;
-                break;
-            }
-            pos += 1 + resp[pos];
-        }
-        if (pos < rlen && resp[pos] == 0)
-            pos++;
+        ssize_t next = skip_dns_name(resp, rlen, pos);
+        if (next < 0) return -1;
+        pos = (size_t)next;
         if (pos + 4 > rlen)
             return -1;
         pos += 4;
@@ -191,17 +226,9 @@ int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
 
     /* Iterate through answers */
     for (uint16_t i = 0; i < ancount && pos < rlen; i++) {
-        while (pos < rlen) {
-            if ((resp[pos] & 0xC0) == 0xC0) {
-                pos += 2;
-                break;
-            }
-            if (resp[pos] == 0) {
-                pos++;
-                break;
-            }
-            pos += 1 + resp[pos];
-        }
+        ssize_t next = skip_dns_name(resp, rlen, pos);
+        if (next < 0) return -1;
+        pos = (size_t)next;
         if (pos + 10 > rlen)
             break;
 
@@ -272,6 +299,7 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
     packet[1] = (uint8_t)(tx_id & 0xFF);
     packet[2] = 0x01; packet[3] = 0x00; /* RD=1 */
     packet[4] = 0x00; packet[5] = 0x01; /* QDCOUNT=1 */
+    packet[11] = 1; /* ARCOUNT=1 */
 
     size_t plen = 12;
     memcpy(&packet[plen], qname, qpos);
@@ -279,11 +307,16 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
     packet[plen++] = 0x00; packet[plen++] = 0x1c; /* QTYPE=AAAA (28) */
     packet[plen++] = 0x00; packet[plen++] = 0x01; /* QCLASS=IN (1) */
 
+    /* EDNS0 OPT, UDP payload 1232; no DNSSEC OK flag is needed for discovery. */
+    const uint8_t opt[] = {0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0};
+    memcpy(packet + plen, opt, sizeof(opt));
+    plen += sizeof(opt);
+
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(server, "53", &hints, &res) != 0 || !res)
+    if (getaddrinfo(server, PREF64_DNS_PORT, &hints, &res) != 0 || !res)
         return -1;
 
     int fd = socket(res->ai_family, SOCK_DGRAM, 0);
@@ -301,26 +334,72 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
         close(fd);
         return -1;
     }
-    freeaddrinfo(res);
-
     ssize_t sent = send(fd, packet, plen, 0);
     if (sent != (ssize_t)plen) {
         close(fd);
+        freeaddrinfo(res);
         return -1;
     }
 
-    uint8_t resp[1024];
+    uint8_t resp[65535];
     ssize_t rlen = recv(fd, resp, sizeof(resp), 0);
     close(fd);
 
-    if (rlen < 12)
-        return -1;
-
-    return parse_dns_response(resp, (size_t)rlen, tx_id, domain, out, prefix_len);
+    int result = rlen < 12 ? -1 : parse_dns_response(resp, (size_t)rlen, tx_id, domain, out, prefix_len);
+    if (result == DNS_ERR_TRUNCATED) {
+        fd = socket(res->ai_family, SOCK_STREAM, 0);
+        if (fd < 0) { freeaddrinfo(res); return -1; }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) goto tcp_fail;
+        if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+            if (errno != EINPROGRESS) goto tcp_fail;
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int err = 0; socklen_t errlen = sizeof(err);
+            if (poll(&pfd, 1, timeout_sec > 2147483 ? 2147483000 : timeout_sec * 1000) <= 0 ||
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err)
+                goto tcp_fail;
+        }
+        if (fcntl(fd, F_SETFL, flags) < 0) goto tcp_fail;
+        uint8_t frame[514];
+        frame[0] = (uint8_t)(plen >> 8); frame[1] = (uint8_t)plen;
+        memcpy(frame + 2, packet, plen);
+        size_t done = 0;
+        while (done < plen + 2) {
+            ssize_t n = send(fd, frame + done, plen + 2 - done, 0);
+            if (n <= 0) goto tcp_fail;
+            done += (size_t)n;
+        }
+        done = 0;
+        while (done < 2) {
+            ssize_t n = recv(fd, frame + done, 2 - done, 0);
+            if (n <= 0) goto tcp_fail;
+            done += (size_t)n;
+        }
+        size_t length = ((size_t)frame[0] << 8) | frame[1];
+        if (length > sizeof(resp)) goto tcp_fail;
+        done = 0;
+        while (done < length) {
+            ssize_t n = recv(fd, resp + done, length - done, 0);
+            if (n <= 0) goto tcp_fail;
+            done += (size_t)n;
+        }
+        result = parse_dns_response(resp, length, tx_id, domain, out, prefix_len);
+        if (result == DNS_ERR_TRUNCATED) result = -1;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return result;
+tcp_fail:
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
 }
 
 int main(int argc, char **argv)
 {
+    signal(SIGPIPE, SIG_IGN);
     const char *domain = DEFAULT_DOMAIN;
     const char *check_ip = NULL;
     const char *dns_server = NULL;

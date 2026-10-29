@@ -3,7 +3,90 @@
 import struct
 import unittest
 import importlib.util
+import socket
+import subprocess
+import tempfile
+import threading
+import shutil
 from pathlib import Path
+
+
+class Dns64RegressionTests(unittest.TestCase):
+    def test_unbound_validation_configuration(self):
+        root = Path(__file__).resolve().parents[2]
+        for name in ("container/rootfs/etc/unbound/unbound.conf.template",
+                     "container/rootfs/usr/local/sbin/nat64-start.sh"):
+            config = (root / name).read_text()
+            for directive in ("trust-anchor-file:", "harden-dnssec-stripped: yes",
+                              "edns-buffer-size: 1232", "max-udp-size: 1232"):
+                self.assertIn(directive, config, name)
+
+    def test_pref64_edns_tcp_fallback(self):
+        if not shutil.which("cc"):
+            self.skipTest("C compiler unavailable")
+        try:
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("127.0.0.1", 0))
+            port = udp.getsockname()[1]
+            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp.bind(("127.0.0.1", port))
+            tcp.listen(1)
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("127.0.0.1", port))
+            probe.close()
+        except OSError as exc:
+            if 'udp' in locals(): udp.close()
+            if 'tcp' in locals(): tcp.close()
+            if 'probe' in locals(): probe.close()
+            self.skipTest(f"loopback sockets unavailable: {exc}")
+        udp.settimeout(5)
+        tcp.settimeout(5)
+        errors = []
+
+        def read_exact(conn, count):
+            data = b""
+            while len(data) < count:
+                chunk = conn.recv(count - len(data))
+                if not chunk: raise EOFError("short DNS TCP frame")
+                data += chunk
+            return data
+
+        def server():
+            try:
+                query, peer = udp.recvfrom(2048)
+                assert query[11] == 1 and query[-11:] == bytes.fromhex("00002904d0000000000000")
+                udp.sendto(query[:2] + bytes.fromhex("83800000000000000000"), peer)
+                conn, _ = tcp.accept()
+                with conn:
+                    conn.settimeout(5)
+                    length = struct.unpack("!H", read_exact(conn, 2))[0]
+                    retry = read_exact(conn, length)
+                    assert retry == query
+                    answer = bytes.fromhex("c00c001c00010000003c0010") + socket.inet_pton(socket.AF_INET6, "64:ff9b::192.0.0.170")
+                    response = retry[:2] + bytes.fromhex("81800001000100000000") + retry[12:-11] + answer
+                    frame = struct.pack("!H", len(response)) + response
+                    for byte in frame:
+                        conn.sendall(bytes([byte]))
+            except Exception as exc:
+                errors.append(exc)
+
+        root = Path(__file__).resolve().parents[2]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                binary = str(Path(directory) / "pref64-discover")
+                subprocess.run(["cc", f'-DPREF64_DNS_PORT="{port}"',
+                                str(root / "src/helpers/pref64-discover.c"), "-o", binary], check=True)
+                worker = threading.Thread(target=server, daemon=True)
+                worker.start()
+                result = subprocess.run([binary, "-s", "127.0.0.1"], capture_output=True, text=True, timeout=8)
+                worker.join(6)
+                self.assertFalse(worker.is_alive(), "DNS server did not complete")
+                self.assertFalse(errors, str(errors))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "64:ff9b::/96")
+        finally:
+            udp.close()
+            tcp.close()
 
 
 class ProtocolPayloadOracleTests(unittest.TestCase):

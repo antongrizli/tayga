@@ -37,6 +37,8 @@ TAYGA_WORKERS="${TAYGA_WORKERS:-3}"
 TAYGA_OFFLOAD="${TAYGA_OFFLOAD:-auto}"
 TAYGA_OFFLINK_MTU="${TAYGA_OFFLINK_MTU:-1280}"
 DNS64_UPSTREAM="${DNS64_UPSTREAM:-1.1.1.1,8.8.8.8}"
+DNS64_DNSSEC="${DNS64_DNSSEC:-validate}"
+TRUST_ANCHOR_FILE="${DNS64_TRUST_ANCHOR_FILE:-/usr/share/dnssec-root/trusted-key.key}"
 DATA_DIR="${TAYGA_DATA_DIR:-/var/lib/tayga}"
 
 validate_uint "TAYGA_WORKERS" "$TAYGA_WORKERS"
@@ -84,10 +86,26 @@ ENABLE_DNS64="${ENABLE_DNS64:-yes}"
 
 # Generate unbound.conf for DNS64 if enabled
 if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
+  case "$DNS64_DNSSEC" in
+    validate)
+      if [ ! -r "$TRUST_ANCHOR_FILE" ]; then
+        echo "ERROR: DNSSEC trust anchor is missing or unreadable: $TRUST_ANCHOR_FILE" >&2
+        exit 1
+      fi
+      # Reject characters that could alter the generated Unbound configuration.
+      case "$TRUST_ANCHOR_FILE" in *[!a-zA-Z0-9_./-]*) echo "ERROR: Invalid trust anchor path" >&2; exit 64;; esac
+      UNBOUND_MODULES="dns64 validator iterator"
+      UNBOUND_DNSSEC_BLOCK="    trust-anchor-file: \"${TRUST_ANCHOR_FILE}\"
+    harden-dnssec-stripped: yes"
+      ;;
+    off) UNBOUND_MODULES="dns64 iterator"; UNBOUND_DNSSEC_BLOCK="" ;;
+    *) echo "ERROR: DNS64_DNSSEC must be 'validate' or 'off' (got '$DNS64_DNSSEC')" >&2; exit 64 ;;
+  esac
   mkdir -p "$TAYGA_RUNTIME_DIR"/unbound
   cat > "$TAYGA_RUNTIME_DIR/unbound.conf" <<CONF_EOF
 server:
     verbosity: 1
+    chroot: ""
     interface: 0.0.0.0
     interface: ::0
     port: 53
@@ -95,11 +113,14 @@ server:
     do-ip6: yes
     do-udp: yes
     do-tcp: yes
+    edns-buffer-size: 1232
+    max-udp-size: 1232
     access-control: 0.0.0.0/0 allow
     access-control: ::0/0 allow
-    module-config: "dns64 validator iterator"
+    module-config: "${UNBOUND_MODULES}"
     dns64-prefix: ${TAYGA_PREF64}
     dns64-synthall: no
+${UNBOUND_DNSSEC_BLOCK}
     hide-identity: yes
     hide-version: yes
     use-syslog: no
@@ -118,6 +139,7 @@ CONF_EOF
     fi
   done
   IFS="$OLD_IFS"
+  unbound-checkconf "$TAYGA_RUNTIME_DIR/unbound.conf"
 fi
 
 # Make tunnel adapter

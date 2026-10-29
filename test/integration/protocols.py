@@ -753,7 +753,7 @@ def sec_l3_edge_cases():
 # Section 10: Layer 7 Application Protocols Over UDP & TCP
 # ============================================================================
 def sec_l7_application_patterns():
-    global expect_sa, expect_da, expect_nh, expect_payload
+    global expect_sa, expect_da, expect_nh, expect_payload, expect_csum
     test.tayga_conf.default()
     test.reload()
 
@@ -817,6 +817,31 @@ def sec_l7_application_patterns():
     expect_payload = dns_query
     pkt6 = IPv6(src=str(test.public_ipv6), dst=str(test.public_ipv4_xlate)) / UDP(sport=53000, dport=53) / Raw(dns_query)
     test.send_and_check(pkt6, proto_ip4_val, "DNS over UDP 6->4 with EDNS0")
+
+    # DNSSEC DO=1 request and a large synthetic RRSIG answer. Compare both
+    # the opaque DNS bytes and the independently calculated UDP checksum.
+    question = b"\x07example\x03com\x00\x00\x01\x00\x01"
+    opt = bytes.fromhex("00002904d0000080000000")
+    dnssec_query = struct.pack("!HHHHHH", 0x4321, 0x0120, 1, 0, 0, 1) + question + opt
+    signature = bytes(range(256)) * 4 + bytes(range(76))
+    rrsig = bytes.fromhex("c00c002e00010000003c") + struct.pack("!H", len(signature)) + signature
+    dnssec_reply = struct.pack("!HHHHHH", 0x4321, 0x81a0, 1, 1, 0, 0) + question + rrsig
+    for payload, sport, dport in ((dnssec_query, 53002, 53), (dnssec_reply, 53, 53002)):
+        expect_payload = payload
+        expect_nh = 17
+        expect_sa, expect_da = test.public_ipv4_xlate, test.public_ipv6
+        expected = IPv6(bytes(IPv6(src=str(expect_sa), dst=str(expect_da)) /
+                              UDP(sport=sport, dport=dport) / Raw(payload)))
+        expect_csum = expected[UDP].chksum
+        pkt4 = IP(src=str(test.public_ipv4), dst=str(test.public_ipv6_xlate)) / UDP(sport=sport, dport=dport) / Raw(payload)
+        test.send_and_check(pkt4, proto_ip6_val, "DNSSEC UDP 4->6 bytes and checksum")
+        expect_sa, expect_da = test.public_ipv6_xlate, test.public_ipv4
+        expected = IP(bytes(IP(src=str(expect_sa), dst=str(expect_da)) /
+                            UDP(sport=sport, dport=dport) / Raw(payload)))
+        expect_csum = expected[UDP].chksum
+        pkt6 = IPv6(src=str(test.public_ipv6), dst=str(test.public_ipv4_xlate)) / UDP(sport=sport, dport=dport) / Raw(payload)
+        test.send_and_check(pkt6, proto_ip4_val, "DNSSEC UDP 6->4 bytes and checksum")
+    expect_csum = -1
 
     # DNS over TCP (Port 53): 2-byte length prefix + DNS query
     dns_tcp_msg = struct.pack("!H", len(dns_query)) + dns_query

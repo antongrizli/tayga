@@ -83,6 +83,8 @@ jobs:
           docker ps --filter "name=test-nat64" --filter "status=running" | grep test-nat64
           docker logs test-nat64 2>&1 | grep "TAYGA Unified NAT64"
           docker logs test-nat64 2>&1 | grep "start of service (unbound"
+          docker exec test-nat64 unbound-checkconf /run/unbound.conf
+          docker exec test-nat64 grep -q "trust-anchor-file:" /run/unbound.conf
           docker stop test-nat64
           docker rm test-nat64
 

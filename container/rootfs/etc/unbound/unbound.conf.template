@@ -1,6 +1,7 @@
 # Template for Unbound DNS64 in TAYGA NAT64 mode
 server:
     verbosity: 1
+    chroot: ""
     interface: 0.0.0.0
     interface: ::0
     port: 53
@@ -8,11 +9,15 @@ server:
     do-ip6: yes
     do-udp: yes
     do-tcp: yes
+    edns-buffer-size: 1232
+    max-udp-size: 1232
     access-control: 0.0.0.0/0 allow
     access-control: ::0/0 allow
     module-config: "dns64 validator iterator"
     dns64-prefix: 64:ff9b::/96
     dns64-synthall: no
+    trust-anchor-file: "/usr/share/dnssec-root/trusted-key.key"
+    harden-dnssec-stripped: yes
     hide-identity: yes
     hide-version: yes
     use-syslog: no

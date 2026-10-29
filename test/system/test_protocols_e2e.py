@@ -375,6 +375,81 @@ s.close()
     print(f"[PASS] TCP Stream Integrity Verified (SHA-256 = {expected_hash[:16]}...)")
 
 
+def test_dnssec_large_udp_and_tcp_fallback():
+    print("\n--- DNSSEC large UDP and TCP fallback through CLAT ---")
+    # These records exercise DNS wire framing and payload integrity; their
+    # synthetic signatures are deliberately not cryptographic validation tests.
+    common = r"""
+import socket, struct
+question = b"\x07example\x03com\x00\x00\x30\x00\x01"
+query = struct.pack("!HHHHHH", 0x1234, 0x0120, 1, 0, 0, 1) + question + bytes.fromhex("0000291000000080000000")
+def response(size):
+    signature = bytes(range(256)) * (size // 256 + 1)
+    header = struct.pack("!HHHHHH", 0x1234, 0x81a0, 1, 1, 0, 0) + question
+    record = bytes.fromhex("c00c002e00010000003c")
+    count = size - len(header) - len(record) - 2
+    return header + record + struct.pack("!H", count) + signature[:count]
+def read_exact(sock, count):
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk: raise EOFError("short DNS TCP frame")
+        data += chunk
+    return data
+"""
+    server_script = common + r"""
+u = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+t = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+u.bind(("64:ff9b::b00:2", 53)); t.bind(("64:ff9b::b00:2", 53)); t.listen(1)
+u.settimeout(10); t.settimeout(10)
+print("ready", flush=True)
+data, peer = u.recvfrom(4096)
+assert data == query
+u.sendto(response(1800), peer)
+data, peer = u.recvfrom(4096)
+assert data == query
+u.sendto(query[:2] + bytes.fromhex("83800000000000000000"), peer)
+conn, _ = t.accept()
+with conn:
+    conn.settimeout(10)
+    length = struct.unpack("!H", read_exact(conn, 2))[0]
+    assert read_exact(conn, length) == query
+    answer = response(3000)
+    conn.sendall(struct.pack("!H", len(answer)) + answer)
+u.close(); t.close()
+"""
+    client_script = common + r"""
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(10); u.connect(("11.0.0.2", 53))
+u.send(query)
+assert u.recv(4096) == response(1800)
+u.send(query)
+truncated = u.recv(4096)
+assert truncated[2] & 2
+with socket.create_connection(("11.0.0.2", 53), timeout=10) as conn:
+    conn.sendall(struct.pack("!H", len(query)) + query)
+    length = struct.unpack("!H", read_exact(conn, 2))[0]
+    assert read_exact(conn, length) == response(3000)
+u.close()
+"""
+    srv = subprocess.Popen(["ip", "netns", "exec", "server", sys.executable, "-c", server_script],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        ready, _, _ = select.select([srv.stdout], [], [], 10)
+        if not ready or srv.stdout.readline().strip() != "ready":
+            raise AssertionError("DNSSEC test server failed to start")
+        cli = subprocess.run(["ip", "netns", "exec", "client", sys.executable, "-c", client_script],
+                             capture_output=True, text=True, timeout=30)
+        _, err = srv.communicate(timeout=12)
+        assert cli.returncode == 0, f"DNSSEC client failed: {cli.stderr}"
+        assert srv.returncode == 0, f"DNSSEC server failed: {err}"
+    finally:
+        if srv.poll() is None:
+            srv.kill()
+            srv.communicate()
+    print("[PASS] DNSSEC UDP reassembly and TCP retry payloads verified")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default=None, help="Path to tayga executable")
@@ -434,6 +509,7 @@ def main():
                 test_stun_rfc5389()
                 test_passive_ftp_emulation()
                 test_tcp_stream_integrity()
+                test_dnssec_large_udp_and_tcp_fallback()
                 print("\nAll End-to-End Protocol Tests PASSED Successfully!")
             finally:
                 if tayga is not None and tayga.poll() is None:
