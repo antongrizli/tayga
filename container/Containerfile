@@ -35,6 +35,7 @@ RUN apk add --no-cache \
     ethtool \
     tini \
     unbound \
+    dnssec-root \
     ca-certificates \
     && apk list -I > /etc/tayga-build-manifest.txt \
     && rm -rf /var/cache/apk/*

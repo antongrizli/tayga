@@ -72,6 +72,16 @@ int main(void)
     /* /32: prefix bytes 0..3, b[4..7]=v4[0..3], b[8]=u=0, b[9..15]=0 */
     test_case("2001:db8:c000:aa::", "2001:db8::", 32);
 
+    test_case("0:0:c000:aa::", NULL, -1); /* zero /32 */
+    test_case("0:0:c0:0:aa::", NULL, -1); /* zero /40 */
+    test_case("::c000:0:aa00:0:0", NULL, -1); /* zero /48 */
+    test_case("::c0:0:aa:0:0", NULL, -1); /* zero /56 */
+    test_case("::c0:0:aa00:0", NULL, -1); /* zero /64 */
+    test_case("::192.0.0.170", NULL, -1);
+    test_case("::ffff:192.0.0.170", NULL, -1);
+    test_case("fe80::192.0.0.170", NULL, -1);
+    test_case("ff02::192.0.0.170", NULL, -1);
+
     /* Negative cases: normal non-NAT64 IPv6 addresses */
     test_case("2001:db8::1", NULL, -1);
     test_case("fe80::1", NULL, -1);
@@ -147,7 +157,7 @@ int main(void)
     /* Test 4: TC=1 (truncated) */
     pkt[2] |= 0x02;
     ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
-    assert(ret == -1);
+    assert(ret == -2);
     pkt[2] &= ~0x02;
     printf("PASS: parse_dns_response TC=1 rejected\n");
 
@@ -164,10 +174,10 @@ int main(void)
     printf("PASS: parse_dns_response QNAME mismatch rejected\n");
 
     /* Test 7: QTYPE mismatch */
-    pkt[27] = 0x01; /* QTYPE = A (1) instead of AAAA (28) */
+    pkt[28] = 0x01; /* QTYPE = A (1) instead of AAAA (28) */
     ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
     assert(ret == -1);
-    pkt[27] = 0x1c; /* Restore QTYPE = AAAA */
+    pkt[28] = 0x1c; /* Restore QTYPE = AAAA */
     printf("PASS: parse_dns_response QTYPE mismatch rejected\n");
 
     /* Test 8: Truncated packet buffer */
@@ -176,11 +186,28 @@ int main(void)
     printf("PASS: parse_dns_response truncated length rejected\n");
 
     /* Test 9: Invalid AAAA rdlen (e.g. 4 bytes instead of 16) */
-    pkt[39] = 0x04; /* rdlen = 4 */
+    pkt[42] = 0x04; /* rdlen = 4 */
     ret = parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p);
     assert(ret == -1);
-    pkt[39] = 0x10; /* Restore rdlen = 16 */
+    pkt[42] = 0x10; /* Restore rdlen = 16 */
     printf("PASS: parse_dns_response invalid rdlen rejected\n");
+
+    /* Malformed answer names and unrelated records preceding the AAAA. */
+    pkt[31] = 0xc0;
+    assert(parse_dns_response(pkt, 32, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == -1);
+    pkt[31] = 0x40;
+    assert(parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == -1);
+    pkt[31] = 0x80;
+    assert(parse_dns_response(pkt, valid_len, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == -1);
+    pkt[31] = 0xc0;
+    memmove(pkt + 31 + 76, pkt + 31, valid_len - 31);
+    memset(pkt + 31, 0, 76);
+    pkt[31] = 0xc0; pkt[32] = 0x0c;
+    pkt[34] = 46; pkt[36] = 1; pkt[42] = 64;
+    pkt[7] = 2;
+    assert(parse_dns_response(pkt, valid_len + 76, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == 0);
+    pkt[34] = 5; /* CNAME */
+    assert(parse_dns_response(pkt, valid_len + 76, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == 0);
 
     printf("All unit_pref64 tests passed successfully!\n");
     return 0;

@@ -179,3 +179,7 @@ records process-relative perf data after the warm-up window; warm-up artifacts
 are kept below `warmup-<direction>/` and measured artifacts below
 `<direction>/`. Docker Desktop on
 macOS may not expose perf; it writes a `perf-unavailable.txt` artifact instead.
+
+### DNS64 and DNSSEC
+
+In NAT64 mode, the bundled DNS64 resolver validates DNSSEC by default using the root trust anchor installed in the container. Set `DNS64_DNSSEC=off` to disable validation when needed, or `DNS64_TRUST_ANCHOR_FILE` to use a different readable Unbound trust anchor file. The packaged root anchor is maintained through image updates; keep the container image current for root key rollovers. DNS64 synthesis can produce unsigned answers, so a validating client may require its own DNS64 strategy. The resolver advertises a 1232-byte EDNS UDP limit and supports TCP.
