@@ -1,5 +1,5 @@
 # Stage 1: Build environment
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS build-env
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS build-env
 
 ARG TAYGA_VERSION=""
 ARG TAYGA_COMMIT=""
@@ -18,7 +18,7 @@ COPY ./ ./
 RUN make clean && make static pref64-discover VERSION="${TAYGA_VERSION}" COMMIT="${TAYGA_COMMIT}" BRANCH="${TAYGA_BRANCH}" && strip tayga pref64-discover
 
 # Stage 2: Unified Minimal Production Base Image
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS production
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS production
 
 ARG TAYGA_VERSION="unknown"
 ARG TAYGA_COMMIT="unknown"
