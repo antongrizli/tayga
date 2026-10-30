@@ -46,13 +46,14 @@ if [ -n "$active" ]; then
     fi
 fi
 
+# Perform coordinated installation
+export TAYGA_PACKAGE_UPGRADE=1
+
 # Unlock solver pin if on Alpine APK
 if [ "$kind" = apk ] && [ -f "$lib/package-lock.sh" ]; then
     sh "$lib/package-lock.sh" unlock || :
 fi
 
-# Perform coordinated installation
-export TAYGA_PACKAGE_UPGRADE=1
 upgrade_ok=yes
 case "$kind" in
     deb) dpkg --force-confold -i "$pkg" || upgrade_ok=no ;;
@@ -86,6 +87,8 @@ if [ "$was_active" = yes ] && [ -n "$active" ] && [ -f "$state/$active.conf" ]; 
     fi
     if [ -x "$lib/tayga-verify" ]; then
         "$lib/tayga-verify" "$state/$active.conf" || fail "Readiness verification failed after upgrade for $active"
+    elif [ -f "$lib/tayga-verify.sh" ]; then
+        sh "$lib/tayga-verify.sh" "$state/$active.conf" || fail "Readiness verification failed after upgrade for $active"
     fi
 fi
 

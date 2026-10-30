@@ -10,7 +10,13 @@ if [ "$action" = apply ]; then
 fi
 if [ "$action" = upgrade ]; then
     [ "$#" -eq 2 ] || { echo 'Usage: tayga-ctl upgrade PACKAGE_FILE' >&2; exit 2; }
-    exec sh "$lib/tayga-package-upgrade.sh" apply "$2"
+    if [ -f "$lib/tayga-package-upgrade" ]; then
+        exec sh "$lib/tayga-package-upgrade" apply "$2"
+    elif [ -f "$lib/tayga-package-upgrade.sh" ]; then
+        exec sh "$lib/tayga-package-upgrade.sh" apply "$2"
+    else
+        echo 'tayga-package-upgrade helper not found' >&2; exit 1
+    fi
 fi
 if [ "$action" = recover ]; then
     [ "$(id -u)" -eq 0 ] || { echo 'Recovery requires root' >&2; exit 1; }

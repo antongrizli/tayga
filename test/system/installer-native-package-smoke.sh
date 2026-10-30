@@ -58,7 +58,7 @@ if install_package "$second" > "$work/blocked.log" 2>&1; then cat "$work/blocked
 [ "$(package_version)" = "$before" ]
 
 # Coordinated live upgrade succeeds with the configured profile retained.
-sh /usr/libexec/tayga/tayga-package-upgrade apply "$second"
+/usr/sbin/tayga-ctl upgrade "$second"
 [ "$(package_version)" != "$before" ]
 [ -f "$state/nat64.conf" ]
 rm "$state/nat64.conf"

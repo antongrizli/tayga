@@ -155,12 +155,25 @@ if [ "$os" = FreeBSD ]; then
         done
         uplink6=$(route -n get -inet6 default 2>/dev/null | awk '$1=="interface:" {print $2}')
     fi
+    if [ -z "$uplink6" ]; then
+        uplink6=$(route -n get default 2>/dev/null | awk '$1=="interface:" {print $2}')
+    fi
+    if [ -z "$uplink6" ]; then
+        for iface in $(ifconfig -l 2>/dev/null || :); do
+            case "$iface" in lo*|tun*|tap*|bridge*) continue ;; esac
+            uplink6=$iface
+            break
+        done
+    fi
     case "$uplink6" in ''|*[!a-zA-Z0-9_.:-]*) fail 'An IPv6 default-route interface is required' ;; esac
     set_sysctl net.inet6.ip6.accept_rtadv 1
     set_sysctl net.inet.ip.forwarding 1
     set_sysctl net.inet6.ip6.forwarding 1
 else
-    uplink6=$(ip -6 route show default | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    uplink6=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    if [ -z "$uplink6" ]; then
+        uplink6=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    fi
     case "$uplink6" in ''|*[!a-zA-Z0-9_.:-]*) fail 'An IPv6 default-route interface is required' ;; esac
     set_sysctl net.ipv6.conf.all.accept_ra 2
     set_sysctl "net.ipv6.conf.$uplink6.accept_ra" 2
