@@ -719,3 +719,48 @@ logical client, then explicitly checks its IPv6 address. This uses QEMU's RA
 responder, not a dedicated DHCPv6 lease server. CI repeats the APK matrix with
 TCG and uploads phase/serial logs and the JSON report, including failures.
 The local 25.12.6 TCG verification also passed the complete matrix.
+
+OpenWrt r7 adds the optional `tayga-managed-openwrt-upgrade` package. Install it
+alongside an r7-or-newer compatible base/procd/network set before using coordinated
+updates. It owns the coordinator and an independent boot recovery hook (START=94),
+so replacing the other three packages cannot remove the recovery program. Core
+archives must declare upgrade API 1; the first transition from older packages
+requires an ordinary stopped installation of the new baseline.
+
+Prepare two directories containing `base.ipk`, `procd.ipk`, `network.ipk` (or
+`.apk` for all three). The old directory must contain the exact installed package
+versions; the new directory must contain one matching target revision. Keep the
+independent coordinator installed; it is deliberately outside the updated set.
+
+```sh
+/usr/libexec/tayga/openwrt-upgrade apply /root/tayga-old /root/tayga-new
+# Explicit opt-in for local unsigned APK test builds:
+/usr/libexec/tayga/openwrt-upgrade apply /root/tayga-old /root/tayga-new --allow-untrusted
+# Retry an interrupted transaction manually:
+/usr/libexec/tayga/openwrt-upgrade recover
+```
+
+Preflight validates package identities, installed rollback revisions and both
+manager plans. Plans touching other packages are rejected. An upgrade mutex and
+profile lock protect staging; the service stops and its writer PID exits before
+configuration/data snapshots are taken. Both package sets and snapshots are
+checksummed in `/etc/tayga-managed/package-upgrade` on persistent overlay. Reserve
+flash space for both sets, the data snapshot and package-manager working space.
+
+Package hooks run normally, but start/reload/restart and profile publication are
+fenced while the journal exists. Only the coordinator can start the accepted
+snapshot for validation. Previously active services resume with readiness checks;
+previously stopped services remain stopped. Candidate-file edits are not imported.
+An installation or validation failure reinstalls the old set and restores its own
+UCI file, accepted configuration and data. Boot recovery retries an interrupted
+transaction before the normal service. A failed recovery retains the journal and
+startup fence. Removing/updating the recovery package during a transaction is
+refused. This updates TAYGA packages, not firmware or unrelated dependencies.
+
+The VM upgrade fixtures build the same source at a next-patch test version; that
+version is not a published release. Tests cover invalid archives, rejected plans
+for unrelated packages, manager and readiness failures, a power cut after target
+installation with core files removed, accepted-state/data recovery, active upgrade
+and stopped reinstall. Final verification status is recorded with the r7 build
+manifests. The crash test exercises that specific package/file interruption point;
+it does not certify arbitrary corruption of the package database or flash.

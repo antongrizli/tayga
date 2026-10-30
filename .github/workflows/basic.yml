@@ -136,6 +136,7 @@ jobs:
           echo 'CONFIG_PACKAGE_tayga-managed-openwrt=m' >> /tmp/openwrt-sdk/.config
           echo 'CONFIG_PACKAGE_tayga-managed-openwrt-procd=m' >> /tmp/openwrt-sdk/.config
           echo 'CONFIG_PACKAGE_tayga-managed-openwrt-network=m' >> /tmp/openwrt-sdk/.config
+          echo 'CONFIG_PACKAGE_tayga-managed-openwrt-upgrade=m' >> /tmp/openwrt-sdk/.config
           make -C /tmp/openwrt-sdk defconfig
           make -C /tmp/openwrt-sdk package/tayga-managed-openwrt/compile V=s -j2
       - name: Install, execute and remove in disposable OpenWrt rootfs
@@ -151,6 +152,8 @@ jobs:
           sudo mkdir -p /tmp/openwrt-service-rootfs
           sudo tar -xzf /tmp/openwrt-rootfs.tar.gz -C /tmp/openwrt-service-rootfs
           sudo sh test/system/installer-openwrt-service-state-smoke.sh /tmp/openwrt-service-rootfs "$base" "$service" /tmp/openwrt-kmod-tun.ipk /tmp/openwrt-flock.ipk
+      - name: Save baseline and build the next-patch upgrade fixture
+        run: sh scripts/ci/prepare-openwrt-upgrade-fixture.sh /tmp/openwrt-sdk /tmp/openwrt-baseline
       - name: Boot real OpenWrt and test procd, managed netifd/fw4 and boot recovery
         run: |
           base=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt_*.ipk')
@@ -159,15 +162,21 @@ jobs:
           test -n "$network"
           python3 test/system/run-openwrt-vm.py --accel tcg \
             --kernel /tmp/openwrt-kernel.bin --image /tmp/openwrt-squashfs.img.gz \
-            --base "$base" --procd "$service" --tun /tmp/openwrt-kmod-tun.ipk \
-            --network "$network" --flock /tmp/openwrt-flock.ipk \
+            --base /tmp/openwrt-baseline/base.ipk --procd /tmp/openwrt-baseline/procd.ipk \
+            --network /tmp/openwrt-baseline/network.ipk --upgrader /tmp/openwrt-baseline/upgrader.ipk \
+            --tun /tmp/openwrt-kmod-tun.ipk \
+            --upgrade-base "$base" --upgrade-procd "$service" --upgrade-network "$network" \
+            --flock /tmp/openwrt-flock.ipk \
             --extra-package /tmp/openwrt-coreutils.ipk --extra-package /tmp/openwrt-timeout.ipk \
             --work "$RUNNER_TEMP/openwrt-procd-vm"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: openwrt-procd-vm-report
+          name: openwrt-24.10.8-upgrade-test-evidence
           path: |
+            /tmp/openwrt-baseline/*
+            /tmp/openwrt-sdk/bin/packages/**/tayga-managed-openwrt*.ipk
+            /tmp/openwrt-sdk/package/tayga-managed-openwrt/source-manifest.json
             ${{ runner.temp }}/openwrt-procd-vm/report.json
             ${{ runner.temp }}/openwrt-procd-vm/*.log
           if-no-files-found: warn
@@ -213,7 +222,7 @@ jobs:
           printf '%s\n' '# CONFIG_ALL is not set' '# CONFIG_ALL_KMODS is not set' '# CONFIG_ALL_NONSHARED is not set' > /tmp/apk-sdk/.config
           make -C /tmp/apk-sdk defconfig
           python3 scripts/prepare-openwrt-package.py --sdk /tmp/apk-sdk --target armsr --subtarget armv8 --architecture aarch64_generic --version "$(cat VERSION)"
-          for package in tayga-managed-openwrt tayga-managed-openwrt-procd tayga-managed-openwrt-network; do
+          for package in tayga-managed-openwrt tayga-managed-openwrt-procd tayga-managed-openwrt-network tayga-managed-openwrt-upgrade; do
             echo "CONFIG_PACKAGE_$package=m" >> /tmp/apk-sdk/.config
           done
           make -C /tmp/apk-sdk defconfig
@@ -229,6 +238,8 @@ jobs:
           done
           sudo sh test/system/installer-openwrt-package-smoke.sh /tmp/apk-rootfs-binary "$base" /tmp/kmod-tun.apk
           sudo sh test/system/installer-openwrt-service-state-smoke.sh /tmp/apk-rootfs-service "$base" "$service" /tmp/kmod-tun.apk /tmp/flock.apk
+      - name: Save baseline and build the next-patch APK upgrade fixture
+        run: sh scripts/ci/prepare-openwrt-upgrade-fixture.sh /tmp/apk-sdk /tmp/apk-baseline
       - name: Boot OpenWrt 25.12.6 and verify APK hooks and networking
         run: |
           base=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-[0-9]*.apk')
@@ -236,15 +247,18 @@ jobs:
           network=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-network-*.apk')
           python3 test/system/run-openwrt-vm.py --release 25.12.6 --accel tcg \
             --kernel /tmp/apk-kernel.bin --image /tmp/apk-squashfs.img.gz \
-            --base "$base" --procd "$service" --network "$network" \
+            --base /tmp/apk-baseline/base.apk --procd /tmp/apk-baseline/procd.apk \
+            --network /tmp/apk-baseline/network.apk --upgrader /tmp/apk-baseline/upgrader.apk \
+            --upgrade-base "$base" --upgrade-procd "$service" --upgrade-network "$network" \
             --tun /tmp/kmod-tun.apk --flock /tmp/flock.apk \
             --extra-package /tmp/coreutils.apk --extra-package /tmp/timeout.apk \
             --work "$RUNNER_TEMP/openwrt-apk-vm"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: openwrt-25.12.6-apk-packages
+          name: openwrt-25.12.6-upgrade-test-evidence
           path: |
+            /tmp/apk-baseline/*
             /tmp/apk-sdk/bin/packages/**/tayga-managed-openwrt*.apk
             /tmp/apk-sdk/package/tayga-managed-openwrt/source-manifest.json
             ${{ runner.temp }}/openwrt-apk-vm/report.json

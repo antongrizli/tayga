@@ -206,6 +206,7 @@ class OpenWrtServiceTests(unittest.TestCase):
         script = (ROOT / 'packaging/openwrt/tayga-managed.init').read_text()
         script = script.replace('/usr/libexec/tayga/openwrt-state', 'sh ' + str(self.helper))
         script = script.replace('/usr/libexec/tayga/openwrt-uplink', str(self.bin / 'uplink'))
+        script = script.replace('/etc/tayga-managed/package-upgrade', str(self.state / 'package-upgrade'))
         script = script.replace('/var/run/tayga-managed', str(self.root / 'run/tayga-managed'))
         harness = self.root / 'service.sh'
         harness.write_text('extra_command() { :; }\n' + script + '''
@@ -223,6 +224,34 @@ start() { start_service; }
                               'TEST_CANDIDATE': str(self.candidate), 'TEST_UPLINK': uplink,
                               'TEST_UPLINK_RESULT': uplink_result,
                               'TEST_UPLINK_INFO': 'wan0 0123456789abcdef'}, capture_output=True, text=True)
+
+    def test_pending_package_upgrade_fences_normal_start(self):
+        previous = self.prepare()
+        marker = self.state / 'package-upgrade'
+        for kind in ('directory', 'file', 'symlink'):
+            with self.subTest(kind=kind):
+                if kind == 'directory': marker.mkdir()
+                elif kind == 'file': marker.write_text('broken journal')
+                else: marker.symlink_to(self.state / 'missing')
+                result = self.service('start_service')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('open:', result.stdout)
+                self.assertEqual((self.state / 'active.conf').read_text(), previous)
+                if kind == 'directory': marker.rmdir()
+                else: marker.unlink()
+
+    def test_profile_publication_is_fenced_by_package_journal(self):
+        previous = self.prepare()
+        (self.state / 'package-upgrade').mkdir()
+        self.candidate.write_text(self.candidate.read_text() + '# changed candidate\n')
+        result = self.run_helper('prepare', self.candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Package upgrade pending', result.stderr)
+        self.assertEqual((self.state / 'active.conf').read_text(), previous)
+        result = self.service('reload_service')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('open:', result.stdout)
+        self.assertEqual((self.state / 'active.conf').read_text(), previous)
 
     def test_procd_disabled_and_enabled_command_contract(self):
         result = self.service('start_service', enabled='0')
@@ -350,6 +379,7 @@ start() { start_service; }
         script = script.replace('/usr/libexec/tayga/openwrt-state', 'sh ' + str(self.helper))
         script = script.replace('/usr/libexec/tayga/openwrt-uplink', str(self.bin / 'uplink'))
         script = script.replace('/usr/libexec/tayga/openwrt-network', str(net_helper))
+        script = script.replace('/etc/tayga-managed/package-upgrade', str(self.state / 'package-upgrade'))
         script = script.replace('/var/run/tayga-managed', str(self.root / 'run/tayga-managed'))
         harness = self.root / 'managed-service.sh'
         harness.write_text('extra_command() { :; }\n' + script + '''

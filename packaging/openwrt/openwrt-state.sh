@@ -58,6 +58,9 @@ case "$action:$#" in
     rollback:1) network_mode=$1; set -- ;;
 esac
 case "$network_mode" in external|managed) ;; *) exit 2 ;; esac
+if [ "$action" = prepare ] && { [ -e "$state/package-upgrade" ] || [ -L "$state/package-upgrade" ]; }; then
+    fail 'Package upgrade pending; profile publication is fenced'
+fi
 recover
 case "$action" in
     recover) [ "$#" -eq 0 ] || exit 2 ;;

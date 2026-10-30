@@ -1,12 +1,20 @@
 #!/bin/sh /etc/rc.common
 # OpenWrt ash supports local; these variables are consumed by rc.common.
 # shellcheck disable=SC2034,SC3043
+# Reject before rc.common opens an empty procd update, which would stop main.
+if { [ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]; } && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+	case "${action:-}" in
+		uplink_changed) exit 0 ;;
+		start|reload|restart) logger -t tayga-managed 'Package upgrade pending; startup fenced'; exit 1 ;;
+	esac
+fi
 USE_PROCD=1
 START=95
 STOP=10
 extra_command uplink_changed 'Reconcile a selected netifd uplink event'
 
 configured_path() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then return 1; fi
 	local enabled network candidate
 	config_load tayga_managed || return 1
 	config_get_bool enabled main enabled 0
@@ -21,12 +29,23 @@ configured_path() {
 	TAYGA_MANAGED_SWITCH=1 /usr/libexec/tayga/openwrt-state prepare "$candidate" "$network"
 }
 
+package_upgrade_pending() {
+	[ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]
+}
+
 boot() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+		/usr/libexec/tayga/openwrt-upgrade recover || return 1
+	fi
 	# A reboot uses the accepted snapshot, never a half-applied source edit.
 	TAYGA_OPENWRT_BOOT=1 start
 }
 
 start_service() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+		logger -t tayga-managed 'Package upgrade pending; startup fenced'
+		return 1
+	fi
 	local config failed=0 uplink info result network inside inside_info network_owner=
 	TAYGA_COMMIT_STATE=0
 	TAYGA_NETWORK_ROLLBACK=0

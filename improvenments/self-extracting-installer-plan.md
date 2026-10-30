@@ -467,7 +467,7 @@ Managed CLAT routing, DNS и traffic-readiness rollback остаются сле�
 2. IPv6 `/128`: Linux iptables/nftables реализован; расширить на FreeBSD/pf и firewalld, автоматическое выделение рассматривать отдельно.
 3. Fallback реализован; расширить CPU CI-матрицу и публикуемые бинарники при необходимости.
 4. Зависимости и базовые unsigned APK/DEB/RPM реализованы; далее подпись/публикация, расширение CPU-матрицы и отдельная стратегия live upgrade.
-5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. В r6 проверены native APK SDK/rootfs 25.12.6 и booted HVF/TCG gates. Далее live package upgrade и расширение DHCPv6/RA/CPU-матрицы.
+5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. В r6 проверены native APK SDK/rootfs 25.12.6 и booted HVF/TCG gates. В r7 реализован coordinated live package upgrade/recovery для IPK/APK с независимым recovery package; HVF/TCG gates обеих веток пройдены. Далее dedicated DHCPv6 server и расширение CPU-матрицы.
 6. Полная CI-матрица, install/upgrade/remove и релизные артефакты.
 
 
@@ -537,3 +537,40 @@ TCG-прогон APK также пройден. Portable OpenWrt: 17 тесто�
 Итог: финальные HVF/TCG reports 25.12.6 и HVF regression 24.10.8 сверены
 с одинаковыми r6-пакетами каждой ветки и текущими runner/guest test hashes.
 Manifests и SHA256SUMS обновлены. Следующий этап — live package upgrade/recovery.
+
+
+### Coordinated OpenWrt package upgrade/recovery r7 (2026-10-30)
+
+Добавлен отдельный optional `tayga-managed-openwrt-upgrade`: coordinator и
+независимый boot recovery START=94 не заменяются вместе с base/procd/network.
+Требуется совместимая baseline с core upgrade API 1 (r7+); первый переход с r6
+выполняется обычной установкой при остановленном сервисе. Архивы old должны
+совпадать с установленными ревизиями всех трёх пакетов; new — один согласованный
+набор. Локальные unsigned APK требуют явного --allow-untrusted.
+
+Preflight проверяет идентичность, версии, планы обоих менеджеров; посторонние
+изменения зависимостей отклоняются до остановки процесса. Package mutex и profile
+lock защищают snapshot; перед копированием данных ожидается завершение writer PID.
+В persistent journal хранятся оба набора архивов, SHA256SUMS, accepted config,
+собственный UCI и data snapshot. Start/reload/restart и profile publication fenced;
+активный сервис возобновляется с accepted snapshot, остановленный не активируется.
+При ошибке установки/валидации выполняется откат пакетов и данных. Recovery
+повторяемый; ошибка сохраняет журнал и блокирует startup. Удаление координатора
+во время операции запрещено. Firmware/системные зависимости не обновляются.
+
+В VM-матрицу добавлены corrupt archive, unrelated package plan, manager failure,
+readiness failure, power cut после установки target с удалёнными core init/state/
+бинарником, boot recovery, успешный active upgrade и stopped reinstall. Fixture
+собирается из тех же исходников с test next-patch version, не как новый релиз.
+Финальные HVF/TCG-прогоны r7 для IPK 24.10.8 и APK 25.12.6 пройдены целиком,
+включая прежние NAT64/DNS64/SIIT/CLAT, forwarded traffic и remove gates. Хеши
+baseline/fixture-пакетов, исходников и runner/guest tests сверены с reports.
+Portable: 84 теста, 2 пропуска; OpenWrt subset: 19. ShellCheck и YAML пройдены.
+Manifests и SHA256SUMS: `build/openwrt/{24.10.8,25.12.6}/armsr-armv8/r7/`
+и соседние `upgrade-fixture-0.9.15-r7/`. Fixture не является релизом.
+Произвольная порча package DB/flash не покрыта; GitHub CI отдельно не проверялся.
+
+Следующие этапы по порядку:
+1. Dedicated DHCPv6 lease-server fixture и смена lease/prefix в OpenWrt VM.
+2. Расширение CPU/build/install матрицы OpenWrt и native APK/DEB/RPM.
+3. Стратегия live upgrade для native пакетов, подпись и публикация релизных артефактов.

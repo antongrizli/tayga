@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tayga-managed-openwrt
 PKG_VERSION:=@VERSION@
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=LICENSE
 PKG_BUILD_PARALLEL:=1
@@ -34,6 +34,7 @@ define Package/tayga-managed-openwrt-procd
   SECTION:=net
   CATEGORY:=Network
   TITLE:=TAYGA optional procd service for externally prepared networking
+  PROVIDES:=tayga-openwrt-core-upgrade-api-1
   DEPENDS:=+tayga-managed-openwrt
   EXTRA_DEPENDS:=$(call tayga_exact_dep,tayga-managed-openwrt), $(call tayga_runtime_dep,procd), $(call tayga_runtime_dep,uci), $(call tayga_runtime_dep,flock), $(call tayga_runtime_dep,netifd), $(call tayga_runtime_dep,jshn)
 endef
@@ -68,6 +69,27 @@ define Package/tayga-managed-openwrt-network/prerm
 if [ -d /var/run/tayga-managed/network ]; then
 	/etc/init.d/tayga-managed stop || exit 1
 fi
+exit 0
+endef
+
+define Package/tayga-managed-openwrt-upgrade
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=TAYGA independent package upgrade and boot recovery coordinator
+  DEPENDS:=+tayga-managed-openwrt-network
+  EXTRA_DEPENDS:=tayga-managed-openwrt-procd $(if $(CONFIG_USE_APK),(>=$(PKG_VERSION)-r$(PKG_RELEASE)),(>= $(PKG_VERSION)-r$(PKG_RELEASE)))
+endef
+
+define Package/tayga-managed-openwrt-upgrade/description
+  Stable coordinator for replacing the base/procd/network package set.
+  Retains previous archives and accepted state; boot recovery runs before TAYGA.
+endef
+
+define Package/tayga-managed-openwrt-upgrade/prerm
+#!/bin/sh
+[ -n "$$IPKG_INSTROOT" ] && exit 0
+if [ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]; then exit 1; fi
+flock -n /var/lock/tayga-package-upgrade.lock true || exit 1
 exit 0
 endef
 
@@ -106,6 +128,7 @@ define Package/tayga-managed-openwrt-procd/install
 	$(INSTALL_BIN) ./source/packaging/openwrt/tayga-managed.init $(1)/etc/init.d/tayga-managed
 	$(INSTALL_CONF) ./source/packaging/openwrt/tayga_managed.config $(1)/etc/config/tayga_managed
 	$(INSTALL_BIN) ./source/packaging/openwrt/openwrt-state.sh $(1)/usr/libexec/tayga/openwrt-state
+	echo 1 > $(1)/usr/libexec/tayga/core-upgrade-api
 	$(INSTALL_BIN) ./source/packaging/openwrt/openwrt-uplink.sh $(1)/usr/libexec/tayga/openwrt-uplink
 	$(INSTALL_DATA) ./source/packaging/openwrt/tayga-managed.hotplug $(1)/etc/hotplug.d/iface/95-tayga-managed
 endef
@@ -118,6 +141,14 @@ define Package/tayga-managed-openwrt-network/install
 	$(foreach chain,forward output srcnat,$(INSTALL_DIR) $(1)/usr/share/nftables.d/chain-pre/$(chain); $(INSTALL_DATA) ./source/packaging/openwrt/fw4-$(chain).nft $(1)/usr/share/nftables.d/chain-pre/$(chain)/95-tayga-managed.nft;)
 endef
 
+define Package/tayga-managed-openwrt-upgrade/install
+	$(INSTALL_DIR) $(1)/usr/libexec/tayga $(1)/etc/init.d
+	$(INSTALL_BIN) ./source/packaging/openwrt/openwrt-upgrade.sh $(1)/usr/libexec/tayga/openwrt-upgrade
+	$(INSTALL_BIN) ./source/packaging/openwrt/tayga-package-recovery.init $(1)/etc/init.d/tayga-package-recovery
+	echo 1 > $(1)/usr/libexec/tayga/package-upgrade-api
+endef
+
 $(eval $(call BuildPackage,tayga-managed-openwrt))
 $(eval $(call BuildPackage,tayga-managed-openwrt-procd))
 $(eval $(call BuildPackage,tayga-managed-openwrt-network))
+$(eval $(call BuildPackage,tayga-managed-openwrt-upgrade))

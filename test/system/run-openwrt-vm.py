@@ -127,7 +127,7 @@ class VM:
         print('Running ' + name, flush=True)
         command = command or ('TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh ' + name)
         try:
-            result = self.run_ssh(command, timeout=480 if name == 'managed' else 120, check=False)
+            result = self.run_ssh(command, timeout=480 if name == 'managed' or 'upgrade' in name else 120, check=False)
         except subprocess.TimeoutExpired as error:
             (self.work / (name + '.log')).write_bytes(error.output or b'')
             diagnostics = self.run_ssh('logread; ubus call service list; ip addr; ip route; ip -6 route', check=False)
@@ -157,6 +157,10 @@ class VM:
         names = ['kernel', 'image', 'base', 'procd', 'tun', 'flock']
         if self.args.network:
             names.append('network')
+        if getattr(self.args, 'upgrader', None):
+            names.append('upgrader')
+        if getattr(self.args, 'upgrade_base', None):
+            names.extend(['upgrade_base', 'upgrade_procd', 'upgrade_network'])
         for name in names:
             path = getattr(self.args, name)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -193,8 +197,11 @@ class VM:
                      shlex.quote(self.args.release) + ' && command -v ' + self.release['manager'])
         archive = self.work / 'inputs.tar'
         with tarfile.open(archive, 'w') as bundle:
-            for name in ['base', 'procd', 'tun', 'flock'] + (['network'] if self.args.network else []):
+            for name in ['base', 'procd', 'tun', 'flock'] + (['network'] if self.args.network else []) + (['upgrader'] if self.args.upgrader else []):
                 bundle.add(getattr(self.args, name), arcname=('kmod-tun' if name == 'tun' else name) + self.release['suffix'])
+            if self.args.upgrade_base:
+                for role in ('base', 'procd', 'network'):
+                    bundle.add(getattr(self.args, 'upgrade_' + role), arcname='next-' + role + self.release['suffix'])
             bundle.add(Path(__file__).with_name('installer-openwrt-procd-smoke.sh'), arcname='test.sh')
             for index, path in enumerate(self.args.extra_package):
                 bundle.add(path, arcname=f'extra-{index}' + self.release['suffix'])
@@ -220,6 +227,20 @@ class VM:
         powercut_id = self.wait_ssh(previous=reboot_id)
         self.phase('check-powercut', 'TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh check-boot')
         self.instance('after_powercut')
+        if self.args.upgrade_base:
+            self.phase('upgrade-failure')
+            self.phase('upgrade-readiness-failure')
+            self.phase('arm-upgrade-powercut')
+            self.process.kill()
+            self.process.wait(timeout=10)
+            time.sleep(0.5)
+            self.start()
+            upgrade_boot = self.wait_ssh(previous=powercut_id)
+            self.phase('check-upgrade-recovery')
+            self.phase('upgrade-success')
+            self.report['upgrade_recovery_boot'] = upgrade_boot
+            self.report['upgrade_powercut'] = 'QEMU SIGKILL after target package installation, before upgrade confirmation'
+            self.instance('after_upgrade')
         if self.args.network:
             self.phase('managed')
         self.phase('remove')
@@ -247,11 +268,19 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--release', choices=tuple(RELEASES), default='24.10.8')
     parser.add_argument('--qemu', default='qemu-system-aarch64')
+    parser.add_argument('--upgrader', type=Path, help='Independent baseline upgrade coordinator package')
     parser.add_argument('--network', type=Path, help='Optional managed netifd/fw4 package (adds isolated test NIC)')
     parser.add_argument('--extra-package', type=Path, action='append', default=[], help='Offline dependency archive; may be repeated')
+    for role in ('base', 'procd', 'network'):
+        parser.add_argument('--upgrade-' + role, type=Path, help='Optional target package; supply all three')
     parser.add_argument('--accel', choices=('auto', 'hvf', 'kvm', 'tcg'), default='auto')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
+    if args.upgrader and not args.network:
+        parser.error('--upgrader requires --network')
+    upgrade_count = sum(getattr(args, 'upgrade_' + role) is not None for role in ('base', 'procd', 'network'))
+    if upgrade_count not in (0, 3) or (upgrade_count and (not args.network or not args.upgrader)):
+        parser.error('Upgrade tests require --network, --upgrader and all three --upgrade-* packages')
     if not 0 <= args.port <= 65535:
         parser.error('invalid loopback port')
     for command in (args.qemu, 'ssh', 'ssh-keygen'):

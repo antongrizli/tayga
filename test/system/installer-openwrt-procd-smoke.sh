@@ -37,11 +37,17 @@ wait_running() {
 }
 one_owner() {
     running
-    # pidof is provided by BusyBox on the test firmware.
-    # Split its numeric PID list to reject more than one owner.
-    # shellcheck disable=SC2046
-    set -- $(pidof tayga)
-    [ "$#" -eq 1 ] && [ "$1" = "$(pid)" ]
+    # Validation helpers have the same comm but do not own packet I/O.
+    owners=0; owner=
+    for process in $(pidof tayga || :); do
+        cmd=$(tr '\000' ' ' < "/proc/$process/cmdline" 2>/dev/null || :)
+        [ -n "$cmd" ] || continue
+        case " $cmd " in
+            *' --check-config '*|*' --mktun '*|*' --rmtun '*|*' --check-offload '*|*' --help '*) continue ;;
+        esac
+        owners=$((owners+1)); owner=$process
+    done
+    [ "$owners" = 1 ] && [ "$owner" = "$(pid)" ]
 }
 stopped() {
     for _ in $(seq 1 20); do
@@ -88,6 +94,73 @@ check_boot() {
     [ -f /sys/class/net/tun64/tun_flags ]
     "$service" status
 }
+upgrade() {
+    if [ "$package_ext" = apk ]; then
+        /usr/libexec/tayga/openwrt-upgrade apply "$1" "$2" --allow-untrusted
+    else /usr/libexec/tayga/openwrt-upgrade apply "$1" "$2"; fi
+}
+check_versions() {
+    if [ "$package_ext" = apk ]; then
+        version=$(apk adbdump "$1/base.apk" | awk '$1=="version:" {print $2; exit}')
+        for pkg in tayga-managed-openwrt tayga-managed-openwrt-procd tayga-managed-openwrt-network; do
+            apk info --exists "$pkg=$version"
+        done
+    else
+        version=$(tar -xzOf "$1/base.ipk" ./control.tar.gz | tar -xzOf - ./control | awk '$1=="Version:" {print $2; exit}')
+        for pkg in tayga-managed-openwrt tayga-managed-openwrt-procd tayga-managed-openwrt-network; do
+            [ "$(opkg status "$pkg" | awk '$1=="Version:" {print $2; exit}')" = "$version" ]
+        done
+    fi
+}
+wrap_manager() {
+    if [ "$package_ext" = apk ]; then manager_path=$(command -v apk); else manager_path=$(command -v opkg); fi
+    echo "$manager_path" > "$state/upgrade-manager.path"
+    cp "$manager_path" "$state/upgrade-manager.real"
+    cat > "$manager_path" <<'EOF'
+#!/bin/sh
+case "$*" in *--simulate*|*--noaction*)
+    mode=$(cat /etc/tayga-procd-test/upgrade-fault 2>/dev/null || :)
+    case "$mode" in
+        plan-apk) echo '(1/1) Upgrading busybox (1 -> 2)' ;;
+        plan-ipk) echo 'Upgrading busybox on root from 1 to 2...' ;;
+        *) mode= ;;
+    esac
+    if [ -n "$mode" ]; then rm /etc/tayga-procd-test/upgrade-fault; exit 0; fi
+    ;;
+esac
+case "$*" in *'/package-upgrade/new/base.'*)
+    mode=$(cat /etc/tayga-procd-test/upgrade-fault 2>/dev/null || :)
+    if [ -n "$mode" ]; then
+        /etc/tayga-procd-test/upgrade-manager.real "$@" || exit $?
+        rm /etc/tayga-procd-test/upgrade-fault
+        if [ "$mode" = fail ]; then exit 1; fi
+        if [ "$mode" = verify ]; then
+            cp /usr/libexec/tayga/openwrt-network /etc/tayga-procd-test/upgrade-network.real
+            cat > /usr/libexec/tayga/openwrt-network <<'VERIFY_EOF'
+#!/bin/sh
+if [ "${TAYGA_NETWORK_LIBRARY:-}" = 1 ]; then
+    . /etc/tayga-procd-test/upgrade-network.real
+    return
+fi
+[ "$1" != verify ] || exit 1
+exec /etc/tayga-procd-test/upgrade-network.real "$@"
+VERIFY_EOF
+            exit 0
+        fi
+        # Emulate missing core files during an interrupted unpack. The independent
+        # recovery package must repair them before the main init can run.
+        rm -f /etc/init.d/tayga-managed /usr/libexec/tayga/openwrt-state /usr/sbin/tayga
+        touch /etc/tayga-procd-test/upgrade-cut-ready
+        sync
+        while :; do sleep 10; done
+    fi
+    ;;
+esac
+exec /etc/tayga-procd-test/upgrade-manager.real "$@"
+EOF
+    chmod 755 "$manager_path"
+}
+restore_manager() { cp "$state/upgrade-manager.real" "$(cat "$state/upgrade-manager.path")"; }
 case "$phase" in
     install)
         packages=${2:?Package directory required}
@@ -99,6 +172,17 @@ case "$phase" in
         if [ -f "$packages/extra-0.$package_ext" ]; then package_install "$packages"/extra-*.$package_ext; fi
         package_install "$packages/base.$package_ext" "$packages/procd.$package_ext"
         if [ -f "$packages/network.$package_ext" ]; then package_install "$packages/network.$package_ext"; fi
+        if [ -f "$packages/upgrader.$package_ext" ]; then
+            package_install "$packages/upgrader.$package_ext"
+            /etc/init.d/tayga-package-recovery enabled
+        fi
+        if [ -f "$packages/next-base.$package_ext" ]; then
+            mkdir "$state/upgrade-old" "$state/upgrade-new"
+            for role in base procd network; do
+                cp "$packages/$role.$package_ext" "$state/upgrade-old/$role.$package_ext"
+                cp "$packages/next-$role.$package_ext" "$state/upgrade-new/$role.$package_ext"
+            done
+        fi
         [ "$(uci -q get tayga_managed.main.enabled)" = 0 ]
         stopped
         mkdir -p "$state/data"
@@ -305,6 +389,139 @@ EOF
         check_boot
         echo 'PASS: real boot restored accepted snapshot and persistent data'
         ;;
+    upgrade-failure)
+        "$service" stop
+        stopped
+        uci set network.tayga_testwan.device=eth1
+        uci set network.tayga_testwan.ipaddr=10.0.3.15
+        uci set network.tayga_testwan.netmask=255.255.255.0
+        uci set network.tayga_testwan.ip6addr='fd42:3::15/64'
+        uci -q delete network.tayga_testwan.ip6prefix || :
+        uci commit network
+        ubus call network reload
+        ifup tayga_testwan
+        sh /usr/libexec/tayga/configure.sh --mode=nat64 --pref64=fd64:100::/96 \
+            --tayga-ipv6=fd64::2 --tun-ipv6=fd64::1 --offload=off --workers=0 \
+            --output=/etc/tayga/upgrade.conf
+        uci set tayga_managed.main.network_mode=managed
+        uci set tayga_managed.main.inside=lan
+        uci set tayga_managed.main.config=/etc/tayga/upgrade.conf
+        uci commit tayga_managed
+        "$service" start
+        wait_running
+        one_owner
+        cp /etc/tayga-managed/active.conf "$state/upgrade.accepted"
+        echo upgrade-retained > /etc/tayga-managed/data/upgrade-retained
+        ping -6 -c 1 -W 3 -I fd64::1 fd64:100::a00:302
+        first=$(pid)
+        mkdir "$state/upgrade-bad"
+        cp "$state/upgrade-new/"* "$state/upgrade-bad/"
+        echo corrupt > "$state/upgrade-bad/procd.$package_ext"
+        if upgrade "$state/upgrade-old" "$state/upgrade-bad"; then exit 1; fi
+        [ "$(pid)" = "$first" ]
+        [ ! -e /etc/tayga-managed/package-upgrade ]
+        wrap_manager
+        echo "plan-$package_ext" > "$state/upgrade-fault"
+        if upgrade "$state/upgrade-old" "$state/upgrade-new"; then exit 1; fi
+        [ ! -f "$state/upgrade-fault" ]
+        [ "$(pid)" = "$first" ]
+        [ ! -e /etc/tayga-managed/package-upgrade ]
+        restore_manager
+        wrap_manager
+        echo fail > "$state/upgrade-fault"
+        if upgrade "$state/upgrade-old" "$state/upgrade-new"; then exit 1; fi
+        [ ! -f "$state/upgrade-fault" ]
+        restore_manager
+        check_versions "$state/upgrade-old"
+        wait_running
+        one_owner
+        cmp "$state/upgrade.accepted" /etc/tayga-managed/active.conf
+        grep -q upgrade-retained /etc/tayga-managed/data/upgrade-retained
+        [ ! -e /etc/tayga-managed/package-upgrade ]
+        ping -6 -c 1 -W 3 -I fd64::1 fd64:100::a00:302
+        first=$(pid)
+        /usr/libexec/tayga/openwrt-upgrade recover
+        [ "$(pid)" = "$first" ]
+        echo 'PASS: malformed upgrade preflight preserves service; manager failure restores old packages and traffic'
+        ;;
+    upgrade-readiness-failure)
+        wrap_manager
+        echo verify > "$state/upgrade-fault"
+        if upgrade "$state/upgrade-old" "$state/upgrade-new"; then exit 1; fi
+        [ ! -f "$state/upgrade-fault" ]
+        restore_manager
+        check_versions "$state/upgrade-old"
+        wait_running
+        one_owner
+        [ ! -e /etc/tayga-managed/package-upgrade ]
+        cmp "$state/upgrade.accepted" /etc/tayga-managed/active.conf
+        ping -6 -c 1 -W 3 -I fd64::1 fd64:100::a00:302
+        echo 'PASS: failed target readiness restores previous packages and managed traffic'
+        ;;
+    arm-upgrade-powercut)
+        rm -f "$state/upgrade-cut-ready"
+        wrap_manager
+        echo cut > "$state/upgrade-fault"
+        cat /proc/sys/kernel/random/boot_id > "$state/upgrade.boot.before"
+        # The manager wrapper pauses only after the new packages are installed.
+        TAYGA_ISOLATED_TEST=yes sh "$0" run-upgrade > "$state/upgrade-background.log" 2>&1 </dev/null &
+        for _ in $(seq 1 120); do
+            if [ -f "$state/upgrade-cut-ready" ]; then
+                [ -d /etc/tayga-managed/package-upgrade ]
+                sync
+                echo 'PASS: power cut armed after target package installation, before confirmation'
+                exit 0
+            fi
+            sleep 1
+        done
+        cat "$state/upgrade-background.log" >&2
+        exit 1
+        ;;
+    run-upgrade) upgrade "$state/upgrade-old" "$state/upgrade-new" ;;
+    check-upgrade-recovery)
+        [ "$(cat "$state/upgrade.boot.before")" != "$(cat /proc/sys/kernel/random/boot_id)" ]
+        for _ in $(seq 1 90); do
+            [ -d /etc/tayga-managed/package-upgrade ] || break
+            sleep 1
+        done
+        [ ! -e /etc/tayga-managed/package-upgrade ]
+        restore_manager
+        check_versions "$state/upgrade-old"
+        # START=90 could not create test-only external TUNs while tayga was absent.
+        /etc/init.d/tayga-test-tun start
+        ifup tayga_testwan
+        wait_running
+        one_owner
+        cmp "$state/upgrade.accepted" /etc/tayga-managed/active.conf
+        grep -q upgrade-retained /etc/tayga-managed/data/upgrade-retained
+        ping -6 -c 1 -W 3 -I fd64::1 fd64:100::a00:302
+        echo 'PASS: reboot recovered previous package set, accepted config, data and managed traffic'
+        ;;
+    upgrade-success)
+        echo invalid >> /etc/tayga/upgrade.conf
+        upgrade "$state/upgrade-old" "$state/upgrade-new"
+        check_versions "$state/upgrade-new"
+        wait_running
+        one_owner
+        cmp "$state/upgrade.accepted" /etc/tayga-managed/active.conf
+        grep -q upgrade-retained /etc/tayga-managed/data/upgrade-retained
+        ping -6 -c 1 -W 3 -I fd64::1 fd64:100::a00:302
+        "$service" stop
+        upgrade "$state/upgrade-new" "$state/upgrade-new"
+        sleep 2
+        stopped
+        [ ! -f /var/run/tayga-managed/armed ]
+        "$service" boot
+        wait_running
+        "$service" stop
+        uci set tayga_managed.main.network_mode=external
+        uci set tayga_managed.main.config=/etc/tayga/managed.conf
+        uci commit tayga_managed
+        cp "$state/accepted.conf" /etc/tayga/managed.conf
+        "$service" start
+        wait_running
+        echo 'PASS: active upgrade and stopped reinstall preserve activation policy and accepted snapshot'
+        ;;
     managed)
         "$service" stop
         stopped
@@ -504,6 +721,7 @@ EOF
         wait "$echo_pid" 2>/dev/null || :
         ip -6 route del fd64:100::/96 dev twan0 metric 128 2>/dev/null || :
         rm -f /tmp/tayga-dns64.hosts
+        if [ -f /usr/libexec/tayga/package-upgrade-api ]; then package_remove tayga-managed-openwrt-upgrade; fi
         package_remove tayga-managed-openwrt-network
         stopped
         [ ! -e /sys/class/net/tmg0 ]
@@ -525,6 +743,7 @@ EOF
         "$service" stop
         stopped
         [ -f /sys/class/net/tun64/tun_flags ]
+        if [ -f /usr/libexec/tayga/package-upgrade-api ]; then package_remove tayga-managed-openwrt-upgrade; fi
         package_remove tayga-managed-openwrt-procd
         [ "$(uci -q get tayga_managed.main.enabled)" = 1 ]
         [ -f /etc/tayga-managed/active.conf ]

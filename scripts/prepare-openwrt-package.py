@@ -34,7 +34,7 @@ def prepare(sdk, target, subtarget, architecture, version):
     inputs += sorted(path for path in (ROOT / 'src').rglob('*') if path.suffix in ('.c', '.h'))
     inputs += [ROOT / 'packaging/openwrt' / name for name in
                ('tayga-managed.init', 'tayga_managed.config', 'openwrt-state.sh',
-                'openwrt-uplink.sh', 'tayga-managed.hotplug', 'openwrt-network.sh',
+                'tayga-package-recovery.init', 'openwrt-upgrade.sh', 'openwrt-uplink.sh', 'tayga-managed.hotplug', 'openwrt-network.sh',
                 'tayga-managed.proto', 'fw4-forward.nft', 'fw4-output.nft', 'fw4-srcnat.nft')]
     inputs += [ROOT / 'packaging/installer/configure.sh']
     hashes = {}
