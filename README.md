@@ -1,11 +1,7 @@
 # TAYGA
 
-[![Latest GitHub Release](https://img.shields.io/github/v/release/antongrizli/tayga?logo=github)](https://github.com/antongrizli/tayga/releases) [![Container Registry](https://img.shields.io/badge/ghcr.io-antongrizli%2Ftayga-blue?logo=docker)](https://github.com/antongrizli/tayga/pkgs/container/tayga)
-[![License: GPL-2.0](https://img.shields.io/github/license/antongrizli/tayga?color=blue)](https://github.com/antongrizli/tayga/blob/main/LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20FreeBSD-informational)](README.md)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-brightgreen)](https://github.com/antongrizli/tayga/releases)
-[![Open Issues](https://img.shields.io/github/issues/antongrizli/tayga)](https://github.com/antongrizli/tayga/issues)
-[![Open PRs](https://img.shields.io/github/issues-pr/antongrizli/tayga)](https://github.com/antongrizli/tayga/pulls)
+[![Latest GitHub Release](https://img.shields.io/github/v/release/antongrizli/tayga?logo=github)](https://github.com/antongrizli/tayga/releases) [![Container Registry](https://img.shields.io/badge/ghcr.io-antongrizli%2Ftayga-blue?logo=docker)](https://github.com/antongrizli/tayga/pkgs/container/tayga) [![License: GPL-2.0](https://img.shields.io/github/license/antongrizli/tayga?color=blue)](https://github.com/antongrizli/tayga/blob/main/LICENSE) [![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20FreeBSD-informational)](README.md) [![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-brightgreen)](https://github.com/antongrizli/tayga/releases) 
+[![Open Issues](https://img.shields.io/github/issues/antongrizli/tayga)](https://github.com/antongrizli/tayga/issues) [![Open PRs](https://img.shields.io/github/issues-pr/antongrizli/tayga)](https://github.com/antongrizli/tayga/pulls)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/antongrizli/badge.svg)](https://hub.xerj.org/contributors/antongrizli)
 
 TAYGA is an out-of-kernel stateless NAT64 implementation for Linux and FreeBSD.  It uses the TUN driver to exchange packets with the kernel, which is the same driver used by OpenVPN and QEMU/KVM.  TAYGA needs no kernel patches or out-of-tree modules on either Linux or FreeBSD.
