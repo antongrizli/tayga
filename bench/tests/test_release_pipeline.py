@@ -83,6 +83,16 @@ class ReleaseArtifactsTests(unittest.TestCase):
                                       'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
             self.manifests[arch] = manifest
             (directory / 'manifest.json').write_text(json.dumps(manifest))
+        for arch in artifacts.FREEBSD_ARCHES:
+            directory = self.inputs / f'candidate-freebsd-{arch}'
+            directory.mkdir()
+            names = [f'tayga-freebsd-{arch}', f'pref64-discover-freebsd-{arch}']
+            for name in names:
+                (directory / name).write_text(name)
+            manifest = {'version': self.source['version'], 'sha': self.source['sha'],
+                        'platform': f'freebsd-{arch}', 'smoke': 'pass',
+                        'files': {n: artifacts.sha256(directory / n) for n in names}}
+            (directory / 'manifest.json').write_text(json.dumps(manifest))
 
     def test_missing_corrupt_or_mixed_artifacts_rejected(self):
         directory = self.inputs / 'candidate-arm64'
@@ -103,6 +113,13 @@ class ReleaseArtifactsTests(unittest.TestCase):
         import shutil
         shutil.copytree(ROOT / 'deploy/mikrotik', self.root / 'deploy/mikrotik')
         shutil.copytree(ROOT / 'scripts', self.root / 'scripts')
+        shutil.copytree(ROOT / 'packaging', self.root / 'packaging')
+        shutil.copytree(ROOT / 'docs/man', self.root / 'docs/man')
+        shutil.copytree(ROOT / 'src', self.root / 'src')
+        shutil.copytree(ROOT / 'mk', self.root / 'mk')
+        shutil.copy2(ROOT / 'Makefile', self.root / 'Makefile')
+        shutil.copy2(ROOT / 'LICENSE', self.root / 'LICENSE')
+        (self.root / 'VERSION').write_text('1.2.3\n')
         (self.root / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
         output = self.root / 'assets'
         artifacts.assemble(self.root, self.inputs, output, self.source)
@@ -110,8 +127,21 @@ class ReleaseArtifactsTests(unittest.TestCase):
                       (output / 'routeros-install-clat.rsc').read_text())
         self.assertIn('A release fix.', (output / 'release-notes.md').read_text())
         self.assertIn('release-manifest.json', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-linux-universal.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-universal.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-freebsd-amd64.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-freebsd-arm64.sh', (output / 'SHA256SUMS').read_text())
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
+
+    def test_freebsd_hash_and_source_mismatch_rejected(self):
+        directory = self.inputs / 'candidate-freebsd-arm64'
+        artifacts.verify_freebsd(directory, 'arm64', self.source)
+        with self.assertRaises(ValueError):
+            artifacts.verify_freebsd(directory, 'arm64', {**self.source, 'sha': 'f' * 40})
+        (directory / 'tayga-freebsd-arm64').write_text('corrupt')
+        with self.assertRaises(ValueError):
+            artifacts.verify_freebsd(directory, 'arm64', self.source)
 
     def publication_fixture(self):
         directory = self.root / 'publish'

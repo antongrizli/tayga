@@ -12,6 +12,7 @@ import time
 import zipfile
 
 ARCHES = ('amd64', 'arm64', 'armv7')
+FREEBSD_ARCHES = ('amd64', 'arm64')
 PROFILES = ('production', 'clat', 'nat64')
 
 
@@ -118,6 +119,19 @@ def verify(directory, arch, source):
     return data
 
 
+def verify_freebsd(directory, arch, source):
+    data = json.loads((directory / 'manifest.json').read_text())
+    expected = {f'tayga-freebsd-{arch}', f'pref64-discover-freebsd-{arch}'}
+    if (data.get('version') != source['version'] or data.get('sha') != source['sha'] or
+            data.get('platform') != f'freebsd-{arch}' or data.get('smoke') != 'pass' or
+            set(data.get('files', {})) != expected):
+        raise ValueError(f'FreeBSD {arch}: invalid source or smoke evidence')
+    for name, digest in data['files'].items():
+        if not re.fullmatch('[0-9a-f]{64}', digest) or sha256(directory / name) != digest:
+            raise ValueError(f'FreeBSD {arch}: hash mismatch: {name}')
+    return data
+
+
 def assemble(root, inputs, output, source):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
@@ -129,6 +143,30 @@ def assemble(root, inputs, output, source):
         for name in manifests[arch]['files']:
             if name.endswith('.tar') or '-linux-' in name:
                 shutil.copy2(directory / name, output / name)
+    builder = root / 'scripts/build-installer.py'
+    platforms = []
+    for arch in ARCHES:
+        directory = inputs / f'candidate-{arch}'
+        args = ['--platform', f'linux-{arch}', str(directory / f'tayga-linux-{arch}'),
+                str(directory / f'pref64-discover-linux-{arch}')]
+        subprocess.run(['python3', str(builder), '--version', source['version'],
+                        '--output', str(output / f'tayga-installer-linux-{arch}.sh'), *args], check=True)
+        platforms.extend(args)
+    subprocess.run(['python3', str(builder), '--version', source['version'],
+                    '--output', str(output / 'tayga-installer-linux-universal.sh'), *platforms], check=True)
+    freebsd = {}
+    for arch in FREEBSD_ARCHES:
+        directory = inputs / f'candidate-freebsd-{arch}'
+        freebsd[arch] = verify_freebsd(directory, arch, source)
+        for name in freebsd[arch]['files']:
+            shutil.copy2(directory / name, output / name)
+        args = ['--platform', f'freebsd-{arch}', str(directory / f'tayga-freebsd-{arch}'),
+                str(directory / f'pref64-discover-freebsd-{arch}')]
+        subprocess.run(['python3', str(builder), '--version', source['version'],
+                        '--output', str(output / f'tayga-installer-freebsd-{arch}.sh'), *args], check=True)
+        platforms.extend(args)
+    subprocess.run(['python3', str(builder), '--version', source['version'],
+                    '--output', str(output / 'tayga-installer-universal.sh'), *platforms], check=True)
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp)
         for path in (root / 'deploy/mikrotik').iterdir():
@@ -150,7 +188,7 @@ def assemble(root, inputs, output, source):
             for path in sorted(staging.iterdir()):
                 archive.write(path, path.name)
     (output / 'release-manifest.json').write_text(json.dumps(
-        {'source': source, 'architectures': manifests}, indent=2) + '\n')
+        {'source': source, 'architectures': manifests, 'freebsd': freebsd}, indent=2) + '\n')
     changelog = (root / 'CHANGELOG.md').read_text()
     notes = re.search(rf"^## \[{re.escape(source['version'])}\].*?\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
     if not notes or not notes.group(1).strip():

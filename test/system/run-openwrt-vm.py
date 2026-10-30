@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Boot a disposable OpenWrt 24.10.8 VM and test real procd/overlay lifecycle.
+
+No shared host folders, external guest networking or non-loopback listeners.
+Every run requires a new work directory and retains its disk/logs/report.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shlex
+import shutil
+import socket
+import subprocess
+import tarfile
+import time
+import zlib
+
+PINNED = {
+    'kernel': 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e',
+    'image': '9013deabf64ddd93bd2039b1b469a595c48201d611a9885afffd050053d063a5',
+    'tun': '9bbbf77e4762077d8bd49602ccb1fff1767c0e540de9f24507dcc5355f150caa',
+    'flock': 'a0718db1870b45db97dbfe79f0a53ed6fe784a92520be08024a1da7a84edfa17',
+}
+
+
+class VM:
+    def __init__(self, args):
+        self.args = args
+        self.work = args.work.resolve()
+        self.work.mkdir(mode=0o700, parents=True, exist_ok=False)
+        self.process = None
+        self.serial = (self.work / 'serial.log').open('wb')
+        self.report = {'openwrt': '24.10.8', 'target': 'armsr/armv8', 'passed': False,
+                       'inputs': {}, 'phases': [], 'supervised_instances': {}}
+        self.port = args.port
+        if not self.port:
+            with socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                self.port = listener.getsockname()[1]
+        self.key = self.work / 'test-key'
+        self.ssh = ['ssh', '-F', os.devnull, '-i', str(self.key), '-p', str(self.port), '-o', 'BatchMode=yes',
+                    '-o', 'IdentitiesOnly=yes', '-o', 'LogLevel=ERROR',
+                    '-o', 'StrictHostKeyChecking=accept-new',
+                    '-o', 'UserKnownHostsFile=' + str(self.work / 'known_hosts'),
+                    '-o', 'ConnectTimeout=2', 'root@127.0.0.1']
+
+    def run_ssh(self, command, timeout=120, check=True, stdin=None):
+        result = subprocess.run(self.ssh + [command], stdin=stdin, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=timeout)
+        if check and result.returncode:
+            raise RuntimeError(f'SSH command failed ({result.returncode}): {command}\n' + result.stdout.decode(errors='replace'))
+        return result
+
+    def start(self):
+        accel = self.args.accel
+        if accel == 'auto':
+            if platform.system() == 'Darwin' and platform.machine() == 'arm64':
+                accel = 'hvf'
+            elif platform.machine() in ('aarch64', 'arm64') and os.access('/dev/kvm', os.R_OK | os.W_OK):
+                accel = 'kvm'
+            else:
+                accel = 'tcg'
+        command = [self.args.qemu, '-machine', 'virt', '-accel', accel,
+                   '-cpu', 'host' if accel in ('hvf', 'kvm') else 'cortex-a72',
+                   '-smp', '2', '-m', '512', '-kernel', str(self.args.kernel.resolve()),
+                   '-append', 'root=/dev/vda2 rootwait console=ttyAMA0',
+                   '-drive', f'file={self.work / "disk.raw"},format=raw,if=virtio',
+                   '-netdev', f'user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:22',
+                   '-device', 'virtio-net-pci,netdev=net0', '-device', 'virtio-rng-pci',
+                   '-display', 'none', '-serial', 'stdio', '-monitor', 'none']
+        if self.args.network:
+            command += ['-netdev', 'user,id=net1,restrict=on,net=10.0.3.0/24,ipv6-net=fd42:3::/64,ipv6-host=fd42:3::2',
+                        '-device', 'virtio-net-pci,netdev=net1']
+        self.report['qemu_command'] = command
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=self.serial, stderr=subprocess.STDOUT)
+
+    def alive(self):
+        if self.process.poll() is not None:
+            raise RuntimeError('QEMU exited; inspect serial.log')
+
+    def console(self, command):
+        self.alive()
+        self.process.stdin.write((command + '\n').encode())
+        self.process.stdin.flush()
+
+    def wait_serial(self, needle, timeout=120, activate=False):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.alive()
+            if needle in (self.work / 'serial.log').read_text(errors='replace'):
+                return
+            if activate:
+                self.console('')
+            time.sleep(0.5)
+        raise TimeoutError('Boot console timed out; inspect serial.log')
+
+    def wait_ssh(self, previous=None, timeout=150):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.alive()
+            try:
+                result = self.run_ssh('cat /proc/sys/kernel/random/boot_id', timeout=5, check=False)
+            except subprocess.TimeoutExpired:
+                time.sleep(1)
+                continue
+            boot_id = result.stdout.decode(errors='replace').strip()
+            if result.returncode == 0 and boot_id and boot_id != previous:
+                return boot_id
+            time.sleep(1)
+        raise TimeoutError('SSH/new boot timed out; inspect serial.log')
+
+    def phase(self, name, command=None):
+        print('Running ' + name, flush=True)
+        command = command or ('TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh ' + name)
+        try:
+            result = self.run_ssh(command, timeout=480 if name == 'managed' else 120, check=False)
+        except subprocess.TimeoutExpired as error:
+            (self.work / (name + '.log')).write_bytes(error.output or b'')
+            diagnostics = self.run_ssh('logread; ubus call service list; ip addr; ip route; ip -6 route', check=False)
+            (self.work / (name + '-diagnostics.log')).write_bytes(diagnostics.stdout)
+            raise
+        output = result.stdout.decode(errors='replace')
+        (self.work / (name + '.log')).write_text(output)
+        if result.returncode:
+            diagnostics = self.run_ssh('logread; ubus call network.interface.tayga_managed status; '
+                                       'ip addr; ip route; ip -6 route; nft list ruleset', check=False)
+            (self.work / (name + '-diagnostics.log')).write_bytes(diagnostics.stdout)
+            raise RuntimeError(f'{name} failed ({result.returncode}):\n{output}')
+        self.report['phases'].append(name)
+        for line in output.splitlines():
+            if line.startswith('PASS:'):
+                print(line, flush=True)
+
+    def instance(self, label):
+        result = self.run_ssh('ubus call service list \'{"name":"tayga-managed"}\'')
+        data = json.loads(result.stdout)['tayga-managed']['instances']
+        assert list(data) == ['main'] and data['main']['running']
+        self.report['supervised_instances'][label] = data['main']
+
+    def execute(self):
+        for name, path in (('runner', Path(__file__)), ('guest_test', Path(__file__).with_name('installer-openwrt-procd-smoke.sh'))):
+            self.report['inputs'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        names = ['kernel', 'image', 'base', 'procd', 'tun', 'flock']
+        if self.args.network:
+            names.append('network')
+        for name in names:
+            path = getattr(self.args, name)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if name in PINNED and digest != PINNED[name]:
+                raise ValueError('Wrong pinned OpenWrt input: ' + name)
+            self.report['inputs'][name] = digest
+        for index, path in enumerate(self.args.extra_package):
+            self.report['inputs'][f'extra_package_{index}'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        # OpenWrt gzip images have a firmware metadata trailer. Validate the
+        # gzip member's CRC/length; its complete input is pinned above.
+        decompressor = zlib.decompressobj(31)
+        with self.args.image.open('rb') as source, (self.work / 'disk.raw').open('wb') as disk:
+            while chunk := source.read(1024 * 1024):
+                disk.write(decompressor.decompress(chunk))
+            disk.write(decompressor.flush())
+        if not decompressor.eof:
+            raise ValueError('Truncated gzip image')
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.key)], check=True)
+        self.start()
+        self.wait_serial('Please press Enter to activate this console.')
+        self.console('')
+        self.wait_serial('root@OpenWrt:', activate=True)
+        public_key = ' '.join(self.key.with_suffix('.pub').read_text().split()[:2])
+        self.console("mkdir -p /etc/dropbear; echo " + shlex.quote(public_key) + " > /etc/dropbear/authorized_keys; "
+                     "chmod 600 /etc/dropbear/authorized_keys; uci set network.lan.ipaddr='10.0.2.15'; "
+                     "uci set network.lan.netmask='255.255.255.0'; uci commit network; /etc/init.d/network restart")
+        initial_boot = self.wait_ssh()
+        self.report['initial_boot'] = initial_boot
+        archive = self.work / 'inputs.tar'
+        with tarfile.open(archive, 'w') as bundle:
+            for name in ['base', 'procd', 'tun', 'flock'] + (['network'] if self.args.network else []):
+                bundle.add(getattr(self.args, name), arcname=('kmod-tun' if name == 'tun' else name) + '.ipk')
+            bundle.add(Path(__file__).with_name('installer-openwrt-procd-smoke.sh'), arcname='test.sh')
+            for index, path in enumerate(self.args.extra_package):
+                bundle.add(path, arcname=f'extra-{index}.ipk')
+        with archive.open('rb') as source:
+            self.run_ssh('mkdir -p /tmp/tayga-procd-inputs; tar -xf - -C /tmp/tayga-procd-inputs', stdin=source)
+        self.phase('install', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/tayga-procd-inputs/test.sh install /tmp/tayga-procd-inputs')
+        self.instance('initial')
+        self.phase('lifecycle')
+        self.instance('after_respawn')
+        self.phase('uplink-facts')
+        self.phase('wan')
+        self.instance('after_wan_handover')
+        self.phase('arm-reboot')
+        self.run_ssh('reboot', timeout=10, check=False)
+        reboot_id = self.wait_ssh(previous=initial_boot)
+        self.phase('check-reboot', 'TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh check-boot')
+        self.instance('after_reboot')
+        self.phase('arm-powercut')
+        self.process.kill()
+        self.process.wait(timeout=10)
+        time.sleep(0.5)
+        self.start()
+        powercut_id = self.wait_ssh(previous=reboot_id)
+        self.phase('check-powercut', 'TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh check-boot')
+        self.instance('after_powercut')
+        if self.args.network:
+            self.phase('managed')
+        self.phase('remove')
+        self.run_ssh('poweroff', timeout=10, check=False)
+        self.process.wait(timeout=30)
+        self.report.update(passed=True, reboot_boot=reboot_id, powercut_boot=powercut_id,
+                           powercut='QEMU SIGKILL after synced pending journal and interrupted active config')
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
+        self.serial.close()
+        self.key.unlink(missing_ok=True)
+        (self.work / 'report.json').write_text(json.dumps(self.report, indent=2) + '\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('kernel', 'image', 'base', 'procd', 'tun', 'flock', 'work'):
+        parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--qemu', default='qemu-system-aarch64')
+    parser.add_argument('--network', type=Path, help='Optional managed netifd/fw4 package (adds isolated test NIC)')
+    parser.add_argument('--extra-package', type=Path, action='append', default=[], help='Offline dependency archive; may be repeated')
+    parser.add_argument('--accel', choices=('auto', 'hvf', 'kvm', 'tcg'), default='auto')
+    parser.add_argument('--port', type=int, default=0)
+    args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error('invalid loopback port')
+    for command in (args.qemu, 'ssh', 'ssh-keygen'):
+        if not shutil.which(command):
+            parser.error('Required tool missing: ' + command)
+    vm = VM(args)
+    try:
+        vm.execute()
+    except BaseException as error:
+        vm.report['error'] = str(error)
+        raise
+    finally:
+        vm.close()
+    print('PASS: OpenWrt VM; report: ' + str(vm.work / 'report.json'), flush=True)
+
+
+if __name__ == '__main__':
+    main()

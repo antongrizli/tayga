@@ -62,6 +62,165 @@ jobs:
         run: make clean && make CC=gcc CFLAGS="-Werror -Wextra -O2"
       - name: run build clang w/ wextra
         run: make clean && make CC=clang CFLAGS="-Werror -Wextra -O2"
+      - name: Native embedded-source installer fallback
+        run: |
+          make CC=cc LDFLAGS= pref64-discover
+          sudo sh test/system/installer-fallback-smoke.sh "$PWD"
+
+  test-installer-dependencies:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+          - debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+          - fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
+      - name: Install selected dependencies in a disposable container
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --tmpfs /var/cache:rw,nosuid,nodev,size=512m --tmpfs /tmp:rw,nosuid,nodev,size=16m -i "$TEST_IMAGE" sh -c '
+            cat > /tmp/dependencies.sh
+            exec sh /tmp/dependencies.sh install nat64 nft no keep no validate
+          ' < packaging/installer/dependencies.sh
+
+  test-openwrt-sdk:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
+      - name: Prepare SDK host and ARM rootfs execution
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential gawk rsync unzip zstd file libncurses-dev libssl-dev zlib1g-dev qemu-user-static binfmt-support qemu-system-arm
+          sudo update-binfmts --enable qemu-aarch64
+      - name: Download pinned OpenWrt 24.10.8 SDK and rootfs
+        run: |
+          base=https://downloads.openwrt.org/releases/24.10.8/targets/armsr/armv8
+          curl -fL --retry 3 "$base/openwrt-sdk-24.10.8-armsr-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst" -o /tmp/openwrt-sdk.tar.zst
+          curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-rootfs.tar.gz" -o /tmp/openwrt-rootfs.tar.gz
+          echo '5f430f5b30c9ea6dc472710356c139abf916b7ebd5de14e108e9cc204f40a2a4  /tmp/openwrt-sdk.tar.zst' | sha256sum -c -
+          echo 'eab7e31f508ff0af1d47afc779eb08f237bb0f1cec5014592afe4893a06318a3  /tmp/openwrt-rootfs.tar.gz' | sha256sum -c -
+          curl -fL --retry 3 "$base/kmods/6.6.144-1-0b532dfcba2e5fa16405c5387dd37cae/kmod-tun_6.6.144-r1_aarch64_generic.ipk" -o /tmp/openwrt-kmod-tun.ipk
+          echo '9bbbf77e4762077d8bd49602ccb1fff1767c0e540de9f24507dcc5355f150caa  /tmp/openwrt-kmod-tun.ipk' | sha256sum -c -
+          curl -fL --retry 3 'https://downloads.openwrt.org/releases/24.10.8/packages/aarch64_generic/base/flock_2.40.2-r1_aarch64_generic.ipk' -o /tmp/openwrt-flock.ipk
+          echo 'a0718db1870b45db97dbfe79f0a53ed6fe784a92520be08024a1da7a84edfa17  /tmp/openwrt-flock.ipk' | sha256sum -c -
+          feed=https://downloads.openwrt.org/releases/24.10.8/packages/aarch64_generic/packages
+          curl -fL --retry 3 "$feed/coreutils_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-coreutils.ipk
+          curl -fL --retry 3 "$feed/coreutils-timeout_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-timeout.ipk
+          echo 'd23a60cc4ad1f9d78f40f4ae8a1d7cd9dee2af070a31889bbaf8dc08dc9422e0  /tmp/openwrt-coreutils.ipk' | sha256sum -c -
+          echo '880f0ff1c347a066fcc9f2ee2ee73c892b06c5bd5d0cc3d5089da409e7df542f  /tmp/openwrt-timeout.ipk' | sha256sum -c -
+          curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-kernel.bin" -o /tmp/openwrt-kernel.bin
+          curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-squashfs-combined-efi.img.gz" -o /tmp/openwrt-squashfs.img.gz
+          echo 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e  /tmp/openwrt-kernel.bin' | sha256sum -c -
+          echo '9013deabf64ddd93bd2039b1b469a595c48201d611a9885afffd050053d063a5  /tmp/openwrt-squashfs.img.gz' | sha256sum -c -
+          mkdir -p /tmp/openwrt-sdk /tmp/openwrt-rootfs
+          tar --zstd -xf /tmp/openwrt-sdk.tar.zst -C /tmp/openwrt-sdk --strip-components=1
+          sudo tar -xzf /tmp/openwrt-rootfs.tar.gz -C /tmp/openwrt-rootfs
+      - name: Build target-specific OpenWrt packages
+        run: |
+          printf '%s\n' '# CONFIG_ALL is not set' '# CONFIG_ALL_KMODS is not set' '# CONFIG_ALL_NONSHARED is not set' > /tmp/openwrt-sdk/.config
+          make -C /tmp/openwrt-sdk defconfig
+          python3 scripts/prepare-openwrt-package.py --sdk /tmp/openwrt-sdk --target armsr --subtarget armv8 --architecture aarch64_generic --version "$(cat VERSION)"
+          echo 'CONFIG_PACKAGE_tayga-managed-openwrt=m' >> /tmp/openwrt-sdk/.config
+          echo 'CONFIG_PACKAGE_tayga-managed-openwrt-procd=m' >> /tmp/openwrt-sdk/.config
+          echo 'CONFIG_PACKAGE_tayga-managed-openwrt-network=m' >> /tmp/openwrt-sdk/.config
+          make -C /tmp/openwrt-sdk defconfig
+          make -C /tmp/openwrt-sdk package/tayga-managed-openwrt/compile V=s -j2
+      - name: Install, execute and remove in disposable OpenWrt rootfs
+        run: |
+          package=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt_*.ipk')
+          test -n "$package"
+          sudo sh test/system/installer-openwrt-package-smoke.sh /tmp/openwrt-rootfs "$package" /tmp/openwrt-kmod-tun.ipk
+      - name: Validate optional procd package and persistent file recovery
+        run: |
+          base=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt_*.ipk')
+          service=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt-procd_*.ipk')
+          test -n "$service"
+          sudo mkdir -p /tmp/openwrt-service-rootfs
+          sudo tar -xzf /tmp/openwrt-rootfs.tar.gz -C /tmp/openwrt-service-rootfs
+          sudo sh test/system/installer-openwrt-service-state-smoke.sh /tmp/openwrt-service-rootfs "$base" "$service" /tmp/openwrt-kmod-tun.ipk /tmp/openwrt-flock.ipk
+      - name: Boot real OpenWrt and test procd, managed netifd/fw4 and boot recovery
+        run: |
+          base=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt_*.ipk')
+          service=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt-procd_*.ipk')
+          network=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt-network_*.ipk')
+          test -n "$network"
+          python3 test/system/run-openwrt-vm.py --accel tcg \
+            --kernel /tmp/openwrt-kernel.bin --image /tmp/openwrt-squashfs.img.gz \
+            --base "$base" --procd "$service" --tun /tmp/openwrt-kmod-tun.ipk \
+            --network "$network" --flock /tmp/openwrt-flock.ipk \
+            --extra-package /tmp/openwrt-coreutils.ipk --extra-package /tmp/openwrt-timeout.ipk \
+            --work "$RUNNER_TEMP/openwrt-procd-vm"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: openwrt-procd-vm-report
+          path: |
+            ${{ runner.temp }}/openwrt-procd-vm/report.json
+            ${{ runner.temp }}/openwrt-procd-vm/*.log
+          if-no-files-found: warn
+
+  test-native-packages:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
+      - name: Build static musl package inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-bins" "$RUNNER_TEMP/native-packages" "$RUNNER_TEMP/nfpm"
+          docker run --rm -v "$PWD:/source:ro" -v "$RUNNER_TEMP/native-bins:/output" \
+            alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 sh -ec '
+              apk add --no-cache gcc make musl-dev linux-headers
+              mkdir /work
+              cp -R /source/Makefile /source/mk /source/src /source/VERSION /work/
+              cd /work
+              make -j2 CC=cc LDFLAGS=-static VERSION="$(cat VERSION)" static pref64-discover
+              cp build/tayga build/pref64-discover /output/
+            '
+      - name: Build unsigned APK DEB RPM test artifacts
+        run: |
+          curl --fail --location --connect-timeout 10 --max-time 120 --proto '=https' --proto-redir '=https' \
+            https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_arm64.tar.gz \
+            -o "$RUNNER_TEMP/nfpm.tar.gz"
+          echo "a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
+          for release in 1 2; do
+            python3 scripts/build-native-packages.py --version "$(cat VERSION)" --release "$release" \
+              --arch arm64 --tayga "$RUNNER_TEMP/native-bins/tayga" --helper "$RUNNER_TEMP/native-bins/pref64-discover" \
+              --maintainer 'CI test <test@example.invalid>' --source-commit "$(git rev-parse HEAD)" \
+              --nfpm "$RUNNER_TEMP/nfpm/nfpm" --output "$RUNNER_TEMP/native-packages"
+          done
+      - name: Native install upgrade preservation and removal
+        run: |
+          version=$(cat VERSION)
+          for kind in deb apk rpm; do
+            case "$kind" in
+              deb) image=debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 ;;
+              apk) image=alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 ;;
+              rpm) image=fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 ;;
+            esac
+            docker run --rm -e TAYGA_ISOLATED_TEST=yes -v "$PWD:/source:ro" -v "$RUNNER_TEMP/native-packages:/packages:ro" \
+              "$image" sh -ec '
+                sh /source/packaging/installer/dependencies.sh install nat64 nft no keep no validate
+                exec sh /source/test/system/installer-native-package-smoke.sh "$1" \
+                  "/packages/tayga-managed-$2-1-arm64.$1" "/packages/tayga-managed-$2-2-arm64.$1" "$2"
+              ' sh "$kind" "$version"
+          done
 
   test-freebsd:
     permissions:
@@ -70,8 +229,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - amd64
+        include:
+          - arch: amd64
+            vm_arch: x86_64
+          - arch: arm64
+            vm_arch: aarch64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -81,12 +243,31 @@ jobs:
         id: freebsd-test
         with:
           release: "15.0"
+          arch: ${{ matrix.vm_arch }}
           prepare: |
-            pkg install -y gmake llvm
+            pkg install -y gmake llvm git python3
           run: |
             gmake clean && gmake CFLAGS="-Werror -Wall -O2"
             gmake test
             gmake clean && gmake CFLAGS="-Werror -Wextra -O2"
+            gmake static pref64-discover
+            sh test/system/installer-fallback-smoke.sh "$PWD"
+            python3 scripts/ci/freebsd_artifacts.py --arch "${{ matrix.arch }}" --output "candidate-freebsd-${{ matrix.arch }}"
+            task_installer_dir=$(mktemp -d)
+            python3 scripts/build-installer.py --version "$(cat VERSION)" --platform "freebsd-${{ matrix.arch }}" tayga pref64-discover --output "$task_installer_dir/installer.sh"
+            sh "$task_installer_dir/installer.sh" --extract-only "$task_installer_dir/extracted"
+            sh "$task_installer_dir/installer.sh" --mode=clat --clat-ipv6=2001:db8::464 --configure-only="$task_installer_dir/clat.conf"
+            grep -q '^tun-device tun64$' "$task_installer_dir/clat.conf"
+            grep -q '^tun-offload off$' "$task_installer_dir/clat.conf"
+            grep -q '^# installer-firewall pf$' "$task_installer_dir/clat.conf"
+            TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-binary-smoke.sh "$task_installer_dir/installer.sh"
+            TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-smoke.sh "$task_installer_dir/installer.sh"
+            rm -rf "$task_installer_dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-freebsd-${{ matrix.arch }}
+          path: candidate-freebsd-${{ matrix.arch }}/
+          if-no-files-found: error
 
   test-static-multiarch:
     permissions:
@@ -115,3 +296,41 @@ jobs:
         run: |
           docker run --rm --platform ${{ matrix.platform }} -v "$PWD":/src -w /src alpine:3.20 sh -c \
             "apk add --no-cache gcc make musl-dev linux-headers binutils && make clean && make static && strip tayga && make test"
+
+  test-installer-network:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        firewall: [iptables, nft]
+        offload: ["off", "auto"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
+          persist-credentials: false
+      - name: Verify installer NAT64 HTTP, ICMP, readiness and cleanup
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN \
+            --security-opt apparmor=unconfined --device /dev/net/tun \
+            --sysctl net.ipv6.conf.all.accept_ra=2 \
+            --sysctl net.ipv6.conf.default.accept_ra=2 \
+            --sysctl net.ipv6.conf.all.forwarding=1 \
+            --sysctl net.ipv4.ip_forward=1 \
+            -e TAYGA_ISOLATED_TEST=yes -e TAYGA_TEST_FIREWALL=${{ matrix.firewall }} -e TAYGA_TEST_OFFLOAD=${{ matrix.offload }} -v "$PWD:/source:ro" \
+            alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -ec '
+              apk add --no-cache gcc make musl-dev linux-headers iproute2 iptables nftables curl python3 mount shellcheck unbound dnssec-root flock
+              mkdir /work
+              cd /work
+              cp -R /source/src /source/mk /source/test /source/packaging /source/Makefile /source/VERSION /source/scripts /source/docs .
+              shellcheck -s sh packaging/installer/*.sh test/system/installer-*smoke.sh
+              shellcheck -s sh -e SC2034 packaging/installer/tayga-managed.openrc packaging/installer/tayga-recovery.openrc
+              python3 -m unittest discover -s test/portable -p "test_installer_*.py" -q
+              make static pref64-discover
+              export PATH=/work:$PATH
+              sh test/system/installer-watchdog-smoke.sh
+              sh test/system/installer-network-smoke.sh
+              sh test/system/installer-siit-smoke.sh
+            '

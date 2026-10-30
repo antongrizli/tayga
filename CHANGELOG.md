@@ -4,8 +4,35 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Added
+
+- Optional OpenWrt NAT64/SIIT netifd/fw4 package with owned TUN/routes, bounded firewall checks, stale-teardown protection and cleanup on stop/removal.
+
+- Optional netifd uplink tracking and filtered OpenWrt iface hotplug handling, with WAN suspension/resume, stable address/prefix/route fingerprints and manual-stop protection.
+
+- Booted OpenWrt QEMU procd/overlay lifecycle gate with real reboot, prepared-journal power-cut recovery, process ownership checks and saved reports/logs.
+
+- Optional OpenWrt procd/UCI service for preconfigured external networking, persistent configuration publication/recovery, and an unprivileged `--check-config` daemon mode.
+
+- Target/ABI-checked OpenWrt SDK binary-only package recipe and source snapshot manifest; separate apk/opkg dependency planning and opkg file ownership protection.
+
+- Native unsigned APK/DEB/RPM package builder with standard `/usr` paths, package ownership isolation, config/data retention tests and an APK dependency pin for managed profiles.
+
+- Self-extracting release installers with verified payloads, per-platform binaries, a universal bundle and native FreeBSD artifact gates.
+- Linux CLAT/NAT64/SIIT profile wizard, systemd/OpenRC activation, readiness checks, owned iptables/nftables rules and transactional reconfiguration/uninstall.
+- Disposable-container CLAT-to-NAT64 HTTP/ICMP and cleanup gates, plus portable installer ownership/rollback regressions.
+
+- Debian AppArmor-compatible owned Unbound configuration, verified with live DNSSEC and systemd-resolved.
+
+- Optional profile-owned Unbound DNS64 and CLAT public DNS through systemd-resolved, with scoped cleanup.
+
+- Early systemd/OpenRC recovery of interrupted activations after reboot, without replaying old kernel journals; native VM reboot/power-cut tests.
+
+- Independent activation watchdog with SIGKILL recovery, atomic commit, owned-session cancellation, persistent snapshots and manual `tayga-ctl recover`.
+
 ### Fixed
 
+- Ignore stale dynamic mapping state when no dynamic pool is configured.
 - MikroTik RouterOS deployment: add `bridge-clat` and `bridge-nat64` to interface list `LAN` so default firewall allows forwarded container traffic.
 - MikroTik RouterOS deployment: register static IPv6 neighbor for container VETH interface, resolving RouterOS 7 neighbor discovery drops on secondary bridges.
 - MikroTik RouterOS deployment: remove duplicate blocking container image archive check in `routeros-install-nat64.rsc` to allow registry pulls (`useRegistry=true`).

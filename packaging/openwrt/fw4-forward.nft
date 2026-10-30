@@ -1,0 +1,1 @@
+include "/var/run/tayga-managed/network/forward*.nft"

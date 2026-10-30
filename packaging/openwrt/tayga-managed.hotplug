@@ -1,0 +1,14 @@
+#!/bin/sh
+# hotplug.d files are sourced: keep exits and variables inside a subshell.
+(
+    case "${ACTION:-}" in ifup|ifdown|ifupdate) ;; *) exit 0 ;; esac
+    uplink=$(uci -q get tayga_managed.main.uplink) || exit 0
+    if [ -z "$uplink" ] || [ "${INTERFACE:-}" != "$uplink" ]; then
+        [ "$(uci -q get tayga_managed.main.network_mode)" = managed ] || exit 0
+        inside=$(uci -q get tayga_managed.main.inside) || exit 0
+        [ -n "$inside" ] && [ "${INTERFACE:-}" = "$inside" ] || exit 0
+    fi
+    if ! /etc/init.d/tayga-managed uplink_changed "$INTERFACE"; then
+        logger -t tayga-managed "Could not reconcile uplink $uplink"
+    fi
+)

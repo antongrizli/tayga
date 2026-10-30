@@ -7,6 +7,7 @@ import unittest
 TOPDIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOPDIR / 'bench/tests'))
 sys.path.insert(0, str(TOPDIR / 'bench'))
+sys.path.insert(0, str(TOPDIR / 'test/portable'))
 
 MODULES = (
     "test_affinity_study", "test_benchmark_offload", "test_benchmark_udp_accounting",
@@ -15,7 +16,7 @@ MODULES = (
     "test_udp_batch_summary", "test_udp_common_stop", "test_udp_envelope_study",
     "test_lima_retention", "test_benchmark_cleanup", "test_udp_batch_endpoint",
     "test_udp_drain_guard", "test_iperf_start_gate", "test_iperf_read_diagnostic",
-    "test_protocols_compatibility", "test_throughput_diagnostics", "test_release_pipeline",
+    "test_protocols_compatibility", "test_throughput_diagnostics", "test_release_pipeline", "test_installer_bundle", "test_installer_network", "test_installer_lifecycle", "test_installer_dns", "test_installer_dependencies", "test_installer_packages", "test_installer_openwrt",
 )
 if __name__ == "__main__":
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(MODULES))
