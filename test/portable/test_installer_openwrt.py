@@ -61,12 +61,48 @@ class OpenWrtPackageTests(unittest.TestCase):
         counter = self.sdk / 'calls'
         counter.write_text('0')
         script = self.sdk / 'down.sh'
-        script.write_text('TAYGA_NETWORK_LIBRARY=1 . "$HELPER"\nnet="$TEST_NET"\nnet_cleanup() { :; }\nsleep() { :; }\nubus() {\n    case "$*" in\n        *status)\n            n=$(cat "$COUNTER"); n=$((n+1)); echo "$n" > "$COUNTER"\n            [ "$n" -lt 6 ] || return 1\n            echo \'{"proto":"tayga_managed","up":false,"pending":false}\' ;;\n        *) : ;;\n    esac\n}\njsonfilter() { cat >/dev/null; echo tayga_managed; }\nnet_down\n')
+        script.write_text('TAYGA_NETWORK_LIBRARY=1 . "$HELPER"\nnet="$TEST_NET"\nnet_cleanup() { :; }\nsleep() { :; }\nubus() {\n    case "$*" in\n        *status)\n            n=$(cat "$COUNTER"); n=$((n+1)); echo "$n" > "$COUNTER"\n            [ "$n" -lt 6 ] || return 1\n            echo \'{"proto":"tayga_managed","up":false,"pending":false}\' ;;\n        *) : ;;\n    esac\n}\njsonfilter() { echo tayga_managed; }\nnet_down\n')
         result = subprocess.run(['sh', str(script)], env={**os.environ,
             'HELPER': str(ROOT / 'packaging/openwrt/openwrt-network.sh'),
             'TEST_NET': str(net), 'COUNTER': str(counter)}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(int(counter.read_text()), 6)
+        self.assertFalse(net.exists())
+
+    def test_network_down_tolerates_failed_down_when_already_inactive(self):
+        net = self.sdk / 'network-down-fail'
+        net.mkdir()
+        (net / 'token').write_text('owner.test')
+        script = self.sdk / 'down-fail.sh'
+        script.write_text('''TAYGA_NETWORK_LIBRARY=1 . "$HELPER"
+net="$TEST_NET"
+net_cleanup() { :; }
+sleep() { :; }
+call_count=0
+ubus() {
+    case "$*" in
+        *down) return 1 ;;
+        *status)
+            call_count=$((call_count + 1))
+            if [ "$call_count" -ge 4 ]; then return 1; fi
+            echo '{"proto":"tayga_managed","up":false,"pending":false}'
+            ;;
+        *) : ;;
+    esac
+}
+jsonfilter() {
+    case "$*" in
+        *proto*) echo tayga_managed ;;
+        *up*) echo false ;;
+        *) echo "" ;;
+    esac
+}
+net_down
+''')
+        result = subprocess.run(['sh', str(script)], env={**os.environ,
+            'HELPER': str(ROOT / 'packaging/openwrt/openwrt-network.sh'),
+            'TEST_NET': str(net)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(net.exists())
 
     def test_vm_rejects_mixed_package_format_before_boot(self):

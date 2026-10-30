@@ -112,8 +112,10 @@ check_journal() {
     (cd "$journal"; sha256sum -c SHA256SUMS) || fail 'Upgrade snapshot checksum mismatch'
 }
 stop_writer() {
-    svc=$(ubus -t 2 call service list '{"name":"tayga-managed"}' 2>/dev/null || :)
-    old_pid=$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
+    old_pid=
+    if svc=$(ubus -t 2 call service list '{"name":"tayga-managed"}' 2>/dev/null) && [ -n "$svc" ]; then
+        old_pid=$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
+    fi
     case "$old_pid" in ''|*[!0-9]*) old_pid= ;; esac
     ticks=
     [ -z "$old_pid" ] || ticks=$(awk '{print $22}' "/proc/$old_pid/stat" 2>/dev/null || :)
@@ -156,10 +158,13 @@ resume_service() {
     seen=
     for _ in $(seq 1 25); do
         svc=$(ubus -t 2 call service list '{"name":"tayga-managed"}' 2>/dev/null || :)
-        pid=$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
-        if [ -n "$pid" ] && [ "$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.running' 2>/dev/null || :)" = true ]; then
-            if [ "$pid" = "$seen" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null || :)" = tayga ]; then return 0; fi
-            seen=$pid
+        pid=
+        if [ -n "$svc" ]; then
+            pid=$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
+            if [ -n "$pid" ] && [ "$(jsonfilter -s "$svc" -e '@["tayga-managed"].instances.main.running' 2>/dev/null || :)" = true ]; then
+                if [ "$pid" = "$seen" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null || :)" = tayga ]; then return 0; fi
+                seen=$pid
+            fi
         fi
         sleep 1
     done

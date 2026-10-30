@@ -209,18 +209,24 @@ net_down() {
     [ -e "$net" ] || return 0
     net_owned || { net_fail 'Unowned managed network state'; return 1; }
     has_iface=0
-    if ubus -t 5 call network.interface.tayga_managed status >/dev/null 2>&1; then
-        [ "$(ubus call network.interface.tayga_managed status | jsonfilter -e '@.proto')" = tayga_managed ] || {
-            net_fail 'Logical interface ownership changed'; return 1;
-        }
-        has_iface=1
+    if status=$(ubus -t 5 call network.interface.tayga_managed status 2>/dev/null) && [ -n "$status" ]; then
+        if [ "$(jsonfilter -s "$status" -e '@.proto' 2>/dev/null || :)" = tayga_managed ]; then
+            has_iface=1
+        else
+            net_fail 'Logical interface ownership changed'; return 1
+        fi
     fi
     net_cleanup || return 1
     if [ "$has_iface" = 1 ]; then
         # Removing the TUN can make netifd retire the dynamic object first.
         for operation in down remove; do
             if ! ubus -t 5 call network.interface.tayga_managed "$operation" >/dev/null 2>&1; then
-                if ubus -t 2 call network.interface.tayga_managed status >/dev/null 2>&1; then
+                cur_status=$(ubus -t 2 call network.interface.tayga_managed status 2>/dev/null || :)
+                if [ -n "$cur_status" ]; then
+                    if [ "$operation" = down ] && [ "$(jsonfilter -s "$cur_status" -e '@.up' 2>/dev/null || :)" != true ]; then
+                        # Interface is already down; this is expected when TUN was removed.
+                        continue
+                    fi
                     net_fail "Could not $operation managed interface"; return 1
                 fi
             fi
@@ -362,7 +368,7 @@ net_verify() {
     net_owned || { net_fail 'Managed network is not active'; return 1; }
     wan=$(cat "$net/wan")
     status=$(ubus -t 5 call network.interface.tayga_managed status 2>/dev/null || :)
-    if [ "$(jsonfilter -s "$status" -e '@.up')" != true ] || [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner')" != "$token" ]; then
+    if [ -z "$status" ] || [ "$(jsonfilter -s "$status" -e '@.up' 2>/dev/null || :)" != true ] || [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner' 2>/dev/null || :)" != "$token" ]; then
         net_fail 'Logical interface is not ready'; return 1
     fi
     if [ ! -d /sys/class/net/tmg0 ] || [ "$(cat /sys/class/net/tmg0/ifalias 2>/dev/null || :)" != "tayga-managed:$token" ]; then
@@ -372,11 +378,13 @@ net_verify() {
     # Allow the bounded procd respawn (5 s delay) after transient startup errors.
     for _ in $(seq 1 25); do
         svc_json=$(ubus -t 2 call service list '{"name":"tayga-managed"}' 2>/dev/null || :)
-        svc_pid=$(jsonfilter -s "$svc_json" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
-        if [ "$(jsonfilter -s "$svc_json" -e '@["tayga-managed"].instances.main.running' 2>/dev/null || :)" = true ] &&
-           [ -n "$svc_pid" ] && [ "$(cat "/proc/$svc_pid/comm" 2>/dev/null || :)" = tayga ]; then
-            daemon_ok=1
-            break
+        if [ -n "$svc_json" ]; then
+            svc_pid=$(jsonfilter -s "$svc_json" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
+            if [ "$(jsonfilter -s "$svc_json" -e '@["tayga-managed"].instances.main.running' 2>/dev/null || :)" = true ] &&
+               [ -n "$svc_pid" ] && [ "$(cat "/proc/$svc_pid/comm" 2>/dev/null || :)" = tayga ]; then
+                daemon_ok=1
+                break
+            fi
         fi
         sleep 1
     done
@@ -481,13 +489,16 @@ case "$action" in
         key=$({ cat "$config"; printf '%s\n%s\n' "$wan" "$inside"; } | sha256sum); key=${key%% *}
         if net_owned && [ "$(cat "$net/key")" = "$key" ]; then
             status=$(ubus -t 5 call network.interface.tayga_managed status 2>/dev/null || :)
-            if [ "$(jsonfilter -s "$status" -e '@.up')" = true ] && [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner')" = "$token" ]; then
+            if [ -n "$status" ] && [ "$(jsonfilter -s "$status" -e '@.up' 2>/dev/null || :)" = true ] && [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner' 2>/dev/null || :)" = "$token" ]; then
                 exit 0
             fi
         fi
         if [ -e "$net" ]; then
             net_owned || exit 1
-            old_pid=$(ubus -t 5 call service list '{"name":"tayga-managed"}' | jsonfilter -e '@["tayga-managed"].instances.main.pid')
+            old_pid=
+            if svc_json=$(ubus -t 5 call service list '{"name":"tayga-managed"}' 2>/dev/null) && [ -n "$svc_json" ]; then
+                old_pid=$(jsonfilter -s "$svc_json" -e '@["tayga-managed"].instances.main.pid' 2>/dev/null || :)
+            fi
             case "$old_pid" in ''|*[!0-9]*) old_pid= ;; esac
             # Stop supervision before removing the TUN: respawn can otherwise
             # recreate it between teardown and setup on a slow router.
@@ -518,7 +529,7 @@ case "$action" in
         if ! ubus -t 5 call network add_dynamic "{\"name\":\"tayga_managed\",\"proto\":\"tayga_managed\",\"auto\":true,\"owner_token\":\"$token\"}"; then net_down; exit 1; fi
         for _ in $(seq 1 15); do
             status=$(ubus -t 5 call network.interface.tayga_managed status 2>/dev/null || :)
-            if [ "$(jsonfilter -s "$status" -e '@.up')" = true ] && [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner')" = "$token" ]; then
+            if [ -n "$status" ] && [ "$(jsonfilter -s "$status" -e '@.up' 2>/dev/null || :)" = true ] && [ "$(jsonfilter -s "$status" -e '@.data.tayga_owner' 2>/dev/null || :)" = "$token" ]; then
                 if ip -6 addr show dev tmg0 | grep -Eq 'tentative|dadfailed'; then sleep 1; continue; fi
                 if [ "$mode" = siit ]; then
                     native=$(ip -6 route get "${map6%/*}" 2>/dev/null || :)
