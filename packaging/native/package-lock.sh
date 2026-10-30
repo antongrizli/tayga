@@ -10,7 +10,16 @@ case "${1:-}" in
         apk --no-network add --virtual .tayga-managed-profile "tayga-managed=$version"
         ;;
     unlock)
-        if [ "${TAYGA_PACKAGE_UPGRADE:-0}" != "1" ] && [ ! -f "$state/.package-upgrade" ]; then
+        is_package_upgrade=0
+        if [ -d "$state/operation.lock" ] && [ -f "$state/operation.lock/package-upgrade" ]; then
+            upg_pid=$(cat "$state/operation.lock/pid" 2>/dev/null || :)
+            if [ -n "$upg_pid" ] && kill -0 "$upg_pid" 2>/dev/null; then
+                is_package_upgrade=1
+            fi
+        elif [ "${TAYGA_PACKAGE_UPGRADE:-0}" = "1" ] || [ -f "$state/.package-upgrade" ]; then
+            is_package_upgrade=1
+        fi
+        if [ "$is_package_upgrade" != 1 ]; then
             for profile in clat nat64 siit; do [ ! -f "$state/$profile.conf" ] || exit 0; done
         fi
         if apk info -e .tayga-managed-profile >/dev/null 2>&1; then apk --no-network del .tayga-managed-profile; fi

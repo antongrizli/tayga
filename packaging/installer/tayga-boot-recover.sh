@@ -7,6 +7,15 @@ root=${TAYGA_TEST_ROOT:-}
 state=$root/var/lib/tayga-installer
 tx=$state/files-transaction
 gate=$state/operation.lock
+if [ -d "$state/package-upgrade" ]; then
+    lib=$root/usr/local/libexec/tayga
+    [ -d "$lib" ] || lib=$root/usr/libexec/tayga
+    if [ -f "$lib/tayga-package-upgrade" ]; then
+        sh "$lib/tayga-package-upgrade" recover || :
+    elif [ -f "$lib/tayga-package-upgrade.sh" ]; then
+        sh "$lib/tayga-package-upgrade.sh" recover || :
+    fi
+fi
 if [ -d "$tx" ] && [ ! -f "$gate/transaction" ]; then
     if [ -f "$tx/files.sh" ]; then
         sh "$tx/files.sh" rollback || :

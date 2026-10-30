@@ -7,7 +7,18 @@ esac
 if [ "${1:-0}" -ge 1 ] 2>/dev/null; then
     exit 0
 fi
-if [ "${TAYGA_PACKAGE_UPGRADE:-}" = 1 ] || [ -f "$state/.package-upgrade" ]; then
+
+is_package_upgrade=0
+if [ -d "$state/operation.lock" ] && [ -f "$state/operation.lock/package-upgrade" ]; then
+    upg_pid=$(cat "$state/operation.lock/pid" 2>/dev/null || :)
+    if [ -n "$upg_pid" ] && kill -0 "$upg_pid" 2>/dev/null; then
+        is_package_upgrade=1
+    fi
+elif [ "${TAYGA_PACKAGE_UPGRADE:-}" = 1 ] || [ -f "$state/.package-upgrade" ]; then
+    is_package_upgrade=1
+fi
+
+if [ "$is_package_upgrade" = 1 ]; then
     exit 0
 fi
 for profile in clat nat64 siit; do

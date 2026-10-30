@@ -9,11 +9,12 @@ if [ "$action" = apply ]; then
     exec sh "$lib/tayga-lifecycle.sh" apply "$2"
 fi
 if [ "$action" = upgrade ]; then
-    [ "$#" -eq 2 ] || { echo 'Usage: tayga-ctl upgrade PACKAGE_FILE' >&2; exit 2; }
+    [ "$#" -ge 2 ] || { echo 'Usage: tayga-ctl upgrade PACKAGE_FILE [OPTIONS]' >&2; exit 2; }
+    shift
     if [ -f "$lib/tayga-package-upgrade" ]; then
-        exec sh "$lib/tayga-package-upgrade" apply "$2"
+        exec sh "$lib/tayga-package-upgrade" apply "$@"
     elif [ -f "$lib/tayga-package-upgrade.sh" ]; then
-        exec sh "$lib/tayga-package-upgrade.sh" apply "$2"
+        exec sh "$lib/tayga-package-upgrade.sh" apply "$@"
     else
         echo 'tayga-package-upgrade helper not found' >&2; exit 1
     fi
@@ -21,6 +22,14 @@ fi
 if [ "$action" = recover ]; then
     [ "$(id -u)" -eq 0 ] || { echo 'Recovery requires root' >&2; exit 1; }
     state=/var/lib/tayga-installer
+    pkg_upg=$state/package-upgrade
+    if [ -d "$pkg_upg" ]; then
+        if [ -f "$lib/tayga-package-upgrade" ]; then
+            exec sh "$lib/tayga-package-upgrade" recover
+        elif [ -f "$lib/tayga-package-upgrade.sh" ]; then
+            exec sh "$lib/tayga-package-upgrade.sh" recover
+        fi
+    fi
     tx=$state/files-transaction
     gate=$state/operation.lock
     if [ -d "$tx" ] && [ ! -d "$gate" ]; then

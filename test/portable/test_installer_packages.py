@@ -1,8 +1,11 @@
 """Native package ABI validation and staged contents; real archives have VM coverage."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -98,3 +101,124 @@ pathlib.Path(args[args.index('--target')+1]).write_text(json.dumps(config))
         self.assertFalse(manifest['signed'])
         with self.assertRaises(ValueError):
             packages.build(*args)
+
+
+class PackageUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.bin = self.root / 'bin'
+        self.state = self.root / 'var/lib/tayga-installer'
+        self.lib = self.root / 'usr/libexec/tayga'
+        self.run_dir = self.root / 'var/run/tayga-installer'
+        self.sys_bin = self.root / 'usr/sbin'
+        for d in (self.bin, self.state, self.lib, self.run_dir, self.sys_bin, self.root / 'run/systemd/system'):
+            d.mkdir(parents=True, exist_ok=True)
+
+        for name, script in {
+            'dpkg': '''case "$*" in
+    *--compare-versions*)
+        if [ "${TEST_FORCE_DOWNGRADE:-no}" = yes ]; then exit 0; fi
+        exit 1
+        ;;
+    *) exit "${TEST_DPKG_RC:-0}" ;;
+esac''',
+            'dpkg-deb': '''case "$*" in
+    *Package*) echo "${TEST_PKG_NAME:-tayga-managed}" ;;
+    *Version*) echo "${TEST_PKG_VER:-0.9.15-1}" ;;
+    *Architecture*) echo "amd64" ;;
+    *) echo "ok" ;;
+esac''',
+            'dpkg-query': 'echo "${TEST_INST_VER:-0.9.14-1}"',
+            'systemctl': 'echo "systemctl $*" >> "$TEST_LOG"; exit "${TEST_SYSCTL_RC:-0}"',
+            'pidof': 'exit 1',
+        }.items():
+            p = self.bin / name
+            p.write_text('#!/bin/sh\n' + script + '\n')
+            p.chmod(0o755)
+
+        self.verify_helper = self.lib / 'tayga-verify.sh'
+        self.verify_helper.write_text('#!/bin/sh\nexit "${TEST_VERIFY_RC:-0}"\n')
+        self.verify_helper.chmod(0o755)
+
+        (self.sys_bin / 'tayga').write_text('binary-v1\n')
+        (self.sys_bin / 'tayga').chmod(0o755)
+
+        self.upgrader = ROOT / 'packaging/installer/tayga-package-upgrade.sh'
+        self.log = self.root / 'log'
+        self.env = {
+            **os.environ,
+            'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+            'TAYGA_TESTING': '1',
+            'TAYGA_TEST_ROOT': str(self.root),
+            'TEST_LOG': str(self.log),
+        }
+        self.pkg = self.root / 'tayga-managed-0.9.15-1-amd64.deb'
+        self.pkg.write_text('deb archive content')
+
+    def test_upgrade_requires_valid_package_and_format(self):
+        res = subprocess.run(['sh', str(self.upgrader)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        bad_pkg = self.root / 'test.zip'
+        bad_pkg.write_text('zip')
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(bad_pkg)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Unsupported package format', res.stderr)
+
+    def test_upgrade_respects_operation_lock(self):
+        (self.state / 'operation.lock').mkdir()
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Another profile operation is in progress', res.stderr)
+
+    def test_upgrade_preflight_validates_package_identity(self):
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                             env={**self.env, 'TEST_PKG_NAME': 'foreign-pkg'}, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Invalid package identity', res.stderr)
+        self.assertFalse((self.state / 'package-upgrade').exists())
+
+    def test_upgrade_active_profile_and_successful_verification(self):
+        (self.state / 'nat64.conf').write_text('tun-device tun64\n')
+        (self.state / 'current').write_text('nat64\n')
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('PASS: Coordinated live package upgrade successful', res.stdout)
+        self.assertFalse((self.state / 'package-upgrade').exists())
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_upgrade_readiness_failure_triggers_automatic_rollback(self):
+        (self.state / 'nat64.conf').write_text('original-config\n')
+        (self.state / 'current').write_text('nat64\n')
+        (self.sys_bin / 'tayga').write_text('original-binary\n')
+
+        # When verify helper fails, upgrader must rollback to original binary and config
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                             env={**self.env, 'TEST_VERIFY_RC': '1'}, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('rolling back', res.stderr)
+        self.assertEqual((self.sys_bin / 'tayga').read_text(), 'original-binary\n')
+        self.assertEqual((self.state / 'nat64.conf').read_text(), 'original-config\n')
+        self.assertFalse((self.state / 'package-upgrade').exists())
+
+    def test_upgrade_recovery_action_restores_from_journal(self):
+        (self.state / 'nat64.conf').write_text('corrupt-config\n')
+        journal = self.state / 'package-upgrade'
+        (journal / 'backup').mkdir(parents=True)
+        (journal / 'backup/tayga').write_text('restored-binary\n')
+        (journal / 'accepted.conf').write_text('restored-config\n')
+        (journal / 'status').write_text('installing\n')
+        (journal / 'active_profile').write_text('nat64\n')
+        (journal / 'was_active').write_text('yes\n')
+        (journal / 'init_type').write_text('systemd\n')
+        (self.state / 'operation.lock').mkdir(parents=True)
+
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('PASS: Package upgrade recovery complete', res.stdout)
+        self.assertEqual((self.sys_bin / 'tayga').read_text(), 'restored-binary\n')
+        self.assertEqual((self.state / 'nat64.conf').read_text(), 'restored-config\n')
+        self.assertFalse(journal.exists())
+        self.assertFalse((self.state / 'operation.lock').exists())
+
