@@ -190,7 +190,7 @@ def assemble(root, inputs, output, source):
                 archive.write(path, path.name)
     native_dir = inputs / 'candidate-native'
     if native_dir.is_dir():
-        for pkg in sorted(native_dir.glob('tayga-managed-*')):
+        for pkg in sorted(native_dir.glob('tayga-managed*')):
             if pkg.is_file() and not pkg.is_symlink():
                 shutil.copy2(pkg, output / pkg.name)
     (output / 'release-manifest.json').write_text(json.dumps(

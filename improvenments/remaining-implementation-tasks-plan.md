@@ -280,12 +280,12 @@ configure_dns64_openwrt() {
 
 ## Чеклист готовности к релизу
 
-- [ ] **Фаза 1**: `tayga-net-ctl.sh` поддерживает `nat66` и `proxy-ndp` на FreeBSD `pf` и Linux `firewalld`.
-- [ ] **Фаза 1**: Модульные тесты в `test_installer_network.py` покрывают новые ветки firewalld и FreeBSD pf.
-- [ ] **Фаза 2**: Реализована генерация RFC 4193 ULA в `wizard.sh` и `configure.sh`.
-- [ ] **Фаза 2**: Поддержан режим `--clat-ipv6=auto` с автоматическим заполнением параметров NAT66.
-- [ ] **Фаза 3**: `release.yml` включает сборку `candidate-native` и подпись Minisign.
-- [ ] **Фаза 3**: `release_artifacts.py` упаковывает `.deb`, `.rpm`, `.apk` и FreeBSD артефакты в релизные ассеты.
-- [ ] **Фаза 4**: OpenWrt-скрипты координируют раздачу DNS64 для локальных клиентов.
-- [ ] **Интеграция**: Все переносимые тесты (`make test-portable`) и `check-doc-links.py` зеленые.
+- [x] **Фаза 1**: `tayga-net-ctl.sh` поддерживает `nat66` и `proxy-ndp` на FreeBSD `pf` и Linux `firewalld`.
+- [x] **Фаза 1**: Модульные тесты в `test_installer_network.py` покрывают новые ветки firewalld и FreeBSD pf.
+- [x] **Фаза 2**: Реализована генерация RFC 4193 ULA в `wizard.sh` и `configure.sh`.
+- [x] **Фаза 2**: Поддержан режим `--clat-ipv6=auto` с автоматическим заполнением параметров NAT66.
+- [x] **Фаза 3**: `release.yml` включает сборку `candidate-native` и подпись Minisign.
+- [x] **Фаза 3**: `release_artifacts.py` упаковывает `.deb`, `.rpm`, `.apk` и FreeBSD артефакты в релизные ассеты.
+- [x] **Фаза 4**: OpenWrt-скрипты координируют раздачу DNS64 для локальных клиентов (`openwrt-network.sh`).
+- [x] **Интеграция**: Все переносимые тесты (`make test-portable`) и `check-doc-links.py` зеленые.
 - [ ] **CI**: Полный прогон `Basic Test` и `Correctness and review gates` на GitHub Actions успешен.

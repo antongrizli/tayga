@@ -121,6 +121,11 @@ class ReleaseArtifactsTests(unittest.TestCase):
         shutil.copy2(ROOT / 'LICENSE', self.root / 'LICENSE')
         (self.root / 'VERSION').write_text('1.2.3\n')
         (self.root / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
+        native_dir = self.inputs / 'candidate-native'
+        native_dir.mkdir()
+        (native_dir / 'tayga-managed_1.2.3_amd64.deb').write_text('deb')
+        (native_dir / 'tayga-managed-1.2.3.x86_64.rpm').write_text('rpm')
+        (native_dir / 'tayga-managed-1.2.3-r1.apk').write_text('apk')
         output = self.root / 'assets'
         artifacts.assemble(self.root, self.inputs, output, self.source)
         self.assertIn('ghcr.io/owner/repo-clat:version-1.2.3',
@@ -131,6 +136,9 @@ class ReleaseArtifactsTests(unittest.TestCase):
         self.assertIn('tayga-installer-universal.sh', (output / 'SHA256SUMS').read_text())
         self.assertIn('tayga-installer-freebsd-amd64.sh', (output / 'SHA256SUMS').read_text())
         self.assertIn('tayga-installer-freebsd-arm64.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed_1.2.3_amd64.deb', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3.x86_64.rpm', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3-r1.apk', (output / 'SHA256SUMS').read_text())
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
 

@@ -95,8 +95,12 @@ address_mode=$(awk '$1=="#" && $2=="installer-clat-address-mode" {print $3}' "$c
 address_mode=${address_mode:-routed}
 nat66_address=$(awk '$1=="#" && $2=="installer-nat66-address" {print $3}' "$config")
 case "$address_mode" in routed) ;; proxy-ndp|nat66)
-    if [ "$mode" != clat ] || [ "$os" != Linux ]; then fail 'Address adaptation requires Linux CLAT'; fi
-    case "$firewall" in iptables|nft) ;; *) fail 'Address adaptation requires iptables or nft' ;; esac
+    if [ "$mode" != clat ]; then fail 'Address adaptation requires CLAT'; fi
+    if [ "$os" = FreeBSD ]; then
+        case "$firewall" in pf) ;; *) fail 'FreeBSD address adaptation requires pf' ;; esac
+    else
+        case "$firewall" in iptables|nft|firewalld) ;; *) fail 'Address adaptation requires iptables, nft, or firewalld' ;; esac
+    fi
     ;;
     *) fail 'Invalid CLAT address mode' ;;
 esac
@@ -350,8 +354,14 @@ fw_pf() {
         elif [ "$mode" = clat ]; then
             printf 'pass in quick on %s inet from any to any keep state\n' "$dev"
             printf 'pass out quick on %s inet from any to any keep state\n' "$dev"
-            printf 'pass out quick on %s inet6 from %s to any keep state\n' "$uplink6" "$clat6"
-            printf 'pass in quick on %s inet6 from any to %s keep state\n' "$uplink6" "$clat6"
+            if [ "$address_mode" = nat66 ]; then
+                printf 'nat on %s inet6 from { %s, %s } to %s -> %s\n' "$uplink6" "$clat6" "$addr6" "$pref64" "$nat66_address"
+                printf 'pass out quick on %s inet6 from { %s, %s, %s } to any keep state\n' "$uplink6" "$clat6" "$addr6" "$nat66_address"
+                printf 'pass in quick on %s inet6 from any to { %s, %s } keep state\n' "$uplink6" "$clat6" "$nat66_address"
+            else
+                printf 'pass out quick on %s inet6 from %s to any keep state\n' "$uplink6" "$clat6"
+                printf 'pass in quick on %s inet6 from any to %s keep state\n' "$uplink6" "$clat6"
+            fi
         fi
     } > "$lock/rules.pf"
     pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf"
@@ -437,24 +447,43 @@ case "$mode" in
         clat6=$(awk '$1=="map" && $2=="192.0.0.1" {print $3}' "$config")
         case "$clat6" in ''|*[!0-9a-fA-F:]*) fail 'Missing CLAT mapping' ;; esac
         if [ "$address_mode" = proxy-ndp ]; then
-            set_sysctl "net.ipv6.conf.$uplink6.proxy_ndp" 1
-            for address in "$clat6" "$addr6"; do
-                if ip -6 neigh show proxy dev "$uplink6" | awk '{print $1}' | grep -Fx "$address" >/dev/null; then fail 'A proxy NDP entry already exists'; fi
-                if ip -6 addr show dev "$uplink6" | awk '$1=="inet6" {split($2,a,"/");print a[1]}' | grep -Fx "$address" >/dev/null; then fail 'Proxy address is already assigned to the uplink'; fi
-                ip -6 neigh add proxy "$address" dev "$uplink6"
-                printf 'ip -6 neigh del proxy %s dev %s\n' "$address" "$uplink6" >> "$journal"
-            done
+            if [ "$os" = FreeBSD ]; then
+                for address in "$clat6" "$addr6"; do
+                    if ifconfig "$uplink6" inet6 2>/dev/null | awk '$1=="inet6" {split($2,a,"/");print a[1]}' | grep -Fx "$address" >/dev/null; then
+                        fail 'Proxy address is already assigned to the uplink'
+                    fi
+                    ifconfig "$uplink6" inet6 "$address/128" alias
+                    printf 'ifconfig %s inet6 %s -alias >/dev/null 2>&1 || :\n' "$uplink6" "$address" >> "$journal"
+                done
+            else
+                set_sysctl "net.ipv6.conf.$uplink6.proxy_ndp" 1
+                for address in "$clat6" "$addr6"; do
+                    if ip -6 neigh show proxy dev "$uplink6" | awk '{print $1}' | grep -Fx "$address" >/dev/null; then fail 'A proxy NDP entry already exists'; fi
+                    if ip -6 addr show dev "$uplink6" | awk '$1=="inet6" {split($2,a,"/");print a[1]}' | grep -Fx "$address" >/dev/null; then fail 'Proxy address is already assigned to the uplink'; fi
+                    ip -6 neigh add proxy "$address" dev "$uplink6"
+                    printf 'ip -6 neigh del proxy %s dev %s\n' "$address" "$uplink6" >> "$journal"
+                done
+            fi
         elif [ "$address_mode" = nat66 ]; then
             for address in "$clat6" "$addr6"; do
                 case "$address" in [fF][cCdD][0-9a-fA-F][0-9a-fA-F]:*) ;; *) fail 'NAT66 requires ULA translation addresses' ;; esac
             done
             [ -n "$nat66_address" ] || fail 'Missing NAT66 source address'
-            ip -6 addr show dev "$uplink6" | awk '$1=="inet6" && !/tentative|dadfailed/ {split($2,a,"/");print a[1]}' | grep -Fx "$nat66_address" >/dev/null || fail 'NAT66 source must be assigned to the uplink (use its displayed spelling)'
-            if [ "$firewall" = iptables ]; then
-                fw_chain ip6tables nat POSTROUTING
-                for address in "$clat6" "$addr6"; do
-                    ip6tables -w -t nat -A "$chain" -s "$address/128" -d "$pref64" -o "$uplink6" -j SNAT --to-source "$nat66_address"
-                done
+            if [ "$os" = FreeBSD ]; then
+                ifconfig "$uplink6" inet6 2>/dev/null | awk '$1=="inet6" && !/tentative|duplicated/ {split($2,a,"/");print a[1]}' | grep -Fx "$nat66_address" >/dev/null || fail 'NAT66 source must be assigned to the uplink (use its displayed spelling)'
+            else
+                ip -6 addr show dev "$uplink6" | awk '$1=="inet6" && !/tentative|dadfailed/ {split($2,a,"/");print a[1]}' | grep -Fx "$nat66_address" >/dev/null || fail 'NAT66 source must be assigned to the uplink (use its displayed spelling)'
+                if [ "$firewall" = iptables ]; then
+                    fw_chain ip6tables nat POSTROUTING
+                    for address in "$clat6" "$addr6"; do
+                        ip6tables -w -t nat -A "$chain" -s "$address/128" -d "$pref64" -o "$uplink6" -j SNAT --to-source "$nat66_address"
+                    done
+                elif [ "$firewall" = firewalld ]; then
+                    for address in "$clat6" "$addr6"; do
+                        firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -o "$uplink6" -s "$address/128" -d "$pref64" -j SNAT --to-source "$nat66_address"
+                        printf 'firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -o %s -s %s/128 -d %s -j SNAT --to-source %s >/dev/null 2>&1 || :\n' "$uplink6" "$address" "$pref64" "$nat66_address" >> "$journal"
+                    done
+                fi
             fi
         fi
         if [ "$os" = FreeBSD ]; then

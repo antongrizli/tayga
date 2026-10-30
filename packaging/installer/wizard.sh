@@ -113,16 +113,38 @@ if [ "$mode" = nat64 ]; then
 else ENABLE_DNS64=no
 fi
 export ENABLE_DNS64 DNS64_LISTEN DNS64_ALLOW DNS64_UPSTREAM DNS64_DNSSEC
+generate_deterministic_ula() {
+    seed=
+    if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
+        seed=$(cat /etc/machine-id)
+    elif [ -f /var/lib/dbus/machine-id ]; then
+        seed=$(cat /var/lib/dbus/machine-id)
+    elif command -v sysctl >/dev/null 2>&1 && sysctl -n kern.hostuuid >/dev/null 2>&1; then
+        seed=$(sysctl -n kern.hostuuid 2>/dev/null)
+    fi
+    [ -n "$seed" ] || seed="tayga-clat-$(uname -n)-$(date +%s 2>/dev/null || echo 1)"
+    hash=
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash=$(printf '%s\n' "$seed" | sha256sum 2>/dev/null | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        hash=$(printf '%s\n' "$seed" | shasum -a 256 2>/dev/null | awk '{print $1}')
+    fi
+    [ -n "$hash" ] || hash="fd4242424242"
+    p1=$(printf '%s' "$hash" | cut -c 1-2)
+    p2=$(printf '%s' "$hash" | cut -c 3-6)
+    p3=$(printf '%s' "$hash" | cut -c 7-10)
+    printf 'fd%s:%s:%s:1' "$p1" "$p2" "$p3"
+}
 if [ "$mode" = clat ]; then
     default_clat6=${CLAT_IPV6:-}
-    if [ -z "$default_clat6" ] && [ -n "$uplink6" ]; then
-        global_v6=
+    global_v6=
+    if [ -n "$uplink6" ]; then
         if [ "$(uname -s)" = FreeBSD ]; then
             global_v6=$(ifconfig "$uplink6" inet6 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ {print $2; exit}')
         elif command -v ip >/dev/null; then
             global_v6=$(ip -6 addr show dev "$uplink6" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" {print $2; exit}')
         fi
-        if [ -n "$global_v6" ]; then
+        if [ -z "$default_clat6" ] && [ -n "$global_v6" ]; then
             ip_base=${global_v6%/*}
             case "$ip_base" in
                 *::*) default_clat6="${ip_base%::*}::464" ;;
@@ -130,8 +152,31 @@ if [ "$mode" = clat ]; then
             esac
         fi
     fi
-    prompt 'Routed CLAT IPv6 address (required)' "$default_clat6"
-    clat6=$answer
+    prompt 'CLAT address mode: routed, proxy-ndp or nat66' "${CLAT_ADDRESS_MODE:-routed}"
+    clat_addr_mode=$answer
+    case "$clat_addr_mode" in
+        routed|proxy-ndp)
+            CLAT_ADDRESS_MODE=$clat_addr_mode
+            prompt 'Routed CLAT IPv6 address (required)' "$default_clat6"
+            clat6=$answer
+            NAT66_ADDRESS=
+            ;;
+        nat66)
+            CLAT_ADDRESS_MODE=nat66
+            ula_prefix=$(generate_deterministic_ula)
+            default_clat6="${ula_prefix}::2"
+            default_tayga_v6="${ula_prefix}::1"
+            prompt 'NAT66 CLAT IPv6 address (ULA)' "$default_clat6"
+            clat6=$answer
+            prompt 'NAT66 daemon IPv6 address (ULA)' "$default_tayga_v6"
+            addr6=$answer
+            uplink_v6=
+            if [ -n "$global_v6" ]; then uplink_v6=${global_v6%/*}; fi
+            prompt 'NAT66 external uplink IPv6 address' "${NAT66_ADDRESS:-$uplink_v6}"
+            NAT66_ADDRESS=$answer
+            ;;
+        *) echo 'Unsupported CLAT address mode' >&2; exit 2 ;;
+    esac
     [ -n "$clat6" ] || { echo 'An assigned routed CLAT address is required' >&2; exit 2; }
     prompt 'Host DNS: keep or public (systemd-resolved stub required)' "${HOST_DNS:-keep}"
     HOST_DNS=$answer

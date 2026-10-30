@@ -31,7 +31,7 @@ class NetworkControllerTests(unittest.TestCase):
             'ip': '''echo "ip $*" >> "$TEST_LOG"
 case "$*" in
     'link show dev '*) exit "${TEST_LINK_EXISTS:-1}" ;;
-    '-6 addr show dev eth0') echo 'inet6 2001:db8::5/128 scope global' ;;
+    '-6 addr show dev eth0'*) echo 'inet6 2001:db8::5/128 scope global' ;;
     '-6 neigh show proxy dev eth0') [ "${TEST_PROXY_EXISTS:-no}" != yes ] || echo '2001:db8::464 dev eth0' ;;
     '-4 route show default') echo 'default via 10.0.0.1 dev eth0' ;;
     '-6 route show default') echo 'default via fe80::1 dev eth0' ;;
@@ -64,6 +64,27 @@ esac''',
         result = subprocess.run(base + ['--nat66-address=2001:db8::5'], env=self.env, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('# installer-clat-address-mode nat66', output.read_text())
+
+    def test_auto_clat_and_nat66_generation(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        # 1. auto in routed mode generates CLAT address
+        out_routed = self.root / 'auto-routed.conf'
+        res = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-ipv6=auto',
+                              '--output=' + str(out_routed)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        text = out_routed.read_text()
+        self.assertIn('map 192.0.0.1 2001:db8::464', text)
+
+        # 2. auto in nat66 mode generates deterministic ULA and picks uplink address
+        out_nat66 = self.root / 'auto-nat66.conf'
+        res = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
+                              '--clat-ipv6=auto', '--nat66-address=auto',
+                              '--output=' + str(out_nat66)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        text = out_nat66.read_text()
+        self.assertIn('# installer-clat-address-mode nat66', text)
+        self.assertIn('# installer-nat66-address 2001:db8::5', text)
+        self.assertRegex(text, r'map 192\.0\.0\.1 fd[0-9a-f]{2}:[0-9a-f]{4}:[0-9a-f]{4}:1::2')
 
     def test_proxy_ndp_is_owned_and_restored_on_failure(self):
         with self.config.open('a') as stream:
@@ -251,6 +272,20 @@ exit 0
         self.assertIn('firewall-cmd --zone=trusted --add-interface=clat', self.log.read_text())
         self.assertEqual(self.run_controller('down').returncode, 0)
 
+        # 5. Firewalld with NAT66 mode
+        nat66_conf = self.root / 'firewalld-nat66.conf'
+        nat66_conf.write_text('tun-device clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr fd64::2\nmap 192.0.0.1 fd64::464\nofflink-mtu 1400\n# installer-firewall firewalld\n# installer-clat-address-mode nat66\n# installer-nat66-address 2001:db8::5\n')
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(nat66_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        up_log = self.log.read_text()
+        self.assertIn('firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -o eth0 -s fd64::464/128 -d 64:ff9b::/96 -j SNAT --to-source 2001:db8::5', up_log)
+        self.assertIn('firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -o eth0 -s fd64::2/128 -d 64:ff9b::/96 -j SNAT --to-source 2001:db8::5', up_log)
+        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(nat66_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        down_log = self.log.read_text()
+        self.assertIn('firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -o eth0 -s fd64::464/128 -d 64:ff9b::/96 -j SNAT --to-source 2001:db8::5', down_log)
+
     def test_siit_routes_bidirectional_rules_and_no_nat44(self):
         for backend in ('iptables', 'nft'):
             self.config.write_text('tun-device siit\nprefix 2001:db8:64::/96\nipv4-addr 192.168.240.1\nipv6-addr fd64::2\nmap 198.51.100.42 2001:db8:20::42\nofflink-mtu 1400\n# installer-firewall ' + backend + '\n')
@@ -314,3 +349,72 @@ esac''',
         self.assertIn('route del -net 0.0.0.0/1', down_log)
         self.assertIn('pfctl -a tayga_sfx/tun64 -F rules', down_log)
         self.assertIn('ifconfig tun64 destroy', down_log)
+
+    def test_freebsd_clat_address_adaptation(self):
+        (self.bin / 'uname').write_text('#!/bin/sh\necho FreeBSD\n')
+        for tool, script in {
+            'ifconfig': '''echo "ifconfig $*" >> "$TEST_LOG"
+case "$*" in
+    tun64) exit "${TEST_IF_EXISTS:-1}" ;;
+    'eth0 inet6')
+        echo 'inet6 fe80::1%eth0 prefixlen 64 scopeid 0x1'
+        [ "${TEST_ALREADY_ASSIGNED:-no}" != yes ] || echo 'inet6 2001:db8::464 prefixlen 128'
+        echo 'inet6 2001:db8::5 prefixlen 64'
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac''',
+            'route': '''echo "route $*" >> "$TEST_LOG"
+case "$*" in
+    '-n get -inet6 default') echo 'interface: eth0' ;;
+    '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
+esac''',
+            'netstat': 'echo "netstat $*" >> "$TEST_LOG"',
+            'pfctl': '''echo "pfctl $*" >> "$TEST_LOG"
+case "$1" in
+    -s) echo 'Status: Enabled' ;;
+    -sr) echo 'anchor "tayga_sfx/*"' ;;
+    -a)
+        if [ "$3" = -f ]; then
+            cat "$4" >> "$TEST_LOG"
+        fi
+        ;;
+esac''',
+        }.items():
+            path = self.bin / tool
+            path.write_text('#!/bin/sh\n' + script + '\n')
+            path.chmod(0o755)
+
+        # 1. FreeBSD Proxy NDP
+        pndp_conf = self.root / 'freebsd-pndp.conf'
+        pndp_conf.write_text('tun-device tun64\n# installer-mode clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr 2001:db8::2\nmap 192.0.0.1 2001:db8::464\nofflink-mtu 1400\n# installer-clat-address-mode proxy-ndp\n# installer-firewall pf\n')
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(pndp_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        log = self.log.read_text()
+        self.assertIn('ifconfig eth0 inet6 2001:db8::464/128 alias', log)
+        self.assertIn('ifconfig eth0 inet6 2001:db8::2/128 alias', log)
+        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(pndp_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        down_log = self.log.read_text()
+        self.assertIn('ifconfig eth0 inet6 2001:db8::464 -alias', down_log)
+        self.assertIn('ifconfig eth0 inet6 2001:db8::2 -alias', down_log)
+
+        # 2. FreeBSD Proxy NDP fails if address already assigned
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(pndp_conf)], env={**self.env, 'TEST_ALREADY_ASSIGNED': 'yes'}, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('already assigned', res.stderr)
+
+        # 3. FreeBSD NAT66
+        nat66_conf = self.root / 'freebsd-nat66.conf'
+        nat66_conf.write_text('tun-device tun64\n# installer-mode clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr fd64::2\nmap 192.0.0.1 fd64::464\nofflink-mtu 1400\n# installer-clat-address-mode nat66\n# installer-nat66-address 2001:db8::5\n# installer-firewall pf\n')
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(nat66_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        log = self.log.read_text()
+        self.assertIn('nat on eth0 inet6 from { fd64::464, fd64::2 } to 64:ff9b::/96 -> 2001:db8::5', log)
+        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(nat66_conf)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        down_log = self.log.read_text()
+        self.assertIn('pfctl -a tayga_sfx/tun64 -F nat', down_log)
