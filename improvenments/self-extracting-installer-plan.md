@@ -467,7 +467,7 @@ Managed CLAT routing, DNS и traffic-readiness rollback остаются сле�
 2. IPv6 `/128`: Linux iptables/nftables реализован; расширить на FreeBSD/pf и firewalld, автоматическое выделение рассматривать отдельно.
 3. Fallback реализован; расширить CPU CI-матрицу и публикуемые бинарники при необходимости.
 4. Зависимости и базовые unsigned APK/DEB/RPM реализованы; далее подпись/публикация, расширение CPU-матрицы и отдельная стратегия live upgrade.
-5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. Далее реальная OpenWrt APK-ветка, live package upgrade и расширение DHCPv6/RA/CPU-матрицы.
+5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. В r6 проверены native APK SDK/rootfs 25.12.6 и booted HVF/TCG gates. Далее live package upgrade и расширение DHCPv6/RA/CPU-матрицы.
 6. Полная CI-матрица, install/upgrade/remove и релизные артефакты.
 
 
@@ -515,3 +515,25 @@ root ownership, точный base revision pin. Добавлен pinned CI job; 
 но booted 25.12 networking пока отдельно не проверен.
 Следующие задачи: full-system 25.12.6/APK gate, live package upgrade/recovery,
 затем расширение CPU/DHCPv6-матрицы и подпись/публикация.
+
+
+### Booted OpenWrt 25.12.6/APK gate (2026-10-30)
+
+Runner получил release profiles 24.10.8/IPK и 25.12.6/APK с отдельными pins,
+проверкой расширения пакетов до boot и проверкой версии guest через SSH.
+Установка и удаление в VM используют настоящий менеджер; APK hooks не отключены.
+В APK CI job добавлены kernel/image/coreutils pins, TCG boot и загрузка отчётов.
+
+Исправлен fixture DHCPv6: stock wan6 и tayga_testwan конкурировали за eth1;
+после остановки stock клиента тестовый интерфейс получает адрес от RA responder.
+Production network/UCI не менялись; fixture отключает только runtime-интерфейс
+в одноразовой VM и теперь явно проверяет наличие IPv6 адреса.
+
+Полные HVF-прогоны 25.12.6/APK и регрессия 24.10.8/IPK пройдены, включая
+NAT64/DNS64/SIIT/CLAT, forwarded LAN traffic, readiness rollback, reboot,
+prepared-journal power-cut и active removal без изменений LAN/firewall/DHCP UCI.
+TCG-прогон APK также пройден. Portable OpenWrt: 17 тестов, ShellCheck и YAML пройдены.
+
+Итог: финальные HVF/TCG reports 25.12.6 и HVF regression 24.10.8 сверены
+с одинаковыми r6-пакетами каждой ветки и текущими runner/guest test hashes.
+Manifests и SHA256SUMS обновлены. Следующий этап — live package upgrade/recovery.

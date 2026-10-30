@@ -6,6 +6,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- Booted OpenWrt 25.12.6 APK lifecycle/networking gate with release-specific input pins, live package hooks and mixed-format rejection; shared IPK regression coverage.
+
 - Pinned OpenWrt 25.12.6 SDK/APK package gate, APK versioned runtime dependencies and matching rootfs lifecycle tests; retained 24.10.8 IPK compatibility.
 
 - Optional OpenWrt NAT64/SIIT netifd/fw4 package with owned TUN/routes, bounded firewall checks, stale-teardown protection and cleanup on stop/removal.

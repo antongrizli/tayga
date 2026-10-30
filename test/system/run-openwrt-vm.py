@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot a disposable OpenWrt 24.10.8 VM and test real procd/overlay lifecycle.
+"""Boot a pinned disposable OpenWrt VM and test real procd/overlay lifecycle.
 
 No shared host folders, external guest networking or non-loopback listeners.
 Every run requires a new work directory and retains its disk/logs/report.
@@ -18,22 +18,33 @@ import tarfile
 import time
 import zlib
 
-PINNED = {
-    'kernel': 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e',
-    'image': '9013deabf64ddd93bd2039b1b469a595c48201d611a9885afffd050053d063a5',
-    'tun': '9bbbf77e4762077d8bd49602ccb1fff1767c0e540de9f24507dcc5355f150caa',
-    'flock': 'a0718db1870b45db97dbfe79f0a53ed6fe784a92520be08024a1da7a84edfa17',
+RELEASES = {
+    '24.10.8': {
+        'manager': 'opkg', 'suffix': '.ipk', 'pins': {
+            'kernel': 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e',
+            'image': '9013deabf64ddd93bd2039b1b469a595c48201d611a9885afffd050053d063a5',
+            'tun': '9bbbf77e4762077d8bd49602ccb1fff1767c0e540de9f24507dcc5355f150caa',
+            'flock': 'a0718db1870b45db97dbfe79f0a53ed6fe784a92520be08024a1da7a84edfa17',
+        }},
+    '25.12.6': {
+        'manager': 'apk', 'suffix': '.apk', 'pins': {
+            'kernel': '2b9ce48df5536e993ee691339057828488e4a31be9c2bb5d3f6120f1135fcbb0',
+            'image': 'da639ebe2205532dce3ffacd2e91657c15d0ac77234c26bda1f63efbbd8efba1',
+            'tun': 'cf50e6c6a97f086810871daefae92cf18b0f3bc0da89550abd9c6e9887eab7ab',
+            'flock': '8d02f35efa78b15aa380a2028fabc10ef1b8e65b30289b5c0d0a91b223651fc0',
+        }},
 }
 
 
 class VM:
     def __init__(self, args):
         self.args = args
+        self.release = RELEASES[args.release]
         self.work = args.work.resolve()
         self.work.mkdir(mode=0o700, parents=True, exist_ok=False)
         self.process = None
         self.serial = (self.work / 'serial.log').open('wb')
-        self.report = {'openwrt': '24.10.8', 'target': 'armsr/armv8', 'passed': False,
+        self.report = {'openwrt': args.release, 'package_manager': self.release['manager'], 'target': 'armsr/armv8', 'passed': False,
                        'inputs': {}, 'phases': [], 'supervised_instances': {}}
         self.port = args.port
         if not self.port:
@@ -149,10 +160,14 @@ class VM:
         for name in names:
             path = getattr(self.args, name)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if name in PINNED and digest != PINNED[name]:
+            if name not in ('kernel', 'image') and path.suffix != self.release['suffix']:
+                raise ValueError('Wrong package format for selected release: ' + name)
+            if name in self.release['pins'] and digest != self.release['pins'][name]:
                 raise ValueError('Wrong pinned OpenWrt input: ' + name)
             self.report['inputs'][name] = digest
         for index, path in enumerate(self.args.extra_package):
+            if path.suffix != self.release['suffix']:
+                raise ValueError('Wrong extra package format for selected release')
             self.report['inputs'][f'extra_package_{index}'] = hashlib.sha256(path.read_bytes()).hexdigest()
         # OpenWrt gzip images have a firmware metadata trailer. Validate the
         # gzip member's CRC/length; its complete input is pinned above.
@@ -174,13 +189,15 @@ class VM:
                      "uci set network.lan.netmask='255.255.255.0'; uci commit network; /etc/init.d/network restart")
         initial_boot = self.wait_ssh()
         self.report['initial_boot'] = initial_boot
+        self.run_ssh('. /etc/openwrt_release; test "$DISTRIB_RELEASE" = ' +
+                     shlex.quote(self.args.release) + ' && command -v ' + self.release['manager'])
         archive = self.work / 'inputs.tar'
         with tarfile.open(archive, 'w') as bundle:
             for name in ['base', 'procd', 'tun', 'flock'] + (['network'] if self.args.network else []):
-                bundle.add(getattr(self.args, name), arcname=('kmod-tun' if name == 'tun' else name) + '.ipk')
+                bundle.add(getattr(self.args, name), arcname=('kmod-tun' if name == 'tun' else name) + self.release['suffix'])
             bundle.add(Path(__file__).with_name('installer-openwrt-procd-smoke.sh'), arcname='test.sh')
             for index, path in enumerate(self.args.extra_package):
-                bundle.add(path, arcname=f'extra-{index}.ipk')
+                bundle.add(path, arcname=f'extra-{index}' + self.release['suffix'])
         with archive.open('rb') as source:
             self.run_ssh('mkdir -p /tmp/tayga-procd-inputs; tar -xf - -C /tmp/tayga-procd-inputs', stdin=source)
         self.phase('install', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/tayga-procd-inputs/test.sh install /tmp/tayga-procd-inputs')
@@ -228,6 +245,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('kernel', 'image', 'base', 'procd', 'tun', 'flock', 'work'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--release', choices=tuple(RELEASES), default='24.10.8')
     parser.add_argument('--qemu', default='qemu-system-aarch64')
     parser.add_argument('--network', type=Path, help='Optional managed netifd/fw4 package (adds isolated test NIC)')
     parser.add_argument('--extra-package', type=Path, action='append', default=[], help='Offline dependency archive; may be repeated')

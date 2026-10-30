@@ -184,7 +184,7 @@ jobs:
       - name: Prepare SDK and ARM rootfs execution
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends build-essential gawk rsync unzip zstd file libncurses-dev libssl-dev zlib1g-dev qemu-user-static binfmt-support
+          sudo apt-get install -y --no-install-recommends build-essential gawk rsync unzip zstd file libncurses-dev libssl-dev zlib1g-dev qemu-user-static binfmt-support qemu-system-arm
           sudo update-binfmts --enable qemu-aarch64
       - name: Download pinned OpenWrt 25.12.6 APK inputs
         run: |
@@ -197,6 +197,15 @@ jobs:
           echo '8fcb00eb886d9add37e111a4ec43d47d57aa74742281c6a8f348a7a7ec37edb7  /tmp/apk-rootfs.tar.gz' | sha256sum -c -
           echo 'cf50e6c6a97f086810871daefae92cf18b0f3bc0da89550abd9c6e9887eab7ab  /tmp/kmod-tun.apk' | sha256sum -c -
           echo '8d02f35efa78b15aa380a2028fabc10ef1b8e65b30289b5c0d0a91b223651fc0  /tmp/flock.apk' | sha256sum -c -
+          curl -fL --retry 3 "$base/openwrt-25.12.6-armsr-armv8-generic-kernel.bin" -o /tmp/apk-kernel.bin
+          curl -fL --retry 3 "$base/openwrt-25.12.6-armsr-armv8-generic-squashfs-combined-efi.img.gz" -o /tmp/apk-squashfs.img.gz
+          feed=https://downloads.openwrt.org/releases/25.12.6/packages/aarch64_generic/packages
+          curl -fL --retry 3 "$feed/coreutils-9.9-r2.apk" -o /tmp/coreutils.apk
+          curl -fL --retry 3 "$feed/coreutils-timeout-9.9-r2.apk" -o /tmp/timeout.apk
+          echo '2b9ce48df5536e993ee691339057828488e4a31be9c2bb5d3f6120f1135fcbb0  /tmp/apk-kernel.bin' | sha256sum -c -
+          echo 'da639ebe2205532dce3ffacd2e91657c15d0ac77234c26bda1f63efbbd8efba1  /tmp/apk-squashfs.img.gz' | sha256sum -c -
+          echo '988d68cb5f3b40b7cb28cf0dd0325b6a545a8aebc1970f22373de4dface62ebd  /tmp/coreutils.apk' | sha256sum -c -
+          echo 'f540d53b8f0668d356d40725e62728b4f5a55f65453abcff338aaa9613985595  /tmp/timeout.apk' | sha256sum -c -
           mkdir /tmp/apk-sdk
           tar --zstd -xf /tmp/apk-sdk.tar.zst -C /tmp/apk-sdk --strip-components=1
       - name: Build native OpenWrt APK packages
@@ -220,12 +229,26 @@ jobs:
           done
           sudo sh test/system/installer-openwrt-package-smoke.sh /tmp/apk-rootfs-binary "$base" /tmp/kmod-tun.apk
           sudo sh test/system/installer-openwrt-service-state-smoke.sh /tmp/apk-rootfs-service "$base" "$service" /tmp/kmod-tun.apk /tmp/flock.apk
+      - name: Boot OpenWrt 25.12.6 and verify APK hooks and networking
+        run: |
+          base=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-[0-9]*.apk')
+          service=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-procd-*.apk')
+          network=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-network-*.apk')
+          python3 test/system/run-openwrt-vm.py --release 25.12.6 --accel tcg \
+            --kernel /tmp/apk-kernel.bin --image /tmp/apk-squashfs.img.gz \
+            --base "$base" --procd "$service" --network "$network" \
+            --tun /tmp/kmod-tun.apk --flock /tmp/flock.apk \
+            --extra-package /tmp/coreutils.apk --extra-package /tmp/timeout.apk \
+            --work "$RUNNER_TEMP/openwrt-apk-vm"
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: openwrt-25.12.6-apk-packages
           path: |
             /tmp/apk-sdk/bin/packages/**/tayga-managed-openwrt*.apk
             /tmp/apk-sdk/package/tayga-managed-openwrt/source-manifest.json
+            ${{ runner.temp }}/openwrt-apk-vm/report.json
+            ${{ runner.temp }}/openwrt-apk-vm/*.log
           if-no-files-found: error
 
   test-native-packages:

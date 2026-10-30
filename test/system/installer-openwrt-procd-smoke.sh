@@ -6,6 +6,17 @@ set -eu
 state=/etc/tayga-procd-test
 service=/etc/init.d/tayga-managed
 phase=${1:-}
+if command -v opkg >/dev/null 2>&1; then
+    package_ext=ipk
+    package_install() { opkg install "$@"; }
+    package_remove() { opkg remove "$@"; }
+else
+    command -v apk >/dev/null 2>&1 || exit 2
+    package_ext=apk
+    # Local unsigned fixtures without persistent package cache; hooks run normally.
+    package_install() { apk --no-network --allow-untrusted --force-non-repository add "$@"; }
+    package_remove() { apk --no-network del "$@"; }
+fi
 pid() {
     ubus call service list '{"name":"tayga-managed"}' | jsonfilter -e '@["tayga-managed"].instances.main.pid'
 }
@@ -84,10 +95,10 @@ case "$phase" in
         mkdir -p "$state"
         cp "$0" "$state/test.sh"
         sha256sum /etc/config/network /etc/config/firewall /etc/config/dhcp > "$state/network.before"
-        opkg install "$packages/kmod-tun.ipk" "$packages/flock.ipk"
-        if [ -f "$packages/extra-0.ipk" ]; then opkg install "$packages"/extra-*.ipk; fi
-        opkg install "$packages/base.ipk" "$packages/procd.ipk"
-        if [ -f "$packages/network.ipk" ]; then opkg install "$packages/network.ipk"; fi
+        package_install "$packages/kmod-tun.$package_ext" "$packages/flock.$package_ext"
+        if [ -f "$packages/extra-0.$package_ext" ]; then package_install "$packages"/extra-*.$package_ext; fi
+        package_install "$packages/base.$package_ext" "$packages/procd.$package_ext"
+        if [ -f "$packages/network.$package_ext" ]; then package_install "$packages/network.$package_ext"; fi
         [ "$(uci -q get tayga_managed.main.enabled)" = 0 ]
         stopped
         mkdir -p "$state/data"
@@ -420,6 +431,10 @@ EOF
         cp "$state/managed-nat64.good" /etc/tayga/managed-nat64.conf
         # Test real DHCPv6/RA dynamic uplink via odhcp6c on eth1 (QEMU slirp RA responder).
         first=$(pid)
+        # The stock image also runs wan6 on eth1. Use a single DHCPv6 client
+        # on this link; newer netifd rejects the competing client setup.
+        default6=$(ubus -t 5 call network.interface.wan6 status 2>/dev/null | jsonfilter -e '@.l3_device' || :)
+        if [ "$default6" = eth1 ]; then ifdown wan6; fi
         uci delete network.tayga_testwan.ip6addr
         uci set network.tayga_testwan.proto=dhcpv6
         uci set network.tayga_testwan.reqaddress=try
@@ -433,6 +448,7 @@ EOF
             fi
             sleep 1
         done
+        ubus call network.interface.tayga_testwan status | jsonfilter -e '@["ipv6-address"][0].address' | grep -q '^fd42:3:'
         wait_running
         one_owner
         [ "$(cat /var/run/tayga-managed/network/wan)" = eth1 ]
@@ -488,7 +504,7 @@ EOF
         wait "$echo_pid" 2>/dev/null || :
         ip -6 route del fd64:100::/96 dev twan0 metric 128 2>/dev/null || :
         rm -f /tmp/tayga-dns64.hosts
-        opkg remove tayga-managed-openwrt-network
+        package_remove tayga-managed-openwrt-network
         stopped
         [ ! -e /sys/class/net/tmg0 ]
         [ ! -e /var/run/tayga-managed/network ]
@@ -509,7 +525,7 @@ EOF
         "$service" stop
         stopped
         [ -f /sys/class/net/tun64/tun_flags ]
-        opkg remove tayga-managed-openwrt-procd
+        package_remove tayga-managed-openwrt-procd
         [ "$(uci -q get tayga_managed.main.enabled)" = 1 ]
         [ -f /etc/tayga-managed/active.conf ]
         grep -q retained /etc/tayga-managed/data/test-retained
@@ -528,7 +544,7 @@ EOF
         /etc/init.d/tayga-test-tun disable
         /etc/init.d/tayga-test-tun stop
         [ ! -e /sys/class/net/tun64 ]
-        opkg remove tayga-managed-openwrt
+        package_remove tayga-managed-openwrt
         [ ! -e /usr/sbin/tayga ]
         stopped
         sha256sum /etc/config/network /etc/config/firewall /etc/config/dhcp > "$state/network.after"

@@ -1,5 +1,7 @@
 """OpenWrt SDK identity and binary-only staging, without touching a host SDK."""
 import importlib.util
+import hashlib
+from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
@@ -65,6 +67,27 @@ class OpenWrtPackageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(int(counter.read_text()), 6)
         self.assertFalse(net.exists())
+
+    def test_vm_rejects_mixed_package_format_before_boot(self):
+        spec = importlib.util.spec_from_file_location('openwrt_vm', ROOT / 'test/system/run-openwrt-vm.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        kernel = self.sdk / 'kernel.bin'
+        kernel.write_bytes(b'test kernel')
+        wrong = self.sdk / 'base.ipk'
+        wrong.write_bytes(b'test package')
+        args = SimpleNamespace(release='25.12.6', work=self.sdk / 'vm', port=0,
+                               kernel=kernel, image=kernel, base=wrong, procd=wrong,
+                               tun=wrong, flock=wrong, network=None, extra_package=[])
+        vm = runner.VM(args)
+        self.addCleanup(vm.close)
+        # Isolate the format guard from the separately pinned image validation.
+        vm.release = {**vm.release, 'pins': {'kernel': hashlib.sha256(kernel.read_bytes()).hexdigest(),
+                                           'image': hashlib.sha256(kernel.read_bytes()).hexdigest()}}
+        with self.assertRaisesRegex(ValueError, 'Wrong package format'):
+            vm.execute()
+        self.assertIsNone(vm.process)
+        self.assertFalse((args.work / 'disk.raw').exists())
 
     def test_fresh_sdk_requires_defconfig_before_staging(self):
         (self.sdk / '.config').unlink()

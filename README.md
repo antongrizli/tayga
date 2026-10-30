@@ -580,8 +580,8 @@ failure. LAN/firewall/DHCP configurations are compared before and after.
 python3 test/system/run-openwrt-vm.py \
   --kernel /path/to/openwrt-24.10.8-armsr-armv8-generic-kernel.bin \
   --image /path/to/openwrt-24.10.8-armsr-armv8-generic-squashfs-combined-efi.img.gz \
-  --base /path/to/tayga-managed-openwrt_0.9.14-r5_aarch64_generic.ipk \
-  --procd /path/to/tayga-managed-openwrt-procd_0.9.14-r5_aarch64_generic.ipk \
+  --base /path/to/tayga-managed-openwrt_0.9.14-r6_aarch64_generic.ipk \
+  --procd /path/to/tayga-managed-openwrt-procd_0.9.14-r6_aarch64_generic.ipk \
   --tun /path/to/kmod-tun.ipk --flock /path/to/flock.ipk \
   --work build/openwrt-procd-vm
 ```
@@ -700,6 +700,22 @@ The `test-openwrt-apk` CI job pins SDK/rootfs/kmod/flock SHA-256 values and repe
 these offline package tests. Local test archives are unsigned; the disposable
 rootfs tests disable package scripts and permit non-repository APK installation
 without a persistent cache. The IPK 24.10.8 r6 build and both rootfs tests also
-passed. These are package/file tests: booted networking on 25.12.6, package live
-upgrade and signed publication remain pending. The r5 full VM reports above
+passed. These package/file tests are complemented by the booted 25.12.6 gate
+below. Package live upgrade and signed publication remain pending. The r5 full VM reports above
 cover 24.10.8 networking; GitHub CI has not been run for this change.
+
+The VM runner accepts `--release 25.12.6` for APK images and defaults to
+`--release 24.10.8` for IPK images. Supply matching kernel/image/kmod/flock and
+base/procd/network archives with their correct `.apk` or `.ipk` suffixes; use
+`--extra-package` for matching coreutils/coreutils-timeout packages. Kernel,
+image, TUN and flock pins are release-specific; mixed package formats are
+rejected before boot and the running firmware release is checked over SSH.
+
+The 25.12.6 HVF and TCG runs passed the complete procd, WAN, reboot/power-cut,
+NAT64/DNS64/SIIT/CLAT, forwarded traffic, readiness rollback and active-removal
+matrix. The same updated runner passed the 24.10.8 IPK regression. The DHCPv6
+fixture stops the stock wan6 client on its test NIC before starting a second
+logical client, then explicitly checks its IPv6 address. This uses QEMU's RA
+responder, not a dedicated DHCPv6 lease server. CI repeats the APK matrix with
+TCG and uploads phase/serial logs and the JSON report, including failures.
+The local 25.12.6 TCG verification also passed the complete matrix.
