@@ -6,6 +6,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- Isolated two-VM OpenWrt DHCPv6 gate with odhcpd IA_NA/IA_PD leases, renew stability and live prefix renumbering through odhcp6c; enabled for IPK/APK CI.
+
 - Optional independent OpenWrt package upgrade/recovery coordinator with a persistent archive/state journal, startup fencing, manager/readiness rollback and boot recovery tests.
 
 - Booted OpenWrt 25.12.6 APK lifecycle/networking gate with release-specific input pins, live package hooks and mixed-format rejection; shared IPK regression coverage.

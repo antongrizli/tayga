@@ -467,7 +467,7 @@ Managed CLAT routing, DNS и traffic-readiness rollback остаются сле�
 2. IPv6 `/128`: Linux iptables/nftables реализован; расширить на FreeBSD/pf и firewalld, автоматическое выделение рассматривать отдельно.
 3. Fallback реализован; расширить CPU CI-матрицу и публикуемые бинарники при необходимости.
 4. Зависимости и базовые unsigned APK/DEB/RPM реализованы; далее подпись/публикация, расширение CPU-матрицы и отдельная стратегия live upgrade.
-5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. В r6 проверены native APK SDK/rootfs 25.12.6 и booted HVF/TCG gates. В r7 реализован coordinated live package upgrade/recovery для IPK/APK с независимым recovery package; HVF/TCG gates обеих веток пройдены. Далее dedicated DHCPv6 server и расширение CPU-матрицы.
+5. OpenWrt: SDK packages, procd/UCI external mode, persistent file recovery и optional netifd/hotplug WAN tracking реализованы. NAT64/SIIT TUN/routes/fw4 добавлены в optional network package (r4, HVF/TCG VM gates пройдены). В r5 добавлены managed CLAT routing, DNS64/dnsmasq, readiness rollback, forwarded traffic для трёх режимов и odhcp6c/RA fixture. Итоговые HVF/TCG-прогоны r5 пройдены. В r6 проверены native APK SDK/rootfs 25.12.6 и booted HVF/TCG gates. В r7 реализован coordinated live package upgrade/recovery для IPK/APK с независимым recovery package; HVF/TCG gates обеих веток пройдены. Добавлен отдельный odhcpd server fixture с IA_NA/IA_PD, renew и перенумерацией с перекрытием/удалением старого префикса. Далее расширение CPU-матрицы.
 6. Полная CI-матрица, install/upgrade/remove и релизные артефакты.
 
 
@@ -571,6 +571,64 @@ Manifests и SHA256SUMS: `build/openwrt/{24.10.8,25.12.6}/armsr-armv8/r7/`
 Произвольная порча package DB/flash не покрыта; GitHub CI отдельно не проверялся.
 
 Следующие этапы по порядку:
-1. Dedicated DHCPv6 lease-server fixture и смена lease/prefix в OpenWrt VM.
+1. Dedicated DHCPv6 lease-server fixture и смена lease/prefix в OpenWrt VM — реализовано, см. следующий этап.
 2. Расширение CPU/build/install матрицы OpenWrt и native APK/DEB/RPM.
 3. Стратегия live upgrade для native пакетов, подпись и публикация релизных артефактов.
+
+
+### Dedicated OpenWrt DHCPv6 lease server gate (2026-10-30)
+
+Добавлен `--dhcpv6-server` в booted VM runner: вторая VM той же pinned версии
+запускает штатный odhcpd, соединение с eth2 клиента — приватная AF_UNIX datagram
+socketpair без host-facing сетевого listener. Никакие host interfaces не меняются.
+Отдельная VM использует test-only prefix pool и IA_NA/IA_PD server, SLAAC отключён.
+
+Проверяются настоящий адрес и делегированный /62 с обеих сторон (netifd и
+odhcpd lease table), renew без смены PID TAYGA, появление нового prefix/lease,
+затем удаление старых адреса и делегации после отзыва prefix на сервере.
+Во время перенумерации допускается временный uplink down: bounded wait должен
+увидеть восстановление, accepted config сохраняется, у odhcp6c не меняется PID.
+PID клиента определяется среди прямых дочерних процессов netifd, чтобы не принять
+краткоживущий fork перед запуском notification script за новый клиент.
+После изменений DHCPv6/RA ожидаются пять последовательных совпадений PID и
+stable uplink facts с единственным владельцем TUN: адрес, route и procd PID
+не обязаны обновляться одновременно. Ожидание покрывает 120-секундный test lease
+и восстановление supervisor; временное отсутствие PID допускается, при смене
+fingerprint сохраняется полный netifd status для диагностики.
+Test-only fw4 include разрешает DHCPv6/ICMPv6 на eth2 и удаляется после проверки;
+исходные network/firewall/DHCP UCI восстанавливаются прежним remove gate.
+
+Общий boot/SSH bootstrap вынесен для повторного использования второй VM.
+При ошибке сохраняются также peer diagnostics; при выходе обе VM и sockets
+закрываются, private SSH keys удаляются. Добавлен portable regression cleanup
+до boot. Оба OpenWrt CI job включают gate и загружают peer reports/logs.
+
+Локальная VM-проверка завершена: полные 20-фазные HVF/IPK, HVF/APK и TCG/APK
+прогоны пройдены. Для IPK/TCG полным прогоном подтверждены 18 фаз до managed:
+reboot, power-cut, package upgrade/recovery и весь новый DHCPv6 gate. На старой
+managed SLARP/RA-проверке поймана гонка wait_running/one_owner; она переведена
+на общий bounded stable-owner wait. После исправления на свежей VM пройдены
+install/lifecycle/WAN, reboot, DHCPv6, вся managed-матрица и remove (network-only).
+Использованы те же target package hashes. Полный актуальный IPK CI job ещё
+требует проверки после push; split-validation не выдаётся за один полный прогон.
+
+Добавлен `--network-only` для воспроизводимых сетевых reruns на свежей VM.
+Он включает один reboot для загрузки установленного netifd protocol package;
+не включает package upgrade/power-cut и несовместим с --upgrade-*.
+
+Артефакты: `build/openwrt-dhcpv6/verification.json` и `SHA256SUMS` содержат
+ссылки/хеши main/peer reports и точные snapshots runner/guest scripts. Три полных
+успешных прогона выполнены до hardening ожидания PID; актуальные IPK/TCG проверки
+и portable-регрессия проверяют временно отсутствующий PID, lease-sized wait,
+диагностику смены fingerprint и общий wait в managed RA-проверке. Условия
+ownership/configuration сохранены, тестовые ревизии указаны явно.
+Portable installer suite: 86 тестов, 2 пропуска; OpenWrt subset: 21. ShellCheck,
+Python syntax и workflow YAML пройдены. Бинарные r7 baseline/fixture packages
+не менялись. Перенумерация тестируется с перекрытием префиксов; single-step
+замена без перекрытия отдельно не сертифицирована. GitHub CI не проверялся.
+
+Следующие этапы по порядку:
+1. Проверить полные GitHub CI gates после push, включая актуальный combined IPK/TCG.
+2. Расширение CPU/build/install матрицы OpenWrt и native APK/DEB/RPM.
+3. Стратегия live upgrade native пакетов.
+4. Подпись и публикация релизных артефактов, завершение полной release CI-матрицы.

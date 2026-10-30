@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,41 @@ class OpenWrtPackageTests(unittest.TestCase):
             vm.execute()
         self.assertIsNone(vm.process)
         self.assertFalse((args.work / 'disk.raw').exists())
+
+    def test_dhcp_wait_tolerates_temporarily_absent_procd_pid(self):
+        source = (ROOT / 'test/system/installer-openwrt-procd-smoke.sh').read_text()
+        body = source.split('wait_dhcp_owner() {', 1)[1].split('\nstopped() {', 1)[0]
+        body = body.replace('/usr/libexec/tayga/openwrt-uplink', '"$TEST_UPLINK"')
+        helper = self.sdk / 'uplink'
+        helper.write_text('#!/bin/sh\necho "eth2 stable-facts"\n')
+        helper.chmod(0o755)
+        counter = self.sdk / 'pid-calls'
+        counter.write_text('0')
+        script = self.sdk / 'wait.sh'
+        script.write_text('set -eu\nwait_dhcp_owner() {' + body +
+            '\npid() { n=$(cat "$TEST_COUNTER"); n=$((n+1)); echo "$n" > "$TEST_COUNTER"; '
+            '[ "$n" -gt 1 ] || return 1; echo 42; }\n'
+            'running() { :; }\none_owner() { :; }\nsleep() { :; }\nubus() { :; }\nwait_dhcp_owner\n')
+        result = subprocess.run(['sh', str(script)], capture_output=True, text=True,
+            env={**os.environ, 'TEST_UPLINK': str(helper), 'TEST_COUNTER': str(counter)}, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(int(counter.read_text()), 7)
+
+    def test_vm_peer_resources_close_even_before_boot(self):
+        spec = importlib.util.spec_from_file_location('openwrt_vm', ROOT / 'test/system/run-openwrt-vm.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        vm = runner.VM(SimpleNamespace(release='24.10.8', work=self.sdk / 'client', port=0))
+        peer = runner.VM(SimpleNamespace(release='24.10.8', work=self.sdk / 'server', port=0))
+        vm.lease_server = peer
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        vm.lease_socket, peer.lease_socket = left, right
+        vm.close()
+        self.assertEqual(left.fileno(), -1)
+        self.assertEqual(right.fileno(), -1)
+        for instance in (vm, peer):
+            self.assertTrue(instance.serial.closed)
+            self.assertFalse(json.loads((instance.work / 'report.json').read_text())['passed'])
 
     def test_fresh_sdk_requires_defconfig_before_staging(self):
         (self.sdk / '.config').unlink()

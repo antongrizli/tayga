@@ -160,7 +160,7 @@ jobs:
           service=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt-procd_*.ipk')
           network=$(find /tmp/openwrt-sdk/bin -name 'tayga-managed-openwrt-network_*.ipk')
           test -n "$network"
-          python3 test/system/run-openwrt-vm.py --accel tcg \
+          python3 test/system/run-openwrt-vm.py --accel tcg --dhcpv6-server \
             --kernel /tmp/openwrt-kernel.bin --image /tmp/openwrt-squashfs.img.gz \
             --base /tmp/openwrt-baseline/base.ipk --procd /tmp/openwrt-baseline/procd.ipk \
             --network /tmp/openwrt-baseline/network.ipk --upgrader /tmp/openwrt-baseline/upgrader.ipk \
@@ -179,6 +179,8 @@ jobs:
             /tmp/openwrt-sdk/package/tayga-managed-openwrt/source-manifest.json
             ${{ runner.temp }}/openwrt-procd-vm/report.json
             ${{ runner.temp }}/openwrt-procd-vm/*.log
+            ${{ runner.temp }}/openwrt-procd-vm/dhcpv6-server/report.json
+            ${{ runner.temp }}/openwrt-procd-vm/dhcpv6-server/*.log
           if-no-files-found: warn
 
   test-openwrt-apk:
@@ -245,7 +247,7 @@ jobs:
           base=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-[0-9]*.apk')
           service=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-procd-*.apk')
           network=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-network-*.apk')
-          python3 test/system/run-openwrt-vm.py --release 25.12.6 --accel tcg \
+          python3 test/system/run-openwrt-vm.py --release 25.12.6 --accel tcg --dhcpv6-server \
             --kernel /tmp/apk-kernel.bin --image /tmp/apk-squashfs.img.gz \
             --base /tmp/apk-baseline/base.apk --procd /tmp/apk-baseline/procd.apk \
             --network /tmp/apk-baseline/network.apk --upgrader /tmp/apk-baseline/upgrader.apk \
@@ -263,6 +265,8 @@ jobs:
             /tmp/apk-sdk/package/tayga-managed-openwrt/source-manifest.json
             ${{ runner.temp }}/openwrt-apk-vm/report.json
             ${{ runner.temp }}/openwrt-apk-vm/*.log
+            ${{ runner.temp }}/openwrt-apk-vm/dhcpv6-server/report.json
+            ${{ runner.temp }}/openwrt-apk-vm/dhcpv6-server/*.log
           if-no-files-found: error
 
   test-native-packages:

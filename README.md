@@ -764,3 +764,20 @@ installation with core files removed, accepted-state/data recovery, active upgra
 and stopped reinstall. Final verification status is recorded with the r7 build
 manifests. The crash test exercises that specific package/file interruption point;
 it does not certify arbitrary corruption of the package database or flash.
+
+The VM runner's optional `--dhcpv6-server` gate adds a second disposable OpenWrt
+VM of the same pinned release. Stock odhcpd serves stateful IA_NA addresses and
+IA_PD /62 delegations over a private AF_UNIX datagram socketpair to the client's
+third NIC. SLAAC is disabled on this test link. The gate checks initial leases,
+renewal without a TAYGA restart, and server-side prefix replacement without
+restarting odhcp6c, followed by TAYGA reconciliation and accepted-config retention.
+Renumbering overlaps the old and new prefixes before retiring the old one and
+checks that its address/delegation disappear. Temporary lease loss during the
+transition is allowed within a bounded wait; odhcp6c must remain the same process,
+and TAYGA must resume the accepted configuration when the uplink returns.
+Both OpenWrt CI jobs enable this gate. Peer logs and its report live under the
+run's `dhcpv6-server/` directory and are uploaded alongside client evidence.
+For focused networking reruns, `--network-only` runs install/lifecycle/WAN,
+one reboot to load the installed netifd protocol, optional DHCPv6, managed traffic
+and removal on a fresh VM. It requires `--network` and excludes `--upgrade-*`;
+power-cut and package-upgrade phases stay in the full gate.

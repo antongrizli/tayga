@@ -27,6 +27,22 @@ running() {
     [ "$(cat "/proc/$current/comm")" = tayga ] || return 1
     [ "$(ubus call service list '{"name":"tayga-managed"}' | jsonfilter -e '@["tayga-managed"].instances.main.running')" = true ]
 }
+dhcp_ping() {
+    for _ in $(seq 1 25); do
+        if ping -6 -c 1 -W 1 -I eth2 "$1"; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+dhcp_client_pid() {
+    parent=$(pidof netifd)
+    for client in $(pidof odhcp6c || :); do
+        [ "$(awk '{print $4}' "/proc/$client/stat" 2>/dev/null || :)" = "$parent" ] || continue
+        command=$(tr '\000' ' ' < "/proc/$client/cmdline" 2>/dev/null || :)
+        case " $command " in *' eth2 '*) echo "$client"; return 0 ;; esac
+    done
+    return 1
+}
 wait_running() {
     for _ in $(seq 1 30); do
         if running; then return 0; fi
@@ -48,6 +64,28 @@ one_owner() {
         owners=$((owners+1)); owner=$process
     done
     [ "$owners" = 1 ] && [ "$owner" = "$(pid)" ]
+}
+wait_dhcp_owner() {
+    # DHCP state, RA routes and procd updates arrive independently. Require
+    # repeated agreement instead of asserting ownership between two restarts.
+    last_pid=; last_facts=; stable=0
+    # Cover the 120-second test lease plus supervisor recovery and stable samples.
+    for _ in $(seq 1 150); do
+        facts=$(/usr/libexec/tayga/openwrt-uplink tayga_testwan 2>/dev/null || :)
+        candidate=$(pid || :)
+        if [ "$facts" != "$last_facts" ]; then
+            ubus call network.interface.tayga_testwan status >&2 || :
+        fi
+        if [ -n "$facts" ] && running && one_owner &&
+           [ "$candidate" = "$(pid)" ] && [ "$candidate" = "$last_pid" ] &&
+           [ "$facts" = "$last_facts" ]; then
+            stable=$((stable+1))
+            [ "$stable" -lt 5 ] || return 0
+        else stable=0; fi
+        last_pid=$candidate; last_facts=$facts
+        sleep 1
+    done
+    return 1
 }
 stopped() {
     for _ in $(seq 1 20); do
@@ -522,6 +560,131 @@ EOF
         wait_running
         echo 'PASS: active upgrade and stopped reinstall preserve activation policy and accepted snapshot'
         ;;
+    dhcpv6-start)
+        # This third NIC is outside the stock WAN firewall zone. Keep test-only
+        # input rules across fw4 hotplug reloads, without editing firewall UCI.
+        mkdir -p /usr/share/nftables.d/chain-pre/input
+        cat > /usr/share/nftables.d/chain-pre/input/95-tayga-dhcpv6-test.nft <<'EOF'
+iifname "eth2" meta l4proto ipv6-icmp accept
+iifname "eth2" udp dport 546 accept
+EOF
+        fw4 reload
+        "$service" stop
+        stopped
+        ifdown tayga_testwan
+        # Hold the physical link up before starting the DHCPv6-only interface,
+        # just as a separate lower-layer WAN interface would on a router.
+        uci set network.tayga_lease_link=interface
+        uci set network.tayga_lease_link.proto=none
+        uci set network.tayga_lease_link.device=eth2
+        uci commit network
+        ubus call network reload
+        ifup tayga_lease_link
+        for _ in $(seq 1 25); do
+            if ip -6 addr show dev eth2 scope link | grep -q 'inet6 fe80:' &&
+               ! ip -6 addr show dev eth2 scope link | grep -q tentative; then break; fi
+            sleep 1
+        done
+        ip -6 addr show dev eth2 scope link | grep 'inet6 fe80:'
+        uci set network.tayga_testwan.device=@tayga_lease_link
+        uci set network.tayga_testwan.proto=dhcpv6
+        for option in ipaddr netmask ip6addr ip6prefix; do
+            uci -q delete "network.tayga_testwan.$option" || :
+        done
+        uci set network.tayga_testwan.reqaddress=force
+        uci set network.tayga_testwan.reqprefix=62
+        uci set network.tayga_testwan.peerdns=0
+        uci set network.tayga_testwan.defaultroute=0
+        uci commit network
+        ubus call network reload
+        ifup tayga_testwan
+        for _ in $(seq 1 90); do
+            status=$(ubus call network.interface.tayga_testwan status)
+            if printf '%s' "$status" | jsonfilter -e '@["ipv6-address"][0].address' | grep -q '^fd62:100:' &&
+               printf '%s' "$status" | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q '^fd62:100:'; then break; fi
+            sleep 1
+        done
+        printf '%s\n' "$status" > "$state/dhcpv6-initial.json"
+        printf '%s' "$status" | jsonfilter -e '@["ipv6-address"][0].address' | grep -q '^fd62:100:'
+        [ "$(printf '%s' "$status" | jsonfilter -e '@["ipv6-prefix"][0].mask')" = 62 ]
+        cp /etc/tayga-managed/active.conf "$state/dhcpv6-accepted.conf"
+        "$service" boot
+        wait_dhcp_owner
+        /usr/libexec/tayga/openwrt-uplink tayga_testwan > "$state/dhcpv6-initial.facts"
+        pid > "$state/dhcpv6-initial.pid"
+        dhcp_client_pid > "$state/dhcpv6-client.pid"
+        dhcp_ping fd62:100::1
+        echo 'PASS: stateful DHCPv6 IA_NA and IA_PD /62 received from odhcpd; SLAAC disabled'
+        ;;
+    dhcpv6-renew)
+        # A lifetime-only renew must not change the supervisor's stable facts.
+        first=$(pid)
+        ubus call network.interface.tayga_testwan renew
+        sleep 8
+        /usr/libexec/tayga/openwrt-uplink tayga_testwan > "$state/dhcpv6-renew.facts"
+        cmp "$state/dhcpv6-initial.facts" "$state/dhcpv6-renew.facts"
+        [ "$(dhcp_client_pid)" = "$(cat "$state/dhcpv6-client.pid")" ]
+        [ "$(pid)" = "$first" ]
+        one_owner
+        echo 'PASS: DHCPv6 renew retains stable facts and the supervised PID'
+        ;;
+    dhcpv6-renumber)
+        first=$(cat "$state/dhcpv6-initial.pid")
+        # Keep odhcp6c alive: odhcpd reconfigure / normal lease renewal must
+        # deliver the replacement address and delegated prefix without ifup.
+        for _ in $(seq 1 150); do
+            status=$(ubus call network.interface.tayga_testwan status)
+            addresses=$(printf '%s' "$status" | jsonfilter -e '@["ipv6-address"][*].address' || :)
+            prefixes=$(printf '%s' "$status" | jsonfilter -e '@["ipv6-prefix"][*].address' || :)
+            if printf '%s\n' "$addresses" | grep -q '^fd62:200:' &&
+               printf '%s\n' "$prefixes" | grep -q '^fd62:200:'; then break; fi
+            sleep 1
+        done
+        printf '%s\n' "$status" > "$state/dhcpv6-renumbered.json"
+        printf '%s\n' "$addresses" | grep -q '^fd62:200:'
+        printf '%s\n' "$prefixes" | grep -q '^fd62:200:'
+        wait_dhcp_owner
+        [ "$(pid)" != "$first" ]
+        [ "$(dhcp_client_pid)" = "$(cat "$state/dhcpv6-client.pid")" ]
+        /usr/libexec/tayga/openwrt-uplink tayga_testwan > "$state/dhcpv6-renumbered.facts"
+        if cmp -s "$state/dhcpv6-initial.facts" "$state/dhcpv6-renumbered.facts"; then exit 1; fi
+        cmp "$state/dhcpv6-accepted.conf" /etc/tayga-managed/active.conf
+        dhcp_ping fd62:200::1
+        echo 'PASS: DHCPv6 renumber changes IA_NA/IA_PD and supervised PID, preserving the accepted config'
+        ;;
+    dhcpv6-retire)
+        for _ in $(seq 1 150); do
+            status=$(ubus call network.interface.tayga_testwan status)
+            addresses=$(printf '%s' "$status" | jsonfilter -e '@["ipv6-address"][*].address' || :)
+            prefixes=$(printf '%s' "$status" | jsonfilter -e '@["ipv6-prefix"][*].address' || :)
+            if printf '%s\n' "$addresses" | grep -q '^fd62:200:' &&
+               printf '%s\n' "$prefixes" | grep -q '^fd62:200:' &&
+               ! printf '%s\n' "$addresses" "$prefixes" | grep -q '^fd62:100:'; then break; fi
+            sleep 1
+        done
+        printf '%s\n' "$addresses" | grep -q '^fd62:200:'
+        printf '%s\n' "$prefixes" | grep -q '^fd62:200:'
+        if printf '%s\n' "$addresses" "$prefixes" | grep -q '^fd62:100:'; then exit 1; fi
+        [ "$(dhcp_client_pid)" = "$(cat "$state/dhcpv6-client.pid")" ]
+        wait_dhcp_owner
+        cmp "$state/dhcpv6-accepted.conf" /etc/tayga-managed/active.conf
+        dhcp_ping fd62:200::1
+        echo 'PASS: retired DHCPv6 prefix removed; replacement lease and accepted config retained'
+        ;;
+    dhcpv6-stop)
+        rm -f /usr/share/nftables.d/chain-pre/input/95-tayga-dhcpv6-test.nft
+        fw4 reload
+        "$service" stop
+        stopped
+        ifdown tayga_testwan
+        ifdown tayga_lease_link
+        uci delete network.tayga_lease_link
+        for option in reqaddress reqprefix peerdns defaultroute; do
+            uci -q delete "network.tayga_testwan.$option" || :
+        done
+        uci set network.tayga_testwan.proto=static
+        uci commit network
+        ;;
     managed)
         "$service" stop
         stopped
@@ -666,8 +829,7 @@ EOF
             sleep 1
         done
         ubus call network.interface.tayga_testwan status | jsonfilter -e '@["ipv6-address"][0].address' | grep -q '^fd42:3:'
-        wait_running
-        one_owner
+        wait_dhcp_owner
         [ "$(cat /var/run/tayga-managed/network/wan)" = eth1 ]
         # Switch tayga_testwan to twan0 with an active IPv6 responder for SIIT and CLAT data-path tests.
         uci set network.tayga_testwan.proto=static

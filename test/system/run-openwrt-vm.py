@@ -5,6 +5,7 @@ No shared host folders, external guest networking or non-loopback listeners.
 Every run requires a new work directory and retains its disk/logs/report.
 """
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -43,6 +44,8 @@ class VM:
         self.work = args.work.resolve()
         self.work.mkdir(mode=0o700, parents=True, exist_ok=False)
         self.process = None
+        self.lease_socket = None
+        self.lease_server = None
         self.serial = (self.work / 'serial.log').open('wb')
         self.report = {'openwrt': args.release, 'package_manager': self.release['manager'], 'target': 'armsr/armv8', 'passed': False,
                        'inputs': {}, 'phases': [], 'supervised_instances': {}}
@@ -85,8 +88,13 @@ class VM:
         if self.args.network:
             command += ['-netdev', 'user,id=net1,restrict=on,net=10.0.3.0/24,ipv6-net=fd42:3::/64,ipv6-host=fd42:3::2',
                         '-device', 'virtio-net-pci,netdev=net1']
+        if self.lease_socket is not None:
+            command += ['-netdev', f'dgram,id=lease,local.type=fd,local.str={self.lease_socket.fileno()}',
+                        '-device', 'virtio-net-pci,netdev=lease,mac=52:54:00:64:00:' +
+                        ('01' if self.args.network else '02')]
         self.report['qemu_command'] = command
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=self.serial, stderr=subprocess.STDOUT)
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=self.serial, stderr=subprocess.STDOUT,
+                                        pass_fds=() if self.lease_socket is None else (self.lease_socket.fileno(),))
 
     def alive(self):
         if self.process.poll() is not None:
@@ -127,7 +135,7 @@ class VM:
         print('Running ' + name, flush=True)
         command = command or ('TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh ' + name)
         try:
-            result = self.run_ssh(command, timeout=480 if name == 'managed' or 'upgrade' in name else 120, check=False)
+            result = self.run_ssh(command, timeout=480 if name == 'managed' or 'upgrade' in name or 'dhcpv6' in name else 120, check=False)
         except subprocess.TimeoutExpired as error:
             (self.work / (name + '.log')).write_bytes(error.output or b'')
             diagnostics = self.run_ssh('logread; ubus call service list; ip addr; ip route; ip -6 route', check=False)
@@ -151,28 +159,7 @@ class VM:
         assert list(data) == ['main'] and data['main']['running']
         self.report['supervised_instances'][label] = data['main']
 
-    def execute(self):
-        for name, path in (('runner', Path(__file__)), ('guest_test', Path(__file__).with_name('installer-openwrt-procd-smoke.sh'))):
-            self.report['inputs'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        names = ['kernel', 'image', 'base', 'procd', 'tun', 'flock']
-        if self.args.network:
-            names.append('network')
-        if getattr(self.args, 'upgrader', None):
-            names.append('upgrader')
-        if getattr(self.args, 'upgrade_base', None):
-            names.extend(['upgrade_base', 'upgrade_procd', 'upgrade_network'])
-        for name in names:
-            path = getattr(self.args, name)
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if name not in ('kernel', 'image') and path.suffix != self.release['suffix']:
-                raise ValueError('Wrong package format for selected release: ' + name)
-            if name in self.release['pins'] and digest != self.release['pins'][name]:
-                raise ValueError('Wrong pinned OpenWrt input: ' + name)
-            self.report['inputs'][name] = digest
-        for index, path in enumerate(self.args.extra_package):
-            if path.suffix != self.release['suffix']:
-                raise ValueError('Wrong extra package format for selected release')
-            self.report['inputs'][f'extra_package_{index}'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    def bootstrap(self):
         # OpenWrt gzip images have a firmware metadata trailer. Validate the
         # gzip member's CRC/length; its complete input is pinned above.
         decompressor = zlib.decompressobj(31)
@@ -195,6 +182,31 @@ class VM:
         self.report['initial_boot'] = initial_boot
         self.run_ssh('. /etc/openwrt_release; test "$DISTRIB_RELEASE" = ' +
                      shlex.quote(self.args.release) + ' && command -v ' + self.release['manager'])
+        return initial_boot
+
+    def execute(self):
+        for name, path in (('runner', Path(__file__)), ('guest_test', Path(__file__).with_name('installer-openwrt-procd-smoke.sh'))):
+            self.report['inputs'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        names = ['kernel', 'image', 'base', 'procd', 'tun', 'flock']
+        if self.args.network:
+            names.append('network')
+        if getattr(self.args, 'upgrader', None):
+            names.append('upgrader')
+        if getattr(self.args, 'upgrade_base', None):
+            names.extend(['upgrade_base', 'upgrade_procd', 'upgrade_network'])
+        for name in names:
+            path = getattr(self.args, name)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if name not in ('kernel', 'image') and path.suffix != self.release['suffix']:
+                raise ValueError('Wrong package format for selected release: ' + name)
+            if name in self.release['pins'] and digest != self.release['pins'][name]:
+                raise ValueError('Wrong pinned OpenWrt input: ' + name)
+            self.report['inputs'][name] = digest
+        for index, path in enumerate(self.args.extra_package):
+            if path.suffix != self.release['suffix']:
+                raise ValueError('Wrong extra package format for selected release')
+            self.report['inputs'][f'extra_package_{index}'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        initial_boot = self.bootstrap()
         archive = self.work / 'inputs.tar'
         with tarfile.open(archive, 'w') as bundle:
             for name in ['base', 'procd', 'tun', 'flock'] + (['network'] if self.args.network else []) + (['upgrader'] if self.args.upgrader else []):
@@ -214,6 +226,21 @@ class VM:
         self.phase('uplink-facts')
         self.phase('wan')
         self.instance('after_wan_handover')
+        if self.args.network_only:
+            # netifd loads protocol handlers on startup, not network reload.
+            self.phase('arm-reboot')
+            self.run_ssh('reboot', timeout=10, check=False)
+            network_boot = self.wait_ssh(previous=initial_boot)
+            self.phase('check-reboot', 'TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh check-boot')
+            self.instance('after_network_reboot')
+            if self.args.dhcpv6_server:
+                self.test_dhcpv6()
+            self.phase('managed')
+            self.phase('remove')
+            self.run_ssh('poweroff', timeout=10, check=False)
+            self.process.wait(timeout=30)
+            self.report.update(passed=True, suite='managed-network-only', reboot_boot=network_boot)
+            return
         self.phase('arm-reboot')
         self.run_ssh('reboot', timeout=10, check=False)
         reboot_id = self.wait_ssh(previous=initial_boot)
@@ -241,6 +268,8 @@ class VM:
             self.report['upgrade_recovery_boot'] = upgrade_boot
             self.report['upgrade_powercut'] = 'QEMU SIGKILL after target package installation, before upgrade confirmation'
             self.instance('after_upgrade')
+        if self.args.dhcpv6_server:
+            self.test_dhcpv6()
         if self.args.network:
             self.phase('managed')
         self.phase('remove')
@@ -249,7 +278,38 @@ class VM:
         self.report.update(passed=True, reboot_boot=reboot_id, powercut_boot=powercut_id,
                            powercut='QEMU SIGKILL after synced pending journal and interrupted active config')
 
+    def test_dhcpv6(self):
+        server = self.lease_server
+        fixture = Path(__file__).with_name('installer-openwrt-dhcpv6-server.sh')
+        digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        self.report['inputs']['dhcpv6_server_fixture'] = digest
+        server.report['inputs'] = {key: self.report['inputs'][key] for key in ('runner', 'kernel', 'image')}
+        server.report['inputs']['fixture'] = digest
+        server.bootstrap()
+        with fixture.open('rb') as source:
+            server.run_ssh('cat > /tmp/dhcpv6-server.sh', stdin=source)
+        server.phase('server-setup', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/dhcpv6-server.sh setup')
+        self.phase('dhcpv6-start')
+        server.phase('server-lease-initial', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/dhcpv6-server.sh leases fd62:100:')
+        self.phase('dhcpv6-renew')
+        server.phase('server-renumber', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/dhcpv6-server.sh renumber')
+        self.phase('dhcpv6-renumber')
+        server.phase('server-lease-renumbered', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/dhcpv6-server.sh leases fd62:200:')
+        server.phase('server-retire-old', 'TAYGA_ISOLATED_TEST=yes sh -x /tmp/dhcpv6-server.sh retire-old')
+        self.phase('dhcpv6-retire')
+        self.instance('after_dhcpv6_renumber')
+        self.phase('dhcpv6-stop')
+        server.report['passed'] = True
+        self.report['dhcpv6_server'] = {'release': self.args.release, 'transport': 'private AF_UNIX datagram socketpair',
+                                      'slaac': False, 'address': 'IA_NA', 'delegation': 'IA_PD /62',
+                                      'prefixes': ['fd62:100::/48', 'fd62:200::/48'], 'renumbering': 'overlap, then retire old prefix',
+                                      'report': str(server.work / 'report.json')}
+
     def close(self):
+        if self.lease_server is not None:
+            self.lease_server.close()
+        if self.lease_socket is not None:
+            self.lease_socket.close()
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -266,6 +326,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('kernel', 'image', 'base', 'procd', 'tun', 'flock', 'work'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--network-only', action='store_true', help='Run install/lifecycle/WAN, one reboot and managed networking without power-cut/package-upgrade phases')
+    parser.add_argument('--dhcpv6-server', action='store_true', help='Test IA_NA/IA_PD and renumbering against a second isolated OpenWrt VM')
     parser.add_argument('--release', choices=tuple(RELEASES), default='24.10.8')
     parser.add_argument('--qemu', default='qemu-system-aarch64')
     parser.add_argument('--upgrader', type=Path, help='Independent baseline upgrade coordinator package')
@@ -276,9 +338,13 @@ def main():
     parser.add_argument('--accel', choices=('auto', 'hvf', 'kvm', 'tcg'), default='auto')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
+    if args.dhcpv6_server and not args.network:
+        parser.error('--dhcpv6-server requires --network')
     if args.upgrader and not args.network:
         parser.error('--upgrader requires --network')
     upgrade_count = sum(getattr(args, 'upgrade_' + role) is not None for role in ('base', 'procd', 'network'))
+    if args.network_only and (not args.network or upgrade_count):
+        parser.error('--network-only requires --network and excludes --upgrade-* packages')
     if upgrade_count not in (0, 3) or (upgrade_count and (not args.network or not args.upgrader)):
         parser.error('Upgrade tests require --network, --upgrader and all three --upgrade-* packages')
     if not 0 <= args.port <= 65535:
@@ -288,9 +354,27 @@ def main():
             parser.error('Required tool missing: ' + command)
     vm = VM(args)
     try:
+        if args.dhcpv6_server:
+            peer_args = copy.copy(args)
+            peer_args.work = vm.work / 'dhcpv6-server'
+            peer_args.port = 0
+            peer_args.network = None
+            peer_args.dhcpv6_server = False
+            vm.lease_server = VM(peer_args)
+            vm.lease_socket, vm.lease_server.lease_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         vm.execute()
     except BaseException as error:
         vm.report['error'] = str(error)
+        if vm.lease_server is not None and vm.lease_server.process is not None and vm.lease_server.process.poll() is None:
+            peer = vm.lease_server
+            peer.report['error'] = str(error)
+            try:
+                diagnostics = peer.run_ssh('logread; ubus call dhcp ipv6leases; '
+                                           'ubus call network.interface.lease status; ip -6 addr; ip -6 route; nft list ruleset',
+                                           timeout=15, check=False)
+                (peer.work / 'failure-diagnostics.log').write_bytes(diagnostics.stdout)
+            except (subprocess.SubprocessError, OSError):
+                pass
         raise
     finally:
         vm.close()
