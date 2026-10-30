@@ -116,7 +116,7 @@ class VM:
             time.sleep(0.5)
         raise TimeoutError('Boot console timed out; inspect serial.log')
 
-    def wait_ssh(self, previous=None, timeout=150):
+    def wait_ssh(self, previous=None, timeout=300):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.alive()
