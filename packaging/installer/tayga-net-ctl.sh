@@ -301,6 +301,10 @@ fw_nft() {
     rm -f "$lock/rules.nft"
 }
 fw_pf() {
+    if [ ! -c /dev/pf ]; then
+        kldload pf 2>/dev/null || :
+        printf 'kldunload pf >/dev/null 2>&1 || :\n' >> "$journal"
+    fi
     was_pf_enabled=no
     if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
         was_pf_enabled=yes

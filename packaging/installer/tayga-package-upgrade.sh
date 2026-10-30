@@ -48,6 +48,10 @@ fi
 
 # Perform coordinated installation
 export TAYGA_PACKAGE_UPGRADE=1
+mkdir -p "$state"
+touch "$state/.package-upgrade"
+cleanup_flag() { rm -f "$state/.package-upgrade"; }
+trap cleanup_flag EXIT HUP INT TERM
 
 # Unlock solver pin if on Alpine APK
 if [ "$kind" = apk ] && [ -f "$lib/package-lock.sh" ]; then
@@ -96,5 +100,8 @@ fi
 if [ "$kind" = apk ] && [ -f "$lib/package-lock.sh" ] && [ -n "$active" ]; then
     sh "$lib/package-lock.sh" lock || :
 fi
+
+rm -f "$state/.package-upgrade"
+trap - EXIT HUP INT TERM
 
 echo "PASS: Coordinated live package upgrade successful ($pkg)"

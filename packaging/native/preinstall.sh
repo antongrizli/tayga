@@ -15,7 +15,7 @@ for path in "$state/files" "$state/files-transaction" "$state/operation.lock" /u
         exit 1
     fi
 done
-if [ "${TAYGA_PACKAGE_UPGRADE:-}" != 1 ]; then
+if [ "${TAYGA_PACKAGE_UPGRADE:-}" != 1 ] && [ ! -f "$state/.package-upgrade" ]; then
     for profile in clat nat64 siit; do
         if [ -f "$state/$profile.conf" ]; then
             echo 'Remove managed profiles with tayga-ctl before package upgrade, or use tayga-ctl upgrade <package>' >&2

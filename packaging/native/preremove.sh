@@ -7,7 +7,7 @@ esac
 if [ "${1:-0}" -ge 1 ] 2>/dev/null; then
     exit 0
 fi
-if [ "${TAYGA_PACKAGE_UPGRADE:-}" = 1 ]; then
+if [ "${TAYGA_PACKAGE_UPGRADE:-}" = 1 ] || [ -f "$state/.package-upgrade" ]; then
     exit 0
 fi
 for profile in clat nat64 siit; do

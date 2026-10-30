@@ -343,6 +343,7 @@ jobs:
           arch: ${{ matrix.vm_arch }}
           prepare: |
             pkg install -y gmake llvm git python3 setsid
+            kldload pf || true
           run: |
             gmake clean && gmake CFLAGS="-Werror -Wall -O2"
             gmake test
