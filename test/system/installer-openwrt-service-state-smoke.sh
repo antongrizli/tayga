@@ -22,8 +22,9 @@ if [ -x "$root/bin/opkg" ]; then
     chroot "$root" opkg --offline-root / install "$@"
     chroot "$root" /usr/bin/env IPKG_NO_SCRIPT=1 opkg install "/tmp/$(basename "$base")" "/tmp/$(basename "$service")"
     manager=opkg
-elif [ -x "$root/sbin/apk" ]; then
-    chroot "$root" apk --no-network --no-scripts --allow-untrusted add "$@" "/tmp/$(basename "$base")" "/tmp/$(basename "$service")"
+elif [ -x "$root/usr/bin/apk" ] || [ -x "$root/sbin/apk" ]; then
+    # Disposable rootfs: local unsigned test packages have no persistent cache.
+    chroot "$root" apk --no-network --no-scripts --allow-untrusted --force-non-repository add "$@" "/tmp/$(basename "$base")" "/tmp/$(basename "$service")"
     manager=apk
 else
     echo 'OpenWrt package manager missing' >&2

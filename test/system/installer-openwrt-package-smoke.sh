@@ -34,8 +34,9 @@ if [ -x "$root/bin/opkg" ]; then
     chroot "$root" /usr/bin/env IPKG_NO_SCRIPT=1 opkg install "/tmp/$(basename "$package")"
     chroot "$root" opkg status tayga-managed-openwrt | grep '^Depends:.*kmod-tun'
     manager=opkg
-elif [ -x "$root/sbin/apk" ]; then
-    chroot "$root" apk --no-network --no-scripts --allow-untrusted add "$@" "/tmp/$(basename "$package")"
+elif [ -x "$root/usr/bin/apk" ] || [ -x "$root/sbin/apk" ]; then
+    # Disposable rootfs: local unsigned test packages have no persistent cache.
+    chroot "$root" apk --no-network --no-scripts --allow-untrusted --force-non-repository add "$@" "/tmp/$(basename "$package")"
     manager=apk
 else echo 'OpenWrt package manager missing' >&2; exit 1
 fi

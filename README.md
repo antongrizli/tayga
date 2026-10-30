@@ -687,3 +687,19 @@ The reviewed r5 packages passed the complete HVF VM run, including removal and
 unchanged network/firewall/DHCP UCI files. Portable installer coverage: 81 tests,
 2 platform skips on macOS. TCG also passed the complete matrix; WAN handover waits for both the new
 process and target L3 device. The expanded phase budget is 480 seconds.
+
+OpenWrt 25.12.6 APK package coverage is available for armsr/armv8
+(`aarch64_generic`, musl). The official GCC 14.3 SDK built all three r6 APKs;
+matching disposable rootfs tests passed binary installation/execution/removal,
+config/data retention, disabled service defaults, validator execution and
+persistent state publication/rollback/recovery. Package metadata retains exact
+base/procd revision dependencies and root ownership. APK-only runtime dependency
+constraints are emitted separately from the existing IPK syntax.
+
+The `test-openwrt-apk` CI job pins SDK/rootfs/kmod/flock SHA-256 values and repeats
+these offline package tests. Local test archives are unsigned; the disposable
+rootfs tests disable package scripts and permit non-repository APK installation
+without a persistent cache. The IPK 24.10.8 r6 build and both rootfs tests also
+passed. These are package/file tests: booted networking on 25.12.6, package live
+upgrade and signed publication remain pending. The r5 full VM reports above
+cover 24.10.8 networking; GitHub CI has not been run for this change.

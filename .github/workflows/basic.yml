@@ -172,6 +172,62 @@ jobs:
             ${{ runner.temp }}/openwrt-procd-vm/*.log
           if-no-files-found: warn
 
+  test-openwrt-apk:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.ver || github.sha }}
+      - name: Prepare SDK and ARM rootfs execution
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential gawk rsync unzip zstd file libncurses-dev libssl-dev zlib1g-dev qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64
+      - name: Download pinned OpenWrt 25.12.6 APK inputs
+        run: |
+          base=https://downloads.openwrt.org/releases/25.12.6/targets/armsr/armv8
+          curl -fL --retry 3 "$base/openwrt-sdk-25.12.6-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst" -o /tmp/apk-sdk.tar.zst
+          curl -fL --retry 3 "$base/openwrt-25.12.6-armsr-armv8-rootfs.tar.gz" -o /tmp/apk-rootfs.tar.gz
+          curl -fL --retry 3 "$base/kmods/6.12.112-1-67e205f26d0458c4d12f1fd315216398/kmod-tun-6.12.112-r1.apk" -o /tmp/kmod-tun.apk
+          curl -fL --retry 3 https://downloads.openwrt.org/releases/25.12.6/packages/aarch64_generic/base/flock-2.41.5-r1.apk -o /tmp/flock.apk
+          echo 'cbf3343bc3d6dc6180fc84077b966c13596a79904adaadbfe68409d563b0b596  /tmp/apk-sdk.tar.zst' | sha256sum -c -
+          echo '8fcb00eb886d9add37e111a4ec43d47d57aa74742281c6a8f348a7a7ec37edb7  /tmp/apk-rootfs.tar.gz' | sha256sum -c -
+          echo 'cf50e6c6a97f086810871daefae92cf18b0f3bc0da89550abd9c6e9887eab7ab  /tmp/kmod-tun.apk' | sha256sum -c -
+          echo '8d02f35efa78b15aa380a2028fabc10ef1b8e65b30289b5c0d0a91b223651fc0  /tmp/flock.apk' | sha256sum -c -
+          mkdir /tmp/apk-sdk
+          tar --zstd -xf /tmp/apk-sdk.tar.zst -C /tmp/apk-sdk --strip-components=1
+      - name: Build native OpenWrt APK packages
+        run: |
+          printf '%s\n' '# CONFIG_ALL is not set' '# CONFIG_ALL_KMODS is not set' '# CONFIG_ALL_NONSHARED is not set' > /tmp/apk-sdk/.config
+          make -C /tmp/apk-sdk defconfig
+          python3 scripts/prepare-openwrt-package.py --sdk /tmp/apk-sdk --target armsr --subtarget armv8 --architecture aarch64_generic --version "$(cat VERSION)"
+          for package in tayga-managed-openwrt tayga-managed-openwrt-procd tayga-managed-openwrt-network; do
+            echo "CONFIG_PACKAGE_$package=m" >> /tmp/apk-sdk/.config
+          done
+          make -C /tmp/apk-sdk defconfig
+          make -C /tmp/apk-sdk package/tayga-managed-openwrt/compile V=s -j2
+      - name: Test APK ownership, validation, state recovery and removal
+        run: |
+          base=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-[0-9]*.apk')
+          service=$(find /tmp/apk-sdk/bin -name 'tayga-managed-openwrt-procd-*.apk')
+          test -n "$base" && test -n "$service"
+          for kind in binary service; do
+            sudo mkdir "/tmp/apk-rootfs-$kind"
+            sudo tar -xzf /tmp/apk-rootfs.tar.gz -C "/tmp/apk-rootfs-$kind"
+          done
+          sudo sh test/system/installer-openwrt-package-smoke.sh /tmp/apk-rootfs-binary "$base" /tmp/kmod-tun.apk
+          sudo sh test/system/installer-openwrt-service-state-smoke.sh /tmp/apk-rootfs-service "$base" "$service" /tmp/kmod-tun.apk /tmp/flock.apk
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-25.12.6-apk-packages
+          path: |
+            /tmp/apk-sdk/bin/packages/**/tayga-managed-openwrt*.apk
+            /tmp/apk-sdk/package/tayga-managed-openwrt/source-manifest.json
+          if-no-files-found: error
+
   test-native-packages:
     permissions:
       contents: read

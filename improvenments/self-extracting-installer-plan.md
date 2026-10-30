@@ -493,3 +493,25 @@ TCG также пройден. Предыдущие утверждения о п
 хеши пакетов, source manifest и VM reports сверены. Артефакты и SHA256SUMS:
 `build/openwrt/24.10.8/armsr-armv8/r5/`. Следующие шаги: настоящая OpenWrt APK-ветка,
 package upgrade/recovery, расширение DHCPv6 server/CPU-матрицы, подпись и публикация.
+
+
+### OpenWrt APK package gate r6 (2026-10-30)
+
+Перед продолжением все исходники и этот план сохранены в ветке
+`codex/self-extracting-installer` (начальный snapshot `4e741a8`).
+
+Реальная APK-ветка проверена официальным SDK/rootfs 25.12.6 armsr/armv8,
+aarch64_generic/musl. Собраны base/procd/network r6. Исправлены APK-specific
+version constraints в EXTRA_DEPENDS и обнаружение `/usr/bin/apk` в smoke tests.
+Локальные unsigned APK в одноразовой rootfs устанавливаются с no-network,
+no-scripts и force-non-repository (нет persistent cache). Пройдены binary install,
+execute/remove, сохранение конфигов/данных, disabled service, unprivileged
+validation и state prepare/rollback/recovery/remove. Метаданные APK проверены:
+root ownership, точный base revision pin. Добавлен pinned CI job; сам GitHub CI
+не запускался. Регрессия: SDK 24.10.8 собрал r6 IPK; обе rootfs-проверки пройдены.
+
+Артефакты: `build/openwrt/25.12.6/armsr-armv8/r6/` и
+`build/openwrt/24.10.8/armsr-armv8/r6/`. Runtime network package собран для APK,
+но booted 25.12 networking пока отдельно не проверен.
+Следующие задачи: full-system 25.12.6/APK gate, live package upgrade/recovery,
+затем расширение CPU/DHCPv6-матрицы и подпись/публикация.

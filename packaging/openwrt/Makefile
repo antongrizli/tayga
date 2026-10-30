@@ -2,12 +2,17 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tayga-managed-openwrt
 PKG_VERSION:=@VERSION@
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=LICENSE
 PKG_BUILD_PARALLEL:=1
 
 include $(INCLUDE_DIR)/package.mk
+
+# APK SDKs require a version constraint on every runtime-only dependency.
+# Keep the established opkg syntax for the IPK branch.
+tayga_runtime_dep = $(1)$(if $(CONFIG_USE_APK), (>=0))
+tayga_exact_dep = $(1) $(if $(CONFIG_USE_APK),(=$(PKG_VERSION)-r$(PKG_RELEASE)),(= $(PKG_VERSION)-r$(PKG_RELEASE)))
 
 define Package/tayga-managed-openwrt
   SECTION:=net
@@ -16,7 +21,7 @@ define Package/tayga-managed-openwrt
   DEPENDS:=@IPV6 +libpthread
   # Runtime-only: the SDK already contains kernel artifacts; do not rebuild
   # its entire package/kernel/linux directory to compile this userspace tool.
-  EXTRA_DEPENDS:=kmod-tun
+  EXTRA_DEPENDS:=$(call tayga_runtime_dep,kmod-tun)
   CONFLICTS:=tayga tayga-managed
 endef
 
@@ -30,7 +35,7 @@ define Package/tayga-managed-openwrt-procd
   CATEGORY:=Network
   TITLE:=TAYGA optional procd service for externally prepared networking
   DEPENDS:=+tayga-managed-openwrt
-  EXTRA_DEPENDS:=tayga-managed-openwrt (= $(PKG_VERSION)-r$(PKG_RELEASE)), procd, uci, flock, netifd, jshn
+  EXTRA_DEPENDS:=$(call tayga_exact_dep,tayga-managed-openwrt), $(call tayga_runtime_dep,procd), $(call tayga_runtime_dep,uci), $(call tayga_runtime_dep,flock), $(call tayga_runtime_dep,netifd), $(call tayga_runtime_dep,jshn)
 endef
 
 define Package/tayga-managed-openwrt-procd/description
@@ -48,7 +53,7 @@ define Package/tayga-managed-openwrt-network
   CATEGORY:=Network
   TITLE:=TAYGA owned CLAT/NAT64/SIIT netifd, fw4 and DNS integration
   DEPENDS:=+tayga-managed-openwrt-procd
-  EXTRA_DEPENDS:=tayga-managed-openwrt-procd (= $(PKG_VERSION)-r$(PKG_RELEASE)), firewall4, nftables, coreutils-timeout
+  EXTRA_DEPENDS:=$(call tayga_exact_dep,tayga-managed-openwrt-procd), $(call tayga_runtime_dep,firewall4), $(call tayga_runtime_dep,nftables), $(call tayga_runtime_dep,coreutils-timeout)
 endef
 
 define Package/tayga-managed-openwrt-network/description
