@@ -342,7 +342,7 @@ jobs:
           release: "15.0"
           arch: ${{ matrix.vm_arch }}
           prepare: |
-            pkg install -y gmake llvm git python3
+            pkg install -y gmake llvm git python3 setsid
           run: |
             gmake clean && gmake CFLAGS="-Werror -Wall -O2"
             gmake test
@@ -383,6 +383,18 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             desc: "x86_64"
+          - arch: riscv64
+            platform: linux/riscv64
+            desc: "RISC-V 64-bit"
+          - arch: ppc64le
+            platform: linux/ppc64le
+            desc: "PowerPC 64-bit LE"
+          - arch: s390x
+            platform: linux/s390x
+            desc: "IBM System/390x"
+          - arch: armv6
+            platform: linux/arm/v6
+            desc: "ARMv6"
     steps:
       - uses: actions/checkout@v7
         with:

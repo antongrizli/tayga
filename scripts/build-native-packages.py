@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPERS = ('tayga-net-ctl.sh', 'tayga-verify.sh', 'tayga-dns64.sh', 'tayga-host-dns.sh',
            'configure.sh', 'wizard.sh', 'tayga-lifecycle.sh', 'tayga-files.sh',
            'tayga-watchdog.sh', 'tayga-recover.sh', 'tayga-boot-recover.sh',
+           'tayga-package-upgrade.sh',
            'tayga-managed@.service', 'tayga-managed.openrc', 'tayga-recovery.service',
            'tayga-recovery.openrc', 'freebsd-rc.in', 'freebsd-recovery-rc.in')
 
@@ -21,12 +22,21 @@ def verify_static(path, arch):
     blob = path.read_bytes()
     if len(blob) < 64 or blob[:4] != b'\x7fELF' or blob[5] not in (1, 2):
         raise ValueError(f'not an ELF binary: {path}')
-    if blob[4] != (1 if arch == 'armv7' else 2) or blob[5] != 1 or blob[7] not in (0, 3):
+    if blob[4] != (1 if arch in ('armv7', 'armv6') else 2) or blob[5] not in (1, 2) or blob[7] not in (0, 3):
         raise ValueError('unsupported ELF ABI for Linux package')
-    endian = '<'
-    if struct.unpack_from('<H', blob, 16)[0] not in (2, 3):
+    endian = '>' if arch == 's390x' else '<'
+    if struct.unpack_from(endian + 'H', blob, 16)[0] not in (2, 3):
         raise ValueError('ELF must be executable')
-    if struct.unpack_from(endian + 'H', blob, 18)[0] != {'amd64': 62, 'arm64': 183, 'armv7': 40}[arch]:
+    machines = {
+        'amd64': 62,
+        'arm64': 183,
+        'armv7': 40,
+        'armv6': 40,
+        'riscv64': 243,
+        'ppc64le': 21,
+        's390x': 22,
+    }
+    if struct.unpack_from(endian + 'H', blob, 18)[0] != machines[arch]:
         raise ValueError('ELF architecture mismatch')
     if blob[4] == 2:
         offset = struct.unpack_from(endian + 'Q', blob, 32)[0]
@@ -75,7 +85,7 @@ def build(output, version, release, arch, daemon, helper, maintainer, formats, n
             add('/usr/sbin/pref64-discover', helper.read_bytes(), 0o755)
             add('/usr/sbin/tayga-ctl', (ROOT / 'packaging/installer/tayga-ctl.sh').read_text().replace('/usr/local', '/usr').encode(), 0o755)
             for name in HELPERS:
-                target = name.removesuffix('.sh') if name in ('tayga-net-ctl.sh', 'tayga-verify.sh', 'tayga-dns64.sh', 'tayga-host-dns.sh') else name
+                target = name.removesuffix('.sh') if name in ('tayga-net-ctl.sh', 'tayga-verify.sh', 'tayga-dns64.sh', 'tayga-host-dns.sh', 'tayga-package-upgrade.sh') else name
                 data = (ROOT / 'packaging/installer' / name).read_text().replace('/usr/local', '/usr').encode()
                 add('/usr/libexec/tayga/' + target, data, 0o644 if name.endswith('.service') else 0o755)
             add('/usr/libexec/tayga/package-owner', (kind + '\n').encode())
@@ -85,7 +95,8 @@ def build(output, version, release, arch, daemon, helper, maintainer, formats, n
                 add('/usr/share/man/man' + section + '/' + name, (ROOT / 'docs/man' / name).read_bytes())
             add('/usr/share/doc/tayga-managed/LICENSE', (ROOT / 'LICENSE').read_bytes())
             add('/etc/tayga/tayga.conf.example', (ROOT / 'packaging/tayga.conf.example').read_bytes(), config=True)
-            config = {'name': 'tayga-managed', 'arch': 'arm7' if arch == 'armv7' else arch, 'platform': 'linux', 'version': version,
+            nfpm_arch = {'armv7': 'arm7', 'armv6': 'arm6'}.get(arch, arch)
+            config = {'name': 'tayga-managed', 'arch': nfpm_arch, 'platform': 'linux', 'version': version,
                       'release': release, 'maintainer': maintainer, 'description': 'TAYGA binary tools and explicit managed profile activation',
                       'license': 'GPL-2.0-or-later', 'contents': contents, 'conflicts': ['tayga'],
                       'scripts': {'preinstall': str(ROOT / 'packaging/native/preinstall.sh'),
@@ -112,7 +123,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--version', required=True)
     parser.add_argument('--release', default='1')
-    parser.add_argument('--arch', choices=('amd64', 'arm64', 'armv7'), required=True)
+    parser.add_argument('--arch', choices=('amd64', 'arm64', 'armv7', 'armv6', 'riscv64', 'ppc64le', 's390x'), required=True)
     parser.add_argument('--tayga', type=Path, required=True)
     parser.add_argument('--helper', type=Path, required=True)
     parser.add_argument('--maintainer', required=True)

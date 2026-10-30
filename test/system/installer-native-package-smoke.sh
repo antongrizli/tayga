@@ -56,10 +56,13 @@ if [ "$kind" = apk ]; then sh /usr/libexec/tayga/package-lock.sh lock; fi
 printf 'configured profile fixture\n'  > "$state/nat64.conf"
 if install_package "$second" > "$work/blocked.log" 2>&1; then cat "$work/blocked.log"; exit 1; fi
 [ "$(package_version)" = "$before" ]
+
+# Coordinated live upgrade succeeds with the configured profile retained.
+sh /usr/libexec/tayga/tayga-package-upgrade apply "$second"
+[ "$(package_version)" != "$before" ]
+[ -f "$state/nat64.conf" ]
 rm "$state/nat64.conf"
 if [ "$kind" = apk ]; then sh /usr/libexec/tayga/package-lock.sh unlock; fi
-install_package "$second"
-[ "$(package_version)" != "$before" ]
 grep -Fx '# native package administrator edit' "$config"
 cat /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv6/conf/all/forwarding > "$work/sysctl.after"
 cmp "$work/sysctl.before" "$work/sysctl.after"
@@ -75,4 +78,4 @@ for candidate in "$config" "$config.rpmsave" "$config.apk-save"; do
     if [ -f "$candidate" ] && grep -Fx '# native package administrator edit' "$candidate" >/dev/null; then preserved=yes; fi
 done
 [ "$preserved" = yes ]
-echo "PASS: $kind install, guarded upgrade, config/data preservation and removal"
+echo "PASS: $kind install, guarded upgrade, live upgrade, config/data preservation and removal"

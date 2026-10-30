@@ -44,6 +44,37 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'ABI'):
             packages.verify_static(self.binary, 'arm64')
 
+    def test_multiarch_static_verification(self):
+        # riscv64 (class 2, little-endian, machine 243)
+        blob = bytearray(120)
+        blob[:8] = b'\x7fELF\x02\x01\x01\x00'
+        struct.pack_into('<HH', blob, 16, 2, 243)
+        struct.pack_into('<Q', blob, 32, 64)
+        struct.pack_into('<HH', blob, 54, 56, 1)
+        struct.pack_into('<I', blob, 64, 1)
+        self.binary.write_bytes(blob)
+        packages.verify_static(self.binary, 'riscv64')
+
+        # s390x (class 2, big-endian, machine 22)
+        blob_s390x = bytearray(120)
+        blob_s390x[:8] = b'\x7fELF\x02\x02\x01\x00'
+        struct.pack_into('>HH', blob_s390x, 16, 2, 22)
+        struct.pack_into('>Q', blob_s390x, 32, 64)
+        struct.pack_into('>HH', blob_s390x, 54, 56, 1)
+        struct.pack_into('>I', blob_s390x, 64, 1)
+        self.binary.write_bytes(blob_s390x)
+        packages.verify_static(self.binary, 's390x')
+
+        # armv6 (class 1, little-endian, machine 40)
+        blob_armv6 = bytearray(100)
+        blob_armv6[:8] = b'\x7fELF\x01\x01\x01\x00'
+        struct.pack_into('<HH', blob_armv6, 16, 2, 40)
+        struct.pack_into('<I', blob_armv6, 28, 52)
+        struct.pack_into('<HH', blob_armv6, 42, 32, 1)
+        struct.pack_into('<I', blob_armv6, 52, 1)
+        self.binary.write_bytes(blob_armv6)
+        packages.verify_static(self.binary, 'armv6')
+
     def test_staged_paths_config_and_package_manifest(self):
         tool = self.root / 'nfpm'
         tool.write_text('#!' + sys.executable + '\n' + '''import json, pathlib, sys

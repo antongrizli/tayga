@@ -374,8 +374,9 @@ binary-only SDK-пакет и optional procd/UCI external-mode с persistent fil
 upgrade при настроенных профилях, обычный upgrade, сохранение правок/данных и remove.
 В реальных systemd/OpenRC VM проверены native apply и readiness rollback.
 APK использует solver-pin `.tayga-managed-profile`: не полагается на abort хука.
-Пакеты пока unsigned/local test; подпись, публикация, живое обновление активных
-профилей и расширение native package CPU-матрицы остаются отдельными задачами.
+Реализованы живое обновление активных профилей через `tayga-package-upgrade`
+(`tayga-ctl upgrade`), расширение CPU-матрицы native-пакетов (`armv6`, `riscv64`,
+`ppc64le`, `s390x`) и генерация/подпись релизных контрольных сумм SHA-256 (с поддержкой minisign).
 
 - Определять дистрибутив через `/etc/os-release`, а пакетный менеджер — по
   доступным командам: apk, apt-get/dpkg, dnf/yum/rpm. Показывать точный список

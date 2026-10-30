@@ -8,6 +8,10 @@ if [ "$action" = apply ]; then
     [ "$#" -eq 2 ] || { echo 'Usage: tayga-ctl apply CONFIG' >&2; exit 2; }
     exec sh "$lib/tayga-lifecycle.sh" apply "$2"
 fi
+if [ "$action" = upgrade ]; then
+    [ "$#" -eq 2 ] || { echo 'Usage: tayga-ctl upgrade PACKAGE_FILE' >&2; exit 2; }
+    exec sh "$lib/tayga-package-upgrade.sh" apply "$2"
+fi
 if [ "$action" = recover ]; then
     [ "$(id -u)" -eq 0 ] || { echo 'Recovery requires root' >&2; exit 1; }
     state=/var/lib/tayga-installer
@@ -31,8 +35,13 @@ if [ "$action" = recover ]; then
     case "$session" in ''|*[!a-zA-Z0-9._-]*) echo 'Invalid transaction pointer' >&2; exit 1 ;; esac
     lock=$gate/$session
     [ -f "$lock/armed" ] || { echo 'No armed activation transaction'; exit 0; }
-    command -v setsid >/dev/null
-    setsid sh "$lock/watchdog.sh" "$lock" "$(cat "$lock/id")" 0 "$(cat "$lock/runner.pid")" "$(cat "$lock/runner.start")" &
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh "$lock/watchdog.sh" "$lock" "$(cat "$lock/id")" 0 "$(cat "$lock/runner.pid")" "$(cat "$lock/runner.start")" &
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' sh "$lock/watchdog.sh" "$lock" "$(cat "$lock/id")" 0 "$(cat "$lock/runner.pid")" "$(cat "$lock/runner.start")" &
+    else
+        command -v setsid >/dev/null
+    fi
     wait "$!"
     exit
 fi
@@ -46,7 +55,7 @@ if [ "$action" = uninstall ] && { [ -z "$profile" ] || [ "$profile" = binary-onl
 fi
 case "$profile" in clat|nat64|siit) ;; *)
     echo 'Usage: tayga-ctl start|stop|status|test|reconfigure|uninstall clat|nat64|siit' >&2
-    echo '       tayga-ctl recover' >&2
+    echo '       tayga-ctl apply CONFIG | upgrade PACKAGE_FILE | recover' >&2
     exit 2
     ;;
 esac

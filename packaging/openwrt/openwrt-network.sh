@@ -457,7 +457,9 @@ net_verify() {
 }
 [ "${TAYGA_NETWORK_LIBRARY:-}" != 1 ] || return 0
 set -e
-exec 1000>&-
+if ( eval 'exec 1000>&-' ) 2>/dev/null; then
+    eval 'exec 1000>&-' 2>/dev/null || :
+fi
 [ "$(id -u)" = 0 ] || exit 1
 action=${1:-}; shift
 case "$action" in

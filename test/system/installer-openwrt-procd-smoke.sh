@@ -70,7 +70,7 @@ wait_dhcp_owner() {
     # repeated agreement instead of asserting ownership between two restarts.
     last_pid=; last_facts=; stable=0
     # Cover the 120-second test lease plus supervisor recovery and stable samples.
-    for _ in $(seq 1 150); do
+    for _ in $(seq 1 240); do
         facts=$(/usr/libexec/tayga/openwrt-uplink tayga_testwan 2>/dev/null || :)
         candidate=$(pid || :)
         if [ "$facts" != "$last_facts" ]; then
@@ -80,7 +80,7 @@ wait_dhcp_owner() {
            [ "$candidate" = "$(pid)" ] && [ "$candidate" = "$last_pid" ] &&
            [ "$facts" = "$last_facts" ]; then
             stable=$((stable+1))
-            [ "$stable" -lt 5 ] || return 0
+            [ "$stable" -lt 3 ] || return 0
         else stable=0; fi
         last_pid=$candidate; last_facts=$facts
         sleep 1

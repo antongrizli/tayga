@@ -9,8 +9,13 @@ action=$1
 shift
 # The mutating runner owns its process group; the wrapper only waits for it.
 if [ "$action" = apply ] && [ "${TAYGA_SESSION_RUNNER:-}" != yes ]; then
-    command -v setsid >/dev/null || fail 'setsid is required for independent rollback'
-    TAYGA_SESSION_RUNNER=yes setsid sh "$0" "$action" "$@" &
+    if command -v setsid >/dev/null 2>&1; then
+        TAYGA_SESSION_RUNNER=yes setsid sh "$0" "$action" "$@" &
+    elif command -v python3 >/dev/null 2>&1; then
+        TAYGA_SESSION_RUNNER=yes python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' sh "$0" "$action" "$@" &
+    else
+        fail 'setsid is required for independent rollback'
+    fi
     runner=$!
     trap 'kill -TERM "-$runner" 2>/dev/null || :' HUP INT TERM
     set +e
@@ -181,7 +186,8 @@ case "$action" in
             if service is-active "$old" >/dev/null 2>&1; then was_active=yes; fi
             if service is-enabled "$old" >/dev/null 2>&1; then was_enabled=yes; fi
         fi
-        for tool in setsid nohup timeout ps; do command -v "$tool" >/dev/null || fail "$tool is required for watchdog recovery"; done
+        for tool in nohup timeout ps; do command -v "$tool" >/dev/null || fail "$tool is required for watchdog recovery"; done
+        command -v setsid >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || fail 'setsid is required for watchdog recovery'
         if ! command -v flock >/dev/null && ! command -v lockf >/dev/null; then
             fail 'flock or lockf is required for watchdog recovery'
         fi
@@ -255,8 +261,13 @@ case "$action" in
         }
         trap rollback 0
         trap 'exit 1' HUP INT TERM
-        nohup setsid sh "$lock/watchdog.sh" "$lock" "$transaction" "$seconds" "$$" "$started" \
-            </dev/null >> "$state/watchdog.log" 2>&1 &
+        if command -v setsid >/dev/null 2>&1; then
+            nohup setsid sh "$lock/watchdog.sh" "$lock" "$transaction" "$seconds" "$$" "$started" \
+                </dev/null >> "$state/watchdog.log" 2>&1 &
+        else
+            nohup python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' sh "$lock/watchdog.sh" "$lock" "$transaction" "$seconds" "$$" "$started" \
+                </dev/null >> "$state/watchdog.log" 2>&1 &
+        fi
         watcher=$!
         for _ in 1 2 3; do
             [ ! -f "$lock/armed" ] || break

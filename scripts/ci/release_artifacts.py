@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -187,6 +188,11 @@ def assemble(root, inputs, output, source):
         with zipfile.ZipFile(output / 'tayga-routeros-scripts.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(staging.iterdir()):
                 archive.write(path, path.name)
+    native_dir = inputs / 'candidate-native'
+    if native_dir.is_dir():
+        for pkg in sorted(native_dir.glob('tayga-managed-*')):
+            if pkg.is_file() and not pkg.is_symlink():
+                shutil.copy2(pkg, output / pkg.name)
     (output / 'release-manifest.json').write_text(json.dumps(
         {'source': source, 'architectures': manifests, 'freebsd': freebsd}, indent=2) + '\n')
     changelog = (root / 'CHANGELOG.md').read_text()
@@ -195,13 +201,26 @@ def assemble(root, inputs, output, source):
         raise ValueError('release notes missing')
     (output / 'release-notes.md').write_text(
         f"# TAYGA {source['tag']}\n\nSource commit: `{source['sha']}`\n\n" + notes.group(1).strip() + '\n')
-    checksums(output)
+    sign_manifest(output)
 
 
 def checksums(directory):
     (directory / 'SHA256SUMS').write_text(''.join(
         f'{sha256(path)}  {path.name}\n' for path in sorted(directory.iterdir())
-        if path.is_file() and path.name != 'SHA256SUMS'))
+        if path.is_file() and path.name != 'SHA256SUMS' and not path.name.endswith('.minisig') and not path.name.endswith('.sig')))
+
+
+def sign_manifest(directory):
+    checksums(directory)
+    sha_file = directory / 'SHA256SUMS'
+    if not sha_file.is_file():
+        return
+    minisign_key = os.environ.get('MINISIGN_KEY_FILE')
+    if minisign_key and Path(minisign_key).is_file() and shutil.which('minisign'):
+        pw = os.environ.get('MINISIGN_PASSWORD', '')
+        subprocess.run(['minisign', '-S', '-s', minisign_key, '-m', str(sha_file),
+                        '-x', str(directory / 'SHA256SUMS.minisig'), '-t', 'TAYGA Release Verification'],
+                       input=(pw + '\n').encode(), check=True)
 
 
 def main():
