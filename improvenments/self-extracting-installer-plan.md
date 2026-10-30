@@ -76,17 +76,25 @@ Pre-flight проверки облачных окружений и вывод в
 owner демона. В Debian VM проверены назначение/восстановление DNS на TUN и
 неизменность IPv4-маршрутов; ошибка назначения покрыта portable-тестом.
 
+Расширение CPU-матрицы и нативные пакеты:
+- Мультиархитектурная матрица расширена до 7 платформ: `amd64`, `arm64`, `armv7`, `armv6`,
+  `riscv64`, `ppc64le`, `s390x`. Реализована строгая статическая верификация заголовков ELF (включая
+  big-endian для s390x), сборка нативных пакетов (`.deb`, `.rpm`, `.apk`) через nFPM и валидация
+  в GitHub Actions `test-static-multiarch`.
+- Реализован скоординированный zero-downtime live upgrade нативных пакетов (`tayga-ctl upgrade <pkg>`
+  / `tayga-package-upgrade.sh`). Поддерживается сохранение активных управляемых профилей,
+  безопасная перезагрузка демона и post-flight верификация (`tayga-verify`).
+- Изоляция окружения Alpine APK и защита солвера решены через точечный флаг
+  `/var/lib/tayga-installer/.package-upgrade` с автоматической очисткой через trap; несанкционированное
+  обновление через штатный пакетный менеджер при активном профиле строго блокируется.
+- Для FreeBSD 15 реализована авто-загрузка модуля ядра `pf.ko` (`kldload pf`) при его отсутствии
+  и мягкий fallback шлюза `uplink6` на дефолтный сетевой интерфейс в IPv4-only VM.
+- Инфраструктура подписи артефактов Minisign и хэширования `SHA256SUMS` интегрирована в
+  `scripts/ci/release_artifacts.py`.
+
 Остаются:
 автоматическое выделение IPv6 и расширение Proxy NDP/NAT66 на FreeBSD/pf и
-firewalld; подпись/публикация пакетов APK/DEB/RPM, live package upgrade и OpenWrt.
-
-Реализован явный архитектурный fallback: `--fallback=build` из встроенных
-проверяемых payload-исходников или `--fallback=download` с HTTPS URL и двумя
-заранее заданными SHA-256. До файловых изменений проверяются версия TAYGA и
-RFC 7050 helper. Native source build/stage/uninstall проверены в Linux arm64
-и FreeBSD arm64; download-контракт проверен offline fault-injection тестами.
-Добавлены идентификаторы Linux armv6/riscv64/ppc64le/s390x; нативная CI-матрица
-этих дополнительных CPU и публикация готовых бинарников остаются отдельной работой.
+firewalld; релизная публикация подписанных пакетов APK/DEB/RPM.
 
 Linux CLAT: добавлены явные `--clat-address-mode=routed|proxy-ndp|nat66` и
 `--nat66-address`. Proxy NDP использует только переданные дополнительные адреса
