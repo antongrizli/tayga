@@ -45,8 +45,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-
-improvements/
+/improvenments/
 improvenments/*
 !improvenments/network-protocols-compatibility-and-testing-guide.md
 
