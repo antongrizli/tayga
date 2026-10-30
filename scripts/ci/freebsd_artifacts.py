@@ -18,7 +18,8 @@ def main():
     if platform.system() != 'FreeBSD' or machine != args.arch:
         raise ValueError('native FreeBSD architecture does not match candidate')
     version = Path('VERSION').read_text().strip()
-    sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+    # The checkout is owned by the CI runner, not by the FreeBSD VM user.
+    sha = subprocess.check_output(['git', '-c', 'safe.directory=*', 'rev-parse', 'HEAD'], text=True).strip()
     help_text = subprocess.check_output(['./tayga', '--help'], text=True)
     if help_text.splitlines()[0] != f'TAYGA version {version}':
         raise ValueError('binary version mismatch')

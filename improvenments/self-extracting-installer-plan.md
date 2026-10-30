@@ -1,6 +1,6 @@
 # План реализации: Универсальный Self-Extracting Shell-инсталлятор TAYGA (`tayga-installer.sh`)
 
-> **Основание:** Анализ сессии развертывания в Google Cloud (`3383050c-f170-4a9a-acff-18d5f0cb7229`) и текущего релизного конвейера [`.github/workflows/release.yml`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/.github/workflows/release.yml).
+> **Основание:** Анализ сессии развертывания в Google Cloud (`3383050c-f170-4a9a-acff-18d5f0cb7229`) и текущего релизного конвейера [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 
 ## Статус реализации (2026-10-29)
@@ -114,14 +114,14 @@ Linux VM. Автоматическая выдача дополнительных
 ## 1. Общая концепция и формат релизного пакета
 
 В качестве дополнительного артефакта релиза создается **самораспаковывающийся POSIX-совместимый shell-скрипт (SFX bundle)**, содержащий внутри себя:
-- Статически скомпилированный бинарник [`tayga`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/tayga.c)
-- Вспомогательную утилиту RFC 7050 [`pref64-discover`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/helpers/pref64-discover.c)
+- Статически скомпилированный бинарник [`tayga`](../src/tayga.c)
+- Вспомогательную утилиту RFC 7050 [`pref64-discover`](../src/helpers/pref64-discover.c)
 - Man-страницы (`tayga.8`, `tayga.conf.5`)
 - Шаблоны сервисов (`systemd`, `OpenRC`, `FreeBSD rc.d`) и скрипты управления сетью (`tayga-net-up`, `tayga-net-down`, `tayga-ctl`)
 
 ### Варианты упаковки в релизе (GitHub Releases)
 
-Предлагается генерировать **два типа SFX-скриптов** в [`scripts/ci/release_artifacts.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/scripts/ci/release_artifacts.py):
+Предлагается генерировать **два типа SFX-скриптов** в [`scripts/ci/release_artifacts.py`](../scripts/ci/release_artifacts.py):
 
 1. **Пер-архитектурные самодостаточные бандлы (100% offline, ~200–250 КБ каждый):**
    - `tayga-installer-linux-amd64.sh`
@@ -226,7 +226,7 @@ Linux VM. Автоматическая выдача дополнительных
 
 | № | Проблема из чата в Google Cloud | Как мы её решаем в инсталляторе и коде |
 | :- | :--- | :--- |
-| **1** | **Баг `SIGSEGV` при переключении NAT64 -> CLAT:** При наличии старого `/var/lib/tayga/dynamic.map` запуск в режиме CLAT (где `gcfg.dynamic_pool == NULL`) вызывал падение демона в `load_dynamic()` ([`src/dynamic.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/dynamic.c#L198)). | **Двойная защита:**<br>1. **В C-коде (`src/tayga.c` и `src/dynamic.c`):** вызывать `load_dynamic()` только если `gcfg.dynamic_pool != NULL`, и добавить проверку `if (!pool) return;` в начале `load_dynamic()`.<br>2. **В инсталляторе:** изолировать `StateDirectory` / `data-dir` по профилям (`/var/lib/tayga/nat64` vs `/var/lib/tayga/clat`) и очищать неактуальный `dynamic.map` при смене режима. |
+| **1** | **Баг `SIGSEGV` при переключении NAT64 -> CLAT:** При наличии старого `/var/lib/tayga/dynamic.map` запуск в режиме CLAT (где `gcfg.dynamic_pool == NULL`) вызывал падение демона в `load_dynamic()` ([`src/dynamic.c`](../src/dynamic.c#L198)). | **Двойная защита:**<br>1. **В C-коде (`src/tayga.c` и `src/dynamic.c`):** вызывать `load_dynamic()` только если `gcfg.dynamic_pool != NULL`, и добавить проверку `if (!pool) return;` в начале `load_dynamic()`.<br>2. **В инсталляторе:** изолировать `StateDirectory` / `data-dir` по профилям (`/var/lib/tayga/nat64` vs `/var/lib/tayga/clat`) и очищать неактуальный `dynamic.map` при смене режима. |
 | **2** | **Потеря SSH-сессии при добавлении `default` маршрута в CLAT:** В Google Cloud SSH (включая IAP/Cloud Console SSH) идет по внутреннему IPv4 (`10.128.0.x`, `35.235.240.0/20`), а метаданные живут на `169.254.169.254`. Замена `default` маршрута на `dev clat` без сохранения локальных маршрутов мгновенно рвет активную SSH-сессию. | Инсталлятор перед установкой маршрутов `0.0.0.0/1` и `128.0.0.0/1` в `clat`:<br>1. Определяет текущий IPv4-шлюз (`GW4`, напр. `10.128.0.1 dev ens4`).<br>2. Явно закрепляет через `GW4` маршруты к RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), Cloud Metadata (`169.254.169.254/32`), Google IAP (`35.235.240.0/20`) и **текущему IP клиента из `$SSH_CONNECTION` (`/32`)**! |
 | **3** | **Предупреждение `TUNSETOFFLOAD failed: flags=0x67` и MTU/MSS:** На ядрах без поддержки `TUN_F_USO` (`0x67`) `tun-offload auto` штатно выводит информационный warning и автоматически переключается на TCP-оффлоад (`0x07`), а реальная причина зависания `curl` в чате была не в оффлоаде, а в неверном префиксе NAT64 (`2a00:1098:2c::/96` вместо `2a00:1098:2c:0:0:5::/96`). | По умолчанию во всех режимах (`clat`, `nat64`, `siit`) ставится **`tun-offload auto`** для сохранения максимальной производительности (GSO/GRO). Инсталлятор поясняет штатный характер fallback-сообщения `0x67 -> 0x07`, выставляет оптимальный MTU (`1400` для GCP) и добавляет правило **TCP MSS Clamping** (`--clamp-mss-to-pmtu`). |
 | **4** | **Неверный префикс NAT64 при ручном угадывании (`2a00:1098:2c::/96` вместо `2a00:1098:2c:0:0:5::/96`):** У публичных шлюзов (`nat64.net`) адрес DNS64 (`2a00:1098:2c::1`) отличается от префикса NAT64 (`2a00:1098:2c:0:0:5::/96`). Из-за этого ICMP пинговался (отвечал сам DNS-сервер), а TCP-трафик к `1.1.1.1` уходил в черную дыру. | Инсталлятор использует встроенный бинарник **`pref64-discover -s <dns64_ip>`**, который отправляет RFC 7050 запрос `AAAA ipv4only.arpa` напрямую к выбранному DNS64-серверу и математически точно извлекает настоящий префикс трансляции (например, `2a00:1098:2c:0:0:5::/96`). |
@@ -250,7 +250,7 @@ Linux VM. Автоматическая выдача дополнительных
 | **FreeBSD** *(вкл. OPNsense / pfSense)* | FreeBSD 13.x, 14.x, 15.x | `rc.d` (`/usr/local/etc/rc.d/tayga` + `/etc/rc.conf.d/tayga`) | `ifconfig`, `route`, `sysctl` | `pf` (`/etc/pf.conf`) / `ipfw` |
 
 #### Особенности реализации для FreeBSD в скрипте:
-- В [`src/tun.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/tun.c#L948-L954) на FreeBSD `--mktun` требует имя интерфейса вида `tun[0-9]+` (например, `tun64` или `tun0`), либо открывает `/dev/tun` и переименовывает его через `SIOCSIFNAME` при работе демона. Инсталлятор учтет это: на FreeBSD по умолчанию используется `tun64` (или создается `ifconfig tun create name clat`).
+- В [`src/tun.c`](../src/tun.c#L948-L954) на FreeBSD `--mktun` требует имя интерфейса вида `tun[0-9]+` (например, `tun64` или `tun0`), либо открывает `/dev/tun` и переименовывает его через `SIOCSIFNAME` при работе демона. Инсталлятор учтет это: на FreeBSD по умолчанию используется `tun64` (или создается `ifconfig tun create name clat`).
 - На FreeBSD `tun-offload` автоматически выставляется в `off` (так как `TUNSETOFFLOAD` специфичен для Linux).
 - Команды маршрутизации абстрагируются в функции `net_link_up()`, `net_addr_add()`, `net_route_add()`:
   - **Linux:** `ip link set dev ...`, `ip -4 addr replace ...`, `ip -6 route replace ...`
@@ -340,7 +340,7 @@ tayga-clat-perf/
 ## 7. Пошаговый план выполнения
 
 1. **Шаг 1. Исправление бага `SIGSEGV` в `load_dynamic()` (`src/dynamic.c`, `src/tayga.c`):**
-   - Добавить guard `if (!pool) return;` в [`src/dynamic.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/dynamic.c#L161) и условие `if (gcfg.data_dir[0] && gcfg.dynamic_pool)` в [`src/tayga.c`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/src/tayga.c#L748), покрыть unit-тестом.
+   - Добавить guard `if (!pool) return;` в [`src/dynamic.c`](../src/dynamic.c#L161) и условие `if (gcfg.data_dir[0] && gcfg.dynamic_pool)` в [`src/tayga.c`](../src/tayga.c#L748), покрыть unit-тестом.
 2. **Шаг 2. Разработка сетевого контроллера `packaging/installer/tayga-net-ctl.sh` и `tayga-ctl.sh`:**
    - Реализовать кроссплатформенную логику (Linux `iproute2` + FreeBSD `ifconfig`/`route`) для режимов `clat`, `nat64`, `siit`.
    - Встроить защиту SSH/VPC маршрутов для Google Cloud / AWS, `accept_ra=2`, TCP MSS Clamping и настройку `iptables`/`nftables`/`firewalld`/`pf`.
@@ -350,7 +350,7 @@ tayga-clat-perf/
    - Интегрировать автодискавери префикса NAT64 через встроенный `pref64-discover`.
 4. **Шаг 4. Создание сборщика SFX-бандла `scripts/build-installer.sh` и интеграция в CI/Release:**
    - Реализовать упаковку бинарников (`tayga`, `pref64-discover`), man-страниц и сервисных шаблонов в единый самораспаковывающийся `.sh` файл.
-   - Обновить [`Makefile`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/Makefile) (таргет `make installer`), [`scripts/ci/release-build.sh`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/scripts/ci/release-build.sh), [`.github/workflows/basic.yml`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/.github/workflows/basic.yml) (экспорт артефакта FreeBSD) и [`scripts/ci/release_artifacts.py`](file:///Users/antongrizli/Documents/MikroTik/tayga-clat-perf/scripts/ci/release_artifacts.py).
+   - Обновить [`Makefile`](../Makefile) (таргет `make installer`), [`scripts/ci/release-build.sh`](../scripts/ci/release-build.sh), [`.github/workflows/basic.yml`](../.github/workflows/basic.yml) (экспорт артефакта FreeBSD) и [`scripts/ci/release_artifacts.py`](../scripts/ci/release_artifacts.py).
 5. **Шаг 5. Тестирование и верификация:**
    - Прогнать `ShellCheck`, `sh -n`, unit-тесты и написать интеграционный тест `test/portable/test_installer_bundle.py`, проверяющий распаковку, контрольные суммы, генерацию конфигов `clat`/`nat64` и идемпотентность скрипта.
 

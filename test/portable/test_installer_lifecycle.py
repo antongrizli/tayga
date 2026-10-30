@@ -258,7 +258,7 @@ esac'''
         (self.root / 'usr/local/etc/rc.d').mkdir(parents=True)
         (self.root / 'etc/rc.conf.d').mkdir(parents=True)
         (self.root / 'etc/hostid').write_text('test-freebsd-hostid\n')
-        for name in ('service', 'sysrc'):
+        for name in ('service', 'sysrc', 'pfctl'):
             path = self.root / 'bin' / name
             path.write_text('#!/bin/sh\necho "' + name + ' $*" >> "$TEST_LOG"\nif [ "$1" = -f ] && [ "$3" = -n ]; then echo YES; fi\n')
             path.chmod(0o755)
@@ -482,6 +482,6 @@ esac'''
                                  'token.old', '0', str(os.getpid()), 'not-this-process'],
                                 env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('another boot/namespace', result.stderr)
+        self.assertRegex(result.stderr, r'another (boot|namespace)')
         self.assertFalse((lock / 'armed').exists())
         self.assertFalse((lock / 'decision').exists())

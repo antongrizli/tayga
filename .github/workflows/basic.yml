@@ -421,7 +421,7 @@ jobs:
               apk add --no-cache gcc make musl-dev linux-headers iproute2 iptables nftables curl python3 mount shellcheck unbound dnssec-root flock
               mkdir /work
               cd /work
-              cp -R /source/src /source/mk /source/test /source/packaging /source/Makefile /source/VERSION /source/scripts /source/docs .
+              cp -R /source/src /source/mk /source/test /source/packaging /source/Makefile /source/VERSION /source/LICENSE /source/scripts /source/docs .
               shellcheck -s sh packaging/installer/*.sh test/system/installer-*smoke.sh
               shellcheck -s sh -e SC2034 packaging/installer/tayga-managed.openrc packaging/installer/tayga-recovery.openrc
               python3 -m unittest discover -s test/portable -p "test_installer_*.py" -q

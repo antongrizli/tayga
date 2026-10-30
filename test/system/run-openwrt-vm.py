@@ -83,14 +83,14 @@ class VM:
                    '-append', 'root=/dev/vda2 rootwait console=ttyAMA0',
                    '-drive', f'file={self.work / "disk.raw"},format=raw,if=virtio',
                    '-netdev', f'user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{self.port}-:22',
-                   '-device', 'virtio-net-pci,netdev=net0', '-device', 'virtio-rng-pci',
+                   '-device', 'virtio-net-pci,netdev=net0,romfile=', '-device', 'virtio-rng-pci',
                    '-display', 'none', '-serial', 'stdio', '-monitor', 'none']
         if self.args.network:
             command += ['-netdev', 'user,id=net1,restrict=on,net=10.0.3.0/24,ipv6-net=fd42:3::/64,ipv6-host=fd42:3::2',
-                        '-device', 'virtio-net-pci,netdev=net1']
+                        '-device', 'virtio-net-pci,netdev=net1,romfile=']
         if self.lease_socket is not None:
             command += ['-netdev', f'dgram,id=lease,local.type=fd,local.str={self.lease_socket.fileno()}',
-                        '-device', 'virtio-net-pci,netdev=lease,mac=52:54:00:64:00:' +
+                        '-device', 'virtio-net-pci,netdev=lease,romfile=,mac=52:54:00:64:00:' +
                         ('01' if self.args.network else '02')]
         self.report['qemu_command'] = command
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=self.serial, stderr=subprocess.STDOUT,

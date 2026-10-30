@@ -64,9 +64,31 @@ class DependencyTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.log.exists())
 
+    def hermetic_path(self, exclude=('apk', 'opkg')):
+        """Host PATH without real package managers (Alpine CI ships a real apk)."""
+        tools = self.root / 'host-tools'
+        tools.mkdir(exist_ok=True)
+        for directory in os.environ['PATH'].split(os.pathsep):
+            if not os.path.isdir(directory):
+                continue
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                continue
+            for name in entries:
+                target = os.path.join(directory, name)
+                link = tools / name
+                if name in exclude or link.is_symlink() or not os.access(target, os.X_OK):
+                    continue
+                try:
+                    link.symlink_to(target)
+                except OSError:
+                    pass
+        return str(self.bin) + os.pathsep + str(tools)
+
     def test_openwrt_binary_only_selects_apk_or_opkg_without_alpine_dependencies(self):
         for manager in ('apk', 'opkg'):
-            result = self.run_helper('openwrt', mode='binary-only')
+            result = self.run_helper('openwrt', mode='binary-only', PATH=self.hermetic_path())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Distribution: OpenWrt', result.stdout)
             self.assertIn('Dependency manager: ' + manager, result.stdout)
@@ -92,10 +114,11 @@ class DependencyTests(unittest.TestCase):
             (minimal / 'id').write_text('#!/bin/sh\necho 0\n')
             (minimal / 'id').chmod(0o755)
             tool = minimal / manager
-            tool.write_text('#!/bin/sh\necho "$*" >> "$TEST_LOG"\ncase "$1" in add|install) /bin/ln -s /usr/bin/true "$TEST_BIN/install";; esac\n')
+            tool.write_text('#!/bin/sh\necho "$*" >> "$TEST_LOG"\ncase "$1" in add|install) /bin/ln -s "$TEST_TRUE" "$TEST_BIN/install";; esac\n')
             tool.chmod(0o755)
             result = subprocess.run(['/bin/sh', str(HELPER), 'install', 'binary-only', 'nft', 'no', 'keep', 'no', 'validate'],
-                                    env={**self.env, 'PATH': str(minimal), 'TEST_BIN': str(minimal)}, capture_output=True, text=True)
+                                    env={**self.env, 'PATH': str(minimal), 'TEST_BIN': str(minimal),
+                                         'TEST_TRUE': shutil.which('true')}, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Dependencies satisfied', result.stdout)
             commands = self.log.read_text().splitlines()
