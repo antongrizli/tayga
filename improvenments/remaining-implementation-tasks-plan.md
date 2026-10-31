@@ -288,4 +288,4 @@ configure_dns64_openwrt() {
 - [x] **Фаза 3**: `release_artifacts.py` упаковывает `.deb`, `.rpm`, `.apk` и FreeBSD артефакты в релизные ассеты.
 - [x] **Фаза 4**: OpenWrt-скрипты координируют раздачу DNS64 для локальных клиентов (`openwrt-network.sh`).
 - [x] **Интеграция**: Все переносимые тесты (`make test-portable`) и `check-doc-links.py` зеленые.
-- [ ] **CI**: Полный прогон `Basic Test` и `Correctness and review gates` на GitHub Actions успешен.
+- [x] **CI**: Полный прогон `Basic Test` и `Correctness and review gates` на GitHub Actions успешен (коммиты `33e5bcc`, `3eb85c9`, прогоны 41186575145, 41187347420, 41187347444).

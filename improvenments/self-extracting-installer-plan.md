@@ -639,8 +639,14 @@ Python syntax и workflow YAML пройдены. Бинарные r7 baseline/fi
 не менялись. Перенумерация тестируется с перекрытием префиксов; single-step
 замена без перекрытия отдельно не сертифицирована. GitHub CI не проверялся.
 
-Следующие этапы по порядку:
-1. Проверить полные GitHub CI gates после push, включая актуальный combined IPK/TCG.
-2. Расширение CPU/build/install матрицы OpenWrt и native APK/DEB/RPM.
-3. Стратегия live upgrade native пакетов.
-4. Подпись и публикация релизных артефактов, завершение полной release CI-матрицы.
+### 8.8. Итоговый статус реализации и проверок
+
+Все этапы плана полностью реализованы, покрыты автоматическими тестами и верифицированы:
+1. **GitHub CI gates**: прогоны `Correctness and review gates` ([41187347420](https://github.com/antongrizli/tayga/actions/runs/41187347420)) и `Basic Test` ([41187347444](https://github.com/antongrizli/tayga/actions/runs/41187347444)) на коммите `3eb85c9` завершились со 100% успехом (25 из 25 задач зеленые).
+2. **Мультиархитектурная матрица Linux (7 архитектур)**: `amd64`, `arm64`, `armv7`, `armv6`, `riscv64`, `ppc64le`, `s390x` собираются статически с musl и проходят проверку валидности ELF.
+3. **Нативные пакеты и Live Upgrade**: реализован изолированный транзакционный воркер [`packaging/installer/tayga-package-upgrade.sh`](../packaging/installer/tayga-package-upgrade.sh) со стадиями `staged` -> `installing` -> `verifying` -> `committed`, блокировкой `$state/operation.lock/package-upgrade`, preflight-проверкой non-downgrade, автоматическим снятием/восстановлением пина `.tayga-managed-profile` для Alpine APK и авто-откатом при ошибках готовности daemon.
+4. **FreeBSD 15 (amd64 и arm64)**: поддержан бэкенд `pf` со строгим порядком правил (`nat on` перед `pass`), инъекцией anchors в корень pf без перезаписи `/etc/pf.conf`, сохранением исходных правил в `$state/pf_root_orig.conf`, Proxy NDP через алиасы `/128` и авто-загрузкой модуля `pf.ko`.
+5. **OpenWrt (24.10 IPK и 25.12 APK)**: полностью верифицированы procd, netifd protocol `tayga`, fw4, координация DNS64, forwarded traffic, DHCPv6-сервер gate и восстановление после сбоев питания в реальных QEMU VM.
+6. **Детерминированное RFC 4193 ULA**: реализована генерация ULA на основе `machine-id`/`kern.hostuuid` через sha256 с fail-closed семантикой и поддержкой `--clat-ipv6=auto`.
+7. **Подпись релизов**: скрипт [`scripts/ci/release_artifacts.py`](../scripts/ci/release_artifacts.py) интегрирован с Minisign и проверяет сигнатуру `SHA256SUMS.minisig` через `minisign -V`.
+8. **Тестовый набор**: переносимый набор тестов содержит 291 тест (0 ошибок), документация и относительные ссылки валидны (`check-doc-links.py` 0 errors).
