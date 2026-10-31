@@ -151,6 +151,33 @@ class ReleaseArtifactsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             artifacts.verify_freebsd(directory, 'arm64', self.source)
 
+    def test_minisign_signing_and_verification(self):
+        output = self.root / 'minisign_test'
+        output.mkdir()
+        (output / 'file1.txt').write_text('content1')
+        key_file = self.root / 'test.key'
+        key_file.write_text('dummy-key')
+        pub_file = self.root / 'test.pub'
+        pub_file.write_text('dummy-pub')
+
+        commands = []
+        def mock_run(cmd, **kwargs):
+            commands.append(cmd)
+            if '-S' in cmd:
+                (output / 'SHA256SUMS.minisig').write_text('dummy-signature')
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch('shutil.which', return_value='/usr/bin/minisign'), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch.dict(os.environ, {'MINISIGN_KEY_FILE': str(key_file), 'MINISIGN_PASSWORD': 'secret'}):
+            artifacts.sign_manifest(output)
+            self.assertTrue((output / 'SHA256SUMS').exists())
+            self.assertTrue((output / 'SHA256SUMS.minisig').exists())
+            self.assertEqual(len(commands), 2)
+            self.assertIn('-S', commands[0])
+            self.assertIn('-V', commands[1])
+            self.assertIn(str(pub_file), commands[1])
+
     def publication_fixture(self):
         directory = self.root / 'publish'
         directory.mkdir()

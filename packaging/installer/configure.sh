@@ -109,22 +109,33 @@ generate_deterministic_ula() {
     seed=
     if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
         seed=$(cat /etc/machine-id)
-    elif [ -f /var/lib/dbus/machine-id ]; then
+    elif [ -f /var/lib/dbus/machine-id ] && [ -s /var/lib/dbus/machine-id ]; then
         seed=$(cat /var/lib/dbus/machine-id)
     elif command -v sysctl >/dev/null 2>&1 && sysctl -n kern.hostuuid >/dev/null 2>&1; then
         seed=$(sysctl -n kern.hostuuid 2>/dev/null)
     fi
-    [ -n "$seed" ] || seed="tayga-clat-$(uname -n)-$(date +%s 2>/dev/null || echo 1)"
+    [ -n "$seed" ] || seed="tayga-clat-$(uname -n 2>/dev/null || hostname 2>/dev/null || echo host)"
     hash=
     if command -v sha256sum >/dev/null 2>&1; then
         hash=$(printf '%s\n' "$seed" | sha256sum 2>/dev/null | awk '{print $1}')
-    elif command -v shasum >/dev/null 2>&1; then
+    fi
+    if [ -z "$hash" ] && command -v shasum >/dev/null 2>&1; then
         hash=$(printf '%s\n' "$seed" | shasum -a 256 2>/dev/null | awk '{print $1}')
     fi
-    [ -n "$hash" ] || hash="fd4242424242"
-    p1=$(printf '%s' "$hash" | cut -c 1-2)
-    p2=$(printf '%s' "$hash" | cut -c 3-6)
-    p3=$(printf '%s' "$hash" | cut -c 7-10)
+    if [ -z "$hash" ] && command -v sha256 >/dev/null 2>&1; then
+        hash=$(printf '%s\n' "$seed" | sha256 -q 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$hash" ] && command -v python3 >/dev/null 2>&1; then
+        hash=$(python3 -c "import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$seed" 2>/dev/null || :)
+    fi
+    [ -n "$hash" ] || fail 'Cannot generate deterministic ULA: sha256sum, shasum, sha256, or python3 is required'
+    case "$hash" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
+        *) fail 'Unexpected sha256 output format' ;;
+    esac
+    p1=$(printf '%s' "$hash" | cut -c 1-2 | tr '[:upper:]' '[:lower:]')
+    p2=$(printf '%s' "$hash" | cut -c 3-6 | tr '[:upper:]' '[:lower:]')
+    p3=$(printf '%s' "$hash" | cut -c 7-10 | tr '[:upper:]' '[:lower:]')
     printf 'fd%s:%s:%s:1' "$p1" "$p2" "$p3"
 }
 if [ "$clat6" = auto ] && [ "$mode" = clat ]; then
@@ -137,17 +148,18 @@ if [ "$clat6" = auto ] && [ "$mode" = clat ]; then
         if [ "$(uname -s)" = FreeBSD ]; then
             uplink=$(route -n get -inet6 default 2>/dev/null | awk '$1=="interface:" {print $2}')
             [ -n "$uplink" ] || uplink=$(route -n get default 2>/dev/null | awk '$1=="interface:" {print $2}')
-            global_v6=$(ifconfig "$uplink" inet6 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ {print $2; exit}')
+            global_v6=$(ifconfig "$uplink" inet6 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
         else
             uplink=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
             [ -n "$uplink" ] || uplink=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
-            global_v6=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" {print $2; exit}')
+            global_v6=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
         fi
+        [ -n "$global_v6" ] || fail 'Cannot determine global IPv6 address on uplink for automatic CLAT address; specify --clat-ipv6 explicitly'
         ip_base=${global_v6%/*}
         case "$ip_base" in
             *::*) clat6="${ip_base%::*}::464" ;;
             *:*:*) clat6="$(printf '%s\n' "$ip_base" | sed -E 's/:[0-9a-fA-F]+$/:464/')" ;;
-            *) clat6="2001:db8::464" ;;
+            *) fail "Invalid uplink IPv6 address format: $ip_base" ;;
         esac
     fi
 fi
@@ -159,7 +171,7 @@ if [ "$address_mode" = nat66 ] && [ "$nat66_address" = auto ]; then
     else
         uplink=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
         [ -n "$uplink" ] || uplink=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
-        nat66_address=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" {split($2,a,"/");print a[1]; exit}')
+        nat66_address=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
     fi
 fi
 if [ "$mode" = clat ]; then

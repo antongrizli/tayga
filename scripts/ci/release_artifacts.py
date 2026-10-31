@@ -218,9 +218,20 @@ def sign_manifest(directory):
     minisign_key = os.environ.get('MINISIGN_KEY_FILE')
     if minisign_key and Path(minisign_key).is_file() and shutil.which('minisign'):
         pw = os.environ.get('MINISIGN_PASSWORD', '')
+        sig_file = directory / 'SHA256SUMS.minisig'
         subprocess.run(['minisign', '-S', '-s', minisign_key, '-m', str(sha_file),
-                        '-x', str(directory / 'SHA256SUMS.minisig'), '-t', 'TAYGA Release Verification'],
+                        '-x', str(sig_file), '-t', 'TAYGA Release Verification'],
                        input=(pw + '\n').encode(), check=True)
+        pubkey_file = os.environ.get('MINISIGN_PUBKEY_FILE')
+        if not pubkey_file:
+            cand = Path(minisign_key).with_suffix('.pub')
+            if cand.is_file():
+                pubkey_file = str(cand)
+        pubkey = os.environ.get('MINISIGN_PUBKEY')
+        if pubkey_file and Path(pubkey_file).is_file():
+            subprocess.run(['minisign', '-V', '-p', pubkey_file, '-m', str(sha_file), '-x', str(sig_file)], check=True)
+        elif pubkey:
+            subprocess.run(['minisign', '-V', '-P', pubkey, '-m', str(sha_file), '-x', str(sig_file)], check=True)
 
 
 def main():

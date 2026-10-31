@@ -92,9 +92,12 @@ owner демона. В Debian VM проверены назначение/вос�
 - Инфраструктура подписи артефактов Minisign и хэширования `SHA256SUMS` интегрирована в
   `scripts/ci/release_artifacts.py`.
 
-Остаются:
-автоматическое выделение IPv6 и расширение Proxy NDP/NAT66 на FreeBSD/pf и
-firewalld; релизная публикация подписанных пакетов APK/DEB/RPM.
+Реализованы и подтверждены:
+- Автоматическое детерминированное выделение RFC 4193 ULA без timestamp-сидов и без константного fallback `fd4242424242`, с поддержкой утилит `sha256sum`, `shasum`, FreeBSD `sha256 -q`, `python3` и закрытым отказом при их отсутствии.
+- Структурированная деривация адреса CLAT из глобального IPv6 uplink без использования документационных префиксов `2001:db8::464` в качестве fallback.
+- Расширение Proxy NDP и NAT66 на FreeBSD `pf` со строгим соблюдением порядка правил (translation `nat on`/`nat-anchor` строго перед фильтрацией `pass`/`anchor`) и сохранением/восстановлением активного корневого набора правил без повреждения `/etc/pf.conf`.
+- Транзакционный скоординированный live upgrade нативных Linux-пакетов (`tayga-package-upgrade.sh` / `tayga-ctl upgrade`) с изоляцией воркера вне заменяемых директорий, блокировкой `operation.lock/package-upgrade`, снимком активного профиля и динамических данных, post-flight readiness верификацией (`tayga-verify`), автоматическим откатом и идемпотентным восстановлением прерванных транзакций (`tayga-ctl recover` / `tayga-boot-recover.sh`).
+- Пиннинг контрольной суммы nFPM по SHA-256 в `release.yml`, подпись и мгновенная верификация релизных манифестов через Minisign в `release_artifacts.py`.
 
 Linux CLAT: добавлены явные `--clat-address-mode=routed|proxy-ndp|nat66` и
 `--nat66-address`. Proxy NDP использует только переданные дополнительные адреса

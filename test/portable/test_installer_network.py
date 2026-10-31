@@ -321,12 +321,36 @@ esac''',
             'pfctl': '''echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
     -s) echo 'Status: Enabled' ;;
-    -sr) echo 'anchor "tayga_sfx/*"' ;;
+    -sn) [ "${TEST_PF_NO_NAT_ANCHOR:-no}" = yes ] || echo 'nat-anchor "tayga_sfx/*"' ;;
+    -sr) [ "${TEST_PF_NO_FILTER_ANCHOR:-no}" = yes ] || echo 'anchor "tayga_sfx/*"' ;;
+    -f)
+        cat "$2" >> "$TEST_LOG"
+        awk '
+            /^(pass|block|anchor)/ { filter=1 }
+            /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                if (filter) {
+                    print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                    exit 1
+                }
+            }
+        ' "$2" || exit 1
+        ;;
     -a)
         if [ "$3" = -f ]; then
             cat "$4" >> "$TEST_LOG"
+            awk '
+                /^(pass|block|anchor)/ { filter=1 }
+                /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                    if (filter) {
+                        print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                        exit 1
+                    }
+                }
+            ' "$4" || exit 1
         fi
         ;;
+    -F) exit 0 ;;
+    -e|-d) exit 0 ;;
 esac''',
         }.items():
             path = self.bin / tool
@@ -373,12 +397,36 @@ esac''',
             'pfctl': '''echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
     -s) echo 'Status: Enabled' ;;
-    -sr) echo 'anchor "tayga_sfx/*"' ;;
+    -sn) [ "${TEST_PF_NO_NAT_ANCHOR:-no}" = yes ] || echo 'nat-anchor "tayga_sfx/*"' ;;
+    -sr) [ "${TEST_PF_NO_FILTER_ANCHOR:-no}" = yes ] || echo 'anchor "tayga_sfx/*"' ;;
+    -f)
+        cat "$2" >> "$TEST_LOG"
+        awk '
+            /^(pass|block|anchor)/ { filter=1 }
+            /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                if (filter) {
+                    print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                    exit 1
+                }
+            }
+        ' "$2" || exit 1
+        ;;
     -a)
         if [ "$3" = -f ]; then
             cat "$4" >> "$TEST_LOG"
+            awk '
+                /^(pass|block|anchor)/ { filter=1 }
+                /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                    if (filter) {
+                        print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                        exit 1
+                    }
+                }
+            ' "$4" || exit 1
         fi
         ;;
+    -F) exit 0 ;;
+    -e|-d) exit 0 ;;
 esac''',
         }.items():
             path = self.bin / tool
@@ -418,3 +466,166 @@ esac''',
         self.assertEqual(res.returncode, 0, res.stderr)
         down_log = self.log.read_text()
         self.assertIn('pfctl -a tayga_sfx/tun64 -F nat', down_log)
+
+    def test_freebsd_pf_anchor_injection_and_root_preservation(self):
+        (self.bin / 'uname').write_text('#!/bin/sh\necho FreeBSD\n')
+        for tool, script in {
+            'ifconfig': '''#!/bin/sh
+case "$*" in
+    tun64) exit 1 ;;
+    *) exit 0 ;;
+esac''',
+            'route': '''#!/bin/sh
+case "$*" in
+    '-n get -inet6 default') echo 'interface: eth0' ;;
+    '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
+esac''',
+            'netstat': 'exit 0',
+            'pfctl': '''#!/bin/sh
+echo "pfctl $*" >> "$TEST_LOG"
+case "$1" in
+    -s) echo 'Status: Enabled' ;;
+    -sn)
+        if [ "${TEST_PF_ROOT_EMPTY:-no}" != yes ]; then
+            echo 'nat on em0 from 192.168.1.0/24 to any -> em0'
+        fi
+        ;;
+    -sr)
+        if [ "${TEST_PF_ROOT_EMPTY:-no}" != yes ]; then
+            echo 'pass in all'
+        fi
+        ;;
+    -f)
+        cat "$2" >> "$TEST_LOG"
+        awk '
+            /^(pass|block|anchor)/ { filter=1 }
+            /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                if (filter) {
+                    print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                    exit 1
+                }
+            }
+        ' "$2" || exit 1
+        ;;
+    -a)
+        if [ "$3" = -f ]; then
+            cat "$4" >> "$TEST_LOG"
+            awk '
+                /^(pass|block|anchor)/ { filter=1 }
+                /^(nat|rdr|binat|nat-anchor|rdr-anchor)/ {
+                    if (filter) {
+                        print "pfctl: syntax error: translation rule after filter rule" > "/dev/stderr"
+                        exit 1
+                    }
+                }
+            ' "$4" || exit 1
+        fi
+        ;;
+    -F) exit 0 ;;
+    -e|-d) exit 0 ;;
+esac''',
+        }.items():
+            path = self.bin / tool
+            path.write_text(script + '\n')
+            path.chmod(0o755)
+
+        config = self.root / 'freebsd-pf-inject.conf'
+        config.write_text('tun-device tun64\n# installer-mode clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr 2001:db8::2\nmap 192.0.0.1 2001:db8::464\nofflink-mtu 1400\n# installer-firewall pf\n')
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(config)],
+                             env={**self.env, 'TEST_PF_NO_NAT_ANCHOR': 'yes', 'TEST_PF_NO_FILTER_ANCHOR': 'yes'},
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        log = self.log.read_text()
+        self.assertIn('nat-anchor "tayga_sfx/*"', log)
+        self.assertIn('anchor "tayga_sfx/*"', log)
+        # nat-anchor must precede filter rules and anchor
+        idx_nat = log.index('\nnat-anchor "tayga_sfx/*"\n')
+        idx_pass = log.index('\npass in all\n')
+        idx_anchor = log.index('\nanchor "tayga_sfx/*"\n')
+        self.assertLess(idx_nat, idx_pass)
+        self.assertLess(idx_pass, idx_anchor)
+
+        # Down restores original root configuration
+        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)],
+                             env={**self.env, 'TEST_PF_NO_NAT_ANCHOR': 'yes', 'TEST_PF_NO_FILTER_ANCHOR': 'yes'},
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        down_log = self.log.read_text()
+        self.assertIn('pfctl -f ' + str(self.state / 'pf_root_orig.conf'), down_log)
+
+    def test_auto_clat_fails_closed_without_global_ipv6(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        out_auto = self.root / 'auto-clat-noglobal.conf'
+        # Mock ip returning no global address
+        ip_mock = self.bin / 'ip'
+        ip_mock.write_text('''#!/bin/sh
+case "$*" in
+    '-6 addr show dev eth0'*) echo 'inet6 fe80::5/64 scope link' ;;
+    '-6 route show default') echo 'default via fe80::1 dev eth0' ;;
+    *) exit 0 ;;
+esac
+''')
+        ip_mock.chmod(0o755)
+        res = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-ipv6=auto',
+                              '--output=' + str(out_auto)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Cannot determine global IPv6 address', res.stderr)
+        self.assertFalse(out_auto.exists())
+
+    def test_deterministic_ula_generation_and_fallbacks(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        out_nat66 = self.root / 'test-ula.conf'
+        # 1. Deterministic output: running twice with same machine-id yields exact same ULA
+        mid = self.root / 'machine-id'
+        mid.write_text('abcdef0123456789abcdef0123456789\n')
+        env_with_mid = {**self.env, 'TAYGA_TEST_MACHINE_ID': str(mid)}
+        res1 = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
+                               '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
+                               '--output=' + str(out_nat66)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        text1 = out_nat66.read_text()
+        out_nat66.unlink()
+        res2 = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
+                               '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
+                               '--output=' + str(out_nat66)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        text2 = out_nat66.read_text()
+        self.assertEqual(text1, text2)
+
+        # 2. FreeBSD sha256 -q fallback
+        # Create a mock sha256 and shadow sha256sum / shasum
+        sha_dir = self.root / 'sha_fallback_bin'
+        sha_dir.mkdir()
+        for mname in ('sha256sum', 'shasum'):
+            m = sha_dir / mname
+            m.write_text('#!/bin/sh\nexit 127\n')
+            m.chmod(0o755)
+        mock_sha256 = sha_dir / 'sha256'
+        mock_sha256.write_text('#!/bin/sh\n[ "$1" = -q ] || exit 1; echo "abcdef0123456789"\n')
+        mock_sha256.chmod(0o755)
+        out_sha = self.root / 'test-sha256-q.conf'
+        clean_path = str(sha_dir) + os.pathsep + self.env['PATH']
+        res_sha = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
+                                  '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
+                                  '--output=' + str(out_sha)],
+                                 env={**self.env, 'PATH': clean_path}, capture_output=True, text=True)
+        self.assertEqual(res_sha.returncode, 0, res_sha.stderr)
+        self.assertIn('map 192.0.0.1 fdab:cdef:0123:1::2', out_sha.read_text())
+
+        # 3. Fail closed if all sha tools and python3 are missing
+        empty_dir = self.root / 'empty_bin'
+        empty_dir.mkdir()
+        for name in ('sha256sum', 'shasum', 'sha256', 'python3'):
+            m = empty_dir / name
+            m.write_text('#!/bin/sh\nexit 127\n')
+            m.chmod(0o755)
+        out_fail = self.root / 'test-sha-fail.conf'
+        clean_empty_path = str(empty_dir) + os.pathsep + self.env['PATH']
+        res_fail = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
+                                   '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
+                                   '--output=' + str(out_fail)],
+                                  env={**self.env, 'PATH': clean_empty_path}, capture_output=True, text=True)
+        self.assertNotEqual(res_fail.returncode, 0)
+        self.assertIn('Cannot generate deterministic ULA', res_fail.stderr)
+

@@ -458,17 +458,19 @@ The package CI job builds and tests arm64 artifacts; amd64/armv7 format metadata
 is supported by the builder but has not yet had the same native package tests.
 
 Generate a candidate with `/usr/libexec/tayga/configure.sh`, then explicitly use
-`sudo tayga-ctl apply /path/to/candidate.conf`. Before package upgrade/removal,
-save the configuration and run `tayga-ctl uninstall PROFILE` for each managed
-profile. Configured-profile upgrades are deliberately refused; there is no live
-package-upgrade rollback guarantee. On APK, the controller installs a virtual
-`.tayga-managed-profile` dependency pinned to the exact installed version before
-activation, and releases it after the last profile is removed or an activation
-is rolled back. This uses the APK dependency solver because failed APK scripts
-do not reliably prevent package replacement. Do not remove that virtual package
-while profiles remain configured. `tayga-ctl recover` releases a stale pin when
-there is no profile or pending activation. Profile data remains after removal;
-DEB purge explicitly removes the packaged example configuration.
+`sudo tayga-ctl apply /path/to/candidate.conf`. Direct uncoordinated package upgrades
+with active profiles are refused to protect service continuity. Coordinated live package
+upgrade is performed via `sudo tayga-ctl upgrade /path/to/package`:
+it executes under mutual exclusion locking (`operation.lock/package-upgrade`), snapshots
+active configuration and dynamic state, executes package installation via a dedicated
+worker outside replaced directories, restarts and verifies the active profile with
+readiness probes, and automatically rolls back if package installation or service
+readiness fails. Interrupted upgrades recover idempotently via `sudo tayga-ctl recover`.
+On Alpine APK, the controller installs a virtual `.tayga-managed-profile` dependency
+pinned to the exact installed version before activation, preventing accidental
+replacement by the APK solver, and unlocks/relocks cleanly during coordinated live upgrades.
+Profile data remains after removal; DEB purge explicitly removes the packaged example
+configuration.
 
 `installer-native-package-smoke.sh` tests install, blocked configured-profile
 upgrade, successful upgrade, config/data retention and removal on Debian,

@@ -117,22 +117,33 @@ generate_deterministic_ula() {
     seed=
     if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
         seed=$(cat /etc/machine-id)
-    elif [ -f /var/lib/dbus/machine-id ]; then
+    elif [ -f /var/lib/dbus/machine-id ] && [ -s /var/lib/dbus/machine-id ]; then
         seed=$(cat /var/lib/dbus/machine-id)
     elif command -v sysctl >/dev/null 2>&1 && sysctl -n kern.hostuuid >/dev/null 2>&1; then
         seed=$(sysctl -n kern.hostuuid 2>/dev/null)
     fi
-    [ -n "$seed" ] || seed="tayga-clat-$(uname -n)-$(date +%s 2>/dev/null || echo 1)"
+    [ -n "$seed" ] || seed="tayga-clat-$(uname -n 2>/dev/null || hostname 2>/dev/null || echo host)"
     hash=
     if command -v sha256sum >/dev/null 2>&1; then
         hash=$(printf '%s\n' "$seed" | sha256sum 2>/dev/null | awk '{print $1}')
-    elif command -v shasum >/dev/null 2>&1; then
+    fi
+    if [ -z "$hash" ] && command -v shasum >/dev/null 2>&1; then
         hash=$(printf '%s\n' "$seed" | shasum -a 256 2>/dev/null | awk '{print $1}')
     fi
-    [ -n "$hash" ] || hash="fd4242424242"
-    p1=$(printf '%s' "$hash" | cut -c 1-2)
-    p2=$(printf '%s' "$hash" | cut -c 3-6)
-    p3=$(printf '%s' "$hash" | cut -c 7-10)
+    if [ -z "$hash" ] && command -v sha256 >/dev/null 2>&1; then
+        hash=$(printf '%s\n' "$seed" | sha256 -q 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$hash" ] && command -v python3 >/dev/null 2>&1; then
+        hash=$(python3 -c "import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$seed" 2>/dev/null || :)
+    fi
+    [ -n "$hash" ] || { echo 'Cannot generate deterministic ULA: sha256sum, shasum, sha256, or python3 is required' >&2; exit 2; }
+    case "$hash" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
+        *) echo 'Unexpected sha256 output format' >&2; exit 2 ;;
+    esac
+    p1=$(printf '%s' "$hash" | cut -c 1-2 | tr '[:upper:]' '[:lower:]')
+    p2=$(printf '%s' "$hash" | cut -c 3-6 | tr '[:upper:]' '[:lower:]')
+    p3=$(printf '%s' "$hash" | cut -c 7-10 | tr '[:upper:]' '[:lower:]')
     printf 'fd%s:%s:%s:1' "$p1" "$p2" "$p3"
 }
 if [ "$mode" = clat ]; then

@@ -306,30 +306,46 @@ fw_nft() {
 }
 fw_pf() {
     if [ ! -c /dev/pf ]; then
-        kldload pf 2>/dev/null || :
+        kldload pf || fail 'Failed to load pf kernel module'
         printf 'kldunload pf >/dev/null 2>&1 || :\n' >> "$journal"
     fi
     was_pf_enabled=no
     if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
         was_pf_enabled=yes
     else
-        pfctl -e >/dev/null 2>&1 || :
+        pfctl -e || fail 'Failed to enable pf'
         printf 'pfctl -d >/dev/null 2>&1 || :\n' >> "$journal"
     fi
-    root_needs_anchor=no
-    if ! pfctl -sr 2>/dev/null | grep -q 'anchor "tayga_sfx/\*"'; then
-        root_needs_anchor=yes
+    root_needs_nat_anchor=no
+    root_needs_filter_anchor=no
+    if ! pfctl -sn 2>/dev/null | grep -q 'nat-anchor "tayga_sfx/\*"'; then
+        root_needs_nat_anchor=yes
     fi
-    if [ "$root_needs_anchor" = yes ]; then
+    if ! pfctl -sr 2>/dev/null | grep -q 'anchor "tayga_sfx/\*"'; then
+        root_needs_filter_anchor=yes
+    fi
+    if [ "$root_needs_nat_anchor" = yes ] || [ "$root_needs_filter_anchor" = yes ]; then
+        if [ ! -f "$state/pf_root_orig.conf" ]; then
+            {
+                pfctl -sn 2>/dev/null || :
+                pfctl -sr 2>/dev/null || :
+            } > "$state/pf_root_orig.conf"
+        fi
         {
+            pfctl -sn 2>/dev/null || :
+            if [ "$root_needs_nat_anchor" = yes ]; then
+                printf 'nat-anchor "tayga_sfx/*"\n'
+            fi
             pfctl -sr 2>/dev/null || :
-            printf 'anchor "tayga_sfx/*"\n'
+            if [ "$root_needs_filter_anchor" = yes ]; then
+                printf 'anchor "tayga_sfx/*"\n'
+            fi
         } > "$lock/root.pf"
-        pfctl -f "$lock/root.pf" 2>/dev/null || :
-        if [ "$was_pf_enabled" = yes ]; then
-            printf 'pfctl -f /etc/pf.conf 2>/dev/null || :\n' >> "$journal"
+        pfctl -f "$lock/root.pf" || fail 'Failed to load pf root ruleset with tayga anchors'
+        if [ -s "$state/pf_root_orig.conf" ]; then
+            printf 'pfctl -f %s >/dev/null 2>&1 && rm -f %s || :\n' "$state/pf_root_orig.conf" "$state/pf_root_orig.conf" >> "$journal"
         else
-            printf 'pfctl -F rules 2>/dev/null || :\n' >> "$journal"
+            printf 'pfctl -F nat >/dev/null 2>&1 && pfctl -F rules >/dev/null 2>&1 && rm -f %s || :\n' "$state/pf_root_orig.conf" >> "$journal"
         fi
         rm -f "$lock/root.pf"
     fi
@@ -352,10 +368,12 @@ fw_pf() {
             printf 'pass in quick on %s inet6 from any to %s keep state\n' "$wan" "$pref64"
             printf 'pass out quick on %s inet6 from any to %s keep state\n' "$dev" "$pref64"
         elif [ "$mode" = clat ]; then
+            if [ "$address_mode" = nat66 ]; then
+                printf 'nat on %s inet6 from { %s, %s } to %s -> %s\n' "$uplink6" "$clat6" "$addr6" "$pref64" "$nat66_address"
+            fi
             printf 'pass in quick on %s inet from any to any keep state\n' "$dev"
             printf 'pass out quick on %s inet from any to any keep state\n' "$dev"
             if [ "$address_mode" = nat66 ]; then
-                printf 'nat on %s inet6 from { %s, %s } to %s -> %s\n' "$uplink6" "$clat6" "$addr6" "$pref64" "$nat66_address"
                 printf 'pass out quick on %s inet6 from { %s, %s, %s } to any keep state\n' "$uplink6" "$clat6" "$addr6" "$nat66_address"
                 printf 'pass in quick on %s inet6 from any to { %s, %s } keep state\n' "$uplink6" "$clat6" "$nat66_address"
             else
@@ -364,7 +382,7 @@ fw_pf() {
             fi
         fi
     } > "$lock/rules.pf"
-    pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf"
+    pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf" || fail "Failed to load pf rules for anchor tayga_sfx/$dev"
     printf 'pfctl -a tayga_sfx/%s -F rules >/dev/null 2>&1 && pfctl -a tayga_sfx/%s -F nat >/dev/null 2>&1 || :\n' "$dev" "$dev" >> "$journal"
     rm -f "$lock/rules.pf"
 }
