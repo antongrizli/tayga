@@ -72,6 +72,7 @@ void usage(int code) {
 			"--rmtun            : Remove the persistent TUN interface\n"
 			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
+			"--check-config     : Validate configuration without changing system state\n"
 			"--tun-steering MODE: kernel (default), groups or flows (eBPF requires a fresh disposable Linux TUN)\n"
 			"--dispatch MODE   : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
 			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
@@ -382,6 +383,8 @@ int main(int argc, char **argv)
 	int detach = 1;
 	int do_mktun = 0;
 	int do_rmtun = 0;
+	int check_config = 0;
+	int check_offload = 0;
 	struct passwd *pw = NULL;
 	struct group *gr = NULL;
 	progname = argv[0];
@@ -415,6 +418,7 @@ int main(int argc, char **argv)
 		{ "packet-io", 1, 0, 1005 },
 		{ "runtime-dir", 1, 0, 1006 },
 		{ "status-file", 1, 0, 1007 },
+		{ "check-config", 0, 0, 1008 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -461,7 +465,11 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 1002:
-			return tun_check_offload_support();
+			check_offload = 1;
+			break;
+		case 1008:
+			check_config = 1;
+			break;
 		case 1001:
 			if (strcasecmp(optarg, "off") == 0) {
 				gcfg.tun_offload = TUN_OFFLOAD_OFF;
@@ -534,12 +542,16 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (check_config && (do_mktun || do_rmtun || check_offload))
+		die("Error: --check-config cannot be combined with tunnel operations");
+	if (check_offload) return tun_check_offload_support();
+
 	/* Setup logging
 	 * But not if we are only doing mktun / rmtun
 	 * This must be done before config parsing, since those rely
 	 * on logging based on log_out
 	 */
-	if(do_mktun || do_rmtun) {
+	if(do_mktun || do_rmtun || check_config) {
 		//Force stdout for these options
 		gcfg.log_out = LOG_TO_STDOUT;
 	} else if (gcfg.log_out == LOG_TO_SYSLOG) {
@@ -573,6 +585,10 @@ int main(int argc, char **argv)
 
 	/* Validate config (and load map file) */
 	if(config_validate() < 0) return 1;
+	/* Validation must not create TUNs, runtime files, data directories or workers. */
+	if (check_config) {
+		return 0;
+	}
 
 	/* Check if we are doing tunnel operations only
 	 * Must be done after config reading so we know tun name
@@ -745,7 +761,7 @@ int main(int argc, char **argv)
 		die("Experimental dispatch requires 1..8 workers, static inline mappings and kernel steering");
 	if(gcfg.async_tun && gcfg.workers>8)die("Experimental io_uring supports at most 8 workers");
 	/* Load dynamic maps if configured */
-	if (gcfg.data_dir[0])
+	if (gcfg.data_dir[0] && gcfg.dynamic_pool)
 		load_dynamic(gcfg.dynamic_pool);
 
 	if (gcfg.cache_size)

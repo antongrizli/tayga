@@ -83,6 +83,16 @@ class ReleaseArtifactsTests(unittest.TestCase):
                                       'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
             self.manifests[arch] = manifest
             (directory / 'manifest.json').write_text(json.dumps(manifest))
+        for arch in artifacts.FREEBSD_ARCHES:
+            directory = self.inputs / f'candidate-freebsd-{arch}'
+            directory.mkdir()
+            names = [f'tayga-freebsd-{arch}', f'pref64-discover-freebsd-{arch}']
+            for name in names:
+                (directory / name).write_text(name)
+            manifest = {'version': self.source['version'], 'sha': self.source['sha'],
+                        'platform': f'freebsd-{arch}', 'smoke': 'pass',
+                        'files': {n: artifacts.sha256(directory / n) for n in names}}
+            (directory / 'manifest.json').write_text(json.dumps(manifest))
 
     def test_missing_corrupt_or_mixed_artifacts_rejected(self):
         directory = self.inputs / 'candidate-arm64'
@@ -103,15 +113,183 @@ class ReleaseArtifactsTests(unittest.TestCase):
         import shutil
         shutil.copytree(ROOT / 'deploy/mikrotik', self.root / 'deploy/mikrotik')
         shutil.copytree(ROOT / 'scripts', self.root / 'scripts')
+        shutil.copytree(ROOT / 'packaging', self.root / 'packaging')
+        shutil.copytree(ROOT / 'docs/man', self.root / 'docs/man')
+        shutil.copytree(ROOT / 'src', self.root / 'src')
+        shutil.copytree(ROOT / 'mk', self.root / 'mk')
+        shutil.copy2(ROOT / 'Makefile', self.root / 'Makefile')
+        shutil.copy2(ROOT / 'LICENSE', self.root / 'LICENSE')
+        (self.root / 'VERSION').write_text('1.2.3\n')
         (self.root / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
+        native_dir = self.inputs / 'candidate-native'
+        native_dir.mkdir()
+        for arch in artifacts.ARCHES:
+            deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
+            rpm_pkg = native_dir / f'tayga-managed-1.2.3-1.{arch}.rpm'
+            apk_pkg = native_dir / f'tayga-managed-1.2.3-r1-{arch}.apk'
+            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
+            rpm_pkg.write_bytes(b'\xed\xab\xee\xdb' + b'\x00' * 20)
+            apk_pkg.write_bytes(b'\x1f\x8b' + b'\x00' * 20)
+            artifacts_map = {
+                deb_pkg.name: artifacts.sha256(deb_pkg),
+                rpm_pkg.name: artifacts.sha256(rpm_pkg),
+                apk_pkg.name: artifacts.sha256(apk_pkg),
+            }
+            manifest = {
+                'version': '1.2.3',
+                'release': '1',
+                'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(self.inputs / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(self.inputs / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': artifacts_map,
+                'signed': False,
+                'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
         output = self.root / 'assets'
         artifacts.assemble(self.root, self.inputs, output, self.source)
         self.assertIn('ghcr.io/owner/repo-clat:version-1.2.3',
                       (output / 'routeros-install-clat.rsc').read_text())
         self.assertIn('A release fix.', (output / 'release-notes.md').read_text())
         self.assertIn('release-manifest.json', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-linux-universal.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-universal.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-freebsd-amd64.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-installer-freebsd-arm64.sh', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed_1.2.3-1_amd64.deb', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3-1.amd64.rpm', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3-r1-amd64.apk', (output / 'SHA256SUMS').read_text())
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
+
+    def test_assemble_requires_candidate_native_and_complete_packages(self):
+        root_dir = self.root / 'test_assembly_req'
+        root_dir.mkdir()
+        (root_dir / 'deploy').mkdir()
+        import shutil
+        shutil.copytree(ROOT / 'deploy/mikrotik', root_dir / 'deploy/mikrotik')
+        shutil.copytree(ROOT / 'scripts', root_dir / 'scripts')
+        shutil.copytree(ROOT / 'packaging', root_dir / 'packaging')
+        shutil.copytree(ROOT / 'docs/man', root_dir / 'docs/man')
+        shutil.copytree(ROOT / 'src', root_dir / 'src')
+        shutil.copytree(ROOT / 'mk', root_dir / 'mk')
+        shutil.copy2(ROOT / 'Makefile', root_dir / 'Makefile')
+        shutil.copy2(ROOT / 'LICENSE', root_dir / 'LICENSE')
+        (root_dir / 'VERSION').write_text('1.2.3\n')
+        (root_dir / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
+
+        inputs_dir = self.root / 'inputs_test_req'
+        inputs_dir.mkdir()
+        for arch in artifacts.ARCHES:
+            d = inputs_dir / f'candidate-{arch}'
+            d.mkdir()
+            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES] + [
+                f'tayga-linux-{arch}', f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt']
+            for name in names:
+                (d / name).write_text(name)
+            m = {'source': self.source, 'arch': arch,
+                 'files': {n: artifacts.sha256(d / n) for n in names},
+                 'images': {p: {'archive': artifacts.archive_name(p, arch),
+                               'reference': f'tayga-release-{p}:{arch}',
+                               'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+            (d / 'manifest.json').write_text(json.dumps(m))
+        for arch in artifacts.FREEBSD_ARCHES:
+            d = inputs_dir / f'candidate-freebsd-{arch}'
+            d.mkdir()
+            names = [f'tayga-freebsd-{arch}', f'pref64-discover-freebsd-{arch}']
+            for name in names:
+                (d / name).write_text(name)
+            m = {'version': self.source['version'], 'sha': self.source['sha'],
+                 'platform': f'freebsd-{arch}', 'smoke': 'pass',
+                 'files': {n: artifacts.sha256(d / n) for n in names}}
+            (d / 'manifest.json').write_text(json.dumps(m))
+
+        output_dir = self.root / 'assets_req'
+
+        # 1. Missing candidate-native directory
+        with self.assertRaisesRegex(ValueError, 'candidate-native directory is required'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        native_dir = inputs_dir / 'candidate-native'
+        native_dir.mkdir()
+
+        # 2. Missing manifest for arch
+        with self.assertRaisesRegex(ValueError, 'expected exactly 1 manifest'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        # 3. Empty artifacts in manifest
+        for arch in artifacts.ARCHES:
+            manifest = {
+                'version': '1.2.3', 'release': '1', 'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': {}, 'signed': False, 'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, 'contains no artifacts'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        # 4. Incomplete formats in manifest (e.g. missing .apk and .rpm)
+        for arch in artifacts.ARCHES:
+            deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
+            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
+            manifest = {
+                'version': '1.2.3', 'release': '1', 'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': {deb_pkg.name: artifacts.sha256(deb_pkg)},
+                'signed': False, 'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, 'missing formats'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+
+    def test_freebsd_hash_and_source_mismatch_rejected(self):
+        directory = self.inputs / 'candidate-freebsd-arm64'
+        artifacts.verify_freebsd(directory, 'arm64', self.source)
+        with self.assertRaises(ValueError):
+            artifacts.verify_freebsd(directory, 'arm64', {**self.source, 'sha': 'f' * 40})
+        (directory / 'tayga-freebsd-arm64').write_text('corrupt')
+        with self.assertRaises(ValueError):
+            artifacts.verify_freebsd(directory, 'arm64', self.source)
+
+    def test_minisign_signing_and_verification(self):
+        output = self.root / 'minisign_test'
+        output.mkdir()
+        (output / 'file1.txt').write_text('content1')
+        key_file = self.root / 'test.key'
+        key_file.write_text('dummy-key')
+        pub_file = self.root / 'test.pub'
+        pub_file.write_text('dummy-pub')
+
+        commands = []
+        def mock_run(cmd, **kwargs):
+            commands.append(cmd)
+            if '-S' in cmd:
+                (output / 'SHA256SUMS.minisig').write_text('dummy-signature')
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch('shutil.which', return_value='/usr/bin/minisign'), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch.dict(os.environ, {'MINISIGN_KEY_FILE': str(key_file), 'MINISIGN_PASSWORD': 'secret'}):
+            artifacts.sign_manifest(output)
+            self.assertTrue((output / 'SHA256SUMS').exists())
+            self.assertTrue((output / 'SHA256SUMS.minisig').exists())
+            self.assertEqual(len(commands), 2)
+            self.assertIn('-S', commands[0])
+            self.assertIn('-V', commands[1])
+            self.assertIn(str(pub_file), commands[1])
 
     def publication_fixture(self):
         directory = self.root / 'publish'
@@ -184,6 +362,31 @@ class ReleaseArtifactsTests(unittest.TestCase):
                 self.assertLess(max(pushes), min(aliases))
                 self.assertEqual(any(':latest' in arg for c in commands for arg in c), not prerelease)
                 self.assertFalse(any('build' in c for c in commands))
+
+    def test_publication_preserves_signed_sha256sums_and_minisig(self):
+        directory = self.publication_fixture()
+        # Seed SHA256SUMS and SHA256SUMS.minisig before publication
+        artifacts.checksums(directory)
+        original_sha = (directory / 'SHA256SUMS').read_text()
+        (directory / 'SHA256SUMS.minisig').write_text('untrusted comment: test signature\nminisig-blob\n')
+
+        def output(*args):
+            if args[1:3] == ('image', 'inspect'):
+                return 'sha256:' + 'b' * 64
+            return 'sha256:' + 'c' * 64
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '123',
+                                     'GITHUB_RUN_ATTEMPT': '2'}), \
+                patch.object(publisher.subprocess, 'run'), \
+                patch.object(publisher, 'run', side_effect=output):
+            publisher.publish(directory)
+
+        # SHA256SUMS must remain identical and MUST NOT include published-images.json
+        self.assertEqual((directory / 'SHA256SUMS').read_text(), original_sha)
+        self.assertNotIn('published-images.json', (directory / 'SHA256SUMS').read_text())
+        self.assertTrue((directory / 'published-images.json').is_file())
+        self.assertTrue((directory / 'published-images.json.sha256').is_file())
+        self.assertTrue((directory / 'SHA256SUMS.minisig').is_file())
 
 
 if __name__ == '__main__':

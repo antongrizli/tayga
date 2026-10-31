@@ -1,0 +1,25 @@
+[Unit]
+Description=TAYGA managed network profile %i
+Requires=tayga-recovery.service
+Wants=network-online.target
+After=tayga-recovery.service network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=tayga-managed-%i
+RuntimeDirectoryMode=0750
+ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/tayga/%i
+ExecStartPre=/usr/local/libexec/tayga/tayga-dns64 prepare /etc/tayga/%i.conf
+ExecStartPre=/usr/local/libexec/tayga/tayga-host-dns prepare /etc/tayga/%i.conf
+ExecStartPre=/usr/local/libexec/tayga/tayga-net-ctl up /etc/tayga/%i.conf
+ExecStart=/usr/local/sbin/tayga --config /etc/tayga/%i.conf --runtime-dir /run/tayga-managed-%i --nodetach
+ExecStartPost=/usr/local/libexec/tayga/tayga-dns64 up /etc/tayga/%i.conf
+ExecStartPost=/usr/local/libexec/tayga/tayga-host-dns up /etc/tayga/%i.conf
+ExecStartPost=/usr/local/libexec/tayga/tayga-verify /etc/tayga/%i.conf
+ExecStopPost=/usr/local/libexec/tayga/tayga-dns64 down /etc/tayga/%i.conf
+ExecStopPost=-/usr/local/libexec/tayga/tayga-host-dns down /etc/tayga/%i.conf
+ExecStopPost=/usr/local/libexec/tayga/tayga-net-ctl down /etc/tayga/%i.conf
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

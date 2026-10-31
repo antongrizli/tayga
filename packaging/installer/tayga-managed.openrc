@@ -1,0 +1,38 @@
+#!/sbin/openrc-run
+name='TAYGA managed profile'
+description='TAYGA CLAT/NAT64 with owned network setup and readiness verification'
+profile=${profile:-nat64}
+command=/usr/local/sbin/tayga
+command_args="--config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
+command_background=yes
+pidfile=/run/tayga-managed.pid
+
+depend() {
+    need net tayga-recovery
+    after firewall
+}
+start_pre() {
+    case "$profile" in clat|nat64|siit) ;; *) eerror 'Invalid managed profile'; return 1 ;; esac
+    checkpath --directory --mode 0750 /var/lib/tayga || return 1
+    checkpath --directory --mode 0750 "/var/lib/tayga/$profile" || return 1
+    checkpath --directory --mode 0750 "/run/tayga-managed-$profile" || return 1
+    /usr/local/libexec/tayga/tayga-dns64 prepare "/etc/tayga/$profile.conf" || return 1
+    /usr/local/libexec/tayga/tayga-host-dns prepare "/etc/tayga/$profile.conf" || return 1
+    /usr/local/libexec/tayga/tayga-net-ctl up "/etc/tayga/$profile.conf"
+}
+start_post() {
+    if ! /usr/local/libexec/tayga/tayga-dns64 up "/etc/tayga/$profile.conf" ||
+        ! /usr/local/libexec/tayga/tayga-host-dns up "/etc/tayga/$profile.conf" ||
+        ! /usr/local/libexec/tayga/tayga-verify "/etc/tayga/$profile.conf"; then
+        start-stop-daemon --stop --pidfile "$pidfile" || :
+        /usr/local/libexec/tayga/tayga-dns64 down "/etc/tayga/$profile.conf" || :
+        /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/$profile.conf" || :
+        /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/$profile.conf"
+        return 1
+    fi
+}
+stop_post() {
+    /usr/local/libexec/tayga/tayga-dns64 down "/etc/tayga/$profile.conf" || :
+    /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/$profile.conf" || :
+    /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/$profile.conf"
+}

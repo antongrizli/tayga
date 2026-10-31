@@ -32,9 +32,9 @@ address.
 TAYGA\[cq]s configuration is stored in the tayga.conf(5) file, which is
 usually found in /etc/tayga.conf or /usr/local/etc/tayga.conf.
 .SH INVOCATION
-Without the \f[B]\-\-mktun\f[R] or \f[B]\-\-rmtun\f[R] options, the
-\[ga]tayga\[ga] executable runs as a daemon, translating packets as
-described above.
+Without the \f[B]\-\-mktun\f[R], \f[B]\-\-rmtun\f[R] or
+\f[B]\-\-check\-config\f[R] options, the \[ga]tayga\[ga] executable runs
+as a daemon, translating packets as described above.
 .PP
 The \f[B]\-\-mktun\f[R] and \f[B]\-\-rmtun\f[R] options instruct
 \[ga]tayga\[ga] to create or destroy, respectively, its configured TUN
@@ -50,6 +50,14 @@ configure tayga\[cq]s TUN device at boot by running \[ga]tayga
 \-\-mktun\[ga] as a \[lq]pre\-up\[rq] command and then configuring the
 TUN device as any other network interface.
 .SH OPTIONS
+.TP
+\f[B]\-\-check\-config\f[R]
+Parse and validate the selected configuration, then exit.
+Does not create TUN interfaces, data/runtime directories, status files
+or worker threads.
+Returns nonzero on invalid configuration.
+Cannot be combined with \f[B]\-\-mktun\f[R], \f[B]\-\-rmtun\f[R] or
+\f[B]\-\-check\-offload\f[R].
 .TP
 \f[B]\-c\f[R] \f[I]configfile\f[R] | \f[B]\-\-config\f[R] \f[I]configfile\f[R]
 Read configuration options from \f[I]configfile\f[R]

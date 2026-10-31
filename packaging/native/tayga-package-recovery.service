@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover interrupted TAYGA native package upgrade
+After=tayga-recovery.service basic.target
+Before=tayga-managed@clat.service tayga-managed@nat64.service tayga-managed@siit.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=TAYGA_BOOT_RECOVERY=1
+ExecStart=/bin/sh -ec 'if [ -d /var/lib/tayga-installer/package-upgrade ]; then test -f /var/lib/tayga-installer/package-upgrade/worker.sh; exec sh /var/lib/tayga-installer/package-upgrade/worker.sh recover; fi'
+TimeoutStartSec=180

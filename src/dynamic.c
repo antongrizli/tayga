@@ -257,6 +257,9 @@ void load_dynamic(struct dynamic_pool *pool)
 	struct map_dynamic *d;
 	int count = 0;
 
+	if (!pool)
+		return;
+
 	in = fopen(MAP_FILE, "r");
 	if (!in) {
 		if (errno != ENOENT)

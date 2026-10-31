@@ -123,8 +123,56 @@ jobs:
           compression-level: 0
           if-no-files-found: warn
 
+  prepare-native-packages:
+    name: Build native packages (DEB, RPM, APK) for release
+    needs: [resolve, compiler-platform-gates, prepare-artifacts]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Install nFPM
+        run: |
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          curl --fail --location --connect-timeout 10 --max-time 120 --proto '=https' --proto-redir '=https' \
+            https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz \
+            -o "$RUNNER_TEMP/nfpm.tar.gz"
+          echo "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> $GITHUB_PATH
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Build packages across all supported Linux architectures
+        run: |
+          mkdir -p release-native
+          version="${{ needs.resolve.outputs.version }}"
+          commit="${{ needs.resolve.outputs.sha }}"
+          for arch in amd64 arm64 armv7; do
+            bin="candidates/candidate-$arch/tayga-linux-$arch"
+            helper="candidates/candidate-$arch/pref64-discover-linux-$arch"
+            if [ ! -f "$bin" ] || [ ! -f "$helper" ]; then
+              echo "ERROR: Missing release binary $bin or helper $helper for $arch" >&2
+              exit 1
+            fi
+            python3 scripts/build-native-packages.py \
+              --version "$version" --release 1 --arch "$arch" \
+              --tayga "$bin" --helper "$helper" \
+              --maintainer "TAYGA Community <antongrizli@gmail.com>" \
+              --source-commit "$commit" \
+              --nfpm "$RUNNER_TEMP/nfpm/nfpm" \
+              --output release-native
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-native
+          path: release-native/
+          if-no-files-found: error
+
   verify-assets:
-    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts]
+    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts, prepare-native-packages]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -138,9 +186,17 @@ jobs:
         with:
           pattern: candidate-*
           path: candidates
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Verify all hashes and source identities; prepare pinned RouterOS assets
+        env:
+          MINISIGN_KEY_FILE: ${{ secrets.MINISIGN_KEY_FILE }}
+          MINISIGN_KEY_DATA: ${{ secrets.MINISIGN_KEY_DATA }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
+          REQUIRE_RELEASE_SIGNATURE: 'true'
         run: |
-          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
           cd release-assets
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@v7

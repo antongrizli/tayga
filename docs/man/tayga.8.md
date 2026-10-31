@@ -40,7 +40,7 @@ usually found in /etc/tayga.conf or /usr/local/etc/tayga.conf.
 
 # INVOCATION
 
-Without the **\-\-mktun** or **\-\-rmtun** options, the \`tayga\`
+Without the **\-\-mktun**, **\-\-rmtun** or **\-\-check-config** options, the \`tayga\`
 executable runs as a daemon, translating packets as described above.
 
 The **\-\-mktun** and **\-\-rmtun** options instruct \`tayga\` to create
@@ -57,6 +57,12 @@ as a "pre-up" command and then configuring the TUN device as any other
 network interface.
 
 # OPTIONS
+
+**\-\-check-config**
+:   Parse and validate the selected configuration, then exit. Does not create
+    TUN interfaces, data/runtime directories, status files or worker threads.
+    Returns nonzero on invalid configuration. Cannot be combined with
+    **\-\-mktun**, **\-\-rmtun** or **\-\-check-offload**.
 
 **-c** *configfile* | **\-\-config** *configfile*
 :   Read configuration options from *configfile*

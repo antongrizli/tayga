@@ -4,8 +4,54 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Changed
+
+- FreeBSD CLAT Proxy NDP now uses a proxy neighbor for the translated address and an owned uplink alias for the daemon identity, avoiding conflicting TUN assignments.
+
+- FreeBSD PF activation now requires administrator-provisioned root NAT/filter calls for `tayga_sfx/*`. The controller only loads its child anchor; root ruleset reconstruction and reload were removed after a real VM gate demonstrated global limit resets. Missing root calls fail activation with network rollback.
+
 ### Fixed
 
+- Initialize the BSD TUN address-family header on normal IPv6-to-IPv4 data output; previously TCP/UDP replies could be discarded by the kernel.
+- Detect byte order through compiler-defined macros on FreeBSD as well as Linux, restoring valid ICMP echo checksum translation.
+
+### Added
+
+- Isolated two-VM OpenWrt DHCPv6 gate with odhcpd IA_NA/IA_PD leases, renew stability and live prefix renumbering through odhcp6c; enabled for IPK/APK CI.
+
+- Optional independent OpenWrt package upgrade/recovery coordinator with a persistent archive/state journal, startup fencing, manager/readiness rollback and boot recovery tests.
+
+- Booted OpenWrt 25.12.6 APK lifecycle/networking gate with release-specific input pins, live package hooks and mixed-format rejection; shared IPK regression coverage.
+
+- Pinned OpenWrt 25.12.6 SDK/APK package gate, APK versioned runtime dependencies and matching rootfs lifecycle tests; retained 24.10.8 IPK compatibility.
+
+- Optional OpenWrt NAT64/SIIT netifd/fw4 package with owned TUN/routes, bounded firewall checks, stale-teardown protection and cleanup on stop/removal.
+
+- Optional netifd uplink tracking and filtered OpenWrt iface hotplug handling, with WAN suspension/resume, stable address/prefix/route fingerprints and manual-stop protection.
+
+- Booted OpenWrt QEMU procd/overlay lifecycle gate with real reboot, prepared-journal power-cut recovery, process ownership checks and saved reports/logs.
+
+- Optional OpenWrt procd/UCI service for preconfigured external networking, persistent configuration publication/recovery, and an unprivileged `--check-config` daemon mode.
+
+- Target/ABI-checked OpenWrt SDK binary-only package recipe and source snapshot manifest; separate apk/opkg dependency planning and opkg file ownership protection.
+
+- Native unsigned APK/DEB/RPM package builder with standard `/usr` paths, package ownership isolation, config/data retention tests and an APK dependency pin for managed profiles.
+
+- Self-extracting release installers with verified payloads, per-platform binaries, a universal bundle and native FreeBSD artifact gates.
+- Linux CLAT/NAT64/SIIT profile wizard, systemd/OpenRC activation, readiness checks, owned iptables/nftables rules and transactional reconfiguration/uninstall.
+- Disposable-container CLAT-to-NAT64 HTTP/ICMP and cleanup gates, plus portable installer ownership/rollback regressions.
+
+- Debian AppArmor-compatible owned Unbound configuration, verified with live DNSSEC and systemd-resolved.
+
+- Optional profile-owned Unbound DNS64 and CLAT public DNS through systemd-resolved, with scoped cleanup.
+
+- Early systemd/OpenRC recovery of interrupted activations after reboot, without replaying old kernel journals; native VM reboot/power-cut tests.
+
+- Independent activation watchdog with SIGKILL recovery, atomic commit, owned-session cancellation, persistent snapshots and manual `tayga-ctl recover`.
+
+### Fixed
+
+- Ignore stale dynamic mapping state when no dynamic pool is configured.
 - MikroTik RouterOS deployment: add `bridge-clat` and `bridge-nat64` to interface list `LAN` so default firewall allows forwarded container traffic.
 - MikroTik RouterOS deployment: register static IPv6 neighbor for container VETH interface, resolving RouterOS 7 neighbor discovery drops on secondary bridges.
 - MikroTik RouterOS deployment: remove duplicate blocking container image archive check in `routeros-install-nat64.rsc` to allow registry pulls (`useRegistry=true`).
