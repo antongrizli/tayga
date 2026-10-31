@@ -190,44 +190,53 @@ def assemble(root, inputs, output, source, require_signature=False):
                 archive.write(path, path.name)
     native_manifests = {}
     native_dir = inputs / 'candidate-native'
-    if native_dir.is_dir():
-        for arch in ARCHES:
-            manifest_candidates = list(native_dir.glob(f'tayga-managed-{source["version"]}-*-{arch}.json'))
-            if not manifest_candidates:
-                raise ValueError(f'candidate-native: missing manifest for arch {arch}')
-            manifest_path = manifest_candidates[0]
-            data = json.loads(manifest_path.read_text())
-            if data.get('version') != source['version']:
-                raise ValueError(f'native package manifest version mismatch for {arch}')
-            if data.get('source_commit') != source['sha']:
-                raise ValueError(f'native package source commit mismatch for {arch}')
-            if data.get('arch') != arch:
-                raise ValueError(f'native package architecture mismatch for {arch}')
-            expected_tayga = manifests[arch]['files'][f'tayga-linux-{arch}']
-            expected_helper = manifests[arch]['files'][f'pref64-discover-linux-{arch}']
-            if data.get('inputs', {}).get('tayga') != expected_tayga:
-                raise ValueError(f'native package input tayga binary hash mismatch for {arch}')
-            if data.get('inputs', {}).get('pref64-discover') != expected_helper:
-                raise ValueError(f'native package input helper hash mismatch for {arch}')
-            for pkg_name, expected_digest in data.get('artifacts', {}).items():
-                pkg_file = native_dir / pkg_name
-                if not pkg_file.is_file():
-                    raise ValueError(f'native package file missing: {pkg_name}')
-                if sha256(pkg_file) != expected_digest:
-                    raise ValueError(f'native package digest mismatch: {pkg_name}')
-                blob = pkg_file.read_bytes()[:16]
-                if pkg_name.endswith('.deb') and not blob.startswith(b'!<arch>\n'):
-                    raise ValueError(f'invalid deb package format: {pkg_name}')
-                elif pkg_name.endswith('.rpm') and not blob.startswith(b'\xed\xab\xee\xdb'):
-                    raise ValueError(f'invalid rpm package format: {pkg_name}')
-                elif pkg_name.endswith('.apk') and not blob.startswith(b'\x1f\x8b'):
-                    raise ValueError(f'invalid apk package format: {pkg_name}')
-                shutil.copy2(pkg_file, output / pkg_name)
-            native_manifests[arch] = data
-        expected_files = {p for m in native_manifests.values() for p in m.get('artifacts', {})}
-        for f in native_dir.iterdir():
-            if f.is_file() and not f.name.endswith('.json') and f.name not in expected_files:
-                raise ValueError(f'candidate-native contains unmanifested file: {f.name}')
+    if not native_dir.is_dir():
+        raise ValueError('candidate-native directory is required for release assembly')
+    required_formats = {'.deb', '.rpm', '.apk'}
+    for arch in ARCHES:
+        manifest_candidates = list(native_dir.glob(f'tayga-managed-{source["version"]}-*-{arch}.json'))
+        if len(manifest_candidates) != 1:
+            raise ValueError(f'candidate-native: expected exactly 1 manifest for arch {arch}, found {len(manifest_candidates)}')
+        manifest_path = manifest_candidates[0]
+        data = json.loads(manifest_path.read_text())
+        if data.get('version') != source['version']:
+            raise ValueError(f'native package manifest version mismatch for {arch}')
+        if data.get('source_commit') != source['sha']:
+            raise ValueError(f'native package source commit mismatch for {arch}')
+        if data.get('arch') != arch:
+            raise ValueError(f'native package architecture mismatch for {arch}')
+        expected_tayga = manifests[arch]['files'][f'tayga-linux-{arch}']
+        expected_helper = manifests[arch]['files'][f'pref64-discover-linux-{arch}']
+        if data.get('inputs', {}).get('tayga') != expected_tayga:
+            raise ValueError(f'native package input tayga binary hash mismatch for {arch}')
+        if data.get('inputs', {}).get('pref64-discover') != expected_helper:
+            raise ValueError(f'native package input helper hash mismatch for {arch}')
+        artifacts_map = data.get('artifacts', {})
+        if not artifacts_map:
+            raise ValueError(f'candidate-native: manifest for {arch} contains no artifacts')
+        found_formats = {Path(p).suffix for p in artifacts_map}
+        missing_formats = required_formats - found_formats
+        if missing_formats:
+            raise ValueError(f'candidate-native: manifest for {arch} is missing formats: {missing_formats}')
+        for pkg_name, expected_digest in artifacts_map.items():
+            pkg_file = native_dir / pkg_name
+            if not pkg_file.is_file():
+                raise ValueError(f'native package file missing: {pkg_name}')
+            if sha256(pkg_file) != expected_digest:
+                raise ValueError(f'native package digest mismatch: {pkg_name}')
+            blob = pkg_file.read_bytes()[:16]
+            if pkg_name.endswith('.deb') and not blob.startswith(b'!<arch>\n'):
+                raise ValueError(f'invalid deb package format: {pkg_name}')
+            elif pkg_name.endswith('.rpm') and not blob.startswith(b'\xed\xab\xee\xdb'):
+                raise ValueError(f'invalid rpm package format: {pkg_name}')
+            elif pkg_name.endswith('.apk') and not blob.startswith(b'\x1f\x8b'):
+                raise ValueError(f'invalid apk package format: {pkg_name}')
+            shutil.copy2(pkg_file, output / pkg_name)
+        native_manifests[arch] = data
+    expected_files = {p for m in native_manifests.values() for p in m.get('artifacts', {})}
+    for f in native_dir.iterdir():
+        if f.is_file() and not f.name.endswith('.json') and f.name not in expected_files:
+            raise ValueError(f'candidate-native contains unmanifested file: {f.name}')
     (output / 'release-manifest.json').write_text(json.dumps(
         {'source': source, 'architectures': manifests, 'freebsd': freebsd, 'native': native_manifests}, indent=2) + '\n')
     changelog = (root / 'CHANGELOG.md').read_text()

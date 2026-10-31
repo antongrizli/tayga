@@ -164,6 +164,97 @@ class ReleaseArtifactsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
 
+    def test_assemble_requires_candidate_native_and_complete_packages(self):
+        root_dir = self.root / 'test_assembly_req'
+        root_dir.mkdir()
+        (root_dir / 'deploy').mkdir()
+        import shutil
+        shutil.copytree(ROOT / 'deploy/mikrotik', root_dir / 'deploy/mikrotik')
+        shutil.copytree(ROOT / 'scripts', root_dir / 'scripts')
+        shutil.copytree(ROOT / 'packaging', root_dir / 'packaging')
+        shutil.copytree(ROOT / 'docs/man', root_dir / 'docs/man')
+        shutil.copytree(ROOT / 'src', root_dir / 'src')
+        shutil.copytree(ROOT / 'mk', root_dir / 'mk')
+        shutil.copy2(ROOT / 'Makefile', root_dir / 'Makefile')
+        shutil.copy2(ROOT / 'LICENSE', root_dir / 'LICENSE')
+        (root_dir / 'VERSION').write_text('1.2.3\n')
+        (root_dir / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
+
+        inputs_dir = self.root / 'inputs_test_req'
+        inputs_dir.mkdir()
+        for arch in artifacts.ARCHES:
+            d = inputs_dir / f'candidate-{arch}'
+            d.mkdir()
+            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES] + [
+                f'tayga-linux-{arch}', f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt']
+            for name in names:
+                (d / name).write_text(name)
+            m = {'source': self.source, 'arch': arch,
+                 'files': {n: artifacts.sha256(d / n) for n in names},
+                 'images': {p: {'archive': artifacts.archive_name(p, arch),
+                               'reference': f'tayga-release-{p}:{arch}',
+                               'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+            (d / 'manifest.json').write_text(json.dumps(m))
+        for arch in artifacts.FREEBSD_ARCHES:
+            d = inputs_dir / f'candidate-freebsd-{arch}'
+            d.mkdir()
+            names = [f'tayga-freebsd-{arch}', f'pref64-discover-freebsd-{arch}']
+            for name in names:
+                (d / name).write_text(name)
+            m = {'version': self.source['version'], 'sha': self.source['sha'],
+                 'platform': f'freebsd-{arch}', 'smoke': 'pass',
+                 'files': {n: artifacts.sha256(d / n) for n in names}}
+            (d / 'manifest.json').write_text(json.dumps(m))
+
+        output_dir = self.root / 'assets_req'
+
+        # 1. Missing candidate-native directory
+        with self.assertRaisesRegex(ValueError, 'candidate-native directory is required'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        native_dir = inputs_dir / 'candidate-native'
+        native_dir.mkdir()
+
+        # 2. Missing manifest for arch
+        with self.assertRaisesRegex(ValueError, 'expected exactly 1 manifest'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        # 3. Empty artifacts in manifest
+        for arch in artifacts.ARCHES:
+            manifest = {
+                'version': '1.2.3', 'release': '1', 'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': {}, 'signed': False, 'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, 'contains no artifacts'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        # 4. Incomplete formats in manifest (e.g. missing .apk and .rpm)
+        for arch in artifacts.ARCHES:
+            deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
+            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
+            manifest = {
+                'version': '1.2.3', 'release': '1', 'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(inputs_dir / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': {deb_pkg.name: artifacts.sha256(deb_pkg)},
+                'signed': False, 'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, 'missing formats'):
+            artifacts.assemble(root_dir, inputs_dir, output_dir, self.source)
+
     def test_freebsd_hash_and_source_mismatch_rejected(self):
         directory = self.inputs / 'candidate-freebsd-arm64'
         artifacts.verify_freebsd(directory, 'arm64', self.source)

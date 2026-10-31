@@ -31,7 +31,7 @@ class NetworkControllerTests(unittest.TestCase):
             'ip': '''echo "ip $*" >> "$TEST_LOG"
 case "$*" in
     'link show dev '*) exit "${TEST_LINK_EXISTS:-1}" ;;
-    '-6 addr show dev eth0'*) echo 'inet6 2001:db8::5/128 scope global' ;;
+    '-6 addr show dev eth0'*) echo 'inet6 2001:db8::5/64 scope global' ;;
     '-6 neigh show proxy dev eth0') [ "${TEST_PROXY_EXISTS:-no}" != yes ] || echo '2001:db8::464 dev eth0' ;;
     '-4 route show default') echo 'default via 10.0.0.1 dev eth0' ;;
     '-6 route show default') echo 'default via fe80::1 dev eth0' ;;
@@ -552,13 +552,17 @@ esac''',
         self.assertLess(idx_nat, idx_pass)
         self.assertLess(idx_pass, idx_anchor)
 
-        # Down restores original root configuration
+        # Down surgically removes tayga anchors and preserves foreign rules
+        self.log.write_text('')
         res = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)],
                              env={**self.env, 'TEST_PF_NO_NAT_ANCHOR': 'yes', 'TEST_PF_NO_FILTER_ANCHOR': 'yes'},
                              capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         down_log = self.log.read_text()
-        self.assertIn('pfctl -f ' + str(self.state / 'pf_root_orig.conf'), down_log)
+        self.assertIn('pass in all', down_log)
+        self.assertNotIn('anchor "tayga_sfx/*"', down_log)
+        self.assertNotIn('nat-anchor "tayga_sfx/*"', down_log)
+        self.assertFalse((self.state / 'pf_root_orig.conf').exists())
 
     def test_auto_clat_fails_closed_without_global_ipv6(self):
         generator = ROOT / 'packaging/installer/configure.sh'
@@ -578,6 +582,56 @@ esac
         self.assertNotEqual(res.returncode, 0)
         self.assertIn('Cannot determine global IPv6 address', res.stderr)
         self.assertFalse(out_auto.exists())
+
+    def test_auto_clat_fails_closed_on_128_uplink_address(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        out_auto = self.root / 'auto-clat-128.conf'
+        ip_mock = self.bin / 'ip'
+        ip_mock.write_text('''#!/bin/sh
+case "$*" in
+    '-6 addr show dev eth0'*) echo 'inet6 2001:db8:1:2:3::1/128 scope global' ;;
+    '-6 route show default') echo 'default via fe80::1 dev eth0' ;;
+    *) exit 0 ;;
+esac
+''')
+        ip_mock.chmod(0o755)
+        res = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-ipv6=auto',
+                              '--output=' + str(out_auto)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Cannot derive automatic CLAT address from a /128 address', res.stderr)
+        self.assertFalse(out_auto.exists())
+
+    def test_auto_clat_prefix_derivation_python_and_awk_parity(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        # Test multi-hextet IPv6 address: 2001:db8:1:2:3::1/64 -> 2001:db8:1:2::464
+        out_py = self.root / 'auto-clat-py.conf'
+        ip_mock = self.bin / 'ip'
+        ip_mock.write_text('''#!/bin/sh
+case "$*" in
+    '-6 addr show dev eth0'*) echo 'inet6 2001:db8:1:2:3::1/64 scope global' ;;
+    '-6 route show default') echo 'default via fe80::1 dev eth0' ;;
+    *) exit 0 ;;
+esac
+''')
+        ip_mock.chmod(0o755)
+        res_py = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-ipv6=auto',
+                                 '--output=' + str(out_py)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res_py.returncode, 0, res_py.stderr)
+        self.assertIn('map 192.0.0.1 2001:db8:1:2::464', out_py.read_text())
+
+        # Test without python3 in PATH (forcing awk path)
+        no_py_dir = self.root / 'no_py_bin'
+        no_py_dir.mkdir(exist_ok=True)
+        py_stub = no_py_dir / 'python3'
+        py_stub.write_text('#!/bin/sh\nexit 127\n')
+        py_stub.chmod(0o755)
+        out_awk = self.root / 'auto-clat-awk.conf'
+        res_awk = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-ipv6=auto',
+                                  '--output=' + str(out_awk)],
+                                 env={**self.env, 'PATH': str(no_py_dir) + os.pathsep + self.env['PATH']},
+                                 capture_output=True, text=True)
+        self.assertEqual(res_awk.returncode, 0, res_awk.stderr)
+        self.assertEqual(out_py.read_text(), out_awk.read_text())
 
     def test_deterministic_ula_generation_and_fallbacks(self):
         generator = ROOT / 'packaging/installer/configure.sh'
@@ -659,4 +713,8 @@ esac
                                 env={**env, 'PATH': clean_py_path}, capture_output=True, text=True)
         self.assertEqual(res_py.returncode, 0, res_py.stderr)
         self.assertEqual(res_py.stdout.strip(), expected)
+
+
+if __name__ == '__main__':
+    unittest.main()
 

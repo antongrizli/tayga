@@ -339,11 +339,7 @@ fw_pf() {
             fi
         } > "$lock/root.pf"
         pfctl -f "$lock/root.pf" || fail 'Failed to load pf root ruleset with tayga anchors'
-        if [ -s "$state/pf_root_orig.conf" ]; then
-            printf 'pfctl -f %s >/dev/null 2>&1 && rm -f %s || :\n' "$state/pf_root_orig.conf" "$state/pf_root_orig.conf" >> "$journal"
-        else
-            printf 'pfctl -F nat >/dev/null 2>&1 && pfctl -F rules >/dev/null 2>&1 && rm -f %s || :\n' "$state/pf_root_orig.conf" >> "$journal"
-        fi
+        printf 'curr_nat=$(pfctl -sn 2>/dev/null | grep -Fvx '\''%s'\'' || :); curr_rules=$(pfctl -sr 2>/dev/null | grep -Fvx '\''%s'\'' || :); if [ -n "$curr_nat" ] || [ -n "$curr_rules" ]; then { [ -z "$curr_nat" ] || printf "%%s\\n" "$curr_nat"; [ -z "$curr_rules" ] || printf "%%s\\n" "$curr_rules"; } | pfctl -f - >/dev/null 2>&1 || :; else pfctl -F nat >/dev/null 2>&1 || :; pfctl -F rules >/dev/null 2>&1 || :; fi; rm -f %s\n' 'nat-anchor "tayga_sfx/*"' 'anchor "tayga_sfx/*"' "$state/pf_root_orig.conf" >> "$journal"
         rm -f "$lock/root.pf"
     fi
     mss=$(( mtu - 40 ))

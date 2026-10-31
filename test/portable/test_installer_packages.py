@@ -126,15 +126,40 @@ class PackageUpgradeTests(unittest.TestCase):
         if [ "${TEST_FORCE_DOWNGRADE:-no}" = yes ]; then exit 0; fi
         exit 1
         ;;
+    *-i*0.9.15*)
+        touch "$TAYGA_TEST_ROOT/upgraded_to_target"
+        exit "${TEST_DPKG_RC:-0}"
+        ;;
+    *-i*old_pkg*)
+        if [ "${TEST_ROLLBACK_PKG_FAIL:-no}" != yes ]; then
+            rm -f "$TAYGA_TEST_ROOT/upgraded_to_target"
+        fi
+        exit "${TEST_DPKG_ROLLBACK_RC:-0}"
+        ;;
     *) exit "${TEST_DPKG_RC:-0}" ;;
 esac''',
             'dpkg-deb': '''case "$*" in
     *Package*) echo "${TEST_PKG_NAME:-tayga-managed}" ;;
-    *Version*) echo "${TEST_PKG_VER:-0.9.15-1}" ;;
+    *Version*)
+        case "$*" in
+            *0.9.14*) echo "${TEST_OLD_PKG_VER:-0.9.14-1}" ;;
+            *) echo "${TEST_PKG_VER:-0.9.15-1}" ;;
+        esac
+        ;;
     *Architecture*) echo "amd64" ;;
     *) echo "ok" ;;
 esac''',
-            'dpkg-query': 'echo "${TEST_INST_VER:-0.9.14-1}"',
+            'dpkg-query': '''case "$*" in
+    *tayga-managed*)
+        if [ -f "$TAYGA_TEST_ROOT/pkg_version_override" ]; then
+            cat "$TAYGA_TEST_ROOT/pkg_version_override"
+        elif [ -f "$TAYGA_TEST_ROOT/upgraded_to_target" ]; then
+            echo "${TEST_PKG_VER:-0.9.15-1}"
+        else
+            echo "${TEST_INST_VER:-0.9.14-1}"
+        fi
+        ;;
+esac''',
             'systemctl': '''echo "systemctl $*" >> "$TEST_LOG"
 case "$*" in
     *is-active*)
@@ -181,6 +206,8 @@ exit "${TEST_VERIFY_RC:-0}"
         }
         self.pkg = self.root / 'tayga-managed-0.9.15-1-amd64.deb'
         self.pkg.write_text('deb archive content')
+        self.old_pkg = self.root / 'tayga-managed-0.9.14-1-amd64.deb'
+        self.old_pkg.write_text('deb archive content old')
 
     def test_upgrade_requires_valid_package_and_format(self):
         res = subprocess.run(['sh', str(self.upgrader)], env=self.env, capture_output=True, text=True)
@@ -192,10 +219,14 @@ exit "${TEST_VERIFY_RC:-0}"
         self.assertIn('Unsupported package format', res.stderr)
 
     def test_upgrade_respects_operation_lock(self):
-        (self.state / 'operation.lock').mkdir()
+        lock_dir = self.state / 'operation.lock'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'pid').write_text(str(os.getpid()))
+        boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip() if Path('/proc/sys/kernel/random/boot_id').is_file() else 'boot-unknown'
+        (lock_dir / 'boot_id').write_text(boot_id)
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn('Another profile operation is in progress', res.stderr)
+        self.assertIn('Another operation is currently in progress', res.stderr)
 
     def test_upgrade_preflight_validates_package_identity(self):
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
@@ -214,15 +245,24 @@ exit "${TEST_VERIFY_RC:-0}"
             tar.addfile(ti, io.BytesIO(pkginfo))
         (self.bin / 'apk').write_text('#!/bin/sh\ncase "$*" in *--print-arch*) echo "x86_64"; exit 0 ;; *) exit 0 ;; esac\n')
         (self.bin / 'apk').chmod(0o755)
+        # When no package is previously installed (TEST_INST_VER empty), upgrade proceeds without old-package
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(apk_path)],
-                             env=self.env, capture_output=True, text=True)
+                             env={**self.env, 'TEST_INST_VER': ''}, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn('PASS: Coordinated live package upgrade successful', res.stdout)
+
+    def test_upgrade_fails_without_old_package_for_installed_version(self):
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                             env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Old package archive for installed version', res.stderr)
+        self.assertFalse((self.state / 'package-upgrade').exists())
 
     def test_upgrade_active_profile_and_successful_verification(self):
         (self.state / 'nat64.conf').write_text('tun-device tun64\n')
         (self.state / 'current').write_text('nat64\n')
-        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)], env=self.env, capture_output=True, text=True)
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg), '--old-package', str(self.old_pkg)],
+                             env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn('PASS: Coordinated live package upgrade successful', res.stdout)
         self.assertFalse((self.state / 'package-upgrade').exists())
@@ -232,7 +272,7 @@ exit "${TEST_VERIFY_RC:-0}"
         (self.state / 'current').write_text('nat64\n')
         (self.sys_bin / 'tayga').write_text('original-binary\n')
 
-        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg), '--old-package', str(self.old_pkg)],
                              env={**self.env, 'TEST_VERIFY_RC': '1', 'TEST_ROLLBACK_VERIFY_RC': '1'},
                              capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
@@ -241,13 +281,28 @@ exit "${TEST_VERIFY_RC:-0}"
         self.assertEqual((self.state / 'package-upgrade/status').read_text().strip(), 'rollback-failed')
         self.assertFalse((self.state / 'operation.lock').exists())
 
+    def test_rollback_fails_if_package_db_still_reports_target_version(self):
+        (self.state / 'nat64.conf').write_text('original-config\n')
+        (self.state / 'current').write_text('nat64\n')
+        (self.sys_bin / 'tayga').write_text('original-binary\n')
+
+        # TEST_ROLLBACK_PKG_FAIL prevents dpkg mock from removing target version
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg), '--old-package', str(self.old_pkg)],
+                             env={**self.env, 'TEST_VERIFY_RC': '1', 'TEST_ROLLBACK_PKG_FAIL': 'yes'},
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('CRITICAL', res.stderr)
+        self.assertIn('Package rollback verification failed', res.stderr)
+        self.assertTrue((self.state / 'package-upgrade').exists())
+        self.assertEqual((self.state / 'package-upgrade/status').read_text().strip(), 'rollback-failed')
+
     def test_upgrade_readiness_failure_triggers_automatic_rollback(self):
         (self.state / 'nat64.conf').write_text('original-config\n')
         (self.state / 'current').write_text('nat64\n')
         (self.sys_bin / 'tayga').write_text('original-binary\n')
 
         # When verify helper fails, upgrader must rollback to original binary and config
-        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg), '--old-package', str(self.old_pkg)],
                              env={**self.env, 'TEST_VERIFY_RC': '1'}, capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn('rolling back', res.stderr)
@@ -255,12 +310,58 @@ exit "${TEST_VERIFY_RC:-0}"
         self.assertEqual((self.state / 'nat64.conf').read_text(), 'original-config\n')
         self.assertFalse((self.state / 'package-upgrade').exists())
 
+    def test_exact_data_snapshot_restoration_purges_new_files(self):
+        data_dir = self.root / 'var/lib/tayga'
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / 'retained.data').write_text('original-data\n')
+        (data_dir / '.retained-dotfile').write_text('original-dotfile\n')
+
+        # Custom verify helper that injects new files before failing readiness
+        inject_helper = self.lib / 'tayga-verify.sh'
+        inject_helper.write_text('''#!/bin/sh
+st="$TAYGA_TEST_ROOT/var/lib/tayga-installer/package-upgrade/status"
+if [ -f "$st" ] && [ "$(cat "$st")" = "verifying" ]; then
+    echo "polluted-file" > "$TAYGA_TEST_ROOT/var/lib/tayga/polluted.tmp"
+    exit 1
+fi
+exit 0
+''')
+        inject_helper.chmod(0o755)
+
+        (self.state / 'nat64.conf').write_text('original-config\n')
+        (self.state / 'current').write_text('nat64\n')
+
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg), '--old-package', str(self.old_pkg)],
+                             env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('rolling back', res.stderr)
+        # Verify original data and dotfiles were preserved
+        self.assertTrue((data_dir / 'retained.data').exists())
+        self.assertTrue((data_dir / '.retained-dotfile').exists())
+        # Verify new files created by upgraded target version were purged
+        self.assertFalse((data_dir / 'polluted.tmp').exists())
+
+    def test_recovery_fails_closed_on_incomplete_journal(self):
+        journal = self.state / 'package-upgrade'
+        journal.mkdir(parents=True, exist_ok=True)
+        (journal / 'status').write_text('installing\n')
+
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('journal at ' + str(journal) + ' is corrupt or incomplete', res.stderr)
+        self.assertTrue(journal.exists())
+        self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
+
     def test_upgrade_recovery_action_restores_from_journal(self):
         (self.state / 'nat64.conf').write_text('corrupt-config\n')
         journal = self.state / 'package-upgrade'
         (journal / 'backup').mkdir(parents=True)
         (journal / 'backup/tayga').write_text('restored-binary\n')
         (journal / 'accepted.conf').write_text('restored-config\n')
+        (journal / 'old_pkg.archive').write_text('old-deb-archive')
+        (journal / 'kind').write_text('deb\n')
+        (journal / 'inst_ver').write_text('0.9.14-1\n')
+        (journal / 'target_ver').write_text('0.9.15-1\n')
         (journal / 'status').write_text('installing\n')
         (journal / 'active_profile').write_text('nat64\n')
         (journal / 'was_active').write_text('yes\n')
@@ -274,4 +375,8 @@ exit "${TEST_VERIFY_RC:-0}"
         self.assertEqual((self.state / 'nat64.conf').read_text(), 'restored-config\n')
         self.assertFalse(journal.exists())
         self.assertFalse((self.state / 'operation.lock').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
 

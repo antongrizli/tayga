@@ -29,11 +29,67 @@ gate=$state/operation.lock
 journal=$state/package-upgrade
 lock_held=0
 
+get_boot_id() {
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        cat /proc/sys/kernel/random/boot_id
+    elif [ "$(uname -s 2>/dev/null || :)" = FreeBSD ] && command -v sysctl >/dev/null 2>&1; then
+        sysctl -n kern.boottime 2>/dev/null | awk '{print $4,$7}'
+    elif [ -r /proc/uptime ]; then
+        awk '{print $1}' /proc/uptime
+    else
+        echo "boot-unknown"
+    fi
+}
+
+acquire_gate() {
+    mkdir -p "$state"
+    current_boot=$(get_boot_id)
+    retries=0
+    while [ "$retries" -lt 5 ]; do
+        if mkdir "$gate" 2>/dev/null; then
+            echo "$$" > "$gate/pid"
+            echo "$current_boot" > "$gate/boot_id"
+            touch "$gate/package-upgrade"
+            date -u +%s 2>/dev/null > "$gate/start" || echo 0 > "$gate/start"
+            lock_held=1
+            return 0
+        fi
+        active_pid=$(cat "$gate/pid" 2>/dev/null || :)
+        active_boot=$(cat "$gate/boot_id" 2>/dev/null || :)
+        stale=no
+        if [ -n "$active_boot" ] && [ "$active_boot" != "$current_boot" ]; then
+            stale=yes
+        elif [ -n "$active_pid" ]; then
+            if ! kill -0 "$active_pid" 2>/dev/null; then
+                stale=yes
+            fi
+        else
+            stale=yes
+        fi
+        if [ "$stale" = yes ]; then
+            echo "WARNING: Breaking stale operation lock from PID ${active_pid:-empty}" >&2
+            rm -rf "$gate" 2>/dev/null || :
+        else
+            fail "Another operation is currently in progress (PID $active_pid)"
+        fi
+        retries=$((retries + 1))
+    done
+    fail "Failed to acquire exclusive operation lock at $gate"
+}
+
+release_gate() {
+    if [ "$lock_held" = 1 ]; then
+        owner_pid=$(cat "$gate/pid" 2>/dev/null || :)
+        if [ "$owner_pid" = "$$" ]; then
+            rm -rf "$gate" || :
+        fi
+        lock_held=0
+    fi
+}
+
 cleanup_lock() {
     rc=$?
-    if [ "$lock_held" = 1 ]; then
-        rm -rf "$gate" || :
-    fi
+    release_gate
     rm -f "$worker" || :
     exit "$rc"
 }
@@ -42,26 +98,36 @@ trap 'exit 1' HUP INT TERM
 
 if [ "$action" = recover ]; then
     [ -d "$journal" ] || { echo 'No pending package upgrade journal'; exit 0; }
+    acquire_gate
     status=$(cat "$journal/status" 2>/dev/null || echo unknown)
     if [ "$status" = committed ] || [ "$status" = recovered ]; then
-        rm -rf "$journal" "$gate"
+        rm -rf "$journal"
+        release_gate
         echo 'Package upgrade already committed/recovered; cleaned up'
         exit 0
     fi
 
-    # Check for active conflicting upgrade process
-    if [ -d "$gate" ] && [ -f "$gate/pid" ]; then
-        active_pid=$(cat "$gate/pid" 2>/dev/null || :)
-        if [ -n "$active_pid" ] && kill -0 "$active_pid" 2>/dev/null && [ "$active_pid" != "$$" ]; then
-            fail "Cannot recover: an upgrade operation is currently running (PID $active_pid)"
+    # Validate journal integrity and schema
+    journal_valid=yes
+    for required in status kind inst_ver target_ver old_pkg.archive; do
+        if [ ! -f "$journal/$required" ] || [ ! -s "$journal/$required" ]; then
+            echo "ERROR: Journal schema violation: missing or empty $required" >&2
+            journal_valid=no
         fi
+    done
+    if [ ! -d "$journal/backup" ]; then
+        echo "ERROR: Journal schema violation: missing backup directory" >&2
+        journal_valid=no
     fi
-    mkdir -p "$gate" 2>/dev/null || :
-    echo "$$" > "$gate/pid"
-    touch "$gate/package-upgrade"
-    lock_held=1
+    if [ "$journal_valid" != yes ]; then
+        echo "recovery-failed" > "$journal/status" 2>/dev/null || :
+        release_gate
+        fail "Cannot recover: journal at $journal is corrupt or incomplete; state preserved"
+    fi
 
-    kind=$(cat "$journal/kind" 2>/dev/null || echo deb)
+    kind=$(cat "$journal/kind")
+    inst_ver=$(cat "$journal/inst_ver")
+    target_ver=$(cat "$journal/target_ver")
     active=$(cat "$journal/active_profile" 2>/dev/null || echo none)
     was_active=$(cat "$journal/was_active" 2>/dev/null || echo no)
     init_type=$(cat "$journal/init_type" 2>/dev/null || echo none)
@@ -76,16 +142,26 @@ if [ "$action" = recover ]; then
         rc-service tayga-managed stop 2>/dev/null || :
     fi
 
-    if [ -f "$journal/old_pkg.archive" ]; then
-        trust_arg=
-        if [ "$kind" = apk ]; then
-            trust_arg="--allow-untrusted"
-        fi
-        case "$kind" in
-            deb) dpkg --force-confold -i "$journal/old_pkg.archive" || recovery_ok=no ;;
-            rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" || recovery_ok=no ;;
-            apk) apk add $trust_arg --force-non-repository "$journal/old_pkg.archive" || recovery_ok=no ;;
-        esac
+    trust_arg=
+    if [ "$kind" = apk ]; then
+        trust_arg="--allow-untrusted"
+    fi
+    case "$kind" in
+        deb) dpkg --force-confold -i "$journal/old_pkg.archive" || recovery_ok=no ;;
+        rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" || recovery_ok=no ;;
+        apk) apk add $trust_arg --force-non-repository "$journal/old_pkg.archive" || recovery_ok=no ;;
+    esac
+
+    # Verify package manager reports the recovered version
+    pkg_ver_now=
+    case "$kind" in
+        deb) pkg_ver_now=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
+        rpm) pkg_ver_now=$(rpm -q --qf '%{VERSION}-%{RELEASE}' tayga-managed 2>/dev/null || :) ;;
+        apk) pkg_ver_now=$(apk info -v tayga-managed 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
+    esac
+    if [ "$pkg_ver_now" != "$inst_ver" ]; then
+        echo "ERROR: Package rollback verification failed: installed version is '$pkg_ver_now', expected '$inst_ver'" >&2
+        recovery_ok=no
     fi
 
     if [ -d "$journal/backup" ]; then
@@ -104,8 +180,11 @@ if [ "$action" = recover ]; then
         cp -p "$journal/accepted.conf" "$state/$active.conf" || recovery_ok=no
     fi
 
-    if [ -d "$journal/data" ] && [ -d "$root/var/lib/tayga" ]; then
-        cp -a "$journal/data/." "$root/var/lib/tayga/" || recovery_ok=no
+    # Exact data restoration: clean target files and restore snapshot
+    if [ -d "$journal/data" ]; then
+        rm -rf "$root/var/lib/tayga"
+        mkdir -p "$root/var/lib/tayga"
+        cp -a "$journal/data/." "$root/var/lib/tayga/" 2>/dev/null || recovery_ok=no
     fi
 
     if [ "$was_active" = yes ] && [ "$active" != none ]; then
@@ -117,8 +196,11 @@ if [ "$action" = recover ]; then
         fi
         verify_helper="$lib/tayga-verify"
         [ -x "$verify_helper" ] || verify_helper="$lib/tayga-verify.sh"
-        if [ -e "$verify_helper" ]; then
+        if [ -x "$verify_helper" ]; then
             "$verify_helper" "$state/$active.conf" || recovery_ok=no
+        else
+            echo "ERROR: Missing readiness verify helper: $verify_helper" >&2
+            recovery_ok=no
         fi
     fi
 
@@ -128,14 +210,13 @@ if [ "$action" = recover ]; then
 
     if [ "$recovery_ok" = yes ]; then
         echo "recovered" > "$journal/status"
-        rm -rf "$journal" "$gate"
-        lock_held=0
+        rm -rf "$journal"
+        release_gate
         echo 'PASS: Package upgrade recovery complete'
         exit 0
     else
         echo "recovery-failed" > "$journal/status"
-        lock_held=0
-        rm -rf "$gate"
+        release_gate
         fail "Package upgrade recovery failed; journal preserved at $journal"
     fi
 fi
@@ -170,24 +251,7 @@ if [ -d "$journal" ]; then
 fi
 
 # Acquire exclusive operation lock (check stale PID if gate exists)
-mkdir -p "$state"
-if ! mkdir "$gate" 2>/dev/null; then
-    if [ -f "$gate/pid" ]; then
-        active_pid=$(cat "$gate/pid" 2>/dev/null || :)
-        if [ -n "$active_pid" ] && kill -0 "$active_pid" 2>/dev/null; then
-            fail "Another profile operation is in progress (PID $active_pid)"
-        fi
-        echo "WARNING: Breaking stale operation lock from PID $active_pid" >&2
-        rm -rf "$gate"
-        mkdir "$gate" 2>/dev/null || fail 'Failed to acquire operation lock after clearing stale gate'
-    else
-        fail 'Another profile operation is in progress'
-    fi
-fi
-lock_held=1
-touch "$gate/package-upgrade"
-echo "$$" > "$gate/pid"
-date -u +%s 2>/dev/null > "$gate/start" || echo 0 > "$gate/start"
+acquire_gate
 
 case "$pkg" in
     *.deb) kind=deb ;;
@@ -371,7 +435,7 @@ if [ -n "$active" ]; then
     fi
 fi
 
-# Locate old package archive for rollback if available
+# Locate old package archive for rollback if previous package was installed
 old_pkg_archive=
 if [ -n "$old_pkg_explicit" ] && [ -f "$old_pkg_explicit" ]; then
     old_pkg_archive=$old_pkg_explicit
@@ -390,6 +454,31 @@ elif [ -n "$inst_ver" ]; then
             [ -n "$c" ] && old_pkg_archive=$c
             ;;
     esac
+fi
+
+if [ -n "$inst_ver" ]; then
+    [ -n "$old_pkg_archive" ] && [ -f "$old_pkg_archive" ] || \
+        fail "Old package archive for installed version ($inst_ver) is required for rollback protection (specify via --old-package or ensure it exists in package cache)"
+
+    old_pkg_name=
+    old_pkg_ver=
+    case "$kind" in
+        deb)
+            old_pkg_name=$(dpkg-deb -f "$old_pkg_archive" Package 2>/dev/null || :)
+            old_pkg_ver=$(dpkg-deb -f "$old_pkg_archive" Version 2>/dev/null || :)
+            ;;
+        rpm)
+            old_pkg_name=$(rpm -qp --queryformat '%{NAME}' "$old_pkg_archive" 2>/dev/null || :)
+            old_pkg_ver=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$old_pkg_archive" 2>/dev/null || :)
+            ;;
+        apk)
+            old_info=$(tar -zxOf "$old_pkg_archive" .PKGINFO 2>/dev/null || tar -xf "$old_pkg_archive" -O .PKGINFO 2>/dev/null || :)
+            old_pkg_name=$(printf '%s\n' "$old_info" | sed -n 's/^pkgname = //p' | head -n1 || :)
+            old_pkg_ver=$(printf '%s\n' "$old_info" | sed -n 's/^pkgver = //p' | head -n1 || :)
+            ;;
+    esac
+    [ "$old_pkg_name" = tayga-managed ] || fail "Old package identity mismatch: '$old_pkg_name'; expected tayga-managed"
+    [ "$old_pkg_ver" = "$inst_ver" ] || fail "Old package version mismatch: $old_pkg_archive has '$old_pkg_ver', expected '$inst_ver'"
 fi
 
 # Create persistent journal and stage immutable package copy
@@ -476,6 +565,18 @@ rollback() {
             rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" || rollback_ok=no ;;
             apk) apk add $trust_arg --force-non-repository "$journal/old_pkg.archive" || rollback_ok=no ;;
         esac
+
+        # Verify package manager reports the recovered version
+        pkg_ver_now=
+        case "$kind" in
+            deb) pkg_ver_now=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
+            rpm) pkg_ver_now=$(rpm -q --qf '%{VERSION}-%{RELEASE}' tayga-managed 2>/dev/null || :) ;;
+            apk) pkg_ver_now=$(apk info -v tayga-managed 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
+        esac
+        if [ "$pkg_ver_now" != "$inst_ver" ]; then
+            echo "ERROR: Package rollback verification failed: installed version is '$pkg_ver_now', expected '$inst_ver'" >&2
+            rollback_ok=no
+        fi
     fi
 
     for b in tayga pref64-discover tayga-ctl; do
@@ -490,7 +591,10 @@ rollback() {
     if [ -f "$journal/accepted.conf" ] && [ -n "$active" ]; then
         cp -p "$journal/accepted.conf" "$state/$active.conf" || rollback_ok=no
     fi
-    if [ -d "$journal/data" ] && [ -d "$root/var/lib/tayga" ]; then
+    # Exact data restoration: clean target files and restore snapshot
+    if [ -d "$journal/data" ]; then
+        rm -rf "$root/var/lib/tayga"
+        mkdir -p "$root/var/lib/tayga"
         cp -a "$journal/data/." "$root/var/lib/tayga/" 2>/dev/null || rollback_ok=no
     fi
 
@@ -503,8 +607,11 @@ rollback() {
         fi
         verify_helper="$lib/tayga-verify"
         [ -x "$verify_helper" ] || verify_helper="$lib/tayga-verify.sh"
-        if [ -e "$verify_helper" ]; then
+        if [ -x "$verify_helper" ]; then
             "$verify_helper" "$state/$active.conf" || rollback_ok=no
+        else
+            echo "ERROR: Missing readiness verify helper: $verify_helper" >&2
+            rollback_ok=no
         fi
     fi
     if [ "$apk_locked" = yes ] && [ -f "$lib/package-lock.sh" ]; then
@@ -514,13 +621,11 @@ rollback() {
     if [ "$rollback_ok" = yes ]; then
         echo "recovered" > "$journal/status"
         rm -rf "$journal"
-        lock_held=0
-        rm -rf "$gate"
+        release_gate
         fail "Live package upgrade failed ($reason); successfully rolled back to previous state"
     else
         echo "rollback-failed" > "$journal/status"
-        lock_held=0
-        rm -rf "$gate"
+        release_gate
         fail "CRITICAL: Upgrade failed ($reason) AND rollback encountered errors; journal preserved at $journal"
     fi
 }
@@ -571,7 +676,6 @@ fi
 
 echo "committed" > "$journal/status"
 rm -rf "$journal"
-lock_held=0
-rm -rf "$gate"
+release_gate
 
 echo "PASS: Coordinated live package upgrade successful ($pkg)"

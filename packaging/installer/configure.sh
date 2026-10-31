@@ -159,33 +159,64 @@ if [ "$clat6" = auto ] && [ "$mode" = clat ]; then
         if [ "$(uname -s)" = FreeBSD ]; then
             uplink=$(route -n get -inet6 default 2>/dev/null | awk '$1=="interface:" {print $2}')
             [ -n "$uplink" ] || uplink=$(route -n get default 2>/dev/null | awk '$1=="interface:" {print $2}')
-            global_v6=$(ifconfig "$uplink" inet6 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
+            global_v6=$(ifconfig "$uplink" inet6 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {print $2; exit}')
         else
             uplink=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
             [ -n "$uplink" ] || uplink=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
-            global_v6=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
+            global_v6=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {print $2; exit}')
         fi
         [ -n "$global_v6" ] || fail 'Cannot determine global IPv6 address on uplink for automatic CLAT address; specify --clat-ipv6 explicitly'
+        ip_addr=${global_v6%/*}
+        ip_mask=${global_v6#*/}
+        [ "$ip_mask" != "$global_v6" ] || ip_mask=64
+        case "$ip_mask" in
+            128) fail "Cannot derive automatic CLAT address from a /128 address; use --clat-address-mode=nat66 or specify --clat-ipv6 explicitly" ;;
+            *[!0-9]*) fail "Invalid IPv6 prefix length on uplink: $ip_mask" ;;
+        esac
+        [ "$ip_mask" -le 64 ] || fail "Uplink IPv6 prefix length /$ip_mask is smaller than /64; automatic derivation not supported"
+
         clat6=
         if command -v python3 >/dev/null 2>&1; then
             clat6=$(python3 -c "import ipaddress, sys
 try:
-    ip_str = sys.argv[1].split('/')[0]
-    addr = ipaddress.IPv6Address(ip_str)
+    addr = ipaddress.IPv6Address(sys.argv[1])
     net = ipaddress.IPv6Network(f'{addr}/64', strict=False)
     print(str(ipaddress.IPv6Address(int(net.network_address) + 0x464)))
 except Exception:
-    pass" "$global_v6" 2>/dev/null || :)
+    pass" "$ip_addr" 2>/dev/null || :)
         fi
         if [ -z "$clat6" ]; then
-            ip_base=${global_v6%/*}
-            case "$ip_base" in
-                *::*) clat6="${ip_base%::*}::464" ;;
-                *:*:*:*:*) clat6="$(printf '%s\n' "$ip_base" | awk -F: '{print $1":"$2":"$3":"$4"::464}')" ;;
-                *:*:*) clat6="$(printf '%s\n' "$ip_base" | sed -E 's/:[0-9a-fA-F]+$/:464/')" ;;
-                *) fail "Invalid uplink IPv6 address format: $ip_base" ;;
-            esac
+            clat6=$(awk '
+function derive_clat(ip,    parts, left, right, nleft, nright, f, i, p) {
+    sub(/\/.*/, "", ip)
+    if (index(ip, "::")) {
+        split(ip, parts, "::")
+        nleft = (parts[1] != "") ? split(parts[1], left, ":") : 0
+        nright = (parts[2] != "") ? split(parts[2], right, ":") : 0
+        for (i = 1; i <= nleft; i++) f[i] = left[i]
+        for (i = nleft + 1; i <= 8 - nright; i++) f[i] = "0"
+        for (i = 1; i <= nright; i++) f[8 - nright + i] = right[i]
+    } else {
+        split(ip, f, ":")
+    }
+    for (i = 1; i <= 4; i++) {
+        sub(/^0+/, "", f[i])
+        if (f[i] == "") f[i] = "0"
+    }
+    if (f[3] == "0" && f[4] == "0") {
+        if (f[2] == "0") p = f[1] "::464"
+        else p = f[1] ":" f[2] "::464"
+    } else if (f[4] == "0") {
+        p = f[1] ":" f[2] ":" f[3] "::464"
+    } else {
+        p = f[1] ":" f[2] ":" f[3] ":" f[4] "::464"
+    }
+    return tolower(p)
+}
+BEGIN { print derive_clat(ARGV[1]) }
+' "$ip_addr" 2>/dev/null || :)
         fi
+        [ -n "$clat6" ] || fail "Cannot derive automatic CLAT address from: $ip_addr"
     fi
 fi
 if [ "$address_mode" = nat66 ] && [ "$nat66_address" = auto ]; then

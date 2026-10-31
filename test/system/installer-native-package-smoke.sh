@@ -57,10 +57,17 @@ printf 'configured profile fixture\n'  > "$state/nat64.conf"
 if install_package "$second" > "$work/blocked.log" 2>&1; then cat "$work/blocked.log"; exit 1; fi
 [ "$(package_version)" = "$before" ]
 
-# Coordinated live upgrade succeeds with the configured profile retained.
+# Upgrade without rollback package archive must fail closed
 extra_upgrade_opts=
 if [ "$kind" = apk ]; then extra_upgrade_opts="--allow-untrusted"; fi
-/usr/sbin/tayga-ctl upgrade "$second" $extra_upgrade_opts
+if /usr/sbin/tayga-ctl upgrade "$second" $extra_upgrade_opts > "$work/missing-old.log" 2>&1; then
+    cat "$work/missing-old.log"; exit 1
+fi
+grep -q 'Old package archive for installed version' "$work/missing-old.log"
+[ "$(package_version)" = "$before" ]
+
+# Coordinated live upgrade succeeds with verified old package for rollback protection
+/usr/sbin/tayga-ctl upgrade "$second" --old-package "$first" $extra_upgrade_opts
 [ "$(package_version)" != "$before" ]
 [ -f "$state/nat64.conf" ]
 rm "$state/nat64.conf"
