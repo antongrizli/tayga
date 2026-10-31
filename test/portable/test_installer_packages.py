@@ -118,6 +118,10 @@ class PackageUpgradeTests(unittest.TestCase):
 
         for name, script in {
             'dpkg': '''case "$*" in
+    *--print-architecture*)
+        echo "${TEST_HOST_ARCH:-amd64}"
+        exit 0
+        ;;
     *--compare-versions*)
         if [ "${TEST_FORCE_DOWNGRADE:-no}" = yes ]; then exit 0; fi
         exit 1
@@ -131,7 +135,22 @@ esac''',
     *) echo "ok" ;;
 esac''',
             'dpkg-query': 'echo "${TEST_INST_VER:-0.9.14-1}"',
-            'systemctl': 'echo "systemctl $*" >> "$TEST_LOG"; exit "${TEST_SYSCTL_RC:-0}"',
+            'systemctl': '''echo "systemctl $*" >> "$TEST_LOG"
+case "$*" in
+    *is-active*)
+        if [ -f "$TAYGA_TEST_ROOT/service_stopped" ]; then exit 3; fi
+        exit "${TEST_SYSCTL_RC:-0}"
+        ;;
+    *stop*)
+        touch "$TAYGA_TEST_ROOT/service_stopped"
+        exit "${TEST_SYSCTL_RC:-0}"
+        ;;
+    *start*|*restart*)
+        rm -f "$TAYGA_TEST_ROOT/service_stopped"
+        exit "${TEST_SYSCTL_RC:-0}"
+        ;;
+    *) exit "${TEST_SYSCTL_RC:-0}" ;;
+esac''',
             'pidof': 'exit 1',
         }.items():
             p = self.bin / name
@@ -139,7 +158,13 @@ esac''',
             p.chmod(0o755)
 
         self.verify_helper = self.lib / 'tayga-verify.sh'
-        self.verify_helper.write_text('#!/bin/sh\nexit "${TEST_VERIFY_RC:-0}"\n')
+        self.verify_helper.write_text('''#!/bin/sh
+st="$TAYGA_TEST_ROOT/var/lib/tayga-installer/package-upgrade/status"
+if [ -f "$st" ] && [ "$(cat "$st")" = "rolling-back" ]; then
+    exit "${TEST_ROLLBACK_VERIFY_RC:-0}"
+fi
+exit "${TEST_VERIFY_RC:-0}"
+''')
         self.verify_helper.chmod(0o755)
 
         (self.sys_bin / 'tayga').write_text('binary-v1\n')
@@ -187,7 +212,7 @@ esac''',
             ti = tarfile.TarInfo(name='.PKGINFO')
             ti.size = len(pkginfo)
             tar.addfile(ti, io.BytesIO(pkginfo))
-        (self.bin / 'apk').write_text('#!/bin/sh\nexit 0\n')
+        (self.bin / 'apk').write_text('#!/bin/sh\ncase "$*" in *--print-arch*) echo "x86_64"; exit 0 ;; *) exit 0 ;; esac\n')
         (self.bin / 'apk').chmod(0o755)
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(apk_path)],
                              env=self.env, capture_output=True, text=True)
@@ -201,6 +226,19 @@ esac''',
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn('PASS: Coordinated live package upgrade successful', res.stdout)
         self.assertFalse((self.state / 'package-upgrade').exists())
+
+    def test_upgrade_rollback_failure_preserves_journal(self):
+        (self.state / 'nat64.conf').write_text('original-config\n')
+        (self.state / 'current').write_text('nat64\n')
+        (self.sys_bin / 'tayga').write_text('original-binary\n')
+
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                             env={**self.env, 'TEST_VERIFY_RC': '1', 'TEST_ROLLBACK_VERIFY_RC': '1'},
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('CRITICAL', res.stderr)
+        self.assertTrue((self.state / 'package-upgrade').exists())
+        self.assertEqual((self.state / 'package-upgrade/status').read_text().strip(), 'rollback-failed')
         self.assertFalse((self.state / 'operation.lock').exists())
 
     def test_upgrade_readiness_failure_triggers_automatic_rollback(self):

@@ -11,9 +11,14 @@ if [ -d "$state/package-upgrade" ]; then
     lib=$root/usr/local/libexec/tayga
     [ -d "$lib" ] || lib=$root/usr/libexec/tayga
     if [ -f "$lib/tayga-package-upgrade" ]; then
-        sh "$lib/tayga-package-upgrade" recover || :
+        sh "$lib/tayga-package-upgrade" recover || exit 1
     elif [ -f "$lib/tayga-package-upgrade.sh" ]; then
-        sh "$lib/tayga-package-upgrade.sh" recover || :
+        sh "$lib/tayga-package-upgrade.sh" recover || exit 1
+    elif [ -f "$state/package-upgrade/worker.sh" ]; then
+        sh "$state/package-upgrade/worker.sh" recover || exit 1
+    else
+        echo 'ERROR: Pending package upgrade journal exists but no recovery helper found' >&2
+        exit 1
     fi
 fi
 if [ -d "$tx" ] && [ ! -f "$gate/transaction" ]; then

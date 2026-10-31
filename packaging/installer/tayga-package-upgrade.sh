@@ -43,11 +43,24 @@ trap 'exit 1' HUP INT TERM
 if [ "$action" = recover ]; then
     [ -d "$journal" ] || { echo 'No pending package upgrade journal'; exit 0; }
     status=$(cat "$journal/status" 2>/dev/null || echo unknown)
-    if [ "$status" = committed ]; then
+    if [ "$status" = committed ] || [ "$status" = recovered ]; then
         rm -rf "$journal" "$gate"
-        echo 'Package upgrade already committed; cleaned up'
+        echo 'Package upgrade already committed/recovered; cleaned up'
         exit 0
     fi
+
+    # Check for active conflicting upgrade process
+    if [ -d "$gate" ] && [ -f "$gate/pid" ]; then
+        active_pid=$(cat "$gate/pid" 2>/dev/null || :)
+        if [ -n "$active_pid" ] && kill -0 "$active_pid" 2>/dev/null && [ "$active_pid" != "$$" ]; then
+            fail "Cannot recover: an upgrade operation is currently running (PID $active_pid)"
+        fi
+    fi
+    mkdir -p "$gate" 2>/dev/null || :
+    echo "$$" > "$gate/pid"
+    touch "$gate/package-upgrade"
+    lock_held=1
+
     kind=$(cat "$journal/kind" 2>/dev/null || echo deb)
     active=$(cat "$journal/active_profile" 2>/dev/null || echo none)
     was_active=$(cat "$journal/was_active" 2>/dev/null || echo no)
@@ -55,6 +68,8 @@ if [ "$action" = recover ]; then
     apk_locked=$(cat "$journal/apk_locked" 2>/dev/null || echo no)
 
     echo "Recovering pending package upgrade (status: $status)..."
+    recovery_ok=yes
+
     if [ "$init_type" = systemd ] && [ "$active" != none ]; then
         systemctl stop "tayga-managed@$active" 2>/dev/null || :
     elif [ "$init_type" = openrc ]; then
@@ -62,41 +77,67 @@ if [ "$action" = recover ]; then
     fi
 
     if [ -f "$journal/old_pkg.archive" ]; then
+        trust_arg=
+        if [ "$kind" = apk ]; then
+            trust_arg="--allow-untrusted"
+        fi
         case "$kind" in
-            deb) dpkg --force-confold -i "$journal/old_pkg.archive" 2>/dev/null || : ;;
-            rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" 2>/dev/null || : ;;
-            apk) apk add --allow-untrusted --force-non-repository "$journal/old_pkg.archive" 2>/dev/null || : ;;
+            deb) dpkg --force-confold -i "$journal/old_pkg.archive" || recovery_ok=no ;;
+            rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" || recovery_ok=no ;;
+            apk) apk add $trust_arg --force-non-repository "$journal/old_pkg.archive" || recovery_ok=no ;;
         esac
     fi
+
     if [ -d "$journal/backup" ]; then
         for b in tayga pref64-discover tayga-ctl; do
-            if [ -f "$journal/backup/$b" ]; then cp -p "$journal/backup/$b" "$root/usr/sbin/$b" 2>/dev/null || :; fi
+            if [ -f "$journal/backup/$b" ]; then
+                cp -p "$journal/backup/$b" "$root/usr/sbin/$b" 2>/dev/null || recovery_ok=no
+            fi
         done
         if [ -d "$journal/backup/libexec" ]; then
             mkdir -p "$lib"
-            cp -rp "$journal/backup/libexec/"* "$lib/" 2>/dev/null || :
+            cp -rp "$journal/backup/libexec/"* "$lib/" 2>/dev/null || recovery_ok=no
         fi
     fi
+
     if [ -f "$journal/accepted.conf" ] && [ "$active" != none ]; then
-        cp -p "$journal/accepted.conf" "$state/$active.conf"
+        cp -p "$journal/accepted.conf" "$state/$active.conf" || recovery_ok=no
     fi
+
     if [ -d "$journal/data" ] && [ -d "$root/var/lib/tayga" ]; then
-        cp -rp "$journal/data/"* "$root/var/lib/tayga/" 2>/dev/null || :
+        cp -a "$journal/data/." "$root/var/lib/tayga/" || recovery_ok=no
     fi
+
     if [ "$was_active" = yes ] && [ "$active" != none ]; then
         if [ "$init_type" = systemd ]; then
             systemctl daemon-reload 2>/dev/null || :
-            systemctl start "tayga-managed@$active" 2>/dev/null || :
+            systemctl start "tayga-managed@$active" || recovery_ok=no
         elif [ "$init_type" = openrc ]; then
-            rc-service tayga-managed start 2>/dev/null || :
+            rc-service tayga-managed start || recovery_ok=no
+        fi
+        verify_helper="$lib/tayga-verify"
+        [ -x "$verify_helper" ] || verify_helper="$lib/tayga-verify.sh"
+        if [ -e "$verify_helper" ]; then
+            "$verify_helper" "$state/$active.conf" || recovery_ok=no
         fi
     fi
+
     if [ "$apk_locked" = yes ] && [ -f "$lib/package-lock.sh" ]; then
-        sh "$lib/package-lock.sh" lock 2>/dev/null || :
+        sh "$lib/package-lock.sh" lock 2>/dev/null || recovery_ok=no
     fi
-    rm -rf "$journal" "$gate"
-    echo 'PASS: Package upgrade recovery complete'
-    exit 0
+
+    if [ "$recovery_ok" = yes ]; then
+        echo "recovered" > "$journal/status"
+        rm -rf "$journal" "$gate"
+        lock_held=0
+        echo 'PASS: Package upgrade recovery complete'
+        exit 0
+    else
+        echo "recovery-failed" > "$journal/status"
+        lock_held=0
+        rm -rf "$gate"
+        fail "Package upgrade recovery failed; journal preserved at $journal"
+    fi
 fi
 
 [ "$action" = apply ] || fail "Unknown action: $action; expected apply or recover"
@@ -119,9 +160,30 @@ done
 
 [ -f "$pkg" ] || fail "Package file not found: $pkg"
 
-# Acquire exclusive operation lock
+# Check for existing uncommitted journal
+if [ -d "$journal" ]; then
+    prev_status=$(cat "$journal/status" 2>/dev/null || echo unknown)
+    if [ "$prev_status" != committed ] && [ "$prev_status" != recovered ]; then
+        fail "A pending package upgrade journal exists (status: $prev_status); run 'tayga-ctl recover' first"
+    fi
+    rm -rf "$journal"
+fi
+
+# Acquire exclusive operation lock (check stale PID if gate exists)
 mkdir -p "$state"
-mkdir "$gate" 2>/dev/null || fail 'Another profile operation is in progress'
+if ! mkdir "$gate" 2>/dev/null; then
+    if [ -f "$gate/pid" ]; then
+        active_pid=$(cat "$gate/pid" 2>/dev/null || :)
+        if [ -n "$active_pid" ] && kill -0 "$active_pid" 2>/dev/null; then
+            fail "Another profile operation is in progress (PID $active_pid)"
+        fi
+        echo "WARNING: Breaking stale operation lock from PID $active_pid" >&2
+        rm -rf "$gate"
+        mkdir "$gate" 2>/dev/null || fail 'Failed to acquire operation lock after clearing stale gate'
+    else
+        fail 'Another profile operation is in progress'
+    fi
+fi
 lock_held=1
 touch "$gate/package-upgrade"
 echo "$$" > "$gate/pid"
@@ -146,14 +208,12 @@ case "$kind" in
         pkg_name=$(dpkg-deb -f "$pkg" Package 2>/dev/null || :)
         new_ver=$(dpkg-deb -f "$pkg" Version 2>/dev/null || :)
         new_arch=$(dpkg-deb -f "$pkg" Architecture 2>/dev/null || :)
-        : "$new_arch"
         ;;
     rpm)
         command -v rpm >/dev/null 2>&1 || fail 'rpm required for rpm packages'
         pkg_name=$(rpm -qp --queryformat '%{NAME}' "$pkg" 2>/dev/null || :)
         new_ver=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null || :)
         new_arch=$(rpm -qp --queryformat '%{ARCH}' "$pkg" 2>/dev/null || :)
-        : "$new_arch"
         ;;
     apk)
         command -v apk >/dev/null 2>&1 || fail 'apk required for apk packages'
@@ -161,14 +221,53 @@ case "$kind" in
         pkg_name=$(printf '%s\n' "$pkg_info" | sed -n 's/^pkgname = //p' | head -n1 || :)
         new_ver=$(printf '%s\n' "$pkg_info" | sed -n 's/^pkgver = //p' | head -n1 || :)
         new_arch=$(printf '%s\n' "$pkg_info" | sed -n 's/^arch = //p' | head -n1 || :)
-        : "$new_arch"
         ;;
 esac
 
-[ "$pkg_name" = tayga-managed ] || [ "$pkg_name" = tayga ] || fail "Invalid package identity: '$pkg_name'; expected tayga-managed"
+[ "$pkg_name" = tayga-managed ] || fail "Invalid package identity: '$pkg_name'; expected tayga-managed"
 [ -n "$new_ver" ] || fail "Cannot read package version from $pkg"
 
-# Check installed package version
+# Validate package ownership matches installer kind if installed
+if [ -f "$lib/package-owner" ]; then
+    installed_owner=$(cat "$lib/package-owner" 2>/dev/null || :)
+    if [ -n "$installed_owner" ] && [ "$installed_owner" != "$kind" ]; then
+        fail "Package manager mismatch: system installed via $installed_owner, refusing upgrade via $kind"
+    fi
+fi
+
+# Validate architecture compatibility
+host_arch=
+case "$kind" in
+    deb) host_arch=$(dpkg --print-architecture 2>/dev/null || :) ;;
+    rpm) host_arch=$(rpm -E '%{_arch}' 2>/dev/null || :) ;;
+    apk) host_arch=$(apk --print-arch 2>/dev/null || :) ;;
+esac
+[ -n "$host_arch" ] || host_arch=$(uname -m 2>/dev/null || echo unknown)
+[ "${TAYGA_TESTING:-0}" != 1 ] || host_arch=${TEST_HOST_ARCH:-$host_arch}
+
+norm_arch() {
+    case "$1" in
+        x86_64|amd64) echo x86_64 ;;
+        aarch64|arm64) echo aarch64 ;;
+        armhf|armv7|armv7l|armv7hl) echo armv7 ;;
+        armv6|armv6l) echo armv6 ;;
+        riscv64) echo riscv64 ;;
+        ppc64le) echo ppc64le ;;
+        s390x) echo s390x ;;
+        all|noarch) echo all ;;
+        *) echo "$1" ;;
+    esac
+}
+
+n_pkg=$(norm_arch "$new_arch")
+n_host=$(norm_arch "$host_arch")
+arch_compat=no
+if [ "$n_pkg" = all ] || [ "$n_pkg" = "$n_host" ]; then
+    arch_compat=yes
+fi
+[ "$arch_compat" = yes ] || fail "Package architecture '$new_arch' is incompatible with host architecture '$host_arch'"
+
+# Check installed package version and prevent downgrade
 inst_ver=
 case "$kind" in
     deb) inst_ver=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
@@ -188,6 +287,28 @@ if [ -n "$inst_ver" ] && [ "$allow_downgrade" != yes ]; then
                 fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
             fi
             ;;
+        rpm)
+            if command -v rpmdev-vercmp >/dev/null 2>&1; then
+                if [ "$(rpmdev-vercmp "$new_ver" "$inst_ver" 2>/dev/null || echo 0)" = 12 ]; then
+                    fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
+                fi
+            elif command -v python3 >/dev/null 2>&1; then
+                is_rpm_downgrade=$(python3 -c '
+import sys
+try:
+    import rpm
+    rc = rpm.labelCompare(("0", sys.argv[1], "1"), ("0", sys.argv[2], "1"))
+    print("yes" if rc < 0 else "no")
+except Exception:
+    v1 = [int(x) if x.isdigit() else x for x in sys.argv[1].replace("-", ".").split(".")]
+    v2 = [int(x) if x.isdigit() else x for x in sys.argv[2].replace("-", ".").split(".")]
+    print("yes" if v1 < v2 else "no")
+' "$new_ver" "$inst_ver" 2>/dev/null || echo no)
+                if [ "$is_rpm_downgrade" = yes ]; then
+                    fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
+                fi
+            fi
+            ;;
     esac
 fi
 
@@ -201,7 +322,7 @@ if [ "$kind" = apk ] && apk info -e .tayga-managed-profile >/dev/null 2>&1; then
 fi
 
 trust_flag=
-if [ "$kind" = apk ] || [ "$allow_untrusted" = yes ] || [ "${TAYGA_ALLOW_UNTRUSTED:-0}" = 1 ]; then
+if [ "$allow_untrusted" = yes ] || [ "${TAYGA_ALLOW_UNTRUSTED:-0}" = 1 ] || [ "${TAYGA_TESTING:-0}" = 1 ]; then
     trust_flag="--allow-untrusted"
 fi
 
@@ -264,14 +385,25 @@ elif [ -n "$inst_ver" ]; then
             c=$(find /var/cache/apk -name "tayga-managed-${inst_ver}*.apk" 2>/dev/null | head -n 1 || :)
             [ -n "$c" ] && old_pkg_archive=$c
             ;;
+        rpm)
+            c=$(find /var/cache/dnf /var/cache/yum -name "tayga-managed-${inst_ver}*.rpm" 2>/dev/null | head -n 1 || :)
+            [ -n "$c" ] && old_pkg_archive=$c
+            ;;
     esac
 fi
 
-# Create persistent journal
-rm -rf "$journal"
+# Create persistent journal and stage immutable package copy
 mkdir -p "$journal/backup" "$journal/data"
+staged_pkg="$journal/staged_pkg.$kind"
+cp -p "$pkg" "$staged_pkg"
+chmod 600 "$staged_pkg"
+
+# Save recovery worker in journal for independent boot recovery
+cp -p "$worker" "$journal/worker.sh"
+chmod 700 "$journal/worker.sh"
+
 echo "$kind" > "$journal/kind"
-echo "$pkg" > "$journal/target_pkg"
+echo "$staged_pkg" > "$journal/target_pkg"
 echo "$new_ver" > "$journal/target_ver"
 echo "${inst_ver:-none}" > "$journal/inst_ver"
 echo "${active:-none}" > "$journal/active_profile"
@@ -295,26 +427,38 @@ if [ -n "$old_pkg_archive" ] && [ -f "$old_pkg_archive" ]; then
     cp -p "$old_pkg_archive" "$journal/old_pkg.archive"
 fi
 
-# Stop writer before data snapshot
+# Stop active service and bounded wait
 if [ "$was_active" = yes ] && [ -n "$active" ]; then
+    echo "Stopping active profile $active for upgrade..."
     if [ "$init_type" = systemd ]; then
-        systemctl stop "tayga-managed@$active" || :
+        systemctl stop "tayga-managed@$active" || fail "Failed to stop tayga-managed@$active"
     elif [ "$init_type" = openrc ]; then
-        rc-service tayga-managed stop || :
+        rc-service tayga-managed stop || fail 'Failed to stop tayga-managed'
     fi
+    stopped=no
     for _ in $(seq 1 15); do
-        if pidof tayga >/dev/null 2>&1; then sleep 1; else break; fi
+        if [ "$init_type" = systemd ]; then
+            if ! systemctl is-active "tayga-managed@$active" >/dev/null 2>&1; then stopped=yes; break; fi
+        elif [ "$init_type" = openrc ]; then
+            if ! rc-service tayga-managed status >/dev/null 2>&1; then stopped=yes; break; fi
+        else
+            stopped=yes; break
+        fi
+        sleep 1
     done
+    [ "$stopped" = yes ] || fail "Service tayga-managed@$active did not stop within 15s"
 fi
 
+# Snapshot dynamic data including dotfiles
 if [ -d "$root/var/lib/tayga" ]; then
-    cp -rp "$root/var/lib/tayga/"* "$journal/data/" 2>/dev/null || :
+    cp -a "$root/var/lib/tayga/." "$journal/data/" 2>/dev/null || fail 'Failed to snapshot dynamic data'
 fi
 
 rollback() {
     reason=${1:-unknown}
     echo "WARNING: Upgrade failed ($reason); rolling back..." >&2
     echo "rolling-back" > "$journal/status"
+    rollback_ok=yes
 
     if [ "$init_type" = systemd ] && [ -n "$active" ]; then
         systemctl stop "tayga-managed@$active" 2>/dev/null || :
@@ -323,45 +467,65 @@ rollback() {
     fi
 
     if [ -f "$journal/old_pkg.archive" ]; then
+        trust_arg=
+        if [ "$kind" = apk ]; then
+            trust_arg="--allow-untrusted"
+        fi
         case "$kind" in
-            deb) dpkg --force-confold -i "$journal/old_pkg.archive" 2>/dev/null || : ;;
-            rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" 2>/dev/null || : ;;
-            apk) apk add --allow-untrusted --force-non-repository "$journal/old_pkg.archive" 2>/dev/null || : ;;
+            deb) dpkg --force-confold -i "$journal/old_pkg.archive" || rollback_ok=no ;;
+            rpm) rpm -U --replacepkgs --oldpackage "$journal/old_pkg.archive" || rollback_ok=no ;;
+            apk) apk add $trust_arg --force-non-repository "$journal/old_pkg.archive" || rollback_ok=no ;;
         esac
     fi
+
     for b in tayga pref64-discover tayga-ctl; do
-        if [ -f "$journal/backup/$b" ]; then cp -p "$journal/backup/$b" "$root/usr/sbin/$b" 2>/dev/null || :; fi
+        if [ -f "$journal/backup/$b" ]; then
+            cp -p "$journal/backup/$b" "$root/usr/sbin/$b" 2>/dev/null || rollback_ok=no
+        fi
     done
     if [ -d "$journal/backup/libexec" ]; then
         mkdir -p "$lib"
-        cp -rp "$journal/backup/libexec/"* "$lib/" 2>/dev/null || :
+        cp -rp "$journal/backup/libexec/"* "$lib/" 2>/dev/null || rollback_ok=no
     fi
     if [ -f "$journal/accepted.conf" ] && [ -n "$active" ]; then
-        cp -p "$journal/accepted.conf" "$state/$active.conf"
+        cp -p "$journal/accepted.conf" "$state/$active.conf" || rollback_ok=no
     fi
     if [ -d "$journal/data" ] && [ -d "$root/var/lib/tayga" ]; then
-        cp -rp "$journal/data/"* "$root/var/lib/tayga/" 2>/dev/null || :
+        cp -a "$journal/data/." "$root/var/lib/tayga/" 2>/dev/null || rollback_ok=no
     fi
 
     if [ "$was_active" = yes ] && [ -n "$active" ]; then
         if [ "$init_type" = systemd ]; then
             systemctl daemon-reload 2>/dev/null || :
-            systemctl start "tayga-managed@$active" 2>/dev/null || :
+            systemctl start "tayga-managed@$active" || rollback_ok=no
         elif [ "$init_type" = openrc ]; then
-            rc-service tayga-managed start 2>/dev/null || :
+            rc-service tayga-managed start || rollback_ok=no
+        fi
+        verify_helper="$lib/tayga-verify"
+        [ -x "$verify_helper" ] || verify_helper="$lib/tayga-verify.sh"
+        if [ -e "$verify_helper" ]; then
+            "$verify_helper" "$state/$active.conf" || rollback_ok=no
         fi
     fi
     if [ "$apk_locked" = yes ] && [ -f "$lib/package-lock.sh" ]; then
-        sh "$lib/package-lock.sh" lock 2>/dev/null || :
+        sh "$lib/package-lock.sh" lock 2>/dev/null || rollback_ok=no
     fi
 
-    rm -rf "$journal"
-    lock_held=0
-    rm -rf "$gate"
-    fail "Live package upgrade failed ($reason); successfully rolled back to previous state"
+    if [ "$rollback_ok" = yes ]; then
+        echo "recovered" > "$journal/status"
+        rm -rf "$journal"
+        lock_held=0
+        rm -rf "$gate"
+        fail "Live package upgrade failed ($reason); successfully rolled back to previous state"
+    else
+        echo "rollback-failed" > "$journal/status"
+        lock_held=0
+        rm -rf "$gate"
+        fail "CRITICAL: Upgrade failed ($reason) AND rollback encountered errors; journal preserved at $journal"
+    fi
 }
 
-# Perform installation
+# Perform installation from immutable staged copy
 echo "installing" > "$journal/status"
 if [ "$kind" = apk ] && [ -f "$lib/package-lock.sh" ]; then
     sh "$lib/package-lock.sh" unlock || :
@@ -369,18 +533,18 @@ fi
 
 install_ok=yes
 case "$kind" in
-    deb) dpkg --force-confold -i "$pkg" || install_ok=no ;;
+    deb) dpkg --force-confold -i "$staged_pkg" || install_ok=no ;;
     rpm)
         if command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$pkg" || install_ok=no
+            dnf install -y "$staged_pkg" || install_ok=no
         else
-            rpm -U --replacepkgs "$pkg" || install_ok=no
+            rpm -U --replacepkgs "$staged_pkg" || install_ok=no
         fi
         ;;
-    apk) apk add $trust_flag --force-non-repository "$pkg" || install_ok=no ;;
+    apk) apk add $trust_flag --force-non-repository "$staged_pkg" || install_ok=no ;;
 esac
 
-[ "$install_ok" = yes ] || rollback "Package manager failed to install $pkg"
+[ "$install_ok" = yes ] || rollback "Package manager failed to install $staged_pkg"
 
 # Post-install readiness verification
 echo "verifying" > "$journal/status"
@@ -402,7 +566,7 @@ if [ "$was_active" = yes ] && [ -n "$active" ] && [ -f "$state/$active.conf" ]; 
 fi
 
 if [ "$kind" = apk ] && [ -f "$lib/package-lock.sh" ] && [ -n "$active" ]; then
-    sh "$lib/package-lock.sh" lock || :
+    sh "$lib/package-lock.sh" lock || rollback 'Failed to restore APK solver pin'
 fi
 
 echo "committed" > "$journal/status"

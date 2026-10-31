@@ -45,10 +45,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-improvenments/*
-!improvenments/network-protocols-compatibility-and-testing-guide.md
-!improvenments/self-extracting-installer-plan.md
-!improvenments/remaining-implementation-tasks-plan.md
+/improvenments/
 
 # Unit sources are tracked even though compatibility binaries use unit_* names.
 !test/unit/unit_mapping.c
