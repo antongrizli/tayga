@@ -8,6 +8,14 @@ state=$root/var/lib/tayga-installer
 tx=$state/files-transaction
 gate=$state/operation.lock
 if [ -d "$state/package-upgrade" ]; then
+    # Native systemd package transactions may invoke distribution triggers that
+    # require basic.target (e.g. man-db/systemd-run). The separate package unit
+    # runs after basic boot and remains a prerequisite of the managed service.
+    if [ -d "$root/run/systemd/system" ] && [ -f "$root/usr/lib/systemd/system/tayga-package-recovery.service" ]; then
+        exit 0
+    fi
+    TAYGA_BOOT_RECOVERY=1
+    export TAYGA_BOOT_RECOVERY
     lib=$root/usr/local/libexec/tayga
     [ -d "$lib" ] || lib=$root/usr/libexec/tayga
     if [ -f "$lib/tayga-package-upgrade" ]; then

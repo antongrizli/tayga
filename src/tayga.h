@@ -479,9 +479,9 @@ enum {
 
 /* Macros and static functions */
 
-#if __BYTE_ORDER == __BIG_ENDIAN
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #  define BIG_LITTLE(x, y) (x)
-#elif __BYTE_ORDER == __LITTLE_ENDIAN
+#elif defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #  define BIG_LITTLE(x, y) (y)
 #else
 # error Unsupported byte order

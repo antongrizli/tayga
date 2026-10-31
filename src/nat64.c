@@ -1328,6 +1328,8 @@ static void xlate_6to4_data(struct pkt *p)
 		tun_write_vnet_inplace(p->tun_fd, NULL, out, sizeof(struct ip4) + p->data_len);
 	}
 #else
+	/* BSD TUNSIFHEAD requires the output address family before the IP header. */
+	TUN_SET_PROTO(&header.pi, ETH_P_IP);
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
 	iov[1].iov_base = p->data;

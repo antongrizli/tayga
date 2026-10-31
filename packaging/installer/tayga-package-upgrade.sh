@@ -19,6 +19,30 @@ case "$0" in */upgrade-worker.*) worker=$0 ;;
         ;;
 esac
 
+# Hold a kernel lock for the whole operation, including stale-gate recovery.
+# The lock inode is permanent; never unlink it. The supervisor owns the lock,
+# so package hooks and service processes cannot accidentally inherit it.
+if [ "${1:-}" != --mutex-held ]; then
+    mkdir -p "$root/var/lib/tayga-installer"
+    mutex="$root/var/lib/tayga-installer/package-upgrade.mutex"
+    if command -v flock >/dev/null 2>&1; then
+        exec flock --close --nonblock "$mutex" sh "$worker" --mutex-held "$@"
+    elif command -v python3 >/dev/null 2>&1; then
+        exec python3 -c '
+import fcntl, subprocess, sys
+with open(sys.argv[1], "a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("Another package operation is currently in progress")
+    sys.exit(subprocess.call(sys.argv[2:], close_fds=True))
+' "$mutex" sh "$worker" --mutex-held "$@"
+    else
+        fail 'flock or python3 is required for exclusive package operations'
+    fi
+fi
+shift
+
 action=${1:-}
 shift || fail 'Usage: tayga-package-upgrade apply PACKAGE_FILE [OPTIONS] | recover'
 
@@ -64,9 +88,11 @@ acquire_gate() {
                 stale=yes
             fi
         else
-            stale=yes
+            fail 'Another operation is initializing its lock; retry later'
         fi
         if [ "$stale" = yes ]; then
+            [ -f "$gate/package-upgrade" ] || fail 'Refusing to remove a foreign operation lock'
+
             echo "WARNING: Breaking stale operation lock from PID ${active_pid:-empty}" >&2
             rm -rf "$gate" 2>/dev/null || :
         else
@@ -96,6 +122,32 @@ cleanup_lock() {
 trap cleanup_lock EXIT
 trap 'exit 1' HUP INT TERM
 
+journal_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$@"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$@"
+    else
+        fail 'sha256sum or shasum is required for journal integrity'
+    fi
+}
+
+seal_journal() {
+    (
+        cd "$journal"
+        find . -type f ! -path ./status ! -path ./data.ready ! -path './SHA256SUMS*' |
+            LC_ALL=C sort | while IFS= read -r entry; do
+                journal_hash "$entry" || exit 1
+            done > SHA256SUMS.tmp
+        mv SHA256SUMS.tmp SHA256SUMS
+    )
+}
+
+verify_journal() {
+    [ -s "$journal/SHA256SUMS" ] || return 1
+    (cd "$journal"; journal_hash -c SHA256SUMS >/dev/null 2>&1)
+}
+
 if [ "$action" = recover ]; then
     [ -d "$journal" ] || { echo 'No pending package upgrade journal'; exit 0; }
     acquire_gate
@@ -119,11 +171,19 @@ if [ "$action" = recover ]; then
         echo "ERROR: Journal schema violation: missing backup directory" >&2
         journal_valid=no
     fi
+    # A staged journal may contain a partial snapshot: package installation has
+    # not begun, so recovery must preserve the live data in that phase.
+    if [ "$status" != staged ] && [ ! -f "$journal/data.ready" ]; then
+        echo 'ERROR: Journal has no completed data snapshot' >&2
+        journal_valid=no
+    fi
     if [ "$journal_valid" != yes ]; then
         echo "recovery-failed" > "$journal/status" 2>/dev/null || :
         release_gate
         fail "Cannot recover: journal at $journal is corrupt or incomplete; state preserved"
     fi
+
+    verify_journal || fail 'Journal integrity verification failed; state preserved'
 
     kind=$(cat "$journal/kind")
     inst_ver=$(cat "$journal/inst_ver")
@@ -158,7 +218,7 @@ if [ "$action" = recover ]; then
     case "$kind" in
         deb) pkg_ver_now=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
         rpm) pkg_ver_now=$(rpm -q --qf '%{VERSION}-%{RELEASE}' tayga-managed 2>/dev/null || :) ;;
-        apk) pkg_ver_now=$(apk info -v tayga-managed 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
+        apk) pkg_ver_now=$(apk info -v 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
     esac
     if [ "$pkg_ver_now" != "$inst_ver" ]; then
         echo "ERROR: Package rollback verification failed: installed version is '$pkg_ver_now', expected '$inst_ver'" >&2
@@ -182,7 +242,7 @@ if [ "$action" = recover ]; then
     fi
 
     # Exact data restoration: clean target files and restore snapshot
-    if [ -d "$journal/data" ]; then
+    if [ -f "$journal/data.ready" ] && [ -d "$journal/data" ]; then
         rm -rf "$root/var/lib/tayga"
         mkdir -p "$root/var/lib/tayga"
         cp -a "$journal/data/." "$root/var/lib/tayga/" 2>/dev/null || recovery_ok=no
@@ -191,14 +251,26 @@ if [ "$action" = recover ]; then
     if [ "$was_active" = yes ] && [ "$active" != none ]; then
         if [ "$init_type" = systemd ]; then
             systemctl daemon-reload 2>/dev/null || :
-            systemctl start "tayga-managed@$active" || recovery_ok=no
+            if [ "${TAYGA_BOOT_RECOVERY:-0}" = 1 ]; then
+                # The managed unit Requires/After this recovery service. Waiting
+                # for it here deadlocks early boot; its ExecStartPost owns readiness.
+                systemctl --no-block start "tayga-managed@$active" || recovery_ok=no
+            else
+                systemctl start "tayga-managed@$active" || recovery_ok=no
+            fi
         elif [ "$init_type" = openrc ]; then
-            rc-service tayga-managed start || recovery_ok=no
+            # OpenRC starts the enabled managed service after this dependency.
+            # Recursively starting it here would wait on recovery itself.
+            if [ "${TAYGA_BOOT_RECOVERY:-0}" != 1 ]; then
+                rc-service tayga-managed start || recovery_ok=no
+            fi
         fi
         verify_helper="$lib/tayga-verify"
         [ -x "$verify_helper" ] || verify_helper="$lib/tayga-verify.sh"
         if [ -x "$verify_helper" ]; then
-            "$verify_helper" "$state/$active.conf" || recovery_ok=no
+            if [ "${TAYGA_BOOT_RECOVERY:-0}" != 1 ]; then
+                "$verify_helper" "$state/$active.conf" || recovery_ok=no
+            fi
         else
             echo "ERROR: Missing readiness verify helper: $verify_helper" >&2
             recovery_ok=no
@@ -340,6 +412,24 @@ case "$kind" in
     apk) inst_ver=$(apk info -v 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
 esac
 
+rpm_old_flag=
+rpm_action=install
+if [ "$kind" = rpm ] && [ -n "$inst_ver" ]; then
+    # Let RPM compare its own versions, without interpolating package metadata
+    # into Lua source. Permission to downgrade does not force a downgrade.
+    rpm_order=$(TAYGA_RPM_TARGET="$new_ver" TAYGA_RPM_INSTALLED="$inst_ver" \
+        rpm --eval '%{lua:print(rpm.vercmp(os.getenv("TAYGA_RPM_TARGET"), os.getenv("TAYGA_RPM_INSTALLED")))}')
+    case "$rpm_order" in
+        -1)
+            [ "$allow_downgrade" = yes ] || fail 'Refusing RPM downgrade (use --allow-downgrade)'
+            rpm_old_flag=--oldpackage
+            rpm_action=downgrade
+            ;;
+        0|1) ;;
+        *) fail 'Cannot compare RPM package versions' ;;
+    esac
+fi
+
 if [ -n "$inst_ver" ] && [ "$allow_downgrade" != yes ]; then
     case "$kind" in
         deb)
@@ -352,28 +442,7 @@ if [ -n "$inst_ver" ] && [ "$allow_downgrade" != yes ]; then
                 fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
             fi
             ;;
-        rpm)
-            if command -v rpmdev-vercmp >/dev/null 2>&1; then
-                if [ "$(rpmdev-vercmp "$new_ver" "$inst_ver" 2>/dev/null || echo 0)" = 12 ]; then
-                    fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
-                fi
-            elif command -v python3 >/dev/null 2>&1; then
-                is_rpm_downgrade=$(python3 -c '
-import sys
-try:
-    import rpm
-    rc = rpm.labelCompare(("0", sys.argv[1], "1"), ("0", sys.argv[2], "1"))
-    print("yes" if rc < 0 else "no")
-except Exception:
-    v1 = [int(x) if x.isdigit() else x for x in sys.argv[1].replace("-", ".").split(".")]
-    v2 = [int(x) if x.isdigit() else x for x in sys.argv[2].replace("-", ".").split(".")]
-    print("yes" if v1 < v2 else "no")
-' "$new_ver" "$inst_ver" 2>/dev/null || echo no)
-                if [ "$is_rpm_downgrade" = yes ]; then
-                    fail "Refusing package downgrade from $inst_ver to $new_ver (use --allow-downgrade)"
-                fi
-            fi
-            ;;
+
     esac
 fi
 
@@ -395,9 +464,9 @@ case "$kind" in
     deb) dpkg --simulate -i "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed' ;;
     rpm)
         if command -v dnf >/dev/null 2>&1; then
-            dnf install --assumeno "$pkg" >/dev/null 2>&1 || rpm -U --test "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed'
+            dnf "$rpm_action" --assumeno "$pkg" >/dev/null 2>&1 || rpm -U $rpm_old_flag --test "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed'
         else
-            rpm -U --test "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed'
+            rpm -U $rpm_old_flag --test "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed'
         fi
         ;;
     apk)
@@ -517,6 +586,8 @@ if [ -n "$old_pkg_archive" ] && [ -f "$old_pkg_archive" ]; then
     cp -p "$old_pkg_archive" "$journal/old_pkg.archive"
 fi
 
+seal_journal
+
 # Stop active service and bounded wait
 if [ "$was_active" = yes ] && [ -n "$active" ]; then
     echo "Stopping active profile $active for upgrade..."
@@ -543,10 +614,17 @@ fi
 if [ -d "$root/var/lib/tayga" ]; then
     cp -a "$root/var/lib/tayga/." "$journal/data/" 2>/dev/null || fail 'Failed to snapshot dynamic data'
 fi
+# Publish completeness only after every copy succeeded. An interrupted staged
+# snapshot must never be used to replace live data during recovery.
+seal_journal
+printf 'complete\n' > "$journal/data.ready.tmp"
+mv "$journal/data.ready.tmp" "$journal/data.ready"
+
 
 rollback() {
     reason=${1:-unknown}
     echo "WARNING: Upgrade failed ($reason); rolling back..." >&2
+    verify_journal || fail 'Journal integrity verification failed before rollback; state preserved'
     echo "rolling-back" > "$journal/status"
     rollback_ok=yes
 
@@ -572,7 +650,7 @@ rollback() {
         case "$kind" in
             deb) pkg_ver_now=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
             rpm) pkg_ver_now=$(rpm -q --qf '%{VERSION}-%{RELEASE}' tayga-managed 2>/dev/null || :) ;;
-            apk) pkg_ver_now=$(apk info -v tayga-managed 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
+            apk) pkg_ver_now=$(apk info -v 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
         esac
         if [ "$pkg_ver_now" != "$inst_ver" ]; then
             echo "ERROR: Package rollback verification failed: installed version is '$pkg_ver_now', expected '$inst_ver'" >&2
@@ -593,7 +671,7 @@ rollback() {
         cp -p "$journal/accepted.conf" "$state/$active.conf" || rollback_ok=no
     fi
     # Exact data restoration: clean target files and restore snapshot
-    if [ -d "$journal/data" ]; then
+    if [ -f "$journal/data.ready" ] && [ -d "$journal/data" ]; then
         rm -rf "$root/var/lib/tayga"
         mkdir -p "$root/var/lib/tayga"
         cp -a "$journal/data/." "$root/var/lib/tayga/" 2>/dev/null || rollback_ok=no
@@ -642,9 +720,9 @@ case "$kind" in
     deb) dpkg --force-confold -i "$staged_pkg" || install_ok=no ;;
     rpm)
         if command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$staged_pkg" || install_ok=no
+            dnf "$rpm_action" -y "$staged_pkg" || install_ok=no
         else
-            rpm -U --replacepkgs "$staged_pkg" || install_ok=no
+            rpm -U $rpm_old_flag --replacepkgs "$staged_pkg" || install_ok=no
         fi
         ;;
     apk) apk add $trust_flag --force-non-repository "$staged_pkg" || install_ok=no ;;

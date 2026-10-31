@@ -85,6 +85,7 @@ args=sys.argv[1:]
 config=json.loads(pathlib.Path(args[args.index('--config')+1]).read_text())
 for item in config['contents']:
     if item['dst']=='/usr/sbin/tayga-ctl': config['ctl']=pathlib.Path(item['src']).read_text()
+    if item['dst']=='/usr/libexec/tayga/tayga-managed@.service': config['managed']=pathlib.Path(item['src']).read_text()
 pathlib.Path(args[args.index('--target')+1]).write_text(json.dumps(config))
 ''')
         tool.chmod(0o755)
@@ -94,9 +95,18 @@ pathlib.Path(args[args.index('--target')+1]).write_text(json.dumps(config))
         packages.build(*args)
         data = json.loads((output / 'tayga-managed-0.9.14-1-arm64.deb').read_text())
         self.assertNotIn('/usr/local', data['ctl'])
+        self.assertIn('Requires=tayga-recovery.service tayga-package-recovery.service', data['managed'])
+        self.assertIn('After=tayga-recovery.service tayga-package-recovery.service', data['managed'])
+        self.assertIn('/usr/lib/systemd/system/tayga-package-recovery.service',
+                      [item['dst'] for item in data['contents']])
         config = next(item for item in data['contents'] if item['dst']=='/etc/tayga/tayga.conf.example')
         self.assertEqual(config['type'], 'config|noreplace')
         self.assertIn('preremove', data['scripts'])
+        recovery_link = next(item for item in data['contents'] if item['dst'] ==
+                             '/usr/lib/systemd/system/multi-user.target.wants/tayga-package-recovery.service')
+        self.assertEqual(recovery_link['type'], 'symlink')
+        self.assertEqual(recovery_link['src'], '../tayga-package-recovery.service')
+
         manifest = json.loads((output / 'tayga-managed-0.9.14-1-arm64.json').read_text())
         self.assertFalse(manifest['signed'])
         with self.assertRaises(ValueError):
@@ -208,6 +218,70 @@ exit "${TEST_VERIFY_RC:-0}"
         self.pkg.write_text('deb archive content')
         self.old_pkg = self.root / 'tayga-managed-0.9.14-1-amd64.deb'
         self.old_pkg.write_text('deb archive content old')
+
+    def seal_journal(self, journal):
+        import hashlib
+        entries = []
+        for path in sorted(journal.rglob('*')):
+            if path.is_file() and str(path.relative_to(journal)) not in ('status', 'data.ready', 'SHA256SUMS'):
+                entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  ./{path.relative_to(journal)}\n")
+        (journal / 'SHA256SUMS').write_text(''.join(entries))
+
+    def test_upgrade_preserves_initializing_operation_gate(self):
+        gate = self.state / 'operation.lock'
+        gate.mkdir()
+        result = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(gate.exists())
+        self.assertIn('initializing', result.stderr)
+
+    def test_kernel_mutex_excludes_concurrent_operation(self):
+        import fcntl
+        with (self.state / 'package-upgrade.mutex').open('a') as mutex:
+            fcntl.flock(mutex, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_explicit_rpm_downgrade_reaches_manager(self):
+        package = self.root / 'tayga-managed-0.9.15.rpm'
+        old = self.root / 'tayga-managed-0.9.14.rpm'
+        package.write_text('target')
+        old.write_text('old')
+        rpm = self.bin / 'rpm'
+        rpm.write_text('#!/bin/sh\ncase "$*" in\n    *--eval*) echo "${TEST_RPM_ORDER:--1}" ;;\n    *NAME*) echo tayga-managed ;;\n    *ARCH*|*-E*) echo x86_64 ;;\n    *-qp*VERSION*) case "$*" in *0.9.14*) echo 0.9.14-1 ;; *) echo 0.9.15-1 ;; esac ;;\n    *-q*VERSION*) echo 0.9.14-1 ;;\nesac\nexit 0\n')
+        rpm.chmod(0o755)
+        dnf = self.bin / 'dnf'
+        dnf.write_text('#!/bin/sh\necho "dnf $*" >> "$TEST_LOG"\nexit 0\n')
+        dnf.chmod(0o755)
+        result = subprocess.run(['sh', str(self.upgrader), 'apply', str(package),
+                                 '--old-package', str(old), '--allow-downgrade'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dnf downgrade -y ', self.log.read_text())
+        self.log.write_text('')
+        result = subprocess.run(['sh', str(self.upgrader), 'apply', str(package),
+                                 '--old-package', str(old), '--allow-downgrade'],
+                                env={**self.env, 'TEST_RPM_ORDER': '1'},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dnf install -y ', self.log.read_text())
+        self.assertNotIn('dnf downgrade ', self.log.read_text())
+
+
+    def test_early_boot_defers_native_package_journal_to_late_unit(self):
+        unit = self.root / 'usr/lib/systemd/system/tayga-package-recovery.service'
+        unit.parent.mkdir(parents=True)
+        unit.write_text('late unit')
+        journal = self.state / 'package-upgrade'
+        journal.mkdir()
+        result = subprocess.run(['sh', str(ROOT / 'packaging/installer/tayga-boot-recover.sh')],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(journal.exists())
+        self.assertFalse((self.state / 'operation.lock').exists())
 
     def test_upgrade_requires_valid_package_and_format(self):
         res = subprocess.run(['sh', str(self.upgrader)], env=self.env, capture_output=True, text=True)
@@ -352,21 +426,98 @@ exit 0
         self.assertTrue(journal.exists())
         self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
 
+    def test_recovery_preserves_live_data_when_snapshot_was_interrupted(self):
+        data = self.root / 'var/lib/tayga'
+        data.mkdir(parents=True)
+        (data / 'valuable').write_text('accepted data')
+        journal = self.state / 'package-upgrade'
+        (journal / 'backup').mkdir(parents=True)
+        (journal / 'data').mkdir()
+        (journal / 'data/partial').write_text('incomplete copy')
+        for name, value in {'status': 'staged', 'kind': 'deb',
+                            'inst_ver': '0.9.14-1', 'target_ver': '0.9.15-1',
+                            'old_pkg.archive': 'old package'}.items():
+            (journal / name).write_text(value)
+        self.seal_journal(journal)
+        result = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((data / 'valuable').read_text(), 'accepted data')
+        self.assertFalse((data / 'partial').exists())
+
+    def test_recovery_rejects_installing_without_completed_snapshot(self):
+        journal = self.state / 'package-upgrade'
+        (journal / 'backup').mkdir(parents=True)
+        for name, value in {'status': 'installing', 'kind': 'deb',
+                            'inst_ver': '0.9.14-1', 'target_ver': '0.9.15-1',
+                            'old_pkg.archive': 'old package'}.items():
+            (journal / name).write_text(value)
+        self.seal_journal(journal)
+        result = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no completed data snapshot', result.stderr)
+        self.assertTrue(journal.exists())
+
+    def test_recovery_rejects_tampered_old_archive(self):
+        (self.state / 'nat64.conf').write_text('original-config\n')
+        (self.state / 'current').write_text('nat64\n')
+        result = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg),
+                                 '--old-package', str(self.old_pkg)],
+                                env={**self.env, 'TEST_VERIFY_RC': '1',
+                                     'TEST_ROLLBACK_VERIFY_RC': '1'},
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        journal = self.state / 'package-upgrade'
+        (journal / 'old_pkg.archive').write_text('damaged archive')
+        before = self.log.read_text()
+        result = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('integrity verification failed', result.stderr)
+        self.assertTrue(journal.exists())
+        self.assertEqual(self.log.read_text(), before)
+
     def test_upgrade_recovery_action_restores_from_journal(self):
+        self.recover_journal()
+
+    def test_boot_recovery_queues_service_without_waiting_on_own_dependency(self):
+        self.env.update(TAYGA_BOOT_RECOVERY='1', TEST_VERIFY_RC='1')
+        self.recover_journal()
+        log = self.log.read_text()
+        self.assertIn('systemctl --no-block start tayga-managed@nat64', log)
+        self.assertNotIn('systemctl start tayga-managed@nat64', log)
+
+    def test_openrc_boot_recovery_defers_dependent_service_start(self):
+        self.env.update(TAYGA_BOOT_RECOVERY='1', TEST_VERIFY_RC='1')
+        mock = self.bin / 'rc-service'
+        mock.write_text('#!/bin/sh\necho "rc-service $*" >> "$TEST_LOG"\nexit 0\n')
+        mock.chmod(0o755)
+        self.recover_journal(init_type='openrc')
+        self.assertNotIn('rc-service tayga-managed start', self.log.read_text())
+
+    def test_apk_recovery_reads_installed_list_not_package_description(self):
+        mock = self.bin / 'apk'
+        mock.write_text('#!/bin/sh\ncase "$*" in\n"info -v") echo tayga-managed-0.9.14-1 ;;\n"info -v tayga-managed") echo "tayga-managed-0.9.14-1 description:" ;;\nesac\nexit 0\n')
+        mock.chmod(0o755)
+        self.recover_journal(init_type='none', kind='apk')
+
+    def recover_journal(self, init_type='systemd', kind='deb'):
         (self.state / 'nat64.conf').write_text('corrupt-config\n')
         journal = self.state / 'package-upgrade'
         (journal / 'backup').mkdir(parents=True)
         (journal / 'backup/tayga').write_text('restored-binary\n')
         (journal / 'accepted.conf').write_text('restored-config\n')
         (journal / 'old_pkg.archive').write_text('old-deb-archive')
-        (journal / 'kind').write_text('deb\n')
+        (journal / 'kind').write_text(kind + '\n')
         (journal / 'inst_ver').write_text('0.9.14-1\n')
         (journal / 'target_ver').write_text('0.9.15-1\n')
         (journal / 'status').write_text('installing\n')
+        (journal / 'data.ready').write_text('complete\n')
         (journal / 'active_profile').write_text('nat64\n')
         (journal / 'was_active').write_text('yes\n')
-        (journal / 'init_type').write_text('systemd\n')
-        (self.state / 'operation.lock').mkdir(parents=True)
+        (journal / 'init_type').write_text(init_type + '\n')
+        self.seal_journal(journal)
 
         res = subprocess.run(['sh', str(self.upgrader), 'recover'], env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)

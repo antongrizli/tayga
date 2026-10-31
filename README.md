@@ -228,7 +228,7 @@ IPv4 address/range must be routed to this gateway, and the mapped IPv6 endpoint
 must be reachable over its native network. SIIT installs translation routes
 and bidirectional forwarding rules without NAT44. SIIT readiness checks TUN
 and routes; a peer traffic test is required to establish end-to-end connectivity.
-FreeBSD profile generation uses `tun64`, disables Linux TUN offload, and selects `pf` in profile metadata. Automatic FreeBSD networking and firewall activation are not implemented yet.
+FreeBSD profiles use `tun64`, rc.d and PF child anchors. Before activation, provision the required root PF calls as described in [FreeBSD PF ownership](docs/dev/freebsd-pf.md); the controller never reloads the root ruleset.
 
 Managed CLAT/NAT64/SIIT activation supports **Linux systemd and OpenRC**. It requires
 `iproute2`, `sysctl`, `curl`, `setsid`, `flock`, `timeout`, and either `iptables`/`ip6tables` or `nft`.
@@ -276,9 +276,11 @@ it checks NAT64 and CLAT-to-NAT64 HTTP/ICMP, readiness failure and firewall
 cleanup against a binary compiled from the current sources. Portable tests cover
 wizard input, file ownership, profile switching and rollback with fake init tools.
 
-FreeBSD network/rc.d activation, firewalld/pf integration, broader DNS manager
-support and automatic routed IPv6 allocation remain under development. FreeBSD installers currently support binary installation,
-extraction and configuration generation.
+FreeBSD network/rc.d activation and PF ownership have dedicated disposable-VM
+gates. CLAT NAT66 and Proxy NDP traffic are tested on FreeBSD arm64 and Linux
+firewalld; see [FreeBSD PF](docs/dev/freebsd-pf.md) and
+[firewalld adaptation](docs/dev/firewalld-adaptation.md) for scope and limitations.
+Broader DNS manager support and automatic routed IPv6 allocation remain under development.
 
 Optional DNS services are selected explicitly:
 
@@ -383,10 +385,11 @@ Linux CLAT supports explicit IPv6 delivery policies:
   two sources and the NAT64 destination prefix match the SNAT rules. The source
   must match the spelling displayed by `ip -6 addr show` on the uplink.
 
-The additional policies currently require Linux with iptables or nftables;
-FreeBSD/pf and firewalld reject them. All proxy entries, changed sysctls and
-firewall objects have owned rollback entries. No uplink address is moved or
-invented. `installer-network-smoke.sh` exercises routed, Proxy NDP and NAT66
+The additional policies support Linux with iptables, nftables or firewalld, and
+FreeBSD with PF. On FreeBSD, Proxy NDP advertises the translated CLAT address
+with `ndp proxy`; the supplied daemon identity is assigned as an owned uplink
+alias. All proxy entries, changed sysctls and firewall objects have owned rollback
+entries. Existing uplink addresses remain in place. `installer-network-smoke.sh` exercises routed, Proxy NDP and NAT66
 CLAT through NAT64 with HTTP, ICMP and a byte-checked 1 MiB download; Proxy NDP
 uses neighbor discovery without static host routes, and NAT66 uses ULA endpoints
 behind an uplink `/128`.

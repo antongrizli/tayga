@@ -21,6 +21,7 @@ if [ -e /usr/local/etc/rc.d/tayga-managed ]; then
     exit 1
 fi
 
+pf_fixture_owned=no
 cleanup() {
     rc=$?
     echo "=== Cleaning up ==="
@@ -32,9 +33,29 @@ cleanup() {
         ifconfig tun64 destroy || :
     fi
     pfctl -a 'tayga_sfx/*' -F all >/dev/null 2>&1 || :
+    if [ "$pf_fixture_owned" = yes ]; then
+        pfctl -F nat >/dev/null 2>&1 || :
+        pfctl -F rules >/dev/null 2>&1 || :
+    fi
     exit $rc
 }
 trap cleanup EXIT HUP INT TERM
+
+# The controller never reloads the administrator's root PF ruleset. This clean
+# disposable fixture explicitly supplies its root calls before activation.
+kldload pf 2>/dev/null || :
+if ! pfctl -sn | grep -q 'nat-anchor "tayga_sfx/\*"' ||
+   ! pfctl -sr | grep -q 'anchor "tayga_sfx/\*"'; then
+    if pfctl -sn | grep -q . || pfctl -sr | grep -q .; then
+        echo 'Expected empty PF root or preconfigured TAYGA anchors' >&2
+        exit 2
+    fi
+    pf_root=$(mktemp)
+    printf 'nat-anchor "tayga_sfx/*"\nanchor "tayga_sfx/*"\npass all\n' > "$pf_root"
+    pfctl -f "$pf_root"
+    rm -f "$pf_root"
+    pf_fixture_owned=yes
+fi
 
 echo "=== 2. Running SFX installation in SIIT mode ==="
 # SIIT mode creates the TUN interface, sets up routes, loads pf anchors,
@@ -137,5 +158,10 @@ if pfctl -a 'tayga_sfx/tun64' -sr 2>/dev/null | grep -q 'scrub on tun64'; then
     exit 1
 fi
 
+if [ "$pf_fixture_owned" = yes ]; then
+    pfctl -F nat >/dev/null 2>&1
+    pfctl -F rules >/dev/null 2>&1
+    pf_fixture_owned=no
+fi
 trap - EXIT HUP INT TERM
 echo "PASS: FreeBSD end-to-end network, pf, rc.d, recovery, and rollback verification"

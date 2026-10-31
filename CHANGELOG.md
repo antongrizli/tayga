@@ -4,6 +4,17 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Changed
+
+- FreeBSD CLAT Proxy NDP now uses a proxy neighbor for the translated address and an owned uplink alias for the daemon identity, avoiding conflicting TUN assignments.
+
+- FreeBSD PF activation now requires administrator-provisioned root NAT/filter calls for `tayga_sfx/*`. The controller only loads its child anchor; root ruleset reconstruction and reload were removed after a real VM gate demonstrated global limit resets. Missing root calls fail activation with network rollback.
+
+### Fixed
+
+- Initialize the BSD TUN address-family header on normal IPv6-to-IPv4 data output; previously TCP/UDP replies could be discarded by the kernel.
+- Detect byte order through compiler-defined macros on FreeBSD as well as Linux, restoring valid ICMP echo checksum translation.
+
 ### Added
 
 - Isolated two-VM OpenWrt DHCPv6 gate with odhcpd IA_NA/IA_PD leases, renew stability and live prefix renumbering through odhcp6c; enabled for IPK/APK CI.

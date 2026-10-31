@@ -87,8 +87,21 @@ def build(output, version, release, arch, daemon, helper, maintainer, formats, n
             for name in HELPERS:
                 target = name.removesuffix('.sh') if name in ('tayga-net-ctl.sh', 'tayga-verify.sh', 'tayga-dns64.sh', 'tayga-host-dns.sh', 'tayga-package-upgrade.sh') else name
                 data = (ROOT / 'packaging/installer' / name).read_text().replace('/usr/local', '/usr').encode()
+                if name == 'tayga-managed@.service' and kind in ('deb', 'rpm'):
+                    data = data.replace(b'Requires=tayga-recovery.service',
+                                        b'Requires=tayga-recovery.service tayga-package-recovery.service')
+                    data = data.replace(b'After=tayga-recovery.service network-online.target',
+                                        b'After=tayga-recovery.service tayga-package-recovery.service network-online.target')
                 add('/usr/libexec/tayga/' + target, data, 0o644 if name.endswith('.service') else 0o755)
             add('/usr/libexec/tayga/package-owner', (kind + '\n').encode())
+            if kind in ('deb', 'rpm'):
+                add('/usr/lib/systemd/system/tayga-package-recovery.service',
+                    (ROOT / 'packaging/native/tayga-package-recovery.service').read_bytes())
+                contents.append({'src': '../tayga-package-recovery.service',
+                                 'dst': '/usr/lib/systemd/system/multi-user.target.wants/tayga-package-recovery.service',
+                                 'type': 'symlink'})
+
+
             if kind == 'apk':
                 add('/usr/libexec/tayga/package-lock.sh', (ROOT / 'packaging/native/package-lock.sh').read_bytes(), 0o755)
             for name, section in (('tayga.8', '8'), ('tayga.conf.5', '5')):

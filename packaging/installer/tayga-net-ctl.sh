@@ -136,7 +136,13 @@ else
     target_addr6=$addr6
 fi
 if [ "$os" = FreeBSD ]; then
-    ifconfig "$dev" inet6 "$target_addr6/128" up
+    # A proxy-mode daemon identity belongs to the uplink; only the translated
+    # CLAT address is forwarded into TUN. Assign it in the owned proxy block.
+    if [ "$mode" != clat ] || [ "$address_mode" != proxy-ndp ]; then
+        ifconfig "$dev" inet6 "$target_addr6/128" up
+    else
+        ifconfig "$dev" inet6 -ifdisabled up
+    fi
 else
     ip -6 addr add "$target_addr6/128" dev "$dev"
 fi
@@ -313,36 +319,13 @@ fw_pf() {
         pfctl -e || fail 'Failed to enable pf'
         printf 'pfctl -d >/dev/null 2>&1 || :\n' >> "$journal"
     fi
-    root_needs_nat_anchor=no
-    root_needs_filter_anchor=no
-    if ! pfctl -sn 2>/dev/null | grep -q 'nat-anchor "tayga_sfx/\*"'; then
-        root_needs_nat_anchor=yes
-    fi
-    if ! pfctl -sr 2>/dev/null | grep -q 'anchor "tayga_sfx/\*"'; then
-        root_needs_filter_anchor=yes
-    fi
-    if [ "$root_needs_nat_anchor" = yes ] || [ "$root_needs_filter_anchor" = yes ]; then
-        if [ ! -f "$state/pf_root_orig.conf" ]; then
-            {
-                pfctl -sn 2>/dev/null || :
-                pfctl -sr 2>/dev/null || :
-            } > "$state/pf_root_orig.conf"
-        fi
-        {
-            pfctl -sn 2>/dev/null || :
-            if [ "$root_needs_nat_anchor" = yes ]; then
-                printf 'nat-anchor "tayga_sfx/*"\n'
-            fi
-            pfctl -sr 2>/dev/null || :
-            if [ "$root_needs_filter_anchor" = yes ]; then
-                printf 'anchor "tayga_sfx/*"\n'
-            fi
-        } > "$lock/root.pf"
-        pfctl -f "$lock/root.pf" || fail 'Failed to load pf root ruleset with tayga anchors'
-        # shellcheck disable=SC2016
-        printf 'curr_nat=$(pfctl -sn 2>/dev/null | grep -Fvx '\''%s'\'' || :); curr_rules=$(pfctl -sr 2>/dev/null | grep -Fvx '\''%s'\'' || :); if [ -n "$curr_nat" ] || [ -n "$curr_rules" ]; then { [ -z "$curr_nat" ] || printf "%%s\\n" "$curr_nat"; [ -z "$curr_rules" ] || printf "%%s\\n" "$curr_rules"; } | pfctl -f - >/dev/null 2>&1 || :; else pfctl -F nat >/dev/null 2>&1 || :; pfctl -F rules >/dev/null 2>&1 || :; fi; rm -f %s\n' 'nat-anchor "tayga_sfx/*"' 'anchor "tayga_sfx/*"' "$state/pf_root_orig.conf" >> "$journal"
-        rm -f "$lock/root.pf"
-    fi
+    # pfctl -sn/-sr are not a complete PF configuration export. Reloading
+    # their output resets global options and can discard administrative state.
+    # Only load our child anchor; root calls must be provisioned by its owner.
+    pfctl -sn | grep -q 'nat-anchor "tayga_sfx/\*"' ||
+        fail 'Configure PF root nat-anchor "tayga_sfx/*" before activation'
+    pfctl -sr | grep -q 'anchor "tayga_sfx/\*"' ||
+        fail 'Configure PF root anchor "tayga_sfx/*" before activation'
     mss=$(( mtu - 40 ))
     {
         printf 'scrub on %s proto tcp all max-mss %d\n' "$dev" "$mss"
@@ -460,12 +443,20 @@ case "$mode" in
         case "$clat6" in ''|*[!0-9a-fA-F:]*) fail 'Missing CLAT mapping' ;; esac
         if [ "$address_mode" = proxy-ndp ]; then
             if [ "$os" = FreeBSD ]; then
+                link_address=$(ifconfig "$uplink6" | awk '$1=="ether" {print $2; exit}')
+                case "$link_address" in ''|*[!0-9a-fA-F:]*) fail 'Missing uplink Ethernet address for proxy NDP' ;; esac
                 for address in "$clat6" "$addr6"; do
+                    if ndp -n "$address" >/dev/null 2>&1; then fail 'A neighbor entry already exists'; fi
                     if ifconfig "$uplink6" inet6 2>/dev/null | awk '$1=="inet6" {split($2,a,"/");print a[1]}' | grep -Fx "$address" >/dev/null; then
                         fail 'Proxy address is already assigned to the uplink'
                     fi
-                    ifconfig "$uplink6" inet6 "$address/128" alias
-                    printf 'ifconfig %s inet6 %s -alias >/dev/null 2>&1 || :\n' "$uplink6" "$address" >> "$journal"
+                    if [ "$address" = "$addr6" ]; then
+                        ifconfig "$uplink6" inet6 "$address/128" alias
+                        printf 'ifconfig %s inet6 %s -alias >/dev/null 2>&1 || :\n' "$uplink6" "$address" >> "$journal"
+                    else
+                        ndp -s "$address" "$link_address" proxy
+                        printf 'ndp -d %s >/dev/null 2>&1 || :\n' "$address" >> "$journal"
+                    fi
                 done
             else
                 set_sysctl "net.ipv6.conf.$uplink6.proxy_ndp" 1

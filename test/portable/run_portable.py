@@ -14,7 +14,7 @@ MODULES = (
     "test_compare_perf_sessions", "test_recovery_acceptance", "test_iperf_server_logs", "test_tcp_flow_study",
     "test_tcp_worker_study", "test_tun_steering_study", "test_udp_batch_study",
     "test_udp_batch_summary", "test_udp_common_stop", "test_udp_envelope_study",
-    "test_lima_retention", "test_benchmark_cleanup", "test_udp_batch_endpoint",
+    "test_image_cache", "test_lima_retention", "test_benchmark_cleanup", "test_udp_batch_endpoint",
     "test_udp_drain_guard", "test_iperf_start_gate", "test_iperf_read_diagnostic",
     "test_protocols_compatibility", "test_throughput_diagnostics", "test_release_pipeline", "test_installer_bundle", "test_installer_network", "test_installer_lifecycle", "test_installer_dns", "test_installer_dependencies", "test_installer_packages", "test_installer_openwrt",
 )

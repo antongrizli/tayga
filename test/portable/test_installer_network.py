@@ -382,6 +382,7 @@ esac''',
             'ifconfig': '''echo "ifconfig $*" >> "$TEST_LOG"
 case "$*" in
     tun64) exit "${TEST_IF_EXISTS:-1}" ;;
+    eth0) echo 'ether 02:00:00:00:00:01'; exit 0 ;;
     'eth0 inet6')
         echo 'inet6 fe80::1%eth0 prefixlen 64 scopeid 0x1'
         [ "${TEST_ALREADY_ASSIGNED:-no}" != yes ] || echo 'inet6 2001:db8::464 prefixlen 128'
@@ -395,6 +396,7 @@ case "$*" in
     '-n get -inet6 default') echo 'interface: eth0' ;;
     '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
 esac''',
+            'ndp': 'echo "ndp $*" >> "$TEST_LOG"; case "$1" in -n) exit "${TEST_NDP_EXISTS:-1}" ;; esac',
             'netstat': 'echo "netstat $*" >> "$TEST_LOG"',
             'kldload': 'echo "kldload $*" >> "$TEST_LOG"',
             'kldunload': 'echo "kldunload $*" >> "$TEST_LOG"',
@@ -444,12 +446,14 @@ esac''',
         res = subprocess.run(['sh', str(CONTROLLER), 'up', str(pndp_conf)], env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         log = self.log.read_text()
-        self.assertIn('ifconfig eth0 inet6 2001:db8::464/128 alias', log)
+        self.assertIn('ndp -s 2001:db8::464 02:00:00:00:00:01 proxy', log)
+        self.assertNotIn('ifconfig tun64 inet6 2001:db8::2/128 up', log)
+        self.assertIn('ifconfig tun64 inet6 -ifdisabled up', log)
         self.assertIn('ifconfig eth0 inet6 2001:db8::2/128 alias', log)
         res = subprocess.run(['sh', str(CONTROLLER), 'down', str(pndp_conf)], env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         down_log = self.log.read_text()
-        self.assertIn('ifconfig eth0 inet6 2001:db8::464 -alias', down_log)
+        self.assertIn('ndp -d 2001:db8::464', down_log)
         self.assertIn('ifconfig eth0 inet6 2001:db8::2 -alias', down_log)
 
         # 2. FreeBSD Proxy NDP fails if address already assigned
@@ -457,6 +461,14 @@ esac''',
         res = subprocess.run(['sh', str(CONTROLLER), 'up', str(pndp_conf)], env={**self.env, 'TEST_ALREADY_ASSIGNED': 'yes'}, capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn('already assigned', res.stderr)
+
+        # An administrator's neighbor entry must not become owned by rollback.
+        self.log.write_text('')
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(pndp_conf)],
+                             env={**self.env, 'TEST_NDP_EXISTS': '0'}, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('neighbor entry already exists', res.stderr)
+        self.assertNotIn('ndp -d', self.log.read_text())
 
         # 3. FreeBSD NAT66
         nat66_conf = self.root / 'freebsd-nat66.conf'
@@ -492,11 +504,13 @@ echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
     -s) echo 'Status: Enabled' ;;
     -sn)
+        [ "${TEST_PF_HAS_NAT_ANCHOR:-no}" != yes ] || echo 'nat-anchor "tayga_sfx/*"'
         if [ "${TEST_PF_ROOT_EMPTY:-no}" != yes ]; then
             echo 'nat on em0 from 192.168.1.0/24 to any -> em0'
         fi
         ;;
     -sr)
+        [ "${TEST_PF_HAS_FILTER_ANCHOR:-no}" != yes ] || echo 'anchor "tayga_sfx/*"'
         if [ "${TEST_PF_ROOT_EMPTY:-no}" != yes ]; then
             echo 'pass in all'
         fi
@@ -537,32 +551,23 @@ esac''',
 
         config = self.root / 'freebsd-pf-inject.conf'
         config.write_text('tun-device tun64\n# installer-mode clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr 2001:db8::2\nmap 192.0.0.1 2001:db8::464\nofflink-mtu 1400\n# installer-firewall pf\n')
-        self.log.write_text('')
-        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(config)],
-                             env={**self.env, 'TEST_PF_NO_NAT_ANCHOR': 'yes', 'TEST_PF_NO_FILTER_ANCHOR': 'yes'},
-                             capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        log = self.log.read_text()
-        self.assertIn('nat-anchor "tayga_sfx/*"', log)
-        self.assertIn('anchor "tayga_sfx/*"', log)
-        # nat-anchor must precede filter rules and anchor
-        idx_nat = log.index('\nnat-anchor "tayga_sfx/*"\n')
-        idx_pass = log.index('\npass in all\n')
-        idx_anchor = log.index('\nanchor "tayga_sfx/*"\n')
-        self.assertLess(idx_nat, idx_pass)
-        self.assertLess(idx_pass, idx_anchor)
-
-        # Down surgically removes tayga anchors and preserves foreign rules
-        self.log.write_text('')
-        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)],
-                             env={**self.env, 'TEST_PF_NO_NAT_ANCHOR': 'yes', 'TEST_PF_NO_FILTER_ANCHOR': 'yes'},
-                             capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        down_log = self.log.read_text()
-        self.assertIn('pass in all', down_log)
-        self.assertNotIn('anchor "tayga_sfx/*"', down_log)
-        self.assertNotIn('nat-anchor "tayga_sfx/*"', down_log)
-        self.assertFalse((self.state / 'pf_root_orig.conf').exists())
+        for nat, filtering in (('no', 'no'), ('yes', 'no'), ('no', 'yes'), ('yes', 'yes')):
+            with self.subTest(nat=nat, filtering=filtering):
+                self.log.write_text('')
+                env = {**self.env, 'TEST_PF_HAS_NAT_ANCHOR': nat,
+                       'TEST_PF_HAS_FILTER_ANCHOR': filtering}
+                res = subprocess.run(['sh', str(CONTROLLER), 'up', str(config)],
+                                     env=env, capture_output=True, text=True)
+                if nat == filtering == 'yes':
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    res = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)],
+                                         env=env, capture_output=True, text=True)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                else:
+                    self.assertNotEqual(res.returncode, 0)
+                    self.assertIn('Configure PF root', res.stderr)
+                self.assertNotIn('pfctl -f ', self.log.read_text())
+                self.assertFalse((self.state / 'tun64.undo').exists())
 
     def test_auto_clat_fails_closed_without_global_ipv6(self):
         generator = ROOT / 'packaging/installer/configure.sh'
