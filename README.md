@@ -437,6 +437,18 @@ separate package-manager workflow. Native `.apk`/`.deb`/`.rpm` test artifacts an
 hooks are described below.
 
 
+### Architecture & Platform Support Matrix
+
+| Architecture | Linux Static Binary | FreeBSD 15 Binary | SFX Installer | Native Packages (DEB/RPM/APK) | OpenWrt Package |
+|---|---|---|---|---|---|
+| `x86_64` / `amd64` | Verified (CI multiarch) | Verified (CI amd64) | Verified (Linux & FreeBSD) | Verified (Release assembly) | - |
+| `aarch64` / `arm64` | Verified (CI multiarch) | Verified (CI arm64) | Verified (Linux & FreeBSD) | Verified (CI container & Release) | Verified (`armsr/armv8` IPK/APK) |
+| `armv7` (32-bit HF) | Verified (CI multiarch) | - | Verified (Linux) | Verified (Release assembly) | - |
+| `armv6` (32-bit) | Verified (CI multiarch) | - | - | - | - |
+| `riscv64` | Verified (CI multiarch) | - | - | - | - |
+| `ppc64le` | Verified (CI multiarch) | - | - | - | - |
+| `s390x` | Verified (CI multiarch) | - | - | - | - |
+
 Native package builds use `scripts/build-native-packages.py` with nFPM 2.48.0.
 Supply verified static Linux binaries (musl static inputs are used in the tests):
 
@@ -451,11 +463,10 @@ ELF architecture and rejects dynamic interpreters and FreeBSD ABI inputs. Packag
 install binaries under `/usr/sbin` and helpers/templates under `/usr/libexec/tayga`;
 installation never enables a TAYGA service or applies routes. Their sample config
 is a package-manager conffile; runtime profile configs/data are not package payload.
-Choose a real maintainer identity when preparing distributable packages.
-These initial artifacts are **unsigned**; the local VM tests explicitly allow
-unsigned APKs. Signing and release publication remain separate pending work.
-The package CI job builds and tests arm64 artifacts; amd64/armv7 format metadata
-is supported by the builder but has not yet had the same native package tests.
+Release assembly verifies and includes native packages for `amd64`, `arm64`, and `armv7`
+in the signed release bundle. In CI, native package verification exercises install,
+blocked uncoordinated upgrade, coordinated live upgrade, dynamic data preservation, and
+clean removal across Debian (`trixie-slim`), Alpine (`3.24`), and Fedora (`44`).
 
 Generate a candidate with `/usr/libexec/tayga/configure.sh`, then explicitly use
 `sudo tayga-ctl apply /path/to/candidate.conf`. Direct uncoordinated package upgrades
