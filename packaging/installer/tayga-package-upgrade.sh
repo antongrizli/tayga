@@ -125,7 +125,7 @@ mkdir "$gate" 2>/dev/null || fail 'Another profile operation is in progress'
 lock_held=1
 touch "$gate/package-upgrade"
 echo "$$" > "$gate/pid"
-echo "$(date -u +%s 2>/dev/null || echo 0)" > "$gate/start"
+date -u +%s 2>/dev/null > "$gate/start" || echo 0 > "$gate/start"
 
 case "$pkg" in
     *.deb) kind=deb ;;
@@ -146,18 +146,22 @@ case "$kind" in
         pkg_name=$(dpkg-deb -f "$pkg" Package 2>/dev/null || :)
         new_ver=$(dpkg-deb -f "$pkg" Version 2>/dev/null || :)
         new_arch=$(dpkg-deb -f "$pkg" Architecture 2>/dev/null || :)
+        : "$new_arch"
         ;;
     rpm)
         command -v rpm >/dev/null 2>&1 || fail 'rpm required for rpm packages'
         pkg_name=$(rpm -qp --queryformat '%{NAME}' "$pkg" 2>/dev/null || :)
         new_ver=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null || :)
         new_arch=$(rpm -qp --queryformat '%{ARCH}' "$pkg" 2>/dev/null || :)
+        : "$new_arch"
         ;;
     apk)
         command -v apk >/dev/null 2>&1 || fail 'apk required for apk packages'
-        pkg_name=$(apk info --name -p "$pkg" 2>/dev/null || :)
-        new_ver=$(apk info -p "$pkg" 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :)
-        new_arch=$(apk info --arch -p "$pkg" 2>/dev/null || :)
+        pkg_info=$(tar -zxOf "$pkg" .PKGINFO 2>/dev/null || tar -xf "$pkg" -O .PKGINFO 2>/dev/null || :)
+        pkg_name=$(printf '%s\n' "$pkg_info" | sed -n 's/^pkgname = //p' | head -n1 || :)
+        new_ver=$(printf '%s\n' "$pkg_info" | sed -n 's/^pkgver = //p' | head -n1 || :)
+        new_arch=$(printf '%s\n' "$pkg_info" | sed -n 's/^arch = //p' | head -n1 || :)
+        : "$new_arch"
         ;;
 esac
 
@@ -169,7 +173,7 @@ inst_ver=
 case "$kind" in
     deb) inst_ver=$(dpkg-query -W -f='${Version}' tayga-managed 2>/dev/null || :) ;;
     rpm) inst_ver=$(rpm -q --qf '%{VERSION}-%{RELEASE}' tayga-managed 2>/dev/null || :) ;;
-    apk) inst_ver=$(apk info -v tayga-managed 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
+    apk) inst_ver=$(apk info -v 2>/dev/null | sed -n 's/^tayga-managed-\([0-9].*\)$/\1/p' || :) ;;
 esac
 
 if [ -n "$inst_ver" ] && [ "$allow_downgrade" != yes ]; then

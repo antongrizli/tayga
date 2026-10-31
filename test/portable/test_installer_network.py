@@ -318,6 +318,8 @@ case "$*" in
     '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
 esac''',
             'netstat': 'echo "netstat $*" >> "$TEST_LOG"',
+            'kldload': 'echo "kldload $*" >> "$TEST_LOG"',
+            'kldunload': 'echo "kldunload $*" >> "$TEST_LOG"',
             'pfctl': '''echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
     -s) echo 'Status: Enabled' ;;
@@ -394,6 +396,8 @@ case "$*" in
     '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
 esac''',
             'netstat': 'echo "netstat $*" >> "$TEST_LOG"',
+            'kldload': 'echo "kldload $*" >> "$TEST_LOG"',
+            'kldunload': 'echo "kldunload $*" >> "$TEST_LOG"',
             'pfctl': '''echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
     -s) echo 'Status: Enabled' ;;
@@ -481,6 +485,8 @@ case "$*" in
     '-n get default') echo 'gateway: 192.168.5.2'; echo 'interface: eth0' ;;
 esac''',
             'netstat': 'exit 0',
+            'kldload': 'exit 0',
+            'kldunload': 'exit 0',
             'pfctl': '''#!/bin/sh
 echo "pfctl $*" >> "$TEST_LOG"
 case "$1" in
@@ -577,27 +583,25 @@ esac
         generator = ROOT / 'packaging/installer/configure.sh'
         out_nat66 = self.root / 'test-ula.conf'
         # 1. Deterministic output: running twice with same machine-id yields exact same ULA
-        mid = self.root / 'machine-id'
-        mid.write_text('abcdef0123456789abcdef0123456789\n')
-        env_with_mid = {**self.env, 'TAYGA_TEST_MACHINE_ID': str(mid)}
+        env_with_mid = {**self.env, 'TAYGA_TEST_MACHINE_ID': 'abcdef0123456789abcdef0123456789'}
         res1 = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
                                '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
-                               '--output=' + str(out_nat66)], env=self.env, capture_output=True, text=True)
+                               '--output=' + str(out_nat66)], env=env_with_mid, capture_output=True, text=True)
         self.assertEqual(res1.returncode, 0, res1.stderr)
         text1 = out_nat66.read_text()
         out_nat66.unlink()
         res2 = subprocess.run(['sh', str(generator), '--mode=clat', '--clat-address-mode=nat66',
                                '--clat-ipv6=auto', '--nat66-address=2001:db8::5',
-                               '--output=' + str(out_nat66)], env=self.env, capture_output=True, text=True)
+                               '--output=' + str(out_nat66)], env=env_with_mid, capture_output=True, text=True)
         self.assertEqual(res2.returncode, 0, res2.stderr)
         text2 = out_nat66.read_text()
         self.assertEqual(text1, text2)
 
         # 2. FreeBSD sha256 -q fallback
-        # Create a mock sha256 and shadow sha256sum / shasum
+        # Create a mock sha256 and shadow sha256sum / shasum / python3
         sha_dir = self.root / 'sha_fallback_bin'
         sha_dir.mkdir()
-        for mname in ('sha256sum', 'shasum'):
+        for mname in ('sha256sum', 'shasum', 'python3'):
             m = sha_dir / mname
             m.write_text('#!/bin/sh\nexit 127\n')
             m.chmod(0o755)

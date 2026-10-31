@@ -309,10 +309,7 @@ fw_pf() {
         kldload pf || fail 'Failed to load pf kernel module'
         printf 'kldunload pf >/dev/null 2>&1 || :\n' >> "$journal"
     fi
-    was_pf_enabled=no
-    if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
-        was_pf_enabled=yes
-    else
+    if ! pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
         pfctl -e || fail 'Failed to enable pf'
         printf 'pfctl -d >/dev/null 2>&1 || :\n' >> "$journal"
     fi

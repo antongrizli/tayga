@@ -107,7 +107,9 @@ done
 case "$workers" in auto) ;; ''|*[!0-9]*|???*) fail 'Invalid worker count' ;; *) [ "$workers" -le 63 ] || fail 'Workers must be auto or 0..63' ;; esac
 generate_deterministic_ula() {
     seed=
-    if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
+    if [ -n "${TAYGA_TEST_MACHINE_ID:-}" ]; then
+        seed="$TAYGA_TEST_MACHINE_ID"
+    elif [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
         seed=$(cat /etc/machine-id)
     elif [ -f /var/lib/dbus/machine-id ] && [ -s /var/lib/dbus/machine-id ]; then
         seed=$(cat /var/lib/dbus/machine-id)

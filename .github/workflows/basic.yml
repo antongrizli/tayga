@@ -119,8 +119,8 @@ jobs:
           feed=https://downloads.openwrt.org/releases/24.10.8/packages/aarch64_generic/packages
           curl -fL --retry 3 "$feed/coreutils_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-coreutils.ipk
           curl -fL --retry 3 "$feed/coreutils-timeout_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-timeout.ipk
-          echo 'd23a60cc4ad1f9d78f40f4ae8a1d7cd9dee2af070a31889bbaf8dc08dc9422e0  /tmp/openwrt-coreutils.ipk' | sha256sum -c -
-          echo '880f0ff1c347a066fcc9f2ee2ee73c892b06c5bd5d0cc3d5089da409e7df542f  /tmp/openwrt-timeout.ipk' | sha256sum -c -
+          echo 'e15a5c623f701152d8e1dc1544ba3fee7fce636f5b719f81bda1b9f0ebedba26  /tmp/openwrt-coreutils.ipk' | sha256sum -c -
+          echo 'b06c5f269829047447db2c8c4d08afdc6d7ac102e5098b00595d60bc30a45b57  /tmp/openwrt-timeout.ipk' | sha256sum -c -
           curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-kernel.bin" -o /tmp/openwrt-kernel.bin
           curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-squashfs-combined-efi.img.gz" -o /tmp/openwrt-squashfs.img.gz
           echo 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e  /tmp/openwrt-kernel.bin' | sha256sum -c -

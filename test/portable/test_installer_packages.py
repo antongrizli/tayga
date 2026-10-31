@@ -179,6 +179,21 @@ esac''',
         self.assertIn('Invalid package identity', res.stderr)
         self.assertFalse((self.state / 'package-upgrade').exists())
 
+    def test_upgrade_apk_package_inspection(self):
+        apk_path = self.root / 'tayga-managed-0.9.15-r2.apk'
+        pkginfo = b'pkgname = tayga-managed\npkgver = 0.9.15-r2\narch = x86_64\n'
+        import tarfile, io
+        with tarfile.open(apk_path, 'w:gz') as tar:
+            ti = tarfile.TarInfo(name='.PKGINFO')
+            ti.size = len(pkginfo)
+            tar.addfile(ti, io.BytesIO(pkginfo))
+        (self.bin / 'apk').write_text('#!/bin/sh\nexit 0\n')
+        (self.bin / 'apk').chmod(0o755)
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(apk_path)],
+                             env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('PASS: Coordinated live package upgrade successful', res.stdout)
+
     def test_upgrade_active_profile_and_successful_verification(self):
         (self.state / 'nat64.conf').write_text('tun-device tun64\n')
         (self.state / 'current').write_text('nat64\n')
