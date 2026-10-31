@@ -153,15 +153,17 @@ jobs:
           for arch in amd64 arm64 armv7; do
             bin="candidates/candidate-$arch/tayga-linux-$arch"
             helper="candidates/candidate-$arch/pref64-discover-linux-$arch"
-            if [ -f "$bin" ] && [ -f "$helper" ]; then
-              python3 scripts/build-native-packages.py \
-                --version "$version" --release 1 --arch "$arch" \
-                --tayga "$bin" --helper "$helper" \
-                --maintainer "TAYGA Community <antongrizli@gmail.com>" \
-                --source-commit "$commit" \
-                --nfpm "$RUNNER_TEMP/nfpm/nfpm" \
-                --output release-native
+            if [ ! -f "$bin" ] || [ ! -f "$helper" ]; then
+              echo "ERROR: Missing release binary $bin or helper $helper for $arch" >&2
+              exit 1
             fi
+            python3 scripts/build-native-packages.py \
+              --version "$version" --release 1 --arch "$arch" \
+              --tayga "$bin" --helper "$helper" \
+              --maintainer "TAYGA Community <antongrizli@gmail.com>" \
+              --source-commit "$commit" \
+              --nfpm "$RUNNER_TEMP/nfpm/nfpm" \
+              --output release-native
           done
       - uses: actions/upload-artifact@v7
         with:
@@ -184,12 +186,17 @@ jobs:
         with:
           pattern: candidate-*
           path: candidates
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Verify all hashes and source identities; prepare pinned RouterOS assets
         env:
           MINISIGN_KEY_FILE: ${{ secrets.MINISIGN_KEY_FILE }}
+          MINISIGN_KEY_DATA: ${{ secrets.MINISIGN_KEY_DATA }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
+          REQUIRE_RELEASE_SIGNATURE: 'true'
         run: |
-          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
           cd release-assets
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@v7

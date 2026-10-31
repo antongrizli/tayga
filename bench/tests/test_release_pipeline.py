@@ -123,9 +123,31 @@ class ReleaseArtifactsTests(unittest.TestCase):
         (self.root / 'CHANGELOG.md').write_text('## [1.2.3] - 2026-10-19\n\nA release fix.\n')
         native_dir = self.inputs / 'candidate-native'
         native_dir.mkdir()
-        (native_dir / 'tayga-managed_1.2.3_amd64.deb').write_text('deb')
-        (native_dir / 'tayga-managed-1.2.3.x86_64.rpm').write_text('rpm')
-        (native_dir / 'tayga-managed-1.2.3-r1.apk').write_text('apk')
+        for arch in artifacts.ARCHES:
+            deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
+            rpm_pkg = native_dir / f'tayga-managed-1.2.3-1.{arch}.rpm'
+            apk_pkg = native_dir / f'tayga-managed-1.2.3-r1-{arch}.apk'
+            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
+            rpm_pkg.write_bytes(b'\xed\xab\xee\xdb' + b'\x00' * 20)
+            apk_pkg.write_bytes(b'\x1f\x8b' + b'\x00' * 20)
+            artifacts_map = {
+                deb_pkg.name: artifacts.sha256(deb_pkg),
+                rpm_pkg.name: artifacts.sha256(rpm_pkg),
+                apk_pkg.name: artifacts.sha256(apk_pkg),
+            }
+            manifest = {
+                'version': '1.2.3',
+                'release': '1',
+                'arch': arch,
+                'inputs': {
+                    'tayga': artifacts.sha256(self.inputs / f'candidate-{arch}' / f'tayga-linux-{arch}'),
+                    'pref64-discover': artifacts.sha256(self.inputs / f'candidate-{arch}' / f'pref64-discover-linux-{arch}')
+                },
+                'artifacts': artifacts_map,
+                'signed': False,
+                'source_commit': self.source['sha']
+            }
+            (native_dir / f'tayga-managed-1.2.3-1-{arch}.json').write_text(json.dumps(manifest))
         output = self.root / 'assets'
         artifacts.assemble(self.root, self.inputs, output, self.source)
         self.assertIn('ghcr.io/owner/repo-clat:version-1.2.3',
@@ -136,9 +158,9 @@ class ReleaseArtifactsTests(unittest.TestCase):
         self.assertIn('tayga-installer-universal.sh', (output / 'SHA256SUMS').read_text())
         self.assertIn('tayga-installer-freebsd-amd64.sh', (output / 'SHA256SUMS').read_text())
         self.assertIn('tayga-installer-freebsd-arm64.sh', (output / 'SHA256SUMS').read_text())
-        self.assertIn('tayga-managed_1.2.3_amd64.deb', (output / 'SHA256SUMS').read_text())
-        self.assertIn('tayga-managed-1.2.3.x86_64.rpm', (output / 'SHA256SUMS').read_text())
-        self.assertIn('tayga-managed-1.2.3-r1.apk', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed_1.2.3-1_amd64.deb', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3-1.amd64.rpm', (output / 'SHA256SUMS').read_text())
+        self.assertIn('tayga-managed-1.2.3-r1-amd64.apk', (output / 'SHA256SUMS').read_text())
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
 
@@ -249,6 +271,31 @@ class ReleaseArtifactsTests(unittest.TestCase):
                 self.assertLess(max(pushes), min(aliases))
                 self.assertEqual(any(':latest' in arg for c in commands for arg in c), not prerelease)
                 self.assertFalse(any('build' in c for c in commands))
+
+    def test_publication_preserves_signed_sha256sums_and_minisig(self):
+        directory = self.publication_fixture()
+        # Seed SHA256SUMS and SHA256SUMS.minisig before publication
+        artifacts.checksums(directory)
+        original_sha = (directory / 'SHA256SUMS').read_text()
+        (directory / 'SHA256SUMS.minisig').write_text('untrusted comment: test signature\nminisig-blob\n')
+
+        def output(*args):
+            if args[1:3] == ('image', 'inspect'):
+                return 'sha256:' + 'b' * 64
+            return 'sha256:' + 'c' * 64
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '123',
+                                     'GITHUB_RUN_ATTEMPT': '2'}), \
+                patch.object(publisher.subprocess, 'run'), \
+                patch.object(publisher, 'run', side_effect=output):
+            publisher.publish(directory)
+
+        # SHA256SUMS must remain identical and MUST NOT include published-images.json
+        self.assertEqual((directory / 'SHA256SUMS').read_text(), original_sha)
+        self.assertNotIn('published-images.json', (directory / 'SHA256SUMS').read_text())
+        self.assertTrue((directory / 'published-images.json').is_file())
+        self.assertTrue((directory / 'published-images.json.sha256').is_file())
+        self.assertTrue((directory / 'SHA256SUMS.minisig').is_file())
 
 
 if __name__ == '__main__':

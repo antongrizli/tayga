@@ -28,6 +28,45 @@ out=
 management4=${SSH_CONNECTION:-}
 management4=${management4%% *}
 case "$management4" in *:*) management4= ;; *[!0-9.]*) fail 'Invalid SSH peer address' ;; esac
+
+generate_deterministic_ula() {
+    seed=
+    if [ -n "${TAYGA_ULA_SEED:-}" ]; then
+        seed="$TAYGA_ULA_SEED"
+    elif [ -n "${TAYGA_TEST_MACHINE_ID:-}" ] && { [ "${TAYGA_TESTING:-0}" = 1 ] || [ "${TAYGA_ISOLATED_TEST:-}" = yes ]; }; then
+        seed="$TAYGA_TEST_MACHINE_ID"
+    elif [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
+        seed=$(cat /etc/machine-id)
+    elif [ -f /var/lib/dbus/machine-id ] && [ -s /var/lib/dbus/machine-id ]; then
+        seed=$(cat /var/lib/dbus/machine-id)
+    elif command -v sysctl >/dev/null 2>&1 && sysctl -n kern.hostuuid >/dev/null 2>&1; then
+        seed=$(sysctl -n kern.hostuuid 2>/dev/null)
+    fi
+    [ -n "$seed" ] || seed="tayga-clat-$(uname -n 2>/dev/null || hostname 2>/dev/null || echo host)"
+    hash=
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash=$(printf '%s' "$seed" | sha256sum 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$hash" ] && command -v shasum >/dev/null 2>&1; then
+        hash=$(printf '%s' "$seed" | shasum -a 256 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$hash" ] && command -v sha256 >/dev/null 2>&1; then
+        hash=$(printf '%s' "$seed" | sha256 -q 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$hash" ] && command -v python3 >/dev/null 2>&1; then
+        hash=$(python3 -c "import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest())" "$seed" 2>/dev/null || :)
+    fi
+    [ -n "$hash" ] || fail 'Cannot generate deterministic ULA: sha256sum, shasum, sha256, or python3 is required'
+    case "$hash" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
+        *) fail 'Unexpected sha256 output format' ;;
+    esac
+    p1=$(printf '%s' "$hash" | cut -c 1-2 | tr '[:upper:]' '[:lower:]')
+    p2=$(printf '%s' "$hash" | cut -c 3-6 | tr '[:upper:]' '[:lower:]')
+    p3=$(printf '%s' "$hash" | cut -c 7-10 | tr '[:upper:]' '[:lower:]')
+    printf 'fd%s:%s:%s:1' "$p1" "$p2" "$p3"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --mode=*) mode=${1#*=} ;;
@@ -53,6 +92,11 @@ while [ "$#" -gt 0 ]; do
         --nat66-address=*) nat66_address=${1#*=} ;;
         --host-dns=*) host_dns=${1#*=} ;;
         --output=*) out=${1#*=} ;;
+        --generate-ula|--print-ula)
+            generate_deterministic_ula
+            echo ""
+            exit 0
+            ;;
         --configure-only=*|--yes|-y|--non-interactive|--defaults|--watchdog-seconds=*) ;;
         *) fail "Unknown profile argument: $1" ;;
     esac
@@ -105,41 +149,6 @@ for value in "$dns64_listen" "$dns64_allow" "$dns64_upstream"; do
     case "$value" in ''|*[!0-9a-fA-F:./@]*) fail 'Invalid DNS64 address token' ;; esac
 done
 case "$workers" in auto) ;; ''|*[!0-9]*|???*) fail 'Invalid worker count' ;; *) [ "$workers" -le 63 ] || fail 'Workers must be auto or 0..63' ;; esac
-generate_deterministic_ula() {
-    seed=
-    if [ -n "${TAYGA_TEST_MACHINE_ID:-}" ]; then
-        seed="$TAYGA_TEST_MACHINE_ID"
-    elif [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
-        seed=$(cat /etc/machine-id)
-    elif [ -f /var/lib/dbus/machine-id ] && [ -s /var/lib/dbus/machine-id ]; then
-        seed=$(cat /var/lib/dbus/machine-id)
-    elif command -v sysctl >/dev/null 2>&1 && sysctl -n kern.hostuuid >/dev/null 2>&1; then
-        seed=$(sysctl -n kern.hostuuid 2>/dev/null)
-    fi
-    [ -n "$seed" ] || seed="tayga-clat-$(uname -n 2>/dev/null || hostname 2>/dev/null || echo host)"
-    hash=
-    if command -v sha256sum >/dev/null 2>&1; then
-        hash=$(printf '%s\n' "$seed" | sha256sum 2>/dev/null | awk '{print $1}')
-    fi
-    if [ -z "$hash" ] && command -v shasum >/dev/null 2>&1; then
-        hash=$(printf '%s\n' "$seed" | shasum -a 256 2>/dev/null | awk '{print $1}')
-    fi
-    if [ -z "$hash" ] && command -v sha256 >/dev/null 2>&1; then
-        hash=$(printf '%s\n' "$seed" | sha256 -q 2>/dev/null | awk '{print $1}')
-    fi
-    if [ -z "$hash" ] && command -v python3 >/dev/null 2>&1; then
-        hash=$(python3 -c "import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$seed" 2>/dev/null || :)
-    fi
-    [ -n "$hash" ] || fail 'Cannot generate deterministic ULA: sha256sum, shasum, sha256, or python3 is required'
-    case "$hash" in
-        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
-        *) fail 'Unexpected sha256 output format' ;;
-    esac
-    p1=$(printf '%s' "$hash" | cut -c 1-2 | tr '[:upper:]' '[:lower:]')
-    p2=$(printf '%s' "$hash" | cut -c 3-6 | tr '[:upper:]' '[:lower:]')
-    p3=$(printf '%s' "$hash" | cut -c 7-10 | tr '[:upper:]' '[:lower:]')
-    printf 'fd%s:%s:%s:1' "$p1" "$p2" "$p3"
-}
 if [ "$clat6" = auto ] && [ "$mode" = clat ]; then
     if [ "$address_mode" = nat66 ]; then
         ula_prefix=$(generate_deterministic_ula)
@@ -157,12 +166,26 @@ if [ "$clat6" = auto ] && [ "$mode" = clat ]; then
             global_v6=$(ip -6 addr show dev "$uplink" scope global -deprecated -tentative 2>/dev/null | awk '$1=="inet6" && $2!~/^fe80/ && $2!~/^fd/ {split($2,a,"/");print a[1]; exit}')
         fi
         [ -n "$global_v6" ] || fail 'Cannot determine global IPv6 address on uplink for automatic CLAT address; specify --clat-ipv6 explicitly'
-        ip_base=${global_v6%/*}
-        case "$ip_base" in
-            *::*) clat6="${ip_base%::*}::464" ;;
-            *:*:*) clat6="$(printf '%s\n' "$ip_base" | sed -E 's/:[0-9a-fA-F]+$/:464/')" ;;
-            *) fail "Invalid uplink IPv6 address format: $ip_base" ;;
-        esac
+        clat6=
+        if command -v python3 >/dev/null 2>&1; then
+            clat6=$(python3 -c "import ipaddress, sys
+try:
+    ip_str = sys.argv[1].split('/')[0]
+    addr = ipaddress.IPv6Address(ip_str)
+    net = ipaddress.IPv6Network(f'{addr}/64', strict=False)
+    print(str(ipaddress.IPv6Address(int(net.network_address) + 0x464)))
+except Exception:
+    pass" "$global_v6" 2>/dev/null || :)
+        fi
+        if [ -z "$clat6" ]; then
+            ip_base=${global_v6%/*}
+            case "$ip_base" in
+                *::*) clat6="${ip_base%::*}::464" ;;
+                *:*:*:*:*) clat6="$(printf '%s\n' "$ip_base" | awk -F: '{print $1":"$2":"$3":"$4"::464}')" ;;
+                *:*:*) clat6="$(printf '%s\n' "$ip_base" | sed -E 's/:[0-9a-fA-F]+$/:464/')" ;;
+                *) fail "Invalid uplink IPv6 address format: $ip_base" ;;
+            esac
+        fi
     fi
 fi
 if [ "$address_mode" = nat66 ] && [ "$nat66_address" = auto ]; then

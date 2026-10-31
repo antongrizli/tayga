@@ -5,9 +5,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
-from release_artifacts import ARCHES, PROFILES, checksums, run, sha256
+from release_artifacts import ARCHES, PROFILES, run, sha256
 from release_metadata import normalize_tag
 
 
@@ -76,7 +77,36 @@ def publish(directory):
     if not source['prerelease']:
         for image in evidence['profiles'].values():
             assign(image, 'latest')
-    checksums(directory)
+
+    # Record publication evidence digest without invalidating immutable signed release checksums
+    (directory / 'published-images.json.sha256').write_text(
+        f"{sha256(directory / 'published-images.json')}  published-images.json\n")
+
+    # Verify that publication did not alter or corrupt any signed release artifacts
+    sha_file = directory / 'SHA256SUMS'
+    if sha_file.is_file():
+        for line in sha_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                expected_sha = parts[0].strip()
+                name = parts[1].strip()
+                target_path = directory / name
+                if not target_path.is_file():
+                    raise ValueError(f'Signed release artifact missing after publication: {name}')
+                if sha256(target_path) != expected_sha:
+                    raise ValueError(f'Signed release artifact checksum mismatch after publication: {name}')
+
+    sig_file = directory / 'SHA256SUMS.minisig'
+    pubkey = os.environ.get('MINISIGN_PUBKEY')
+    pubkey_file = os.environ.get('MINISIGN_PUBKEY_FILE')
+    if sig_file.is_file() and shutil.which('minisign'):
+        if pubkey_file and Path(pubkey_file).is_file():
+            subprocess.run(['minisign', '-V', '-p', pubkey_file, '-m', str(sha_file), '-x', str(sig_file)], check=True)
+        elif pubkey:
+            subprocess.run(['minisign', '-V', '-P', pubkey, '-m', str(sha_file), '-x', str(sig_file)], check=True)
 
 
 def main():

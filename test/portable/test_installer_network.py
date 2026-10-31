@@ -633,3 +633,30 @@ esac
         self.assertNotEqual(res_fail.returncode, 0)
         self.assertIn('Cannot generate deterministic ULA', res_fail.stderr)
 
+    def test_ula_hash_backends_produce_identical_prefix(self):
+        generator = ROOT / 'packaging/installer/configure.sh'
+        seed = "test-seed-for-backends"
+        env = {**self.env, 'TAYGA_ULA_SEED': seed}
+
+        # Expected ULA from direct SHA256 of the seed bytes
+        import hashlib
+        h = hashlib.sha256(seed.encode('utf-8')).hexdigest()
+        expected = f'fd{h[:2]}:{h[2:6]}:{h[6:10]}:1'
+
+        res = subprocess.run(['sh', str(generator), '--generate-ula'], env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), expected)
+
+        # Force python3 fallback only
+        py_dir = self.root / 'py_only_bin'
+        py_dir.mkdir()
+        for name in ('sha256sum', 'shasum', 'sha256'):
+            m = py_dir / name
+            m.write_text('#!/bin/sh\nexit 127\n')
+            m.chmod(0o755)
+        clean_py_path = str(py_dir) + os.pathsep + self.env['PATH']
+        res_py = subprocess.run(['sh', str(generator), '--generate-ula'],
+                                env={**env, 'PATH': clean_py_path}, capture_output=True, text=True)
+        self.assertEqual(res_py.returncode, 0, res_py.stderr)
+        self.assertEqual(res_py.stdout.strip(), expected)
+

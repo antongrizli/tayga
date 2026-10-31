@@ -58,7 +58,9 @@ if install_package "$second" > "$work/blocked.log" 2>&1; then cat "$work/blocked
 [ "$(package_version)" = "$before" ]
 
 # Coordinated live upgrade succeeds with the configured profile retained.
-/usr/sbin/tayga-ctl upgrade "$second"
+extra_upgrade_opts=
+if [ "$kind" = apk ]; then extra_upgrade_opts="--allow-untrusted"; fi
+/usr/sbin/tayga-ctl upgrade "$second" $extra_upgrade_opts
 [ "$(package_version)" != "$before" ]
 [ -f "$state/nat64.conf" ]
 rm "$state/nat64.conf"

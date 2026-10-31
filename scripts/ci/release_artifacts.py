@@ -133,7 +133,7 @@ def verify_freebsd(directory, arch, source):
     return data
 
 
-def assemble(root, inputs, output, source):
+def assemble(root, inputs, output, source, require_signature=False):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError('asset output must be empty')
@@ -188,20 +188,55 @@ def assemble(root, inputs, output, source):
         with zipfile.ZipFile(output / 'tayga-routeros-scripts.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(staging.iterdir()):
                 archive.write(path, path.name)
+    native_manifests = {}
     native_dir = inputs / 'candidate-native'
     if native_dir.is_dir():
-        for pkg in sorted(native_dir.glob('tayga-managed*')):
-            if pkg.is_file() and not pkg.is_symlink():
-                shutil.copy2(pkg, output / pkg.name)
+        for arch in ARCHES:
+            manifest_candidates = list(native_dir.glob(f'tayga-managed-{source["version"]}-*-{arch}.json'))
+            if not manifest_candidates:
+                raise ValueError(f'candidate-native: missing manifest for arch {arch}')
+            manifest_path = manifest_candidates[0]
+            data = json.loads(manifest_path.read_text())
+            if data.get('version') != source['version']:
+                raise ValueError(f'native package manifest version mismatch for {arch}')
+            if data.get('source_commit') != source['sha']:
+                raise ValueError(f'native package source commit mismatch for {arch}')
+            if data.get('arch') != arch:
+                raise ValueError(f'native package architecture mismatch for {arch}')
+            expected_tayga = manifests[arch]['files'][f'tayga-linux-{arch}']
+            expected_helper = manifests[arch]['files'][f'pref64-discover-linux-{arch}']
+            if data.get('inputs', {}).get('tayga') != expected_tayga:
+                raise ValueError(f'native package input tayga binary hash mismatch for {arch}')
+            if data.get('inputs', {}).get('pref64-discover') != expected_helper:
+                raise ValueError(f'native package input helper hash mismatch for {arch}')
+            for pkg_name, expected_digest in data.get('artifacts', {}).items():
+                pkg_file = native_dir / pkg_name
+                if not pkg_file.is_file():
+                    raise ValueError(f'native package file missing: {pkg_name}')
+                if sha256(pkg_file) != expected_digest:
+                    raise ValueError(f'native package digest mismatch: {pkg_name}')
+                blob = pkg_file.read_bytes()[:16]
+                if pkg_name.endswith('.deb') and not blob.startswith(b'!<arch>\n'):
+                    raise ValueError(f'invalid deb package format: {pkg_name}')
+                elif pkg_name.endswith('.rpm') and not blob.startswith(b'\xed\xab\xee\xdb'):
+                    raise ValueError(f'invalid rpm package format: {pkg_name}')
+                elif pkg_name.endswith('.apk') and not blob.startswith(b'\x1f\x8b'):
+                    raise ValueError(f'invalid apk package format: {pkg_name}')
+                shutil.copy2(pkg_file, output / pkg_name)
+            native_manifests[arch] = data
+        expected_files = {p for m in native_manifests.values() for p in m.get('artifacts', {})}
+        for f in native_dir.iterdir():
+            if f.is_file() and not f.name.endswith('.json') and f.name not in expected_files:
+                raise ValueError(f'candidate-native contains unmanifested file: {f.name}')
     (output / 'release-manifest.json').write_text(json.dumps(
-        {'source': source, 'architectures': manifests, 'freebsd': freebsd}, indent=2) + '\n')
+        {'source': source, 'architectures': manifests, 'freebsd': freebsd, 'native': native_manifests}, indent=2) + '\n')
     changelog = (root / 'CHANGELOG.md').read_text()
     notes = re.search(rf"^## \[{re.escape(source['version'])}\].*?\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
     if not notes or not notes.group(1).strip():
         raise ValueError('release notes missing')
     (output / 'release-notes.md').write_text(
         f"# TAYGA {source['tag']}\n\nSource commit: `{source['sha']}`\n\n" + notes.group(1).strip() + '\n')
-    sign_manifest(output)
+    sign_manifest(output, require_signature=require_signature)
 
 
 def checksums(directory):
@@ -210,21 +245,49 @@ def checksums(directory):
         if path.is_file() and path.name != 'SHA256SUMS' and not path.name.endswith('.minisig') and not path.name.endswith('.sig')))
 
 
-def sign_manifest(directory):
+def sign_manifest(directory, require_signature=False):
     checksums(directory)
     sha_file = directory / 'SHA256SUMS'
     if not sha_file.is_file():
         return
+    require_signature = (require_signature or
+                         os.environ.get('REQUIRE_RELEASE_SIGNATURE', '').lower() in ('1', 'true', 'yes'))
     minisign_key = os.environ.get('MINISIGN_KEY_FILE')
-    if minisign_key and Path(minisign_key).is_file() and shutil.which('minisign'):
+    minisign_key_data = os.environ.get('MINISIGN_KEY_DATA')
+    minisign_bin = shutil.which('minisign')
+
+    if require_signature:
+        if not minisign_bin:
+            raise ValueError('Release signing is required but minisign binary is not found')
+        if not minisign_key and not minisign_key_data:
+            raise ValueError('Release signing is required but MINISIGN_KEY_FILE / MINISIGN_KEY_DATA is not configured')
+
+    if not minisign_bin or (not minisign_key and not minisign_key_data):
+        return
+
+    temp_key_file = None
+    key_path = minisign_key
+    if not key_path and minisign_key_data:
+        t = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        t.write(minisign_key_data.strip() + '\n')
+        t.close()
+        os.chmod(t.name, 0o600)
+        temp_key_file = t.name
+        key_path = temp_key_file
+
+    try:
+        if not Path(key_path).is_file():
+            if require_signature:
+                raise ValueError(f'Minisign key file not found: {key_path}')
+            return
         pw = os.environ.get('MINISIGN_PASSWORD', '')
         sig_file = directory / 'SHA256SUMS.minisig'
-        subprocess.run(['minisign', '-S', '-s', minisign_key, '-m', str(sha_file),
+        subprocess.run(['minisign', '-S', '-s', key_path, '-m', str(sha_file),
                         '-x', str(sig_file), '-t', 'TAYGA Release Verification'],
                        input=(pw + '\n').encode(), check=True)
         pubkey_file = os.environ.get('MINISIGN_PUBKEY_FILE')
         if not pubkey_file:
-            cand = Path(minisign_key).with_suffix('.pub')
+            cand = Path(key_path).with_suffix('.pub')
             if cand.is_file():
                 pubkey_file = str(cand)
         pubkey = os.environ.get('MINISIGN_PUBKEY')
@@ -232,6 +295,11 @@ def sign_manifest(directory):
             subprocess.run(['minisign', '-V', '-p', pubkey_file, '-m', str(sha_file), '-x', str(sig_file)], check=True)
         elif pubkey:
             subprocess.run(['minisign', '-V', '-P', pubkey, '-m', str(sha_file), '-x', str(sig_file)], check=True)
+        elif require_signature:
+            raise ValueError('Release signature verification requires MINISIGN_PUBKEY or MINISIGN_PUBKEY_FILE')
+    finally:
+        if temp_key_file and os.path.exists(temp_key_file):
+            os.unlink(temp_key_file)
 
 
 def main():
@@ -242,12 +310,13 @@ def main():
     parser.add_argument('--arch', choices=ARCHES)
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--require-signature', action='store_true')
     args = parser.parse_args()
     source = json.loads(args.source.read_text())
     if args.action == 'assemble':
         if not args.output:
             parser.error('--output is required for assemble')
-        assemble(args.root, args.directory, args.output, source)
+        assemble(args.root, args.directory, args.output, source, require_signature=args.require_signature)
     else:
         if not args.arch:
             parser.error('--arch is required')
