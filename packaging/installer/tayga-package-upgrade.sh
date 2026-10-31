@@ -192,8 +192,16 @@ if [ -n "$inst_ver" ] && [ "$allow_downgrade" != yes ]; then
 fi
 
 # Preflight dependency simulation
+apk_locked=no
+if [ "$kind" = apk ] && apk info -e .tayga-managed-profile >/dev/null 2>&1; then
+    apk_locked=yes
+    if [ -f "$lib/package-lock.sh" ]; then
+        sh "$lib/package-lock.sh" unlock || :
+    fi
+fi
+
 trust_flag=
-if [ "$allow_untrusted" = yes ] || [ "${TAYGA_ALLOW_UNTRUSTED:-0}" = 1 ]; then
+if [ "$kind" = apk ] || [ "$allow_untrusted" = yes ] || [ "${TAYGA_ALLOW_UNTRUSTED:-0}" = 1 ]; then
     trust_flag="--allow-untrusted"
 fi
 
@@ -206,7 +214,14 @@ case "$kind" in
             rpm -U --test "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed'
         fi
         ;;
-    apk) apk add --simulate $trust_flag --force-non-repository "$pkg" >/dev/null 2>&1 || fail 'Package dependency preflight failed' ;;
+    apk)
+        if ! apk add --simulate $trust_flag --force-non-repository "$pkg" >/dev/null 2>&1; then
+            if [ "$apk_locked" = yes ] && [ -f "$lib/package-lock.sh" ]; then
+                sh "$lib/package-lock.sh" lock 2>/dev/null || :
+            fi
+            fail 'Package dependency preflight failed'
+        fi
+        ;;
 esac
 
 # Identify active profile and init system
@@ -233,11 +248,6 @@ if [ -n "$active" ]; then
         init_type=openrc
         if rc-service tayga-managed status >/dev/null 2>&1; then was_active=yes; fi
     fi
-fi
-
-apk_locked=no
-if [ "$kind" = apk ] && apk info -e .tayga-managed-profile >/dev/null 2>&1; then
-    apk_locked=yes
 fi
 
 # Locate old package archive for rollback if available
