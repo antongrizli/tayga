@@ -339,6 +339,7 @@ fw_pf() {
             fi
         } > "$lock/root.pf"
         pfctl -f "$lock/root.pf" || fail 'Failed to load pf root ruleset with tayga anchors'
+        # shellcheck disable=SC2016
         printf 'curr_nat=$(pfctl -sn 2>/dev/null | grep -Fvx '\''%s'\'' || :); curr_rules=$(pfctl -sr 2>/dev/null | grep -Fvx '\''%s'\'' || :); if [ -n "$curr_nat" ] || [ -n "$curr_rules" ]; then { [ -z "$curr_nat" ] || printf "%%s\\n" "$curr_nat"; [ -z "$curr_rules" ] || printf "%%s\\n" "$curr_rules"; } | pfctl -f - >/dev/null 2>&1 || :; else pfctl -F nat >/dev/null 2>&1 || :; pfctl -F rules >/dev/null 2>&1 || :; fi; rm -f %s\n' 'nat-anchor "tayga_sfx/*"' 'anchor "tayga_sfx/*"' "$state/pf_root_orig.conf" >> "$journal"
         rm -f "$lock/root.pf"
     fi

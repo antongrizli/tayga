@@ -128,6 +128,7 @@ if [ "$action" = recover ]; then
     kind=$(cat "$journal/kind")
     inst_ver=$(cat "$journal/inst_ver")
     target_ver=$(cat "$journal/target_ver")
+    : "$target_ver"
     active=$(cat "$journal/active_profile" 2>/dev/null || echo none)
     was_active=$(cat "$journal/was_active" 2>/dev/null || echo no)
     init_type=$(cat "$journal/init_type" 2>/dev/null || echo none)
