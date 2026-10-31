@@ -6,12 +6,16 @@ set -eu
 [ "$(id -u)" -eq 0 ] || exit 2
 base=${1:?source directory}
 work=${2:?evidence directory}
+PATH="$base/build:$base:${PATH:-/sbin:/bin:/usr/sbin:/usr/bin}"; export PATH
 if ifconfig tun64 >/dev/null 2>&1 || jls -j tayga-clat-upstream >/dev/null 2>&1; then exit 2; fi
 mkdir -p "$work"
 TAYGA_NET_STATE=$work/network-state
 export TAYGA_NET_STATE
-old_gateway=$(route -n get -inet6 default | awk '$1=="gateway:" {print $2}')
-case "$old_gateway" in ''|*[!a-zA-Z0-9_.:%-]*) exit 2 ;; esac
+old_gateway=
+for _ in 1 2 3 4 5; do
+    old_gateway=$(route -n get -inet6 default 2>/dev/null | awk '$1=="gateway:" {print $2}')
+    case "$old_gateway" in ''|*[!a-zA-Z0-9_.:%-]*) sleep 1 ;; *) break ;; esac
+done
 epair=; config=; daemon=; server=; udp_server=; capture=; tun_capture=; changed_default=no; root_owned=no
 cleanup() {
     rc=$?
@@ -22,8 +26,10 @@ cleanup() {
     [ -z "$udp_server" ] || { kill "$udp_server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :; }
     if [ -n "$config" ]; then sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config" || rc=1; fi
     if [ "$changed_default" = yes ]; then
-        route delete -inet6 default || :
-        route add -inet6 default "$old_gateway" || rc=1
+        route delete -inet6 default 2>/dev/null || :
+        if [ -n "$old_gateway" ]; then
+            route add -inet6 default "$old_gateway" || rc=1
+        fi
     fi
     jail -r tayga-clat-upstream 2>/dev/null || :
     ndp -d 2001:db8:2::99 2>/dev/null || :
@@ -50,7 +56,9 @@ ifconfig "$peer" vnet tayga-clat-upstream
 ifconfig "$epair" inet6 2001:db8:2::2/64 -ifdisabled no_dad up
 jexec tayga-clat-upstream ifconfig "$peer" inet6 2001:db8:2::1/64 -ifdisabled no_dad up
 jexec tayga-clat-upstream ifconfig lo0 inet6 fd64:100::101:101/128 alias up
-route delete -inet6 default
+if [ -n "$old_gateway" ]; then
+    route delete -inet6 default 2>/dev/null || :
+fi
 changed_default=yes
 route add -inet6 default 2001:db8:2::1
 
@@ -69,6 +77,19 @@ dd if=/dev/zero of="$work/large" bs=4096 count=256 2>/dev/null
 
 cat > "$work/udp_server.py" <<'EOF'
 import socket, sys, select, struct
+
+def calc_udp_csum_v6(src_bytes, dst_bytes, udp_hdr_no_ck, payload):
+    length = len(udp_hdr_no_ck) + len(payload)
+    ph = src_bytes + dst_bytes + struct.pack("!II", length, 17)
+    full = ph + udp_hdr_no_ck + payload
+    if len(full) % 2 != 0:
+        full += b"\x00"
+    words = struct.unpack(f"!{len(full)//2}H", full)
+    total = sum(words)
+    while total > 0xffff:
+        total = (total & 0xffff) + (total >> 16)
+    cksum = (~total) & 0xffff
+    return 0xffff if cksum == 0 else cksum
 
 sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -94,20 +115,25 @@ while True:
         if data.startswith(b"PTB_TRIGGER_"):
             peer_ip, peer_port = addr[0], addr[1]
             reported_mtu = 1280
+            src_bytes = socket.inet_pton(socket.AF_INET6, peer_ip)
+            dst_bytes = socket.inet_pton(socket.AF_INET6, "fd64:100::101:101")
+            udp_len = len(data) + 8
+            udp_hdr_raw = struct.pack("!HHHH", peer_port, 18080, udp_len, 0)
+            cksum = calc_udp_csum_v6(src_bytes, dst_bytes, udp_hdr_raw, data)
+            udp_hdr = struct.pack("!HHHH", peer_port, 18080, udp_len, cksum)
             ip6_hdr = struct.pack("!IHBB16s16s",
                 0x60000000,
-                len(data) + 8,
+                udp_len,
                 17,
                 64,
-                socket.inet_pton(socket.AF_INET6, peer_ip),
-                socket.inet_pton(socket.AF_INET6, "fd64:100::101:101")
+                src_bytes,
+                dst_bytes
             )
-            udp_hdr = struct.pack("!HHHH", peer_port, 18080, len(data) + 8, 0)
             icmp6_pkt = struct.pack("!BBHI", 2, 0, 0, reported_mtu) + ip6_hdr + udp_hdr + data
             try:
                 raw_icmp6.sendto(icmp6_pkt, (peer_ip, 0))
                 with open(peer_log + ".ptb", "a") as f:
-                    f.write(f"SENT_PTB:{peer_ip}:{peer_port}:{reported_mtu}\n")
+                    f.write(f"SENT_PTB:{peer_ip}:{peer_port}:{reported_mtu}:ck={cksum:04x}\n")
             except Exception as e:
                 with open(peer_log + ".ptb", "a") as f:
                     f.write(f"ERROR_PTB:{e}\n")
@@ -139,8 +165,8 @@ for size in sizes:
         else:
             payload = token[:size]
         t0 = time.monotonic()
-        sock.sendto(payload, (target_ip, target_port))
         try:
+            sock.sendto(payload, (target_ip, target_port))
             resp, _ = sock.recvfrom(65535)
             if resp == payload:
                 success = True
@@ -148,8 +174,8 @@ for size in sizes:
                 break
             else:
                 print(f"UDP payload {size} bytes mismatch: got {len(resp)} bytes, expected {len(payload)}")
-        except socket.timeout:
-            print(f"UDP payload {size} bytes timeout on attempt {attempt}, retrying...")
+        except (socket.timeout, OSError) as e:
+            print(f"UDP payload {size} bytes error on attempt {attempt}: {e}, retrying...")
             time.sleep(0.2)
     if not success:
         print(f"UDP payload {size} bytes failed after 3 attempts!", file=sys.stderr)
@@ -180,45 +206,48 @@ cat > "$work/test_ptb.py" <<'EOF'
 import socket, struct, sys, time
 
 raw_icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-raw_icmp.settimeout(5.0)
+raw_icmp.settimeout(0.5)
 
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 udp_sock.bind(('0.0.0.0', 55555))
 
 probe_data = b"PTB_TRIGGER_PAYLOAD_TEST_1234567890"
-udp_sock.sendto(probe_data, ("1.1.1.1", 18080))
 
-t0 = time.monotonic()
 found = False
-while time.monotonic() - t0 < 5.0:
-    try:
-        pkt, _ = raw_icmp.recvfrom(65535)
-    except socket.timeout:
+for attempt in range(1, 4):
+    udp_sock.sendto(probe_data, ("1.1.1.1", 18080))
+    t_end = time.monotonic() + 1.5
+    while time.monotonic() < t_end:
+        try:
+            pkt, _ = raw_icmp.recvfrom(65535)
+        except socket.timeout:
+            continue
+        ihl = (pkt[0] & 0x0f) * 4
+        if len(pkt) < ihl + 8:
+            continue
+        icmp_type = pkt[ihl]
+        icmp_code = pkt[ihl + 1]
+        if icmp_type == 3 and icmp_code == 4:
+            next_hop_mtu = (pkt[ihl + 6] << 8) | pkt[ihl + 7]
+            quoted = pkt[ihl + 8:]
+            if len(quoted) >= 28:
+                q_src = socket.inet_ntoa(quoted[12:16])
+                q_dst = socket.inet_ntoa(quoted[16:20])
+                q_proto = quoted[9]
+                q_ihl = (quoted[0] & 0x0f) * 4
+                if len(quoted) >= q_ihl + 4:
+                    q_sport = (quoted[q_ihl] << 8) | quoted[q_ihl + 1]
+                    q_dport = (quoted[q_ihl + 2] << 8) | quoted[q_ihl + 3]
+                    if q_proto == 17 and q_sport == 55555 and q_dport == 18080:
+                        print(f"ICMPv4 Frag-Needed received: MTU={next_hop_mtu}, quoted {q_src}:{q_sport} -> {q_dst}:{q_dport} (attempt {attempt})")
+                        if next_hop_mtu == 1260:
+                            found = True
+                            break
+                        else:
+                            print(f"MTU mismatch: got {next_hop_mtu}, expected 1260", file=sys.stderr)
+                            sys.exit(1)
+    if found:
         break
-    ihl = (pkt[0] & 0x0f) * 4
-    if len(pkt) < ihl + 8:
-        continue
-    icmp_type = pkt[ihl]
-    icmp_code = pkt[ihl + 1]
-    if icmp_type == 3 and icmp_code == 4:
-        next_hop_mtu = (pkt[ihl + 6] << 8) | pkt[ihl + 7]
-        quoted = pkt[ihl + 8:]
-        if len(quoted) >= 28:
-            q_src = socket.inet_ntoa(quoted[12:16])
-            q_dst = socket.inet_ntoa(quoted[16:20])
-            q_proto = quoted[9]
-            q_ihl = (quoted[0] & 0x0f) * 4
-            if len(quoted) >= q_ihl + 4:
-                q_sport = (quoted[q_ihl] << 8) | quoted[q_ihl + 1]
-                q_dport = (quoted[q_ihl + 2] << 8) | quoted[q_ihl + 3]
-                if q_proto == 17 and q_sport == 55555 and q_dport == 18080:
-                    print(f"ICMPv4 Frag-Needed received: MTU={next_hop_mtu}, quoted {q_src}:{q_sport} -> {q_dst}:{q_dport}")
-                    if next_hop_mtu == 1260:
-                        found = True
-                        break
-                    else:
-                        print(f"MTU mismatch: got {next_hop_mtu}, expected 1260", file=sys.stderr)
-                        sys.exit(1)
 
 if not found:
     print("Did not receive translated ICMPv4 Frag-Needed for PTB trigger!", file=sys.stderr)
@@ -258,33 +287,42 @@ for mode in nat66 proxy-ndp; do
     for cycle in 1 2; do
         echo "=== Mode: $mode, Cycle: $cycle ==="
         capture=; tun_capture=
-        if [ "$cycle" -eq 1 ]; then
-            tcpdump -ni "$epair" -U -w "$work/$mode.pcap" > "$work/$mode.capture.log" 2>&1 &
-            capture=$!
-        fi
+        tcpdump -ni "$epair" -U -w "$work/$mode.c$cycle.pcap" > "$work/$mode.capture.c$cycle.log" 2>&1 &
+        capture=$!
 
         sh "$base/packaging/installer/tayga-net-ctl.sh" up "$config"
 
-        if [ "$cycle" -eq 1 ]; then
-            tcpdump -ni tun64 -U -w "$work/$mode.tun.pcap" > "$work/$mode.tun-capture.log" 2>&1 &
-            tun_capture=$!
-        fi
+        tcpdump -ni tun64 -U -w "$work/$mode.tun.c$cycle.pcap" > "$work/$mode.tun-capture.c$cycle.log" 2>&1 &
+        tun_capture=$!
 
         mkdir -p "$work/runtime-$mode-c$cycle"
         tayga --config "$config" --runtime-dir "$work/runtime-$mode-c$cycle" --nodetach > "$work/$mode.daemon.c$cycle.log" 2>&1 &
         daemon=$!
 
-        jexec tayga-clat-upstream python3 -m http.server 80 --bind fd64:100::101:101 --directory "$work" > "$work/$mode.http.c$cycle.log" 2>&1 &
+        jexec tayga-clat-upstream python3 -u -m http.server 80 --bind fd64:100::101:101 --directory "$work" > "$work/$mode.http.c$cycle.log" 2>&1 &
         server=$!
 
-        jexec tayga-clat-upstream python3 "$work/udp_server.py" "$work/$mode.udp-ready.c$cycle" "$work/$mode.udp-peers.c$cycle.log" > "$work/$mode.udp-server.c$cycle.log" 2>&1 &
+        jexec tayga-clat-upstream python3 -u "$work/udp_server.py" "$work/$mode.udp-ready.c$cycle" "$work/$mode.udp-peers.c$cycle.log" > "$work/$mode.udp-server.c$cycle.log" 2>&1 &
         udp_server=$!
+        sleep 1
 
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             if [ -f "$work/$mode.udp-ready.c$cycle" ] && curl -4 -fsS --noproxy '*' --connect-timeout 2 --max-time 4 http://1.1.1.1/proof > "$work/$mode.result.c$cycle"; then break; fi
             sleep 1
         done
-        grep -Fx 'freebsd-translated-proof' "$work/$mode.result.c$cycle"
+        if ! grep -Fx 'freebsd-translated-proof' "$work/$mode.result.c$cycle" 2>/dev/null; then
+            echo "DIAGNOSTICS for failed curl in cycle $cycle:" >&2
+            curl -4 -v --noproxy '*' --connect-timeout 2 --max-time 4 http://1.1.1.1/proof >&2 || :
+            ifconfig >&2
+            netstat -rn -f inet >&2
+            netstat -rn -f inet6 >&2
+            pfctl -sr >&2
+            pfctl -sn >&2
+            pfctl -a 'tayga_sfx/tun64' -sr >&2
+            pfctl -a 'tayga_sfx/tun64' -sn >&2
+            jexec tayga-clat-upstream sockstat -4 -6 >&2 || :
+            exit 1
+        fi
 
         # UDP Echo verification: 1, 7, 32, 511, 1200 byte payloads with token validation
         expected_peer=$clat6
@@ -313,6 +351,7 @@ for mode in nat66 proxy-ndp; do
 
         kill "$daemon" "$server" "$udp_server"
         wait "$daemon" 2>/dev/null || :; wait "$server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :
+        jexec tayga-clat-upstream pkill -f python3 2>/dev/null || :
         daemon=; server=; udp_server=
 
         if [ -n "$capture" ]; then

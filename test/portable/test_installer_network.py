@@ -372,7 +372,7 @@ esac''',
         result = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         down_log = self.log.read_text()
-        self.assertIn('route del -net 0.0.0.0/1', down_log)
+        self.assertIn('route delete -net 0.0.0.0/1', down_log)
         self.assertIn('pfctl -a tayga_sfx/tun64 -F rules', down_log)
         self.assertIn('ifconfig tun64 destroy', down_log)
 

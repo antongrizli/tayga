@@ -196,11 +196,11 @@ add_route() {
         case "$family" in
             -4)
                 route add -net "$destination" "$@"
-                printf 'route del -net %s >/dev/null 2>&1 || :\n' "$destination" >> "$journal"
+                printf 'route delete -net %s >/dev/null 2>&1 || :\n' "$destination" >> "$journal"
                 ;;
             -6)
                 route add -inet6 "$destination" "$@"
-                printf 'route del -inet6 %s >/dev/null 2>&1 || :\n' "$destination" >> "$journal"
+                printf 'route delete -inet6 %s >/dev/null 2>&1 || :\n' "$destination" >> "$journal"
                 ;;
         esac
     else
@@ -361,6 +361,25 @@ fw_pf() {
     } > "$lock/rules.pf"
     pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf" || fail "Failed to load pf rules for anchor tayga_sfx/$dev"
     printf 'pfctl -a tayga_sfx/%s -F rules >/dev/null 2>&1 && pfctl -a tayga_sfx/%s -F nat >/dev/null 2>&1 || :\n' "$dev" "$dev" >> "$journal"
+    case "$mode" in
+        nat64)
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pool" >> "$journal"
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pref64" >> "$journal"
+            ;;
+        siit)
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pool" >> "$journal"
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$map6" >> "$journal"
+            ;;
+        clat)
+            printf 'pfctl -k 192.0.0.1 >/dev/null 2>&1 || :\n' >> "$journal"
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$clat6" >> "$journal"
+            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$addr6" >> "$journal"
+            if [ "$address_mode" = nat66 ]; then
+                printf 'pfctl -k %s -k %s >/dev/null 2>&1 || :\n' "$nat66_address" "$pref64" >> "$journal"
+                printf 'pfctl -k %s -k %s >/dev/null 2>&1 || :\n' "$pref64" "$nat66_address" >> "$journal"
+            fi
+            ;;
+    esac
     rm -f "$lock/rules.pf"
 }
 case "$mode" in

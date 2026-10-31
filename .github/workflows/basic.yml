@@ -342,7 +342,7 @@ jobs:
           release: "15.0"
           arch: ${{ matrix.vm_arch }}
           prepare: |
-            pkg install -y gmake llvm git python3 setsid
+            pkg install -y gmake llvm git python3 setsid curl
             kldload pf || true
           run: |
             gmake clean && gmake CFLAGS="-Werror -Wall -O2"
@@ -360,6 +360,9 @@ jobs:
             grep -q '^# installer-firewall pf$' "$task_installer_dir/clat.conf"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-binary-smoke.sh "$task_installer_dir/installer.sh"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-smoke.sh "$task_installer_dir/installer.sh"
+            TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-pf-ownership.sh \
+              packaging/installer/tayga-net-ctl.sh "$task_installer_dir/clat.conf" "$task_installer_dir/evidence-ownership"
+            TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-ipv6-smoke.sh "$PWD" "$task_installer_dir/evidence-ipv6"
             rm -rf "$task_installer_dir"
       - uses: actions/upload-artifact@v7
         with:

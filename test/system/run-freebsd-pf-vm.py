@@ -55,7 +55,7 @@ def main():
                 (command -v curl >/dev/null || sudo pkg install -y curl) &&
                 (command -v python3 >/dev/null || sudo pkg install -y python3) &&
                 gmake -j2 tayga &&
-                sudo env TAYGA_ISOLATED_TEST=yes PATH="/var/tmp/tayga-pf-source:$PATH" \
+                sudo env TAYGA_ISOLATED_TEST=yes PATH="/var/tmp/tayga-pf-source/build:/var/tmp/tayga-pf-source:$PATH" \
                     sh test/system/installer-freebsd-ipv6-smoke.sh \
                     /var/tmp/tayga-pf-source /var/tmp/tayga-ipv6-gate-evidence'''
         run(args.gate, ['limactl', 'shell', args.vm, 'sh', '-ec', command])
