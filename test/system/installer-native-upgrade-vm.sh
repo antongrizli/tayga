@@ -29,7 +29,11 @@ active() {
 }
 ready() {
     if [ "$profile_state" = active ]; then active; else
-        if systemctl is-active --quiet tayga-managed@siit; then return 1; fi
+        if [ "$kind" = apk ]; then
+            if rc-service tayga-managed status >/dev/null 2>&1; then return 1; fi
+        else
+            if systemctl is-active --quiet tayga-managed@siit; then return 1; fi
+        fi
         if [ "$profile_state" = unconfigured ]; then [ ! -e "$state/current" ]; fi
     fi
 }
@@ -38,8 +42,8 @@ case "$phase" in
         [ ! -e "$fixture" ] || exit 2
         [ ! -e "$state/current" ] || exit 2
         mkdir -p "$fixture"
-        if [ "$kind" = rpm ]; then
-            # Fedora's cloud image has no IPv6 default route. Supply an owned,
+        if [ "$kind" = rpm ] || [ "$kind" = deb ]; then
+            # Cloud images often have no IPv6 default route. Supply an owned,
             # boot-persistent native endpoint route for SIIT route readiness.
             ip_bin=$(command -v ip)
             cat > /etc/systemd/system/tayga-native-testnet.service <<EOF
@@ -58,6 +62,26 @@ EOF
             printf '[Unit]\nRequires=tayga-native-testnet.service\nAfter=tayga-native-testnet.service\n' > /etc/systemd/system/tayga-managed@siit.service.d/native-testnet.conf
             systemctl daemon-reload
             systemctl start tayga-native-testnet.service
+        elif [ "$kind" = apk ]; then
+            ip_bin=$(command -v ip)
+            cat > /etc/init.d/tayga-native-testnet <<EOF
+#!/sbin/openrc-run
+description="Disposable TAYGA native upgrade fixture network"
+depend() {
+    before tayga-managed
+}
+start() {
+    $ip_bin link add tnative type dummy 2>/dev/null || :
+    $ip_bin link set tnative up
+    $ip_bin -6 addr add fd64:200::2/64 dev tnative 2>/dev/null || :
+}
+stop() {
+    $ip_bin link delete tnative 2>/dev/null || :
+}
+EOF
+            chmod 755 /etc/init.d/tayga-native-testnet
+            rc-update add tayga-native-testnet default 2>/dev/null || :
+            rc-service tayga-native-testnet start
         fi
         if [ "$kind" = apk ]; then apk add --allow-untrusted "$baseline";
         elif [ "$kind" = rpm ]; then dnf install -y "$baseline";
@@ -69,7 +93,12 @@ EOF
         tayga-ctl apply "$fixture/siit.conf"
         active
             if [ "$profile_state" = stopped ]; then
-                systemctl disable --now tayga-managed@siit
+                if [ "$kind" = apk ]; then
+                    rc-service tayga-managed stop
+                    rc-update del tayga-managed default 2>/dev/null || :
+                else
+                    systemctl disable --now tayga-managed@siit
+                fi
             fi
         fi
         ready
@@ -156,10 +185,14 @@ EOF
         elif [ "$kind" = rpm ]; then rpm -e tayga-managed;
         else dpkg --remove tayga-managed; fi
         rm -f /var/lib/tayga/.native-upgrade-proof /var/lib/tayga/native-upgrade-target-only
-        if [ "$kind" = rpm ]; then
+        if [ "$kind" = rpm ] || [ "$kind" = deb ]; then
             systemctl stop tayga-native-testnet.service
             rm -f /etc/systemd/system/tayga-native-testnet.service /etc/systemd/system/tayga-managed@siit.service.d/native-testnet.conf
             systemctl daemon-reload
+        elif [ "$kind" = apk ]; then
+            rc-service tayga-native-testnet stop 2>/dev/null || :
+            rc-update del tayga-native-testnet default 2>/dev/null || :
+            rm -f /etc/init.d/tayga-native-testnet /etc/init.d/tayga-recovery /etc/conf.d/tayga-managed /etc/init.d/tayga-managed
         fi
         rm -rf "$fixture"
         ;;

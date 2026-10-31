@@ -42,6 +42,7 @@ ip -6 route add fd64:200::1/128 via fd64:201::2 dev twserver
 printf 'translated-native-wire-proof\n' > "$work/proof"
 ip netns exec tayga-wire-server python3 -m http.server 18080 --bind fd64:200::1 --directory "$work" > "$work/server.log" 2>&1 &
 server=$!
+sleep 1
 ip netns exec tayga-wire-client ping -c 2 -W 3 198.18.10.1
 for _ in $(seq 1 10); do
     if ip netns exec tayga-wire-client curl -fsS --noproxy '*' --connect-timeout 2 --max-time 4 http://198.18.10.1:18080/proof > "$work/result"; then break; fi
