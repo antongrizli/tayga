@@ -12,7 +12,7 @@ from release_artifacts import ARCHES, PROFILES, run, sha256
 from release_metadata import normalize_tag
 
 
-def verify_production_preflight(directory, allow_unsigned=False):
+def verify_production_preflight(directory, manifest, allow_unsigned=False):
     sha_file = directory / 'SHA256SUMS'
     sig_file = directory / 'SHA256SUMS.minisig'
     pubkey = os.environ.get('MINISIGN_PUBKEY')
@@ -46,6 +46,7 @@ def verify_production_preflight(directory, allow_unsigned=False):
         raise ValueError('Production publication requires a verified Minisign signature')
 
     # Verify integrity of all release artifacts listed in SHA256SUMS
+    listed_files = {}
     for line in sha_file.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
@@ -59,6 +60,30 @@ def verify_production_preflight(directory, allow_unsigned=False):
             raise ValueError(f'Release artifact missing: {name}')
         if sha256(target_path) != expected_sha:
             raise ValueError(f'Release artifact checksum mismatch: {name}')
+        listed_files[name] = expected_sha
+
+    # Mandatory signed manifest and complete archive bundle validation
+    if 'release-manifest.json' not in listed_files:
+        raise ValueError('release-manifest.json must be included in signed SHA256SUMS')
+
+    if not isinstance(manifest, dict) or 'architectures' not in manifest:
+        raise ValueError('release-manifest.json has invalid structure')
+
+    for arch in ARCHES:
+        if arch not in manifest['architectures']:
+            raise ValueError(f'manifest missing required architecture: {arch}')
+        evidence = manifest['architectures'][arch]
+        if 'images' not in evidence:
+            raise ValueError(f'manifest missing images for architecture: {arch}')
+        for profile in PROFILES:
+            if profile not in evidence['images']:
+                raise ValueError(f'manifest missing image profile {profile} for {arch}')
+            image = evidence['images'][profile]
+            archive = image.get('archive')
+            if not archive:
+                raise ValueError(f'manifest image {profile} for {arch} has no archive')
+            if archive not in listed_files:
+                raise ValueError(f'Required release archive {archive} must be included in signed SHA256SUMS')
 
 
 def publish(directory, allow_unsigned=False):
@@ -76,7 +101,7 @@ def publish(directory, allow_unsigned=False):
         raise ValueError('publication source mismatch')
 
     # Production preflight: verify SHA256SUMS, minisig signature and artifact checksums BEFORE touching docker or registry
-    verify_production_preflight(directory, allow_unsigned=allow_unsigned)
+    verify_production_preflight(directory, manifest, allow_unsigned=allow_unsigned)
     # All archive hashes and IDs must pass before the first registry write.
     for arch in ARCHES:
         evidence = manifest['architectures'][arch]

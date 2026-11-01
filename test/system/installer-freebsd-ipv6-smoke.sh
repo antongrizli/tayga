@@ -38,6 +38,7 @@ foreign_ndp_owned=no
 foreign_alias_owned=no
 foreign_rules_owned=no
 config_active=no
+config_attempted=no
 
 cleanup() {
     rc=$?
@@ -61,7 +62,7 @@ cleanup() {
     [ -z "$capture" ] || { kill "$capture" 2>/dev/null || :; wait "$capture" 2>/dev/null || :; }
     [ -z "$server" ] || { kill "$server" 2>/dev/null || :; wait "$server" 2>/dev/null || :; }
     [ -z "$udp_server" ] || { kill "$udp_server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :; }
-    if [ "$config_active" = yes ] && [ -n "$config" ]; then sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config" || rc=1; fi
+    if [ "$config_attempted" = yes ] && [ -n "$config" ]; then sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config" || rc=1; fi
     if [ "$changed_default" = yes ]; then
         route delete -inet6 default 2>/dev/null || :
         if [ -n "$old_gateway" ]; then
@@ -370,6 +371,45 @@ except OSError as e:
         raise
 EOF
 
+# Fault test: Verify that an unsuccessful/aborted 'up' triggers down cleanup via config_attempted
+echo "=== Fault test: unsuccessful up cleanup ==="
+fault_conf="$work/fault.conf"
+cat > "$fault_conf" <<EOF
+tun-device tun64
+ipv4-addr 192.168.5.1
+prefix fd64:100::/96
+# installer-mode siit
+# installer-firewall pf
+EOF
+fault_rc=0
+(
+    f_config="$fault_conf"
+    f_attempted=no
+    f_cleanup() {
+        if [ "$f_attempted" = yes ] && [ -n "$f_config" ]; then
+            sh "$base/packaging/installer/tayga-net-ctl.sh" down "$f_config" >/dev/null 2>&1 || :
+        fi
+    }
+    trap f_cleanup EXIT
+
+    f_attempted=yes
+    # Create tun64 and record an undo entry to simulate partial activation before an abort/failure
+    ifconfig tun64 create >/dev/null 2>&1
+    f_dev=tun64
+    f_state="${TAYGA_NET_STATE:-/var/run/tayga}"
+    mkdir -p "$f_state"
+    printf 'ifconfig %s destroy\n' "$f_dev" > "$f_state/$f_dev.undo"
+    # Exit with failure before reaching f_active=yes
+    exit 42
+) || fault_rc=$?
+
+[ "$fault_rc" -eq 42 ] || { echo "Fault subshell did not exit with expected code 42 (got $fault_rc)" >&2; exit 1; }
+if ifconfig tun64 >/dev/null 2>&1; then
+    echo "FAIL: tun64 leaked after unsuccessful up cleanup!" >&2
+    exit 1
+fi
+echo "PASS: Unsuccessful up cleanup verified"
+
 for mode in nat66 proxy-ndp; do
     clat6=2001:db8:2::464; daemon6=2001:db8:2::465; external=
     if [ "$mode" = nat66 ]; then clat6=fd64:2::464; daemon6=fd64:2::465; external=2001:db8:2::2; fi
@@ -385,6 +425,7 @@ for mode in nat66 proxy-ndp; do
         tcpdump -ni "$epair" -U -w "$work/$mode.c$cycle.pcap" > "$work/$mode.capture.c$cycle.log" 2>&1 &
         capture=$!
 
+        config_attempted=yes
         sh "$base/packaging/installer/tayga-net-ctl.sh" up "$config"
         config_active=yes
 
@@ -478,6 +519,7 @@ for mode in nat66 proxy-ndp; do
 
         sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config"
         config_active=no
+        config_attempted=no
 
         if [ "$cycle" -eq 1 ]; then
             # Signal foreign flow that TAYGA is down; it must successfully exchange post-down traffic over same connection

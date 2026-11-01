@@ -538,6 +538,82 @@ class ReleasePublicationPreflightTests(unittest.TestCase):
                 publisher.publish(self.directory)
         self.assertFalse(any(is_registry_write(c) for c in docker_calls))
 
+    def test_sha256sums_omitting_release_manifest_fails_closed_before_registry_writes(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        artifacts.checksums(self.directory)
+        sha_file = self.directory / 'SHA256SUMS'
+        # Omit release-manifest.json from SHA256SUMS
+        filtered_lines = [l for l in sha_file.read_text().splitlines() if 'release-manifest.json' not in l]
+        sha_file.write_text('\n'.join(filtered_lines) + '\n')
+        sig_file = self.directory / 'SHA256SUMS.minisig'
+        subprocess.run(['minisign', '-S', '-s', str(key_file), '-m', str(sha_file),
+                        '-x', str(sig_file), '-t', 'TAYGA Release Verification'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, 'release-manifest.json must be included in signed SHA256SUMS'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_tampered_release_manifest_fails_closed_before_registry_writes(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        self.sign_directory(key_file)
+
+        # Tamper with release-manifest.json after signing
+        manifest_data = json.loads((self.directory / 'release-manifest.json').read_text())
+        manifest_data['tampered_comment'] = 'attacker_added'
+        (self.directory / 'release-manifest.json').write_text(json.dumps(manifest_data, indent=2))
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, 'Release artifact checksum mismatch: release-manifest.json'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_sha256sums_omitting_required_archive_fails_closed_before_registry_writes(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        artifacts.checksums(self.directory)
+        sha_file = self.directory / 'SHA256SUMS'
+        target_name = artifacts.archive_name('production', 'armv7')
+        # Omit target_name from SHA256SUMS
+        filtered_lines = [l for l in sha_file.read_text().splitlines() if target_name not in l]
+        sha_file.write_text('\n'.join(filtered_lines) + '\n')
+        sig_file = self.directory / 'SHA256SUMS.minisig'
+        subprocess.run(['minisign', '-S', '-s', str(key_file), '-m', str(sha_file),
+                        '-x', str(sig_file), '-t', 'TAYGA Release Verification'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, f'Required release archive {target_name} must be included in signed SHA256SUMS'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
     def test_real_minisign_roundtrip_production_publication_succeeds(self):
         key_file, _, pubkey = self.create_keypair('signer')
         self.sign_directory(key_file)
