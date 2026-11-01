@@ -447,10 +447,19 @@ hooks are described below.
 | `x86_64` / `amd64` | Verified (CI multiarch) | Verified (CI amd64) | Verified (Linux & FreeBSD) | Verified (Release assembly) | - |
 | `aarch64` / `arm64` | Verified (CI multiarch) | Verified (CI arm64) | Verified (Linux & FreeBSD) | Verified (CI container & Release) | Verified (`armsr/armv8` IPK/APK) |
 | `armv7` (32-bit HF) | Verified (CI multiarch) | - | Verified (Linux) | Verified (Release assembly) | - |
-| `armv6` (32-bit) | Verified (CI multiarch) | - | - | - | - |
-| `riscv64` | Verified (CI multiarch) | - | - | - | - |
-| `ppc64le` | Verified (CI multiarch) | - | - | - | - |
-| `s390x` | Verified (CI multiarch) | - | - | - | - |
+| `armv6` (32-bit) | Verified (CI multiarch) | - | Release-required (Linux) | Release-required | - |
+| `riscv64` | Verified (CI multiarch) | - | Release-required (Linux) | Release-required | - |
+| `ppc64le` | Verified (CI multiarch) | - | Release-required (Linux) | Release-required | - |
+| `s390x` | Verified (CI multiarch) | - | Release-required (Linux) | Release-required | - |
+
+The [release platform contract](packaging/release-platforms.json) requires Linux
+binaries, platform/universal shell installers and DEB/RPM/Alpine APK archives for
+all seven Linux architectures, plus FreeBSD amd64/arm64 binaries/installers and
+both OpenWrt IPK/APK3 package sets. `Release-required` describes configured
+mandatory outputs; it does not claim final CI or runtime acceptance on those
+architectures. Container publication remains limited to amd64/arm64/armv7.
+See [release inventory and acceptance](docs/dev/release-platforms.md) for gates
+and evidence limits. Each final candidate must pass its exact-source checks.
 
 Native package builds use `scripts/build-native-packages.py` with nFPM 2.48.0.
 Supply verified static Linux binaries (musl static inputs are used in the tests):

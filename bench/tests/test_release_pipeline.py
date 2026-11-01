@@ -11,10 +11,32 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'bench/tests'))
+from test_package_metadata import package_bytes
 sys.path.insert(0, str(ROOT / 'scripts/ci'))
 metadata = importlib.import_module('release_metadata')
 artifacts = importlib.import_module('release_artifacts')
 publisher = importlib.import_module('release_publish')
+
+
+def openwrt_candidates(inputs, source):
+    from release_platforms import CONTRACT
+    from openwrt_release import ROLES
+    for spec in CONTRACT['openwrt']:
+        directory = inputs / f'candidate-openwrt-{spec["release"]}'
+        directory.mkdir()
+        packages = {}
+        for role in ROLES:
+            name = f'openwrt-{spec["release"]}-armsr-armv8-{role}.{spec["format"]}'
+            from test_openwrt_release import ipk_bytes
+            (directory / name).write_bytes(ipk_bytes(role, source['version']) if spec['format'] == 'ipk' else b'ADBdpackage-fixture')
+            package_name = 'tayga-managed-openwrt' + {'base': '', 'upgrader': '-upgrade'}.get(role, '-' + role)
+            packages[role] = {'name': name, 'sha256': artifacts.sha256(directory / name),
+                              'identity': [package_name, source['version'] + '-r1', 'aarch64_generic']}
+        (directory / 'manifest.json').write_text(json.dumps(
+            {'source': source, 'platform': spec, 'packages': packages,
+             'sdk_source': {'version': source['version'], 'target': 'armsr',
+                            'subtarget': 'armv8', 'architecture': 'aarch64_generic'}}))
 
 
 class ReleaseSourceTests(unittest.TestCase):
@@ -60,6 +82,56 @@ class ReleaseSourceTests(unittest.TestCase):
                 metadata.resolve(root, 'v9.9.9', 'Owner/Repo')
 
 
+class CandidateSourceTests(unittest.TestCase):
+    def test_candidate_resolves_committed_version_without_creating_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return metadata.git(root, *args)
+            git('init', '-q'); git('config', 'user.name', 'Candidate Test')
+            git('config', 'user.email', 'test@example.invalid')
+            (root / 'VERSION').write_text('0.9.14\n')
+            git('add', '.'); git('commit', '-qm', 'candidate source')
+            first = git('rev-parse', 'HEAD')
+            (root / 'VERSION').write_text('0.9.15\n')
+            git('add', '.'); git('commit', '-qm', 'later source')
+            result = metadata.resolve_candidate(root, first, 'Owner/Repo')
+            self.assertEqual(result['sha'], first)
+            self.assertEqual(result['version'], '0.9.14')
+            self.assertTrue(result['candidate_only'])
+            self.assertEqual(result['repository'], 'owner/repo')
+            self.assertEqual(git('tag', '--list'), '')
+            self.assertEqual((root / 'VERSION').read_text(), '0.9.15\n')
+            for invalid in ('main', 'HEAD', first[:12], first.upper(), '--help'):
+                with self.subTest(ref=invalid), self.assertRaises(ValueError):
+                    metadata.resolve_candidate(root, invalid, 'owner/repo')
+
+
+    def test_candidate_mode_does_not_relax_production_release_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return metadata.git(root, *args)
+            git('init', '-q'); git('config', 'user.name', 'Candidate Test')
+            git('config', 'user.email', 'test@example.invalid')
+            (root / 'VERSION').write_text('0.9.14\n')
+            (root / 'CHANGELOG.md').write_text('# Unreleased draft\n')
+            git('add', '.'); git('commit', '-qm', 'unprepared source')
+            sha = git('rev-parse', 'HEAD'); git('tag', 'v0.9.14')
+            self.assertTrue(metadata.resolve_candidate(root, sha, 'owner/repo')['candidate_only'])
+            with self.assertRaisesRegex(ValueError, 'dated, nonempty notes'):
+                metadata.resolve(root, 'v0.9.14', 'owner/repo')
+
+    def test_candidate_override_is_rejected_for_tag_push(self):
+        import contextlib
+        import io
+        with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'push', 'CANDIDATE_ONLY': 'true'}), \
+                patch.object(sys, 'argv', ['metadata']), patch.object(metadata, 'git') as execute:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                metadata.main()
+            execute.assert_not_called()
+
+
 class ReleaseArtifactsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -69,11 +141,13 @@ class ReleaseArtifactsTests(unittest.TestCase):
                        'repository': 'owner/repo', 'prerelease': False}
         self.inputs = self.root / 'inputs'
         self.inputs.mkdir()
+        openwrt_candidates(self.inputs, self.source)
         self.manifests = {}
         for arch in artifacts.ARCHES:
             directory = self.inputs / f'candidate-{arch}'
             directory.mkdir()
-            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES] + [
+            profiles = artifacts.PROFILES if arch in artifacts.CONTAINER_ARCHES else ()
+            names = [artifacts.archive_name(p, arch) for p in profiles] + [
                 f'tayga-linux-{arch}', f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt']
             for name in names:
                 (directory / name).write_text(name)
@@ -81,7 +155,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
                         'files': {n: artifacts.sha256(directory / n) for n in names},
                         'images': {p: {'archive': artifacts.archive_name(p, arch),
                                       'reference': f'tayga-release-{p}:{arch}',
-                                      'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+                                      'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in profiles}}
             self.manifests[arch] = manifest
             (directory / 'manifest.json').write_text(json.dumps(manifest))
         for arch in artifacts.FREEBSD_ARCHES:
@@ -94,6 +168,24 @@ class ReleaseArtifactsTests(unittest.TestCase):
                         'platform': f'freebsd-{arch}', 'smoke': 'pass',
                         'files': {n: artifacts.sha256(directory / n) for n in names}}
             (directory / 'manifest.json').write_text(json.dumps(manifest))
+
+    def test_binary_only_candidate_has_no_container_payload(self):
+        for arch in set(artifacts.ARCHES) - set(artifacts.CONTAINER_ARCHES):
+            directory = self.inputs / f'candidate-{arch}'
+            manifest = artifacts.verify(directory, arch, self.source)
+            self.assertEqual(manifest['images'], {})
+            binary = directory / f'tayga-linux-{arch}'
+            binary.unlink()
+            with self.assertRaises(FileNotFoundError):
+                artifacts.verify(directory, arch, self.source)
+
+    def test_binary_only_candidate_rejects_unexpected_image(self):
+        directory = self.inputs / 'candidate-riscv64'
+        manifest = json.loads((directory / 'manifest.json').read_text())
+        manifest['images']['production'] = {}
+        (directory / 'manifest.json').write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'incomplete artifact set'):
+            artifacts.verify(directory, 'riscv64', self.source)
 
     def test_missing_corrupt_or_mixed_artifacts_rejected(self):
         directory = self.inputs / 'candidate-arm64'
@@ -128,9 +220,9 @@ class ReleaseArtifactsTests(unittest.TestCase):
             deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
             rpm_pkg = native_dir / f'tayga-managed-1.2.3-1.{arch}.rpm'
             apk_pkg = native_dir / f'tayga-managed-1.2.3-r1-{arch}.apk'
-            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
-            rpm_pkg.write_bytes(b'\xed\xab\xee\xdb' + b'\x00' * 20)
-            apk_pkg.write_bytes(b'\x1f\x8b' + b'\x00' * 20)
+            deb_pkg.write_bytes(package_bytes('deb', arch))
+            rpm_pkg.write_bytes(package_bytes('rpm', arch))
+            apk_pkg.write_bytes(package_bytes('apk', arch))
             artifacts_map = {
                 deb_pkg.name: artifacts.sha256(deb_pkg),
                 rpm_pkg.name: artifacts.sha256(rpm_pkg),
@@ -165,6 +257,56 @@ class ReleaseArtifactsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             artifacts.assemble(self.root, self.inputs, output, self.source)
 
+        if not shutil.which('minisign'):
+            self.skipTest('minisign required for signed assembly roundtrip')
+        key = self.root / 'bundle.key'; public = self.root / 'bundle.pub'
+        subprocess.run(['minisign', '-G', '-W', '-s', str(key), '-p', str(public)],
+                       check=True, capture_output=True)
+        environment = {**os.environ, 'MINISIGN_KEY_FILE': str(key),
+                       'MINISIGN_PUBKEY_FILE': str(public), 'MINISIGN_PASSWORD': '',
+                       'RELEASE_SHA': self.source['sha']}
+        with patch.dict(os.environ, environment):
+            artifacts.sign_manifest(output, require_signature=True)
+        command = [sys.executable, str(ROOT / 'scripts/ci/release_publish.py'), str(output), '--verify-only']
+        # A real subprocess exercises the public CLI; Docker must never be needed.
+        subprocess.run(command, env=environment, check=True, capture_output=True)
+        signed_manifest = json.loads((output / 'release-manifest.json').read_text())
+        expected = publisher.required_signed_assets(signed_manifest) | {'SHA256SUMS', 'SHA256SUMS.minisig'}
+        self.assertEqual({path.name for path in output.iterdir()}, expected)
+        self.assertEqual(signed_manifest['platform_contract'], importlib.import_module('release_platforms').CONTRACT)
+        targets = ['tayga-installer-linux-armv6.sh', 'pref64-discover-freebsd-arm64',
+                   'tayga-managed-1.2.3-r1-s390x.apk']
+        bundle = json.loads((output / 'release-manifest.json').read_text())
+        targets.append(bundle['openwrt']['25.12.6']['packages']['network']['name'])
+        for name in targets:
+            with self.subTest(missing_signed_asset=name):
+                path = output / name; original = path.read_bytes(); path.unlink()
+                result = subprocess.run(command, env=environment, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                path.write_bytes(original)
+        # The same real assembler supports unprepared candidate notes and
+        # preserves an unpublishable marker through signing and verification.
+        candidate_source = {**self.source, 'candidate_only': True}
+        for arch in artifacts.ARCHES:
+            path = self.inputs / f'candidate-{arch}' / 'manifest.json'
+            data = json.loads(path.read_text()); data['source'] = candidate_source
+            path.write_text(json.dumps(data))
+        (self.root / 'CHANGELOG.md').write_text('# Draft notes only\n')
+        candidate_output = self.root / 'candidate-assets'
+        with patch.dict(os.environ, environment):
+            artifacts.assemble(self.root, self.inputs, candidate_output, candidate_source, require_signature=True)
+        candidate_command = [sys.executable, str(ROOT / 'scripts/ci/release_publish.py'), str(candidate_output), '--verify-only']
+        subprocess.run(candidate_command, env=environment, check=True, capture_output=True)
+        self.assertIn('Unpublished CI candidate', (candidate_output / 'release-notes.md').read_text())
+        with patch.object(publisher.subprocess, 'run') as external:
+            with self.assertRaisesRegex(ValueError, 'must never be published'):
+                publisher.publish(candidate_output, allow_unsigned=True)
+            external.assert_not_called()
+        # Unsigned environment overrides cannot weaken verify-only mode.
+        (output / 'SHA256SUMS.minisig').unlink()
+        result = subprocess.run(command, env={**environment, 'ALLOW_UNSIGNED_RELEASE': '1'}, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_assemble_requires_candidate_native_and_complete_packages(self):
         root_dir = self.root / 'test_assembly_req'
         root_dir.mkdir()
@@ -183,10 +325,11 @@ class ReleaseArtifactsTests(unittest.TestCase):
 
         inputs_dir = self.root / 'inputs_test_req'
         inputs_dir.mkdir()
+        openwrt_candidates(inputs_dir, self.source)
         for arch in artifacts.ARCHES:
             d = inputs_dir / f'candidate-{arch}'
             d.mkdir()
-            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES] + [
+            names = [artifacts.archive_name(p, arch) for p in (artifacts.PROFILES if arch in artifacts.CONTAINER_ARCHES else ())] + [
                 f'tayga-linux-{arch}', f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt']
             for name in names:
                 (d / name).write_text(name)
@@ -194,7 +337,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
                  'files': {n: artifacts.sha256(d / n) for n in names},
                  'images': {p: {'archive': artifacts.archive_name(p, arch),
                                'reference': f'tayga-release-{p}:{arch}',
-                               'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+                               'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in (artifacts.PROFILES if arch in artifacts.CONTAINER_ARCHES else ())}}
             (d / 'manifest.json').write_text(json.dumps(m))
         for arch in artifacts.FREEBSD_ARCHES:
             d = inputs_dir / f'candidate-freebsd-{arch}'
@@ -241,7 +384,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
         # 4. Incomplete formats in manifest (e.g. missing .apk and .rpm)
         for arch in artifacts.ARCHES:
             deb_pkg = native_dir / f'tayga-managed_1.2.3-1_{arch}.deb'
-            deb_pkg.write_bytes(b'!<arch>\ndebian-binary   ' + b'\x00' * 10)
+            deb_pkg.write_bytes(package_bytes('deb', arch))
             manifest = {
                 'version': '1.2.3', 'release': '1', 'arch': arch,
                 'inputs': {
@@ -296,7 +439,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
         directory = self.root / 'publish'
         directory.mkdir()
         import shutil
-        for arch in artifacts.ARCHES:
+        for arch in artifacts.CONTAINER_ARCHES:
             for profile in artifacts.PROFILES:
                 name = artifacts.archive_name(profile, arch)
                 shutil.copy2(self.inputs / f'candidate-{arch}' / name, directory / name)
@@ -409,17 +552,32 @@ class ReleasePublicationPreflightTests(unittest.TestCase):
         self.directory.mkdir()
         self.manifests = {}
         for arch in artifacts.ARCHES:
-            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES]
+            names = [artifacts.archive_name(p, arch) for p in (artifacts.PROFILES if arch in artifacts.CONTAINER_ARCHES else ())]
             for name in names:
                 (self.directory / name).write_text(name)
             manifest = {'source': self.source, 'arch': arch,
                         'files': {n: artifacts.sha256(self.directory / n) for n in names},
                         'images': {p: {'archive': artifacts.archive_name(p, arch),
                                       'reference': f'tayga-release-{p}:{arch}',
-                                      'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+                                      'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in (artifacts.PROFILES if arch in artifacts.CONTAINER_ARCHES else ())}}
             self.manifests[arch] = manifest
+        from release_platforms import CONTRACT, required_assets
+        from openwrt_release import ROLES
+        native = {arch: {'artifacts': {f'native-{arch}.{fmt}': 'fixture' for fmt in CONTRACT['native_formats']}}
+                  for arch in artifacts.ARCHES}
+        for name in required_assets(native):
+            if not (self.directory / name).exists():
+                (self.directory / name).write_text('fixture')
+        openwrt = {}
+        for spec in CONTRACT['openwrt']:
+            packages = {}
+            for role in ROLES:
+                name = f'openwrt-{spec["release"]}-{role}.{spec["format"]}'
+                (self.directory / name).write_text('fixture')
+                packages[role] = {'name': name, 'sha256': artifacts.sha256(self.directory / name)}
+            openwrt[spec['release']] = {'platform': spec, 'packages': packages}
         (self.directory / 'release-manifest.json').write_text(json.dumps(
-            {'source': self.source, 'architectures': self.manifests}))
+            {'source': self.source, 'architectures': self.manifests, 'native': native, 'openwrt': openwrt}))
 
     def create_keypair(self, name='test'):
         if not shutil.which('minisign'):
@@ -616,6 +774,25 @@ class ReleasePublicationPreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, f'Required release archive {target_name} must be included in signed SHA256SUMS'):
                 publisher.publish(self.directory)
         self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_signed_list_requires_shell_native_freebsd_and_openwrt_assets(self):
+        key_file, _, pubkey = self.create_keypair('inventory')
+        targets = ['tayga-installer-linux-riscv64.sh', 'native-s390x.rpm',
+                   'pref64-discover-freebsd-arm64', 'openwrt-24.10.8-network.ipk']
+        for target in targets:
+            with self.subTest(target=target):
+                artifacts.checksums(self.directory)
+                sums = self.directory / 'SHA256SUMS'
+                sums.write_text(''.join(line + '\n' for line in sums.read_text().splitlines()
+                                        if line.split(None, 1)[1] != target))
+                signature = self.directory / 'SHA256SUMS.minisig'
+                signature.unlink(missing_ok=True)
+                subprocess.run(['minisign', '-S', '-s', str(key_file), '-m', str(sums),
+                                '-x', str(signature)], check=True, capture_output=True)
+                with patch.dict(os.environ, {'MINISIGN_PUBKEY': pubkey}):
+                    with self.assertRaisesRegex(ValueError, 'missing from signed SHA256SUMS'):
+                        publisher.verify_production_preflight(self.directory,
+                            json.loads((self.directory / 'release-manifest.json').read_text()))
 
     def test_real_minisign_roundtrip_production_publication_succeeds(self):
         key_file, _, pubkey = self.create_keypair('signer')

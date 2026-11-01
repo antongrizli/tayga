@@ -17,6 +17,10 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- A shared release platform contract drives seven Linux binary/SFX/native-package targets, FreeBSD installers, required OpenWrt IPK/APK3 subpackages and RouterOS assets; assembly rejects incomplete or unexpected bundles.
+- Read-only signed bundle preflight and candidate-only CI with temporary signing keys, immutable source SHA selection and independent publication guards.
+- Native archive metadata validation and real nFPM format/architecture gates; pinned SDK export checks OpenWrt package identity before publishing CI candidates.
+
 - Isolated two-VM OpenWrt DHCPv6 gate with odhcpd IA_NA/IA_PD leases, renew stability and live prefix renumbering through odhcp6c; enabled for IPK/APK CI.
 
 - Optional independent OpenWrt package upgrade/recovery coordinator with a persistent archive/state journal, startup fencing, manager/readiness rollback and boot recovery tests.

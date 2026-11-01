@@ -12,9 +12,9 @@ import tempfile
 import time
 import zipfile
 
-ARCHES = ('amd64', 'arm64', 'armv7')
-FREEBSD_ARCHES = ('amd64', 'arm64')
-PROFILES = ('production', 'clat', 'nat64')
+from package_metadata import verify_identity
+from release_platforms import (LINUX_ARCHES as ARCHES, FREEBSD_ARCHES, PROFILES,
+                               NATIVE_FORMATS, CONTAINER_ARCHES, verify_assets)
 
 
 def run(*args, **kwargs):
@@ -88,13 +88,13 @@ def smoke(image, profile, source, arch):
 
 def record(directory, arch, source):
     images = {}
-    for profile in PROFILES:
+    for profile in (PROFILES if arch in CONTAINER_ARCHES else ()):
         image = f'tayga-release-{profile}:{arch}'
         image_id = smoke(image, profile, source, arch)
         archive = archive_name(profile, arch)
         subprocess.run(['docker', 'save', '-o', str(directory / archive), image], check=True)
         images[profile] = {'reference': image, 'id': image_id, 'archive': archive, 'smoke': 'pass'}
-    names = [archive_name(p, arch) for p in PROFILES] + [f'tayga-linux-{arch}',
+    names = [archive_name(p, arch) for p in (PROFILES if arch in CONTAINER_ARCHES else ())] + [f'tayga-linux-{arch}',
              f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt']
     data = {'source': source, 'arch': arch, 'images': images,
             'files': {name: sha256(directory / name) for name in names}}
@@ -105,9 +105,10 @@ def verify(directory, arch, source):
     data = json.loads((directory / 'manifest.json').read_text())
     if data['source'] != source or data['arch'] != arch:
         raise ValueError(f'{arch}: source/architecture mismatch')
-    expected = {archive_name(p, arch) for p in PROFILES} | {f'tayga-linux-{arch}',
+    profiles = PROFILES if arch in CONTAINER_ARCHES else ()
+    expected = {archive_name(p, arch) for p in profiles} | {f'tayga-linux-{arch}',
                 f'pref64-discover-linux-{arch}', 'binary-help.txt', 'install-files.txt'}
-    if set(data['files']) != expected or set(data['images']) != set(PROFILES):
+    if set(data['files']) != expected or set(data['images']) != set(profiles):
         raise ValueError(f'{arch}: incomplete artifact set')
     for name, digest in data['files'].items():
         if not re.fullmatch('[0-9a-f]{64}', digest) or sha256(directory / name) != digest:
@@ -188,11 +189,20 @@ def assemble(root, inputs, output, source, require_signature=False):
         with zipfile.ZipFile(output / 'tayga-routeros-scripts.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(staging.iterdir()):
                 archive.write(path, path.name)
+    from release_platforms import CONTRACT
+    from openwrt_release import verify as verify_openwrt
+    openwrt = {}
+    for spec in CONTRACT['openwrt']:
+        directory = inputs / f'candidate-openwrt-{spec["release"]}'
+        data = verify_openwrt(directory, spec, source)
+        openwrt[spec['release']] = data
+        for package in data['packages'].values():
+            shutil.copy2(directory / package['name'], output / package['name'])
     native_manifests = {}
     native_dir = inputs / 'candidate-native'
     if not native_dir.is_dir():
         raise ValueError('candidate-native directory is required for release assembly')
-    required_formats = {'.deb', '.rpm', '.apk'}
+    required_formats = {f'.{fmt}' for fmt in NATIVE_FORMATS}
     for arch in ARCHES:
         manifest_candidates = list(native_dir.glob(f'tayga-managed-{source["version"]}-*-{arch}.json'))
         if len(manifest_candidates) != 1:
@@ -218,7 +228,11 @@ def assemble(root, inputs, output, source, require_signature=False):
         missing_formats = required_formats - found_formats
         if missing_formats:
             raise ValueError(f'candidate-native: manifest for {arch} is missing formats: {missing_formats}')
+        if len(artifacts_map) != len(required_formats):
+            raise ValueError(f'candidate-native: expected exactly one package per format for {arch}')
         for pkg_name, expected_digest in artifacts_map.items():
+            if Path(pkg_name).name != pkg_name:
+                raise ValueError('Invalid native release archive path')
             pkg_file = native_dir / pkg_name
             if not pkg_file.is_file():
                 raise ValueError(f'native package file missing: {pkg_name}')
@@ -231,6 +245,7 @@ def assemble(root, inputs, output, source, require_signature=False):
                 raise ValueError(f'invalid rpm package format: {pkg_name}')
             elif pkg_name.endswith('.apk') and not blob.startswith(b'\x1f\x8b'):
                 raise ValueError(f'invalid apk package format: {pkg_name}')
+            verify_identity(pkg_file, source['version'], data['release'], arch)
             shutil.copy2(pkg_file, output / pkg_name)
         native_manifests[arch] = data
     expected_files = {p for m in native_manifests.values() for p in m.get('artifacts', {})}
@@ -238,13 +253,18 @@ def assemble(root, inputs, output, source, require_signature=False):
         if f.is_file() and not f.name.endswith('.json') and f.name not in expected_files:
             raise ValueError(f'candidate-native contains unmanifested file: {f.name}')
     (output / 'release-manifest.json').write_text(json.dumps(
-        {'source': source, 'architectures': manifests, 'freebsd': freebsd, 'native': native_manifests}, indent=2) + '\n')
+        {'source': source, 'architectures': manifests, 'freebsd': freebsd, 'native': native_manifests, 'openwrt': openwrt, 'platform_contract': CONTRACT}, indent=2) + '\n')
     changelog = (root / 'CHANGELOG.md').read_text()
     notes = re.search(rf"^## \[{re.escape(source['version'])}\].*?\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
-    if not notes or not notes.group(1).strip():
+    if source.get('candidate_only'):
+        body = 'Unpublished CI candidate. Not a release and not a production signing key.\n'
+    elif not notes or not notes.group(1).strip():
         raise ValueError('release notes missing')
+    else:
+        body = notes.group(1).strip() + '\n'
     (output / 'release-notes.md').write_text(
-        f"# TAYGA {source['tag']}\n\nSource commit: `{source['sha']}`\n\n" + notes.group(1).strip() + '\n')
+        f"# TAYGA {source['tag']}\n\nSource commit: `{source['sha']}`\n\n" + body)
+    verify_assets(output, native_manifests, openwrt)
     sign_manifest(output, require_signature=require_signature)
 
 

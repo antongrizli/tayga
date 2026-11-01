@@ -6,21 +6,30 @@ on:
   workflow_dispatch:
     inputs:
       ver:
-        description: 'Existing prepared release tag (e.g. v0.9.14)'
+        description: 'Prepared release tag; required only when candidate_only=false'
+        required: false
+        type: string
+      candidate_only:
+        description: 'Build/verify a candidate with a temporary key; never publish'
         required: true
+        default: true
+        type: boolean
+      candidate_sha:
+        description: 'Candidate commit SHA (40 lowercase hex); empty uses the selected workflow commit'
+        required: false
         type: string
 
 permissions:
   contents: read
 
-# Serialize releases so two successful candidates cannot race on latest.
+# Serialize production publication; unpublished candidate runs have independent groups.
 concurrency:
-  group: release-pipeline
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only && github.run_id || 'publication' }}
   cancel-in-progress: false
 
 jobs:
   resolve:
-    name: Resolve and validate release source
+    name: Resolve and validate immutable source
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
@@ -28,16 +37,28 @@ jobs:
       version: ${{ steps.source.outputs.version }}
       repository: ${{ steps.source.outputs.repository }}
       prerelease: ${{ steps.source.outputs.prerelease }}
+      candidate_only: ${{ steps.source.outputs.candidate_only }}
+      linux_matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve existing tag and verify committed metadata
+      - name: Resolve candidate commit or prepared release tag
         id: source
         env:
           RELEASE_TAG: ${{ inputs.ver }}
+          CANDIDATE_ONLY: ${{ inputs.candidate_only }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: python3 scripts/ci/release_metadata.py
+      - name: Resolve enabled release platform matrix
+        id: platforms
+        env:
+          RELEASE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          git show "$RELEASE_SHA:packaging/release-platforms.json" > "$RUNNER_TEMP/release-platforms.json"
+          matrix=$(python3 -c 'import json,sys; print(json.dumps({"include":json.load(open(sys.argv[1]))["linux"]}))' "$RUNNER_TEMP/release-platforms.json")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: release-source
@@ -83,14 +104,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-          - arch: arm64
-            platform: linux/arm64
-          - arch: armv7
-            platform: linux/arm/v7
+      matrix: ${{ fromJSON(needs.resolve.outputs.linux_matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,7 +115,7 @@ jobs:
           name: release-source
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - name: Build static binaries, verify staged install, test all image profiles
+      - name: Build static binaries, verify staged install and applicable image profiles
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           RELEASE_ARCH: ${{ matrix.arch }}
@@ -145,12 +159,16 @@ jobs:
         with:
           pattern: candidate-*
           path: candidates
+      - name: Verify real nFPM package metadata for every release architecture
+        env:
+          NFPM_TEST_BINARY: ${{ runner.temp }}/nfpm/nfpm
+        run: python3 -m unittest discover -s bench/tests -p test_package_metadata_nfpm.py
       - name: Build packages across all supported Linux architectures
         run: |
           mkdir -p release-native
           version="${{ needs.resolve.outputs.version }}"
           commit="${{ needs.resolve.outputs.sha }}"
-          for arch in amd64 arm64 armv7; do
+          for arch in $(python3 scripts/ci/release_platforms.py linux-arches); do
             bin="candidates/candidate-$arch/tayga-linux-$arch"
             helper="candidates/candidate-$arch/pref64-discover-linux-$arch"
             if [ ! -f "$bin" ] || [ ! -f "$helper" ]; then
@@ -164,6 +182,7 @@ jobs:
               --source-commit "$commit" \
               --nfpm "$RUNNER_TEMP/nfpm/nfpm" \
               --output release-native
+            python3 scripts/ci/package_metadata.py "release-native/tayga-managed-$version-1-$arch.json"
           done
       - uses: actions/upload-artifact@v7
         with:
@@ -172,6 +191,7 @@ jobs:
           if-no-files-found: error
 
   verify-assets:
+    if: needs.resolve.outputs.candidate_only != 'true'
     needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts, prepare-native-packages]
     runs-on: ubuntu-24.04
     steps:
@@ -195,8 +215,10 @@ jobs:
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
           MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
           REQUIRE_RELEASE_SIGNATURE: 'true'
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
+          python3 scripts/ci/release_publish.py release-assets --verify-only
           cd release-assets
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@v7
@@ -206,7 +228,50 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  verify-candidate-assets:
+    if: needs.resolve.outputs.candidate_only == 'true'
+    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts, prepare-native-packages]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-source
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Assemble and verify unpublished candidate with a temporary signing key
+        env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/candidate-signing"
+          minisign -G -W -s "$RUNNER_TEMP/candidate-signing/key" -p "$RUNNER_TEMP/candidate-signing/pub"
+          export MINISIGN_KEY_FILE="$RUNNER_TEMP/candidate-signing/key"
+          export MINISIGN_PUBKEY_FILE="$RUNNER_TEMP/candidate-signing/pub"
+          export MINISIGN_PASSWORD=''
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
+          python3 scripts/ci/release_publish.py release-assets --verify-only
+          (cd release-assets && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-verification-public-key
+          path: ${{ runner.temp }}/candidate-signing/pub
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verified-candidate-assets
+          path: release-assets/
+          compression-level: 0
+          if-no-files-found: error
+
   publish:
+    if: needs.resolve.outputs.candidate_only != 'true'
     name: Publish verified artifacts without rebuilding
     needs: [resolve, verify-assets]
     runs-on: ubuntu-24.04

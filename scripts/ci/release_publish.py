@@ -8,7 +8,8 @@ import re
 import shutil
 import subprocess
 
-from release_artifacts import ARCHES, PROFILES, run, sha256
+from release_artifacts import PROFILES, run, sha256
+from release_platforms import CONTAINER_ARCHES as ARCHES, CONTRACT, required_signed_assets
 from release_metadata import normalize_tag
 
 
@@ -55,6 +56,9 @@ def verify_production_preflight(directory, manifest, allow_unsigned=False):
         if len(parts) != 2:
             raise ValueError(f'Malformed SHA256SUMS entry: {line}')
         expected_sha, name = parts[0].strip(), parts[1].strip()
+        if (Path(name).name != name or name in listed_files
+                or not re.fullmatch(r'[0-9a-f]{64}', expected_sha)):
+            raise ValueError('Invalid or duplicate SHA256SUMS entry')
         target_path = directory / name
         if not target_path.is_file():
             raise ValueError(f'Release artifact missing: {name}')
@@ -85,6 +89,14 @@ def verify_production_preflight(directory, manifest, allow_unsigned=False):
             if archive not in listed_files:
                 raise ValueError(f'Required release archive {archive} must be included in signed SHA256SUMS')
 
+    if 'platform_contract' in manifest and manifest['platform_contract'] != CONTRACT:
+        raise ValueError('Release platform contract mismatch')
+
+    if not allow_unsigned:
+        missing = required_signed_assets(manifest) - set(listed_files)
+        if missing:
+            raise ValueError(f'Required release assets missing from signed SHA256SUMS: {sorted(missing)}')
+
 
 def publish(directory, allow_unsigned=False):
     allow_unsigned = allow_unsigned or (os.environ.get('ALLOW_UNSIGNED_RELEASE', '').lower() in ('1', 'true', 'yes'))
@@ -93,6 +105,8 @@ def publish(directory, allow_unsigned=False):
         raise ValueError('release-manifest.json is missing')
     manifest = json.loads(manifest_file.read_text())
     source = manifest['source']
+    if source.get('candidate_only'):
+        raise ValueError('Candidate-only bundles must never be published')
     if normalize_tag(source['tag']) != source['version']:
         raise ValueError('tag/version mismatch')
     if source['prerelease'] != ('-' in source['version']):
@@ -195,8 +209,26 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--allow-unsigned', action='store_true',
                         help='Allow publishing unsigned releases (test/staging only)')
+    parser.add_argument('--verify-only', action='store_true',
+                        help='Verify the production signature/inventory without Docker or registry writes')
     args = parser.parse_args()
-    publish(args.directory, allow_unsigned=args.allow_unsigned)
+    if args.verify_only:
+        if args.allow_unsigned:
+            parser.error('--verify-only requires a signed production bundle')
+        manifest = json.loads((args.directory / 'release-manifest.json').read_text())
+        source = manifest['source']
+        if normalize_tag(source['tag']) != source['version']:
+            raise ValueError('tag/version mismatch')
+        if source['prerelease'] != ('-' in source['version']):
+            raise ValueError('prerelease metadata mismatch')
+        if source['sha'] != os.environ.get('RELEASE_SHA'):
+            raise ValueError('verification source mismatch')
+        # Intentionally ignore ALLOW_UNSIGNED_RELEASE for this read-only gate.
+        verify_production_preflight(args.directory, manifest, allow_unsigned=False)
+        label = 'unpublished candidate' if source.get('candidate_only') else 'production release bundle'
+        print(f'PASS: signed {label}; no publication performed')
+    else:
+        publish(args.directory, allow_unsigned=args.allow_unsigned)
 
 
 if __name__ == '__main__':

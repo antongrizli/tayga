@@ -47,7 +47,20 @@ def resolve(root, tag, repository, expected_sha=None):
     from datetime import date
     date.fromisoformat(match.group(1))
     return {'tag': tag, 'version': version, 'sha': sha, 'repository': repository.lower(),
-            'prerelease': '-' in version}
+            'prerelease': '-' in version, 'candidate_only': False}
+
+
+def resolve_candidate(root, sha, repository):
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise ValueError('Candidate source must be a full lowercase commit SHA')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('invalid owner/repository')
+    resolved = git(root, 'rev-parse', '--verify', f'{sha}^{{commit}}')
+    version = git(root, 'show', f'{resolved}:VERSION')
+    normalize_tag('v' + version)
+    return {'tag': 'v' + version, 'version': version, 'sha': resolved,
+            'repository': repository.lower(), 'prerelease': '-' in version,
+            'candidate_only': True}
 
 
 def main():
@@ -56,6 +69,9 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('release-source.json'))
     args = parser.parse_args()
     event = os.environ.get('GITHUB_EVENT_NAME')
+    candidate_only = os.environ.get('CANDIDATE_ONLY', '').lower() == 'true'
+    if candidate_only and event != 'workflow_dispatch':
+        parser.error('Candidate-only mode requires manual workflow dispatch')
     if event == 'workflow_dispatch':
         tag = os.environ.get('RELEASE_TAG', '')
         expected = None
@@ -66,7 +82,10 @@ def main():
     else:
         parser.error('only a release tag push or an explicit manual tag is supported')
     try:
-        data = resolve(args.root, tag, os.environ['GITHUB_REPOSITORY'], expected)
+        if candidate_only:
+            data = resolve_candidate(args.root, os.environ.get('CANDIDATE_SHA') or os.environ.get('GITHUB_SHA', ''), os.environ['GITHUB_REPOSITORY'])
+        else:
+            data = resolve(args.root, tag, os.environ['GITHUB_REPOSITORY'], expected)
     except (ValueError, subprocess.CalledProcessError) as exc:
         parser.error(str(exc))
     args.output.write_text(json.dumps(data, indent=2) + '\n')
