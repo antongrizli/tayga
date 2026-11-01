@@ -984,8 +984,8 @@ def main():
     time.sleep(1)
     test.cleanup()
 
-    # 62 tests across 10 sections: all expected to pass cleanly
-    test.report(62, 0)
+    # 66 tests across 10 sections, including four DNSSEC checksum cases.
+    test.report(66, 0)
 
 
 if __name__ == "__main__":
