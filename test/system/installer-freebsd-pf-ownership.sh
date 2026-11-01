@@ -13,6 +13,10 @@ export TAYGA_NET_STATE
 cleanup() {
     rc=$?
     sh "$controller" down "$config" || rc=1
+    pfctl -F nat >/dev/null 2>&1 || :
+    pfctl -F rules >/dev/null 2>&1 || :
+    pfctl -F states >/dev/null 2>&1 || :
+    pfctl -F Tables >/dev/null 2>&1 || :
     exit "$rc"
 }
 trap cleanup EXIT

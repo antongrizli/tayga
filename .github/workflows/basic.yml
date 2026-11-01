@@ -349,6 +349,7 @@ jobs:
             gmake test
             gmake clean && gmake CFLAGS="-Werror -Wextra -O2"
             gmake static pref64-discover
+            export PATH="$PWD:$PWD/build:$PATH"
             sh test/system/installer-fallback-smoke.sh "$PWD"
             python3 scripts/ci/freebsd_artifacts.py --arch "${{ matrix.arch }}" --output "candidate-freebsd-${{ matrix.arch }}"
             task_installer_dir="$PWD/freebsd-evidence-${{ matrix.arch }}"
