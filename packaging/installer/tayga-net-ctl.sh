@@ -361,9 +361,11 @@ fw_pf() {
         fi
     } > "$lock/rules.pf"
     pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf" || fail "Failed to load pf rules for anchor tayga_sfx/$dev"
-    printf 'pfctl -M -k label -k "tayga_sfx-%s" >/dev/null 2>&1 || :\n' "$dev" >> "$journal"
-    printf 'pfctl -M -i %s -Fs >/dev/null 2>&1 || :\n' "$dev" >> "$journal"
-    printf 'pfctl -a tayga_sfx/%s -F rules >/dev/null 2>&1 && pfctl -a tayga_sfx/%s -F nat >/dev/null 2>&1 || :\n' "$dev" "$dev" >> "$journal"
+    {
+        printf 'pfctl -M -k label -k "tayga_sfx-%s" >/dev/null 2>&1 || :\n' "$dev"
+        printf 'pfctl -M -i %s -Fs >/dev/null 2>&1 || :\n' "$dev"
+        printf 'pfctl -a tayga_sfx/%s -F rules >/dev/null 2>&1 && pfctl -a tayga_sfx/%s -F nat >/dev/null 2>&1 || :\n' "$dev" "$dev"
+    } >> "$journal"
     rm -f "$lock/rules.pf"
 }
 case "$mode" in

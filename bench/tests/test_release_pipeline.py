@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -421,6 +422,8 @@ class ReleasePublicationPreflightTests(unittest.TestCase):
             {'source': self.source, 'architectures': self.manifests}))
 
     def create_keypair(self, name='test'):
+        if not shutil.which('minisign'):
+            self.skipTest('minisign is not installed')
         key_file = self.root / f'{name}.key'
         pub_file = self.root / f'{name}.pub'
         subprocess.run(['minisign', '-G', '-W', '-p', str(pub_file), '-s', str(key_file)],

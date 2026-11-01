@@ -37,7 +37,6 @@ jail_owned=no
 foreign_ndp_owned=no
 foreign_alias_owned=no
 foreign_rules_owned=no
-config_active=no
 config_attempted=no
 
 cleanup() {
@@ -385,6 +384,7 @@ fault_rc=0
 (
     f_config="$fault_conf"
     f_attempted=no
+    # shellcheck disable=SC2329
     f_cleanup() {
         if [ "$f_attempted" = yes ] && [ -n "$f_config" ]; then
             sh "$base/packaging/installer/tayga-net-ctl.sh" down "$f_config" >/dev/null 2>&1 || :
@@ -427,7 +427,6 @@ for mode in nat66 proxy-ndp; do
 
         config_attempted=yes
         sh "$base/packaging/installer/tayga-net-ctl.sh" up "$config"
-        config_active=yes
 
         tcpdump -ni tun64 -U -w "$work/$mode.tun.c$cycle.pcap" > "$work/$mode.tun-capture.c$cycle.log" 2>&1 &
         tun_capture=$!
@@ -518,7 +517,6 @@ for mode in nat66 proxy-ndp; do
         fi
 
         sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config"
-        config_active=no
         config_attempted=no
 
         if [ "$cycle" -eq 1 ]; then

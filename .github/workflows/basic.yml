@@ -359,10 +359,13 @@ jobs:
             grep -q '^tun-device tun64$' "$task_installer_dir/clat.conf"
             grep -q '^tun-offload off$' "$task_installer_dir/clat.conf"
             grep -q '^# installer-firewall pf$' "$task_installer_dir/clat.conf"
+            sh packaging/installer/configure.sh --mode=siit --pref64=fd64:100::/96 \
+              --map-ipv4=198.18.10.1 --map-ipv6=fd64:200::1 --firewall=pf \
+              --output="$task_installer_dir/siit.conf"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-binary-smoke.sh "$task_installer_dir/installer.sh"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-smoke.sh "$task_installer_dir/installer.sh"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-pf-ownership.sh \
-              packaging/installer/tayga-net-ctl.sh "$task_installer_dir/clat.conf" "$task_installer_dir/evidence-ownership"
+              packaging/installer/tayga-net-ctl.sh "$task_installer_dir/siit.conf" "$task_installer_dir/evidence-ownership"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-ipv6-smoke.sh "$PWD" "$task_installer_dir/evidence-ipv6"
       - uses: actions/upload-artifact@v7
         if: always()
