@@ -434,8 +434,12 @@ case "$mode" in
         saved_peer=$(awk '$1=="#" && $2=="installer-management4" {print $3}' "$config")
         case "$saved_peer" in '') ;; *[!0-9.]*) fail 'Invalid saved SSH peer' ;; *) saved_peer=$saved_peer/32 ;; esac
         for destination in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.169.254/32 35.235.240.0/20 $peer $saved_peer; do
+            case "$destination" in
+                "$gateway"|"$gateway"/*) continue ;;
+            esac
             if [ "$os" = FreeBSD ]; then
-                if ! netstat -rn -f inet | awk '{print $1}' | grep -Fx "$destination" >/dev/null 2>&1; then
+                dest_bare=${destination%/32}
+                if ! netstat -rn -f inet | awk '{print $1}' | grep -F -x -e "$destination" -e "$dest_bare" >/dev/null 2>&1; then
                     add_route -4 "$destination" "$gateway"
                 fi
             else
