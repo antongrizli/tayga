@@ -502,10 +502,10 @@ exit 0
         mock.chmod(0o755)
         self.recover_journal(init_type='none', kind='apk')
 
-    def recover_journal(self, init_type='systemd', kind='deb'):
-        (self.state / 'nat64.conf').write_text('corrupt-config\n')
+    def setup_recovery_journal(self, init_type='systemd', kind='deb', active_profile='nat64', was_active='yes'):
+        (self.state / f'{active_profile}.conf').write_text('corrupt-config\n')
         journal = self.state / 'package-upgrade'
-        (journal / 'backup').mkdir(parents=True)
+        (journal / 'backup').mkdir(parents=True, exist_ok=True)
         (journal / 'backup/tayga').write_text('restored-binary\n')
         (journal / 'accepted.conf').write_text('restored-config\n')
         (journal / 'old_pkg.archive').write_text('old-deb-archive')
@@ -514,10 +514,14 @@ exit 0
         (journal / 'target_ver').write_text('0.9.15-1\n')
         (journal / 'status').write_text('installing\n')
         (journal / 'data.ready').write_text('complete\n')
-        (journal / 'active_profile').write_text('nat64\n')
-        (journal / 'was_active').write_text('yes\n')
+        (journal / 'active_profile').write_text(f'{active_profile}\n')
+        (journal / 'was_active').write_text(f'{was_active}\n')
         (journal / 'init_type').write_text(init_type + '\n')
         self.seal_journal(journal)
+        return journal
+
+    def recover_journal(self, init_type='systemd', kind='deb'):
+        journal = self.setup_recovery_journal(init_type=init_type, kind=kind)
 
         res = subprocess.run(['sh', str(self.upgrader), 'recover'], env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -525,6 +529,46 @@ exit 0
         self.assertEqual((self.sys_bin / 'tayga').read_text(), 'restored-binary\n')
         self.assertEqual((self.state / 'nat64.conf').read_text(), 'restored-config\n')
         self.assertFalse(journal.exists())
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_recovery_fails_and_preserves_journal_when_rollback_package_manager_fails(self):
+        journal = self.setup_recovery_journal()
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                             env={**self.env, 'TEST_DPKG_ROLLBACK_RC': '1'},
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue(journal.exists())
+        self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_recovery_fails_and_preserves_journal_when_service_start_fails(self):
+        journal = self.setup_recovery_journal()
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                             env={**self.env, 'TEST_SYSCTL_RC': '1'},
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue(journal.exists())
+        self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_recovery_fails_and_preserves_journal_when_readiness_fails(self):
+        journal = self.setup_recovery_journal()
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'],
+                             env={**self.env, 'TEST_VERIFY_RC': '1'},
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue(journal.exists())
+        self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
+        self.assertFalse((self.state / 'operation.lock').exists())
+
+    def test_recovery_fails_and_preserves_journal_when_readiness_verify_helper_is_missing(self):
+        journal = self.setup_recovery_journal()
+        self.verify_helper.unlink()
+        res = subprocess.run(['sh', str(self.upgrader), 'recover'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Missing readiness verify helper', res.stderr)
+        self.assertTrue(journal.exists())
+        self.assertEqual((journal / 'status').read_text().strip(), 'recovery-failed')
         self.assertFalse((self.state / 'operation.lock').exists())
 
 

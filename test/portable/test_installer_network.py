@@ -286,6 +286,86 @@ exit 0
         down_log = self.log.read_text()
         self.assertIn('firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -o eth0 -s fd64::464/128 -d 64:ff9b::/96 -j SNAT --to-source 2001:db8::5', down_log)
 
+    def test_firewalld_reload_lifecycle_and_foreign_rule_preservation(self):
+        rules_file = self.root / 'firewalld_rules.txt'
+        rules_file.write_text('ipv4 filter FORWARD 99 -s 10.0.0.0/8 -j ACCEPT\n')
+        fcmd = self.bin / 'firewall-cmd'
+        fcmd.write_text(f'''#!/bin/sh
+echo "firewall-cmd $*" >> "$TEST_LOG"
+db="{rules_file}"
+case "$1" in
+    --state) exit 0 ;;
+    --get-zone-of-interface=*) echo "external" ;;
+    --get-default-zone) echo "public" ;;
+    --zone=*) exit 0 ;;
+    --reload)
+        # Reload drops runtime rules, keeping permanent/foreign rules
+        if [ -f "$db" ]; then
+            grep '10.0.0.0/8' "$db" > "$db.tmp" 2>/dev/null || :
+            mv "$db.tmp" "$db"
+        fi
+        exit 0
+        ;;
+    --direct)
+        shift
+        case "$1" in
+            --add-rule)
+                shift
+                echo "$*" >> "$db"
+                exit 0
+                ;;
+            --remove-rule)
+                shift
+                rule="$*"
+                if [ -f "$db" ] && grep -Fxq "$rule" "$db"; then
+                    grep -Fxv "$rule" "$db" > "$db.tmp"
+                    mv "$db.tmp" "$db"
+                    exit 0
+                else
+                    # Real firewalld returns non-zero when removing an absent rule
+                    exit 1
+                fi
+                ;;
+            --get-all-rules)
+                [ -f "$db" ] && cat "$db"
+                exit 0
+                ;;
+        esac
+        ;;
+esac
+exit 0
+''')
+        fcmd.chmod(0o755)
+
+        config = self.root / 'firewalld-reload-test.conf'
+        config.write_text('tun-device clat\nprefix 64:ff9b::/96\nipv4-addr 192.0.0.2\nipv6-addr 2001:db8::2\nmap 192.0.0.1 2001:db8::464\nofflink-mtu 1400\n# installer-firewall firewalld\n')
+
+        # 1. Bring up profile
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(config)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('ipv4 filter FORWARD 99 -s 10.0.0.0/8 -j ACCEPT', rules_file.read_text())
+        self.assertIn('ipv4 mangle FORWARD 0 -o clat', rules_file.read_text())
+
+        # 2. Simulate external firewall-cmd --reload
+        res = subprocess.run([str(fcmd), '--reload'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+        rules_after_reload = rules_file.read_text()
+        self.assertIn('ipv4 filter FORWARD 99 -s 10.0.0.0/8 -j ACCEPT', rules_after_reload)
+        self.assertNotIn('ipv4 mangle FORWARD 0 -o clat', rules_after_reload)
+
+        # 3. Teardown after reload must exit 0 and leave foreign rule intact
+        res = subprocess.run(['sh', str(CONTROLLER), 'down', str(config)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        final_rules = rules_file.read_text().strip()
+        self.assertEqual(final_rules, 'ipv4 filter FORWARD 99 -s 10.0.0.0/8 -j ACCEPT')
+
+        # 4. Bring up again to verify controlled re-application succeeds
+        res = subprocess.run(['sh', str(CONTROLLER), 'up', str(config)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('ipv4 mangle FORWARD 0 -o clat', rules_file.read_text())
+        self.assertIn('ipv4 filter FORWARD 99 -s 10.0.0.0/8 -j ACCEPT', rules_file.read_text())
+        self.assertEqual(subprocess.run(['sh', str(CONTROLLER), 'down', str(config)], env=self.env, capture_output=True).returncode, 0)
+
     def test_siit_routes_bidirectional_rules_and_no_nat44(self):
         for backend in ('iptables', 'nft'):
             self.config.write_text('tun-device siit\nprefix 2001:db8:64::/96\nipv4-addr 192.168.240.1\nipv6-addr fd64::2\nmap 198.51.100.42 2001:db8:20::42\nofflink-mtu 1400\n# installer-firewall ' + backend + '\n')
