@@ -351,7 +351,8 @@ jobs:
             gmake static pref64-discover
             sh test/system/installer-fallback-smoke.sh "$PWD"
             python3 scripts/ci/freebsd_artifacts.py --arch "${{ matrix.arch }}" --output "candidate-freebsd-${{ matrix.arch }}"
-            task_installer_dir=$(mktemp -d)
+            task_installer_dir="$PWD/freebsd-evidence-${{ matrix.arch }}"
+            mkdir -p "$task_installer_dir"
             python3 scripts/build-installer.py --version "$(cat VERSION)" --platform "freebsd-${{ matrix.arch }}" tayga pref64-discover --output "$task_installer_dir/installer.sh"
             sh "$task_installer_dir/installer.sh" --extract-only "$task_installer_dir/extracted"
             sh "$task_installer_dir/installer.sh" --mode=clat --clat-ipv6=2001:db8::464 --configure-only="$task_installer_dir/clat.conf"
@@ -363,7 +364,12 @@ jobs:
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-pf-ownership.sh \
               packaging/installer/tayga-net-ctl.sh "$task_installer_dir/clat.conf" "$task_installer_dir/evidence-ownership"
             TAYGA_ISOLATED_TEST=yes sh test/system/installer-freebsd-ipv6-smoke.sh "$PWD" "$task_installer_dir/evidence-ipv6"
-            rm -rf "$task_installer_dir"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: freebsd-${{ matrix.arch }}-test-evidence
+          path: freebsd-evidence-${{ matrix.arch }}/
+          retention-days: 7
       - uses: actions/upload-artifact@v7
         with:
           name: candidate-freebsd-${{ matrix.arch }}

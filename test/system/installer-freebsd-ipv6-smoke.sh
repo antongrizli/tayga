@@ -7,7 +7,18 @@ set -eu
 base=${1:?source directory}
 work=${2:?evidence directory}
 PATH="$base/build:$base:${PATH:-/sbin:/bin:/usr/sbin:/usr/bin}"; export PATH
-if ifconfig tun64 >/dev/null 2>&1 || jls -j tayga-clat-upstream >/dev/null 2>&1; then exit 2; fi
+
+# Preflight conflict checks before any mutations or resource allocations
+kldload pf 2>/dev/null || :
+if ifconfig tun64 >/dev/null 2>&1; then echo 'Conflict: tun64 exists' >&2; exit 2; fi
+if jls -j tayga-clat-upstream >/dev/null 2>&1; then echo 'Conflict: jail tayga-clat-upstream exists' >&2; exit 2; fi
+if ndp -n 2001:db8:2::99 >/dev/null 2>&1; then echo 'Conflict: neighbor 2001:db8:2::99 exists' >&2; exit 2; fi
+if pfctl -a tayga_sfx/foreign -sr 2>/dev/null | grep -q . || pfctl -a tayga_sfx/foreign -sn 2>/dev/null | grep -q .; then echo 'Conflict: anchor tayga_sfx/foreign exists' >&2; exit 2; fi
+if pfctl -sn 2>/dev/null | grep -q . || pfctl -sr 2>/dev/null | grep -q .; then
+    echo 'Requires a clean PF root in a disposable VM' >&2
+    exit 2
+fi
+
 mkdir -p "$work"
 TAYGA_NET_STATE=$work/network-state
 export TAYGA_NET_STATE
@@ -16,42 +27,66 @@ for _ in 1 2 3 4 5; do
     old_gateway=$(route -n get -inet6 default 2>/dev/null | awk '$1=="gateway:" {print $2}')
     case "$old_gateway" in ''|*[!a-zA-Z0-9_.:%-]*) sleep 1 ;; *) break ;; esac
 done
-epair=; config=; daemon=; server=; udp_server=; capture=; tun_capture=; changed_default=no; root_owned=no
+
+epair=; config=; daemon=; server=; udp_server=; capture=; tun_capture=
+foreign_server_pid=
+changed_default=no
+root_owned=no
+epair_owned=no
+jail_owned=no
+foreign_ndp_owned=no
+foreign_alias_owned=no
+foreign_rules_owned=no
+config_active=no
+
 cleanup() {
     rc=$?
+    if [ "$jail_owned" = yes ]; then
+        if [ -n "$foreign_server_pid" ]; then jexec tayga-clat-upstream kill "$foreign_server_pid" 2>/dev/null || :; fi
+        if [ -f "$work/http.pid" ]; then
+            hpid=$(cat "$work/http.pid" 2>/dev/null || :)
+            [ -z "$hpid" ] || jexec tayga-clat-upstream kill "$hpid" 2>/dev/null || :
+        fi
+        if [ -f "$work/udp_server.pid" ]; then
+            upid=$(cat "$work/udp_server.pid" 2>/dev/null || :)
+            [ -z "$upid" ] || jexec tayga-clat-upstream kill "$upid" 2>/dev/null || :
+        fi
+        if [ -f "$work/foreign.pid" ]; then
+            fpid=$(cat "$work/foreign.pid" 2>/dev/null || :)
+            [ -z "$fpid" ] || jexec tayga-clat-upstream kill "$fpid" 2>/dev/null || :
+        fi
+    fi
     [ -z "$daemon" ] || { kill "$daemon" 2>/dev/null || :; wait "$daemon" 2>/dev/null || :; }
     [ -z "$tun_capture" ] || { kill "$tun_capture" 2>/dev/null || :; wait "$tun_capture" 2>/dev/null || :; }
     [ -z "$capture" ] || { kill "$capture" 2>/dev/null || :; wait "$capture" 2>/dev/null || :; }
     [ -z "$server" ] || { kill "$server" 2>/dev/null || :; wait "$server" 2>/dev/null || :; }
     [ -z "$udp_server" ] || { kill "$udp_server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :; }
-    if [ -n "$config" ]; then sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config" || rc=1; fi
+    if [ "$config_active" = yes ] && [ -n "$config" ]; then sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config" || rc=1; fi
     if [ "$changed_default" = yes ]; then
         route delete -inet6 default 2>/dev/null || :
         if [ -n "$old_gateway" ]; then
             route add -inet6 default "$old_gateway" || rc=1
         fi
     fi
-    jail -r tayga-clat-upstream 2>/dev/null || :
-    ndp -d 2001:db8:2::99 2>/dev/null || :
-    if [ -n "$epair" ]; then ifconfig "$epair" inet6 2001:db8:2::88/64 -alias 2>/dev/null || :; fi
-    pfctl -a tayga_sfx/foreign -F rules 2>/dev/null || :
-    [ -z "$epair" ] || ifconfig "$epair" destroy 2>/dev/null || :
-    if [ "$root_owned" = yes ]; then pfctl -F nat; pfctl -F rules; fi
+    if [ "$foreign_rules_owned" = yes ]; then pfctl -a tayga_sfx/foreign -F rules 2>/dev/null || :; fi
+    if [ "$foreign_ndp_owned" = yes ]; then ndp -d 2001:db8:2::99 2>/dev/null || :; fi
+    if [ "$foreign_alias_owned" = yes ] && [ -n "$epair" ]; then ifconfig "$epair" inet6 2001:db8:2::88/64 -alias 2>/dev/null || :; fi
+    if [ "$jail_owned" = yes ]; then jail -r tayga-clat-upstream 2>/dev/null || :; fi
+    if [ "$epair_owned" = yes ] && [ -n "$epair" ]; then ifconfig "$epair" destroy 2>/dev/null || :; fi
+    if [ "$root_owned" = yes ]; then pfctl -F nat 2>/dev/null || :; pfctl -F rules 2>/dev/null || :; fi
     exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-kldload pf 2>/dev/null || :
-if pfctl -sn | grep -q . || pfctl -sr | grep -q .; then
-    echo 'Requires a clean PF root in a disposable VM' >&2
-    exit 2
-fi
+
 printf 'nat-anchor "tayga_sfx/*"\nanchor "tayga_sfx/*"\npass all\n' > "$work/root.pf"
 pfctl -f "$work/root.pf"
 root_owned=yes
 epair=$(ifconfig epair create)
+epair_owned=yes
 peer=${epair%a}b
 jail -c name=tayga-clat-upstream persist vnet path=/ host.hostname=tayga-clat-upstream allow.raw_sockets=1
+jail_owned=yes
 ifconfig "$peer" vnet tayga-clat-upstream
 ifconfig "$epair" inet6 2001:db8:2::2/64 -ifdisabled no_dad up
 jexec tayga-clat-upstream ifconfig "$peer" inet6 2001:db8:2::1/64 -ifdisabled no_dad up
@@ -64,9 +99,12 @@ route add -inet6 default 2001:db8:2::1
 
 # Add foreign NDP entry, IPv6 alias, and PF child rule to verify ownership isolation
 ndp -s 2001:db8:2::99 52:54:00:12:34:56
+foreign_ndp_owned=yes
 ifconfig "$epair" inet6 2001:db8:2::88/64 alias
-printf 'pass in quick inet proto tcp to any port 64999 label "foreign-rule"\n' > "$work/foreign.pf"
+foreign_alias_owned=yes
+printf 'pass in quick inet proto tcp to any port 64999 keep state label "foreign-rule"\npass out quick on %s inet6 proto tcp to any port 64999 keep state label "foreign-rule"\npass in quick on %s inet6 proto tcp to any port 64999 keep state label "foreign-rule"\n' "$epair" "$peer" > "$work/foreign.pf"
 pfctl -a tayga_sfx/foreign -f "$work/foreign.pf"
+foreign_rules_owned=yes
 
 ndp -an | grep '2001:db8:2::99' > "$work/foreign.ndp.expected"
 ifconfig "$epair" | grep '2001:db8:2::88' > "$work/foreign.if.expected"
@@ -76,7 +114,7 @@ printf 'freebsd-translated-proof\n' > "$work/proof"
 dd if=/dev/zero of="$work/large" bs=4096 count=256 2>/dev/null
 
 cat > "$work/udp_server.py" <<'EOF'
-import socket, sys, select, struct
+import socket, sys, select, struct, os
 
 def calc_udp_csum_v6(src_bytes, dst_bytes, udp_hdr_no_ck, payload):
     length = len(udp_hdr_no_ck) + len(payload)
@@ -99,6 +137,9 @@ raw_icmp6 = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV
 
 ready_file = sys.argv[1]
 peer_log = sys.argv[2]
+if len(sys.argv) > 3:
+    with open(sys.argv[3], 'w') as f:
+        f.write(str(os.getpid()) + '\n')
 with open(ready_file, 'w') as f:
     f.write('ready\n')
 
@@ -159,15 +200,20 @@ sock.settimeout(3.0)
 for size in sizes:
     success = False
     for attempt in range(1, 4):
-        token = f"TAYGA_{size}_{attempt}_".encode()
-        if len(token) < size:
-            payload = token + bytes([(i + attempt) % 256 for i in range(size - len(token))])
+        if size == 1:
+            payload = bytes([(attempt * 67 + 13) % 256])
+        elif size == 7:
+            payload = f"A{attempt}_S07_".encode()[:7]
         else:
-            payload = token[:size]
+            token = f"TAYGA_{size}_{attempt}_".encode()
+            payload = token + bytes([(i + attempt * 17) % 256 for i in range(size - len(token))])
         t0 = time.monotonic()
         try:
             sock.sendto(payload, (target_ip, target_port))
-            resp, _ = sock.recvfrom(65535)
+            resp, from_addr = sock.recvfrom(65535)
+            if from_addr[0] != target_ip or from_addr[1] != target_port:
+                print(f"UDP peer mismatch: got {from_addr}, expected ({target_ip}, {target_port})", file=sys.stderr)
+                sys.exit(1)
             if resp == payload:
                 success = True
                 print(f"UDP payload {size} bytes: OK (attempt {attempt}, elapsed {time.monotonic()-t0:.3f}s)")
@@ -180,6 +226,16 @@ for size in sizes:
     if not success:
         print(f"UDP payload {size} bytes failed after 3 attempts!", file=sys.stderr)
         sys.exit(1)
+
+# Negative test: sending to an unmapped/closed port must timeout, not return spurious data
+sock.settimeout(0.5)
+try:
+    sock.sendto(b"NEGATIVE_PROBE", (target_ip, 18081))
+    resp, from_addr = sock.recvfrom(65535)
+    print("Unexpected response received on closed port 18081!", file=sys.stderr)
+    sys.exit(1)
+except socket.timeout:
+    print("Negative test: timed out as expected on closed port 18081")
 
 if not os.path.exists(peer_log):
     print(f"Peer log {peer_log} does not exist!", file=sys.stderr)
@@ -200,6 +256,42 @@ for line in lines:
         sys.exit(1)
 
 print(f"Verified {len(lines)} UDP datagrams received by server from expected source {expected_peer_ip}")
+EOF
+
+cat > "$work/foreign_echo.py" <<'EOF'
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('2001:db8:2::1', 64999))
+s.listen(1)
+with open(sys.argv[1], 'w') as f:
+    f.write('ready\n')
+conn, addr = s.accept()
+while True:
+    data = conn.recv(1024)
+    if not data:
+        break
+    conn.sendall(data)
+conn.close()
+EOF
+
+cat > "$work/foreign_client.py" <<'EOF'
+import socket, sys, time, os
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+s.connect(('2001:db8:2::1', 64999))
+s.sendall(b"foreign-hello-1")
+resp1 = s.recv(1024)
+assert resp1 == b"foreign-hello-1"
+with open(sys.argv[1], 'w') as f:
+    f.write('connected\n')
+while not os.path.exists(sys.argv[2]):
+    time.sleep(0.1)
+s.sendall(b"foreign-hello-2")
+resp2 = s.recv(1024)
+assert resp2 == b"foreign-hello-2"
+s.close()
+with open(sys.argv[3], 'w') as f:
+    f.write('verified\n')
 EOF
 
 cat > "$work/test_ptb.py" <<'EOF'
@@ -239,8 +331,11 @@ for attempt in range(1, 4):
                     q_sport = (quoted[q_ihl] << 8) | quoted[q_ihl + 1]
                     q_dport = (quoted[q_ihl + 2] << 8) | quoted[q_ihl + 3]
                     if q_proto == 17 and q_sport == 55555 and q_dport == 18080:
-                        print(f"ICMPv4 Frag-Needed received: MTU={next_hop_mtu}, quoted {q_src}:{q_sport} -> {q_dst}:{q_dport} (attempt {attempt})")
+                        if q_dst != "1.1.1.1":
+                            print(f"Quoted dst mismatch: got {q_dst}, expected 1.1.1.1", file=sys.stderr)
+                            sys.exit(1)
                         if next_hop_mtu == 1260:
+                            print(f"ICMPv4 Frag-Needed received: MTU={next_hop_mtu}, quoted {q_src}:{q_sport} -> {q_dst}:{q_dport} (attempt {attempt})")
                             found = True
                             break
                         else:
@@ -291,6 +386,7 @@ for mode in nat66 proxy-ndp; do
         capture=$!
 
         sh "$base/packaging/installer/tayga-net-ctl.sh" up "$config"
+        config_active=yes
 
         tcpdump -ni tun64 -U -w "$work/$mode.tun.c$cycle.pcap" > "$work/$mode.tun-capture.c$cycle.log" 2>&1 &
         tun_capture=$!
@@ -299,10 +395,11 @@ for mode in nat66 proxy-ndp; do
         tayga --config "$config" --runtime-dir "$work/runtime-$mode-c$cycle" --nodetach > "$work/$mode.daemon.c$cycle.log" 2>&1 &
         daemon=$!
 
-        jexec tayga-clat-upstream python3 -u -m http.server 80 --bind fd64:100::101:101 --directory "$work" > "$work/$mode.http.c$cycle.log" 2>&1 &
+        rm -f "$work/http.pid" "$work/udp_server.pid"
+        jexec tayga-clat-upstream sh -c "python3 -u -m http.server 80 --bind fd64:100::101:101 --directory '$work' > '$work/$mode.http.c$cycle.log' 2>&1 & echo \$! > '$work/http.pid'"
         server=$!
 
-        jexec tayga-clat-upstream python3 -u "$work/udp_server.py" "$work/$mode.udp-ready.c$cycle" "$work/$mode.udp-peers.c$cycle.log" > "$work/$mode.udp-server.c$cycle.log" 2>&1 &
+        jexec tayga-clat-upstream sh -c "python3 -u '$work/udp_server.py' '$work/$mode.udp-ready.c$cycle' '$work/$mode.udp-peers.c$cycle.log' '$work/udp_server.pid' > '$work/$mode.udp-server.c$cycle.log' 2>&1 & echo \$! > '$work/udp_server.runner.pid'"
         udp_server=$!
         sleep 1
 
@@ -347,12 +444,26 @@ for mode in nat66 proxy-ndp; do
             pfctl -a tayga_sfx/tun64 -sn > "$work/$mode.nat"
             ndp -an > "$work/$mode.ndp"
             netstat -rn -f inet6 > "$work/$mode.routes"
+
+            # Start foreign TCP flow on port 64999 through the foreign PF rule
+            rm -f "$work/foreign.pid" "$work/foreign.ready" "$work/foreign.connected" "$work/foreign.down_signal" "$work/foreign.verified"
+            jexec tayga-clat-upstream sh -c "python3 -u '$work/foreign_echo.py' '$work/foreign.ready' > '$work/foreign.server.log' 2>&1 & echo \$! > '$work/foreign.pid'"
+            for _ in 1 2 3 4 5; do
+                if [ -f "$work/foreign.ready" ]; then break; fi
+                sleep 0.2
+            done
+            python3 -u "$work/foreign_client.py" "$work/foreign.connected" "$work/foreign.down_signal" "$work/foreign.verified" > "$work/foreign.client.log" 2>&1 &
+            foreign_client_pid=$!
+            for _ in 1 2 3 4 5; do
+                if [ -f "$work/foreign.connected" ]; then break; fi
+                sleep 0.2
+            done
+            pfctl -ss > "$work/$mode.pf-states.before-down"
+            grep -F '64999' "$work/$mode.pf-states.before-down" >/dev/null || { echo "Foreign state 64999 missing before down!" >&2; exit 1; }
         fi
 
-        kill "$daemon" "$server" "$udp_server"
-        wait "$daemon" 2>/dev/null || :; wait "$server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :
-        jexec tayga-clat-upstream pkill -f python3 2>/dev/null || :
-        daemon=; server=; udp_server=
+        kill "$daemon" 2>/dev/null || :; wait "$daemon" 2>/dev/null || :
+        daemon=
 
         if [ -n "$capture" ]; then
             kill "$capture"
@@ -366,6 +477,36 @@ for mode in nat66 proxy-ndp; do
         fi
 
         sh "$base/packaging/installer/tayga-net-ctl.sh" down "$config"
+        config_active=no
+
+        if [ "$cycle" -eq 1 ]; then
+            # Signal foreign flow that TAYGA is down; it must successfully exchange post-down traffic over same connection
+            touch "$work/foreign.down_signal"
+            wait "$foreign_client_pid"
+            [ -f "$work/foreign.verified" ] || { echo "Foreign flow broken by TAYGA teardown!" >&2; exit 1; }
+            pfctl -ss > "$work/$mode.pf-states.after-down"
+            grep -F '64999' "$work/$mode.pf-states.after-down" >/dev/null || { echo "Foreign state 64999 vanished after down!" >&2; exit 1; }
+            if grep -F 'tayga_sfx-tun64' "$work/$mode.pf-states.after-down"; then
+                echo "TAYGA states leaked in PF table after down!" >&2; exit 1
+            fi
+            if [ -f "$work/foreign.pid" ]; then
+                fpid=$(cat "$work/foreign.pid" 2>/dev/null || :)
+                [ -z "$fpid" ] || jexec tayga-clat-upstream kill "$fpid" 2>/dev/null || :
+            fi
+        fi
+
+        # Stop HTTP and UDP servers in jail cleanly by exact PID
+        if [ -f "$work/http.pid" ]; then
+            hpid=$(cat "$work/http.pid" 2>/dev/null || :)
+            [ -z "$hpid" ] || jexec tayga-clat-upstream kill "$hpid" 2>/dev/null || :
+        fi
+        if [ -f "$work/udp_server.pid" ]; then
+            upid=$(cat "$work/udp_server.pid" 2>/dev/null || :)
+            [ -z "$upid" ] || jexec tayga-clat-upstream kill "$upid" 2>/dev/null || :
+        fi
+        kill "$server" "$udp_server" 2>/dev/null || :
+        wait "$server" 2>/dev/null || :; wait "$udp_server" 2>/dev/null || :
+        server=; udp_server=
 
         # Verify owned interface and state cleanup
         if ifconfig tun64 >/dev/null 2>&1; then echo 'TUN leaked after down' >&2; exit 1; fi

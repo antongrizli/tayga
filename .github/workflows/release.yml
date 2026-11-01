@@ -228,9 +228,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Verify and promote saved images; record registry digests
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           cd release-assets

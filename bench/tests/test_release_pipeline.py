@@ -306,7 +306,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
     def test_corrupt_last_archive_prevents_every_registry_write(self):
         directory = self.publication_fixture()
         (directory / 'tayga-nat64-armv7.tar').write_text('corrupt')
-        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'ALLOW_UNSIGNED_RELEASE': 'true'}), \
                 patch.object(publisher.subprocess, 'run') as calls, \
                 patch.object(publisher, 'run', return_value='sha256:' + 'b' * 64):
             with self.assertRaises(ValueError):
@@ -316,7 +316,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
     def test_last_image_id_mismatch_prevents_every_registry_write(self):
         directory = self.publication_fixture()
         outputs = ['sha256:' + 'b' * 64] * 8 + ['sha256:' + 'd' * 64]
-        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'ALLOW_UNSIGNED_RELEASE': 'true'}), \
                 patch.object(publisher.subprocess, 'run') as calls, \
                 patch.object(publisher, 'run', side_effect=outputs):
             with self.assertRaisesRegex(ValueError, 'saved image ID'):
@@ -330,7 +330,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
                 return 'sha256:' + 'b' * 64
             return 'sha256:' + ('c' if ':candidate-' in args[4] else 'd') * 64
         with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '123',
-                                     'GITHUB_RUN_ATTEMPT': '2'}), \
+                                     'GITHUB_RUN_ATTEMPT': '2', 'ALLOW_UNSIGNED_RELEASE': 'true'}), \
                 patch.object(publisher.subprocess, 'run') as calls, \
                 patch.object(publisher, 'run', side_effect=output):
             with self.assertRaisesRegex(ValueError, 'promoted alias digest mismatch'):
@@ -350,7 +350,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
                         return 'sha256:' + 'b' * 64
                     return 'sha256:' + 'c' * 64
                 with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '123',
-                                             'GITHUB_RUN_ATTEMPT': '2'}), \
+                                             'GITHUB_RUN_ATTEMPT': '2', 'ALLOW_UNSIGNED_RELEASE': 'true'}), \
                         patch.object(publisher.subprocess, 'run') as calls, \
                         patch.object(publisher, 'run', side_effect=output):
                     publisher.publish(directory)
@@ -376,7 +376,7 @@ class ReleaseArtifactsTests(unittest.TestCase):
             return 'sha256:' + 'c' * 64
 
         with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '123',
-                                     'GITHUB_RUN_ATTEMPT': '2'}), \
+                                     'GITHUB_RUN_ATTEMPT': '2', 'ALLOW_UNSIGNED_RELEASE': 'true'}), \
                 patch.object(publisher.subprocess, 'run'), \
                 patch.object(publisher, 'run', side_effect=output):
             publisher.publish(directory)
@@ -387,6 +387,190 @@ class ReleaseArtifactsTests(unittest.TestCase):
         self.assertTrue((directory / 'published-images.json').is_file())
         self.assertTrue((directory / 'published-images.json.sha256').is_file())
         self.assertTrue((directory / 'SHA256SUMS.minisig').is_file())
+
+
+def is_registry_write(call_args):
+    cmd = call_args[0] if isinstance(call_args[0], (list, tuple)) else list(call_args)
+    if 'docker' in cmd:
+        if 'push' in cmd or ('imagetools' in cmd and 'create' in cmd):
+            return True
+    return False
+
+
+class ReleasePublicationPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = {'tag': 'version-1.2.3', 'version': '1.2.3', 'sha': 'a' * 40,
+                       'repository': 'owner/repo', 'prerelease': False}
+        self.directory = self.root / 'publish'
+        self.directory.mkdir()
+        self.manifests = {}
+        for arch in artifacts.ARCHES:
+            names = [artifacts.archive_name(p, arch) for p in artifacts.PROFILES]
+            for name in names:
+                (self.directory / name).write_text(name)
+            manifest = {'source': self.source, 'arch': arch,
+                        'files': {n: artifacts.sha256(self.directory / n) for n in names},
+                        'images': {p: {'archive': artifacts.archive_name(p, arch),
+                                      'reference': f'tayga-release-{p}:{arch}',
+                                      'id': 'sha256:' + 'b' * 64, 'smoke': 'pass'} for p in artifacts.PROFILES}}
+            self.manifests[arch] = manifest
+        (self.directory / 'release-manifest.json').write_text(json.dumps(
+            {'source': self.source, 'architectures': self.manifests}))
+
+    def create_keypair(self, name='test'):
+        key_file = self.root / f'{name}.key'
+        pub_file = self.root / f'{name}.pub'
+        subprocess.run(['minisign', '-G', '-W', '-p', str(pub_file), '-s', str(key_file)],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        pubkey = pub_file.read_text().splitlines()[1].strip()
+        return key_file, pub_file, pubkey
+
+    def sign_directory(self, key_file):
+        artifacts.checksums(self.directory)
+        sha_file = self.directory / 'SHA256SUMS'
+        sig_file = self.directory / 'SHA256SUMS.minisig'
+        subprocess.run(['minisign', '-S', '-s', str(key_file), '-m', str(sha_file),
+                        '-x', str(sig_file), '-t', 'TAYGA Release Verification'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+    def test_missing_sha256sums_fails_closed_before_registry_writes(self):
+        docker_calls = []
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+                patch.object(publisher.subprocess, 'run', side_effect=lambda cmd, **kw: docker_calls.append(cmd)):
+            with self.assertRaisesRegex(ValueError, 'Release SHA256SUMS is required for production publication'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_missing_signature_fails_closed_before_registry_writes(self):
+        artifacts.checksums(self.directory)
+        docker_calls = []
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+                patch.object(publisher.subprocess, 'run', side_effect=lambda cmd, **kw: docker_calls.append(cmd)):
+            with self.assertRaisesRegex(ValueError, 'Release signature SHA256SUMS.minisig is required for production publication'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_missing_minisign_binary_fails_closed_before_registry_writes(self):
+        artifacts.checksums(self.directory)
+        (self.directory / 'SHA256SUMS.minisig').write_text('dummy-sig')
+        docker_calls = []
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+                patch('shutil.which', return_value=None), \
+                patch.object(publisher.subprocess, 'run', side_effect=lambda cmd, **kw: docker_calls.append(cmd)):
+            with self.assertRaisesRegex(ValueError, 'Minisign binary is required for production publication'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_missing_public_key_fails_closed_before_registry_writes(self):
+        artifacts.checksums(self.directory)
+        (self.directory / 'SHA256SUMS.minisig').write_text('dummy-sig')
+        docker_calls = []
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha']}), \
+                patch('shutil.which', return_value='/usr/bin/minisign'), \
+                patch.object(publisher.subprocess, 'run', side_effect=lambda cmd, **kw: docker_calls.append(cmd)):
+            with self.assertRaisesRegex(ValueError, 'Trusted Minisign public key'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_invalid_signature_or_wrong_key_fails_closed_before_registry_writes(self):
+        key_a, _, _ = self.create_keypair('key_a')
+        _, _, pubkey_b = self.create_keypair('key_b')
+        self.sign_directory(key_a)
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey_b}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, 'Minisign cryptographic verification failed'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_tampered_artifact_checksum_fails_closed_before_registry_writes(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        self.sign_directory(key_file)
+
+        # Tamper with an archive after signing
+        target_archive = self.directory / artifacts.archive_name('production', 'amd64')
+        target_archive.write_text('tampered-content')
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, 'Release artifact checksum mismatch'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_missing_artifact_fails_closed_before_registry_writes(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        self.sign_directory(key_file)
+
+        # Delete an artifact listed in SHA256SUMS
+        target_archive = self.directory / artifacts.archive_name('production', 'amd64')
+        target_archive.unlink()
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run):
+            with self.assertRaisesRegex(ValueError, 'Release artifact missing'):
+                publisher.publish(self.directory)
+        self.assertFalse(any(is_registry_write(c) for c in docker_calls))
+
+    def test_real_minisign_roundtrip_production_publication_succeeds(self):
+        key_file, _, pubkey = self.create_keypair('signer')
+        self.sign_directory(key_file)
+        original_sha = (self.directory / 'SHA256SUMS').read_text()
+        original_sig = (self.directory / 'SHA256SUMS.minisig').read_text()
+
+        def output(*args):
+            if args[1:3] == ('image', 'inspect'):
+                return 'sha256:' + 'b' * 64
+            return 'sha256:' + 'c' * 64
+
+        docker_calls = []
+        orig_run = subprocess.run
+        def mock_run(cmd, **kw):
+            if cmd[0] == 'docker':
+                docker_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, **kw)
+
+        with patch.dict(os.environ, {'RELEASE_SHA': self.source['sha'], 'GITHUB_RUN_ID': '456',
+                                     'GITHUB_RUN_ATTEMPT': '1', 'MINISIGN_PUBKEY': pubkey}), \
+                patch.object(publisher.subprocess, 'run', side_effect=mock_run), \
+                patch.object(publisher, 'run', side_effect=output):
+            publisher.publish(self.directory, allow_unsigned=False)
+
+        # Registry writes must have been executed
+        self.assertTrue(any(is_registry_write(c) for c in docker_calls))
+        # SHA256SUMS and signature must remain identical and valid
+        self.assertEqual((self.directory / 'SHA256SUMS').read_text(), original_sha)
+        self.assertEqual((self.directory / 'SHA256SUMS.minisig').read_text(), original_sig)
+        self.assertNotIn('published-images.json', (self.directory / 'SHA256SUMS').read_text())
+        self.assertTrue((self.directory / 'published-images.json').is_file())
+        self.assertTrue((self.directory / 'published-images.json.sha256').is_file())
 
 
 if __name__ == '__main__':

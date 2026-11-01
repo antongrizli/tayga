@@ -12,15 +12,71 @@ from release_artifacts import ARCHES, PROFILES, run, sha256
 from release_metadata import normalize_tag
 
 
-def publish(directory):
-    manifest = json.loads((directory / 'release-manifest.json').read_text())
+def verify_production_preflight(directory, allow_unsigned=False):
+    sha_file = directory / 'SHA256SUMS'
+    sig_file = directory / 'SHA256SUMS.minisig'
+    pubkey = os.environ.get('MINISIGN_PUBKEY')
+    pubkey_file = os.environ.get('MINISIGN_PUBKEY_FILE')
+    minisign_bin = shutil.which('minisign')
+
+    if not sha_file.is_file():
+        if not allow_unsigned:
+            raise ValueError('Release SHA256SUMS is required for production publication')
+        return
+
+    if not allow_unsigned:
+        if not sig_file.is_file():
+            raise ValueError('Release signature SHA256SUMS.minisig is required for production publication')
+        if not minisign_bin:
+            raise ValueError('Minisign binary is required for production publication')
+        if not pubkey and not (pubkey_file and Path(pubkey_file).is_file()):
+            raise ValueError('Trusted Minisign public key (MINISIGN_PUBKEY or MINISIGN_PUBKEY_FILE) is required for production publication')
+
+    if sig_file.is_file() and (pubkey or (pubkey_file and Path(pubkey_file).is_file())) and minisign_bin:
+        cmd = [minisign_bin, '-V', '-m', str(sha_file), '-x', str(sig_file)]
+        if pubkey_file and Path(pubkey_file).is_file():
+            cmd.extend(['-p', str(pubkey_file)])
+        else:
+            cmd.extend(['-P', pubkey])
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            err = res.stderr.decode(errors='replace').strip()
+            raise ValueError(f'Minisign cryptographic verification failed: {err}')
+    elif not allow_unsigned:
+        raise ValueError('Production publication requires a verified Minisign signature')
+
+    # Verify integrity of all release artifacts listed in SHA256SUMS
+    for line in sha_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise ValueError(f'Malformed SHA256SUMS entry: {line}')
+        expected_sha, name = parts[0].strip(), parts[1].strip()
+        target_path = directory / name
+        if not target_path.is_file():
+            raise ValueError(f'Release artifact missing: {name}')
+        if sha256(target_path) != expected_sha:
+            raise ValueError(f'Release artifact checksum mismatch: {name}')
+
+
+def publish(directory, allow_unsigned=False):
+    allow_unsigned = allow_unsigned or (os.environ.get('ALLOW_UNSIGNED_RELEASE', '').lower() in ('1', 'true', 'yes'))
+    manifest_file = directory / 'release-manifest.json'
+    if not manifest_file.is_file():
+        raise ValueError('release-manifest.json is missing')
+    manifest = json.loads(manifest_file.read_text())
     source = manifest['source']
     if normalize_tag(source['tag']) != source['version']:
         raise ValueError('tag/version mismatch')
     if source['prerelease'] != ('-' in source['version']):
         raise ValueError('prerelease metadata mismatch')
-    if source['sha'] != os.environ['RELEASE_SHA']:
+    if source['sha'] != os.environ.get('RELEASE_SHA'):
         raise ValueError('publication source mismatch')
+
+    # Production preflight: verify SHA256SUMS, minisig signature and artifact checksums BEFORE touching docker or registry
+    verify_production_preflight(directory, allow_unsigned=allow_unsigned)
     # All archive hashes and IDs must pass before the first registry write.
     for arch in ARCHES:
         evidence = manifest['architectures'][arch]
@@ -112,8 +168,10 @@ def publish(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
+    parser.add_argument('--allow-unsigned', action='store_true',
+                        help='Allow publishing unsigned releases (test/staging only)')
     args = parser.parse_args()
-    publish(args.directory)
+    publish(args.directory, allow_unsigned=args.allow_unsigned)
 
 
 if __name__ == '__main__':

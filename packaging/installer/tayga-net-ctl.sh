@@ -327,59 +327,43 @@ fw_pf() {
     pfctl -sr | grep -q 'anchor "tayga_sfx/\*"' ||
         fail 'Configure PF root anchor "tayga_sfx/*" before activation'
     mss=$(( mtu - 40 ))
+    label="tayga_sfx-$dev"
     {
         printf 'scrub on %s proto tcp all max-mss %d\n' "$dev" "$mss"
         if [ "$mode" = nat64 ]; then
             printf 'nat on %s inet from %s to any -> (%s)\n' "$wan" "$pool" "$wan"
-            printf 'pass in quick on %s inet from %s to any keep state\n' "$dev" "$pool"
-            printf 'pass out quick on %s inet from %s to any keep state\n' "$wan" "$pool"
-            printf 'pass in quick on %s inet6 from any to %s keep state\n' "$wan" "$pref64"
-            printf 'pass out quick on %s inet6 from any to %s keep state\n' "$dev" "$pref64"
+            printf 'pass in quick on %s inet from %s to any keep state label "%s"\n' "$dev" "$pool" "$label"
+            printf 'pass out quick on %s inet from %s to any keep state label "%s"\n' "$wan" "$pool" "$label"
+            printf 'pass in quick on %s inet6 from any to %s keep state label "%s"\n' "$wan" "$pref64" "$label"
+            printf 'pass out quick on %s inet6 from any to %s keep state label "%s"\n' "$dev" "$pref64" "$label"
         elif [ "$mode" = siit ]; then
-            printf 'pass in quick on %s inet from %s to any keep state\n' "$dev" "$pool"
-            printf 'pass out quick on %s inet from %s to any keep state\n' "$wan" "$pool"
-            printf 'pass in quick on %s inet from any to %s keep state\n' "$wan" "$pool"
-            printf 'pass out quick on %s inet from any to %s keep state\n' "$dev" "$pool"
-            printf 'pass in quick on %s inet6 from %s to any keep state\n' "$dev" "$pref64"
-            printf 'pass out quick on %s inet6 from %s to any keep state\n' "$wan" "$pref64"
-            printf 'pass in quick on %s inet6 from any to %s keep state\n' "$wan" "$pref64"
-            printf 'pass out quick on %s inet6 from any to %s keep state\n' "$dev" "$pref64"
+            printf 'pass in quick on %s inet from %s to any keep state label "%s"\n' "$dev" "$pool" "$label"
+            printf 'pass out quick on %s inet from %s to any keep state label "%s"\n' "$wan" "$pool" "$label"
+            printf 'pass in quick on %s inet from any to %s keep state label "%s"\n' "$wan" "$pool" "$label"
+            printf 'pass out quick on %s inet from any to %s keep state label "%s"\n' "$dev" "$pool" "$label"
+            printf 'pass in quick on %s inet6 from %s to any keep state label "%s"\n' "$dev" "$pref64" "$label"
+            printf 'pass out quick on %s inet6 from %s to any keep state label "%s"\n' "$wan" "$pref64" "$label"
+            printf 'pass in quick on %s inet6 from any to %s keep state label "%s"\n' "$wan" "$pref64" "$label"
+            printf 'pass out quick on %s inet6 from any to %s keep state label "%s"\n' "$dev" "$pref64" "$label"
         elif [ "$mode" = clat ]; then
             if [ "$address_mode" = nat66 ]; then
                 printf 'nat on %s inet6 from { %s, %s } to %s -> %s\n' "$uplink6" "$clat6" "$addr6" "$pref64" "$nat66_address"
             fi
-            printf 'pass in quick on %s inet from any to any keep state\n' "$dev"
-            printf 'pass out quick on %s inet from any to any keep state\n' "$dev"
+            printf 'pass in quick on %s inet from any to any keep state label "%s"\n' "$dev" "$label"
+            printf 'pass out quick on %s inet from any to any keep state label "%s"\n' "$dev" "$label"
             if [ "$address_mode" = nat66 ]; then
-                printf 'pass out quick on %s inet6 from { %s, %s, %s } to any keep state\n' "$uplink6" "$clat6" "$addr6" "$nat66_address"
-                printf 'pass in quick on %s inet6 from any to { %s, %s } keep state\n' "$uplink6" "$clat6" "$nat66_address"
+                printf 'pass out quick on %s inet6 from { %s, %s, %s } to any keep state label "%s"\n' "$uplink6" "$clat6" "$addr6" "$nat66_address" "$label"
+                printf 'pass in quick on %s inet6 from any to { %s, %s } keep state label "%s"\n' "$uplink6" "$clat6" "$nat66_address" "$label"
             else
-                printf 'pass out quick on %s inet6 from %s to any keep state\n' "$uplink6" "$clat6"
-                printf 'pass in quick on %s inet6 from any to %s keep state\n' "$uplink6" "$clat6"
+                printf 'pass out quick on %s inet6 from %s to any keep state label "%s"\n' "$uplink6" "$clat6" "$label"
+                printf 'pass in quick on %s inet6 from any to %s keep state label "%s"\n' "$uplink6" "$clat6" "$label"
             fi
         fi
     } > "$lock/rules.pf"
     pfctl -a "tayga_sfx/$dev" -f "$lock/rules.pf" || fail "Failed to load pf rules for anchor tayga_sfx/$dev"
+    printf 'pfctl -M -k label -k "tayga_sfx-%s" >/dev/null 2>&1 || :\n' "$dev" >> "$journal"
+    printf 'pfctl -M -i %s -Fs >/dev/null 2>&1 || :\n' "$dev" >> "$journal"
     printf 'pfctl -a tayga_sfx/%s -F rules >/dev/null 2>&1 && pfctl -a tayga_sfx/%s -F nat >/dev/null 2>&1 || :\n' "$dev" "$dev" >> "$journal"
-    case "$mode" in
-        nat64)
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pool" >> "$journal"
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pref64" >> "$journal"
-            ;;
-        siit)
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$pool" >> "$journal"
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$map6" >> "$journal"
-            ;;
-        clat)
-            printf 'pfctl -k 192.0.0.1 >/dev/null 2>&1 || :\n' >> "$journal"
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$clat6" >> "$journal"
-            printf 'pfctl -k %s >/dev/null 2>&1 || :\n' "$addr6" >> "$journal"
-            if [ "$address_mode" = nat66 ]; then
-                printf 'pfctl -k %s -k %s >/dev/null 2>&1 || :\n' "$nat66_address" "$pref64" >> "$journal"
-                printf 'pfctl -k %s -k %s >/dev/null 2>&1 || :\n' "$pref64" "$nat66_address" >> "$journal"
-            fi
-            ;;
-    esac
     rm -f "$lock/rules.pf"
 }
 case "$mode" in
