@@ -1,0 +1,184 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt ash supports local; these variables are consumed by rc.common.
+# shellcheck disable=SC2034,SC3043
+# Reject before rc.common opens an empty procd update, which would stop main.
+if { [ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]; } && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+	case "${action:-}" in
+		uplink_changed) exit 0 ;;
+		start|reload|restart) logger -t tayga-managed 'Package upgrade pending; startup fenced'; exit 1 ;;
+	esac
+fi
+USE_PROCD=1
+START=95
+STOP=10
+extra_command uplink_changed 'Reconcile a selected netifd uplink event'
+
+configured_path() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then return 1; fi
+	local enabled network candidate
+	config_load tayga_managed || return 1
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ] || return 0
+	config_get network main network_mode
+	case "$network" in external) ;; managed) [ -x /usr/libexec/tayga/openwrt-network ] || return 1 ;; *) return 1 ;; esac
+	config_get candidate main config
+	if [ "${TAYGA_OPENWRT_BOOT:-}" = 1 ] || [ "${TAYGA_OPENWRT_EVENT:-}" = 1 ] || [ "${TAYGA_OPENWRT_ROLLBACK:-}" = 1 ]; then
+		/usr/libexec/tayga/openwrt-state current "$network"
+		return $?
+	fi
+	TAYGA_MANAGED_SWITCH=1 /usr/libexec/tayga/openwrt-state prepare "$candidate" "$network"
+}
+
+package_upgrade_pending() {
+	[ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]
+}
+
+boot() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+		/usr/libexec/tayga/openwrt-upgrade recover || return 1
+	fi
+	# A reboot uses the accepted snapshot, never a half-applied source edit.
+	TAYGA_OPENWRT_BOOT=1 start
+}
+
+start_service() {
+	if package_upgrade_pending && [ "${TAYGA_OPENWRT_UPGRADE:-}" != 1 ]; then
+		logger -t tayga-managed 'Package upgrade pending; startup fenced'
+		return 1
+	fi
+	local config failed=0 uplink info result network inside inside_info network_owner=
+	TAYGA_COMMIT_STATE=0
+	TAYGA_NETWORK_ROLLBACK=0
+	TAYGA_VERIFY_CONFIG=
+	# The flag exists only while explicitly started/boot-enabled, including
+	# when suspended for a down WAN. Recheck after rc.common acquires its lock.
+	if [ "${TAYGA_OPENWRT_EVENT:-}" = 1 ] && [ ! -f /var/run/tayga-managed/armed ]; then
+		return 0
+	fi
+	/usr/libexec/tayga/openwrt-state recover || return 1
+	config_load tayga_managed || return 1
+	config_get network main network_mode
+	config=$(configured_path) || {
+		failed=1
+		# Preserve the previous procd command if a running service is given
+		# invalid input. rc.common closes the service message even on failure.
+		config=$(/usr/libexec/tayga/openwrt-state current "$network") || return 1
+		logger -t tayga-managed 'Rejected candidate; retaining previous configuration'
+	}
+	if [ -z "$config" ]; then
+		stop_service
+		return 0
+	fi
+	mkdir -p /var/run/tayga-managed || return 1
+	: > /var/run/tayga-managed/armed
+	config_load tayga_managed || return 1
+	config_get uplink main uplink
+	if [ -n "$uplink" ]; then
+		info=$(/usr/libexec/tayga/openwrt-uplink "$uplink")
+		result=$?
+		case "$result" in
+			0) ;;
+			3)
+				[ ! -x /usr/libexec/tayga/openwrt-network ] || /usr/libexec/tayga/openwrt-network down || return 1
+				logger -t tayga-managed "Waiting for uplink $uplink"
+				return 0 ;;
+			*) logger -t tayga-managed "Invalid uplink state for $uplink"; return 1 ;;
+		esac
+	fi
+	if [ "$network" = managed ]; then
+		[ -n "$uplink" ] || return 1
+		config_get inside main inside
+		inside_info=$(/usr/libexec/tayga/openwrt-uplink "$inside") || {
+			/usr/libexec/tayga/openwrt-network down
+			return 0
+		}
+		if ! /usr/libexec/tayga/openwrt-network up "$config" "${info%% *}" "${inside_info%% *}"; then
+			failed=1
+			TAYGA_NETWORK_ROLLBACK=1
+			logger -t tayga-managed 'Managed network setup failed; rolling back'
+			config=$(/usr/libexec/tayga/openwrt-state rollback "$network" || :)
+			if [ -z "$config" ] || ! /usr/libexec/tayga/openwrt-network up "$config" "${info%% *}" "${inside_info%% *}"; then
+				/usr/libexec/tayga/openwrt-network down || :
+				rm -f /var/run/tayga-managed/armed
+				return 1
+			fi
+		fi
+		network_owner=$(cat /var/run/tayga-managed/network/token) || return 1
+		[ "$failed" = 0 ] && TAYGA_VERIFY_CONFIG=$config
+	elif [ -x /usr/libexec/tayga/openwrt-network ]; then
+		/usr/libexec/tayga/openwrt-network down || return 1
+	fi
+	[ "$failed" = 0 ] && TAYGA_COMMIT_STATE=1
+	procd_open_instance main
+	procd_set_param command /usr/sbin/tayga --config "$config" --runtime-dir /var/run/tayga-managed --nodetach
+	procd_set_param file "$config"
+	if [ -n "$uplink" ]; then
+		procd_set_param netdev "${info%% *}"
+		procd_set_param data "uplink=$uplink" "uplink_state=${info#* }"
+		# procd data is observable metadata; environment changes trigger restart.
+		procd_set_param env "TAYGA_UPLINK=$uplink" "TAYGA_UPLINK_STATE=${info#* }" "TAYGA_NETWORK_OWNER=$network_owner"
+	fi
+	procd_set_param respawn 3600 5 3
+	procd_set_param term_timeout 15
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+	return "$failed"
+}
+
+service_started() {
+	local verify_target=
+	[ "${TAYGA_NETWORK_ROLLBACK:-0}" = 0 ] || return 1
+	if [ -z "${TAYGA_VERIFY_CONFIG:-}" ]; then
+		[ "${TAYGA_COMMIT_STATE:-0}" != 1 ] || /usr/libexec/tayga/openwrt-state commit
+		return 0
+	fi
+	config_load tayga_managed || return 1
+	config_get verify_target main verify_target
+	if /usr/libexec/tayga/openwrt-network verify "$TAYGA_VERIFY_CONFIG" "$verify_target"; then
+		/usr/libexec/tayga/openwrt-state commit
+		return 0
+	fi
+	logger -t tayga-managed 'Managed readiness verification failed; rolling back'
+	if [ "${TAYGA_OPENWRT_ROLLBACK:-}" = 1 ]; then
+		stop
+		return 1
+	fi
+	if [ -n "$(/usr/libexec/tayga/openwrt-state rollback managed || :)" ]; then
+		TAYGA_OPENWRT_ROLLBACK=1 start || stop
+	else
+		stop
+	fi
+	return 1
+}
+
+stop_service() {
+	rm -f /var/run/tayga-managed/armed
+	[ ! -x /usr/libexec/tayga/openwrt-network ] || /usr/libexec/tayga/openwrt-network down
+}
+
+uplink_changed() {
+	local selected enabled network inside
+	[ "$#" -eq 1 ] && [ -f /var/run/tayga-managed/armed ] || return 0
+	config_load tayga_managed || return 1
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ] || return 0
+	config_get selected main uplink
+	config_get network main network_mode
+	config_get inside main inside
+	if [ "$selected" != "$1" ]; then
+		[ "$network" = managed ] && [ -n "$inside" ] && [ "$inside" = "$1" ] || return 0
+	fi
+	# Events never import an unreviewed candidate or change network settings.
+	TAYGA_OPENWRT_EVENT=1 start
+}
+
+reload_service() {
+	# Validate before opening a procd update, so failed reload leaves it intact.
+	configured_path >/dev/null || return 1
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger tayga_managed
+}

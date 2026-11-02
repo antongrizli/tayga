@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "linux": [
+    {
+      "arch": "amd64",
+      "platform": "linux/amd64"
+    },
+    {
+      "arch": "arm64",
+      "platform": "linux/arm64"
+    },
+    {
+      "arch": "armv7",
+      "platform": "linux/arm/v7"
+    },
+    {
+      "arch": "armv6",
+      "platform": "linux/arm/v6"
+    },
+    {
+      "arch": "riscv64",
+      "platform": "linux/riscv64"
+    },
+    {
+      "arch": "ppc64le",
+      "platform": "linux/ppc64le"
+    },
+    {
+      "arch": "s390x",
+      "platform": "linux/s390x"
+    }
+  ],
+  "freebsd": [
+    "amd64",
+    "arm64"
+  ],
+  "native_formats": [
+    "deb",
+    "rpm",
+    "apk"
+  ],
+  "container_profiles": [
+    "production",
+    "clat",
+    "nat64"
+  ],
+  "container_arches": [
+    "amd64",
+    "arm64",
+    "armv7"
+  ],
+  "pending_linux": [],
+  "openwrt": [
+    {
+      "release": "24.10.8",
+      "target": "armsr/armv8",
+      "format": "ipk"
+    },
+    {
+      "release": "25.12.6",
+      "target": "armsr/armv8",
+      "format": "apk"
+    }
+  ],
+  "routeros_scripts": [
+    "clat-setup.rsc",
+    "nat64-setup.rsc",
+    "routeros-controller.rsc",
+    "routeros-disable.rsc",
+    "routeros-enable.rsc",
+    "routeros-install-clat.rsc",
+    "routeros-install-nat64.rsc",
+    "routeros-preflight.rsc",
+    "routeros-remove.rsc",
+    "routeros-rollback.rsc",
+    "routeros-upgrade.rsc",
+    "routeros-verify.rsc"
+  ]
+}

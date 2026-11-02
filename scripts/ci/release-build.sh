@@ -5,10 +5,13 @@ arch=$1
 platform=$2
 source_json=$3
 out=$4
-case "$arch:$platform" in
-  amd64:linux/amd64|arm64:linux/arm64|armv7:linux/arm/v7) ;;
-  *) echo "Unsupported architecture/platform pair" >&2; exit 1 ;;
-esac
+python3 - "$arch" "$platform" <<'PYCONTRACT'
+import sys
+sys.path.insert(0, 'scripts/ci')
+from release_platforms import CONTRACT
+if {'arch': sys.argv[1], 'platform': sys.argv[2]} not in CONTRACT['linux']:
+    raise SystemExit('Unsupported architecture/platform pair')
+PYCONTRACT
 read -r version sha tag < <(python3 - "$source_json" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
@@ -82,7 +85,14 @@ test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" -eq 0
 docker cp "$container:/out/." "$out/"
 docker rm "$container" >/dev/null
 trap - EXIT
-for profile in production clat nat64; do
+profiles=$(python3 - "$arch" <<'PYPROFILES'
+import sys
+sys.path.insert(0, 'scripts/ci')
+from release_platforms import CONTAINER_ARCHES, PROFILES
+print(' '.join(PROFILES) if sys.argv[1] in CONTAINER_ARCHES else '')
+PYPROFILES
+)
+for profile in $profiles; do
   image="tayga-release-$profile:$arch"
   docker buildx build --platform "$platform" --target "$profile" \
     --build-arg "TAYGA_VERSION=$version" --build-arg "TAYGA_COMMIT=$sha" \

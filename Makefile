@@ -26,6 +26,7 @@ help:
 	@echo 'check-man       - Check that committed man pages match markdown sources'
 	@echo 'check-docs      - Verify markdown documentation links'
 	@echo 'install         - Installs tayga and manpages'
+	@echo 'installer       - Build a binary-only installer for the current platform'
 	@echo 'clean           - Remove compiled files and build artifacts'
 	@echo
 	@echo 'Compilation Variables:'
@@ -37,6 +38,13 @@ help:
 	@echo 'WITH_SYSTEMD    - Install systemd scripts'
 	@echo 'WITH_OPENRC     - Install OpenRC scripts and example config'
 
+.PHONY: installer
+installer: tayga pref64-discover
+	@mkdir -p $(BUILDDIR)
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m); case "$$arch" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; armv7|armv7l|armhf) arch=armv7;; esac; \
+	python3 scripts/build-installer.py --output $(BUILDDIR)/tayga-installer.sh --version "$(VERSION)" --platform "$$os-$$arch" $(BUILDDIR)/tayga $(BUILDDIR)/pref64-discover
+
 # Release preparation deliberately requires an explicit version and notes.
 .PHONY: release
 release:
@@ -45,7 +53,7 @@ release:
 
 RELEASE ?= $(DEFAULT_VERSION)
 # Fixed metadata; update deliberately when publishing a release.
-MAN_DATE ?= October 2026
+MAN_DATE ?= November 2026
 
 .PHONY: man check-man
 man:

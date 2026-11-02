@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# PROVIDE: tayga-recovery
+# REQUIRE: mountcritlocal
+# BEFORE: NETWORKING
+# KEYWORD: nojail
+
+case ":${PATH:-}:" in *:/usr/local/sbin:*) ;; *) PATH="${PATH:-/sbin:/bin:/usr/sbin:/usr/bin}:/usr/local/sbin:/usr/local/bin"; export PATH ;; esac
+
+. /etc/rc.subr
+
+name="tayga_recovery"
+rcvar="tayga_recovery_enable"
+
+start_cmd="tayga_recovery_start"
+
+tayga_recovery_start() {
+    if [ -x /usr/local/libexec/tayga/tayga-boot-recover.sh ]; then
+        /usr/local/libexec/tayga/tayga-boot-recover.sh
+    fi
+}
+
+load_rc_config $name
+: ${tayga_recovery_enable:="YES"}
+
+run_rc_command "$@"

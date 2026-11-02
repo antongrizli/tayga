@@ -174,5 +174,9 @@ static void test_eam(void)
 
 int main(void)
 {
+    FILE *stale = fopen("dynamic.map", "w"); assert(stale);
+    fputs("192.0.2.1 2001:db8::1 10000\n", stale); assert(fclose(stale) == 0);
+    load_dynamic(NULL);
+    assert(unlink("dynamic.map") == 0);
     test_circular_pool(); test_eam(); return 0;
 }

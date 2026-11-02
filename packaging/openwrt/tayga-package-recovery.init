@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034
+START=94
+STOP=11
+start() {
+    if [ -e /etc/tayga-managed/package-upgrade ] || [ -L /etc/tayga-managed/package-upgrade ]; then
+        /usr/libexec/tayga/openwrt-upgrade recover
+    fi
+}
+boot() { start; }
+stop() { :; }

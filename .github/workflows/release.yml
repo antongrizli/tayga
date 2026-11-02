@@ -5,22 +5,75 @@ on:
     tags: ['v*', 'version*', '[0-9]*']
   workflow_dispatch:
     inputs:
-      ver:
-        description: 'Existing prepared release tag (e.g. v0.9.14)'
+      signing_check_only:
+        description: 'Only test production signing credentials; never build or publish a release'
         required: true
+        default: false
+        type: boolean
+      ver:
+        description: 'Prepared release tag; required only when candidate_only=false'
+        required: false
+        type: string
+      candidate_only:
+        description: 'Build/verify a candidate with a temporary key; never publish'
+        required: true
+        default: true
+        type: boolean
+      candidate_sha:
+        description: 'Candidate commit SHA (40 lowercase hex); empty uses the selected workflow commit'
+        required: false
         type: string
 
 permissions:
   contents: read
 
-# Serialize releases so two successful candidates cannot race on latest.
+# Serialize production publication; unpublished candidate runs have independent groups.
 concurrency:
-  group: release-pipeline
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only && github.run_id || 'publication' }}
   cancel-in-progress: false
 
 jobs:
+  signing-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.signing_check_only
+    name: Check production signing credentials without publication
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign and verify an isolated test checksum list
+        env:
+          MINISIGN_KEY_DATA: ${{ secrets.MINISIGN_KEY_DATA }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import hashlib
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/ci')
+          from release_artifacts import sign_manifest
+          for name in ('MINISIGN_KEY_DATA', 'MINISIGN_PASSWORD', 'MINISIGN_PUBKEY'):
+              if not os.environ.get(name):
+                  raise SystemExit(f'Missing required signing secret: {name}')
+          with tempfile.TemporaryDirectory(prefix='tayga-signing-check-', dir=os.environ['RUNNER_TEMP']) as directory:
+              root = Path(directory)
+              (root / 'signing-test.txt').write_text('TAYGA signing credentials check\n' + os.environ['GITHUB_SHA'] + '\n')
+              sign_manifest(root, require_signature=True)
+          fingerprint = hashlib.sha256(os.environ['MINISIGN_PUBKEY'].strip().encode('ascii')).hexdigest()
+          print('Public key SHA256: ' + fingerprint)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Production signing check passed: private key/password and public key match. No release built or published.\n')
+              summary.write('Public key SHA256: `' + fingerprint + '`\n')
+          PY
+
   resolve:
-    name: Resolve and validate release source
+    if: github.event_name != 'workflow_dispatch' || !inputs.signing_check_only
+    name: Resolve and validate immutable source
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
@@ -28,16 +81,28 @@ jobs:
       version: ${{ steps.source.outputs.version }}
       repository: ${{ steps.source.outputs.repository }}
       prerelease: ${{ steps.source.outputs.prerelease }}
+      candidate_only: ${{ steps.source.outputs.candidate_only }}
+      linux_matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve existing tag and verify committed metadata
+      - name: Resolve candidate commit or prepared release tag
         id: source
         env:
           RELEASE_TAG: ${{ inputs.ver }}
+          CANDIDATE_ONLY: ${{ inputs.candidate_only }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: python3 scripts/ci/release_metadata.py
+      - name: Resolve enabled release platform matrix
+        id: platforms
+        env:
+          RELEASE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          git show "$RELEASE_SHA:packaging/release-platforms.json" > "$RUNNER_TEMP/release-platforms.json"
+          matrix=$(python3 -c 'import json,sys; print(json.dumps({"include":json.load(open(sys.argv[1]))["linux"]}))' "$RUNNER_TEMP/release-platforms.json")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: release-source
@@ -83,14 +148,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-          - arch: arm64
-            platform: linux/arm64
-          - arch: armv7
-            platform: linux/arm/v7
+      matrix: ${{ fromJSON(needs.resolve.outputs.linux_matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,7 +159,7 @@ jobs:
           name: release-source
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - name: Build static binaries, verify staged install, test all image profiles
+      - name: Build static binaries, verify staged install and applicable image profiles
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           RELEASE_ARCH: ${{ matrix.arch }}
@@ -123,8 +181,62 @@ jobs:
           compression-level: 0
           if-no-files-found: warn
 
+  prepare-native-packages:
+    name: Build native packages (DEB, RPM, APK) for release
+    needs: [resolve, compiler-platform-gates, prepare-artifacts]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Install nFPM
+        run: |
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          curl --fail --location --connect-timeout 10 --max-time 120 --proto '=https' --proto-redir '=https' \
+            https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz \
+            -o "$RUNNER_TEMP/nfpm.tar.gz"
+          echo "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/nfpm" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> $GITHUB_PATH
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Verify real nFPM package metadata for every release architecture
+        env:
+          NFPM_TEST_BINARY: ${{ runner.temp }}/nfpm/nfpm
+        run: python3 -m unittest discover -s bench/tests -p test_package_metadata_nfpm.py
+      - name: Build packages across all supported Linux architectures
+        run: |
+          mkdir -p release-native
+          version="${{ needs.resolve.outputs.version }}"
+          commit="${{ needs.resolve.outputs.sha }}"
+          for arch in $(python3 scripts/ci/release_platforms.py linux-arches); do
+            bin="candidates/candidate-$arch/tayga-linux-$arch"
+            helper="candidates/candidate-$arch/pref64-discover-linux-$arch"
+            if [ ! -f "$bin" ] || [ ! -f "$helper" ]; then
+              echo "ERROR: Missing release binary $bin or helper $helper for $arch" >&2
+              exit 1
+            fi
+            python3 scripts/build-native-packages.py \
+              --version "$version" --release 1 --arch "$arch" \
+              --tayga "$bin" --helper "$helper" \
+              --maintainer "TAYGA Community <antongrizli@gmail.com>" \
+              --source-commit "$commit" \
+              --nfpm "$RUNNER_TEMP/nfpm/nfpm" \
+              --output release-native
+            python3 scripts/ci/package_metadata.py "release-native/tayga-managed-$version-1-$arch.json"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-native
+          path: release-native/
+          if-no-files-found: error
+
   verify-assets:
-    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts]
+    if: needs.resolve.outputs.candidate_only != 'true'
+    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts, prepare-native-packages]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -138,9 +250,19 @@ jobs:
         with:
           pattern: candidate-*
           path: candidates
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Verify all hashes and source identities; prepare pinned RouterOS assets
+        env:
+          MINISIGN_KEY_FILE: ${{ secrets.MINISIGN_KEY_FILE }}
+          MINISIGN_KEY_DATA: ${{ secrets.MINISIGN_KEY_DATA }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
+          REQUIRE_RELEASE_SIGNATURE: 'true'
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
-          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
+          python3 scripts/ci/release_publish.py release-assets --verify-only
           cd release-assets
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@v7
@@ -150,7 +272,50 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  verify-candidate-assets:
+    if: needs.resolve.outputs.candidate_only == 'true'
+    needs: [resolve, compiler-platform-gates, correctness-gates, integration, prepare-artifacts, prepare-native-packages]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-source
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Assemble and verify unpublished candidate with a temporary signing key
+        env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/candidate-signing"
+          minisign -G -W -s "$RUNNER_TEMP/candidate-signing/key" -p "$RUNNER_TEMP/candidate-signing/pub"
+          export MINISIGN_KEY_FILE="$RUNNER_TEMP/candidate-signing/key"
+          export MINISIGN_PUBKEY_FILE="$RUNNER_TEMP/candidate-signing/pub"
+          export MINISIGN_PASSWORD=''
+          python3 scripts/ci/release_artifacts.py assemble --source release-source.json --directory candidates --output release-assets --require-signature
+          python3 scripts/ci/release_publish.py release-assets --verify-only
+          (cd release-assets && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-verification-public-key
+          path: ${{ runner.temp }}/candidate-signing/pub
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verified-candidate-assets
+          path: release-assets/
+          compression-level: 0
+          if-no-files-found: error
+
   publish:
+    if: needs.resolve.outputs.candidate_only != 'true'
     name: Publish verified artifacts without rebuilding
     needs: [resolve, verify-assets]
     runs-on: ubuntu-24.04
@@ -172,9 +337,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Verify and promote saved images; record registry digests
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           cd release-assets

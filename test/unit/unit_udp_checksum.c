@@ -590,6 +590,61 @@ static void setup_quote_maps(void)
     }
 }
 
+/* Exercise the complete data output path, including BSD's TUN family header. */
+static void test_ipv6_udp_output_family(void)
+{
+    setup_quote_maps(); gcfg.mtu = 1500;
+    int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    alignas(4) uint8_t buffer[HEADROOM + 128] = {0}, response[128];
+    struct ip6 *ip = (struct ip6 *)(buffer + HEADROOM);
+    ip->ver_tc_fl = htonl(0x60000000); ip->hop_limit = 64;
+    ip->next_header = IPPROTO_UDP; ip->payload_length = htons(8);
+    inet_pton(AF_INET6, "64:ff9b::808:808", &ip->src);
+    inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip->dest);
+    uint8_t *udp = (uint8_t *)(ip + 1);
+    uint16_t words[4] = {htons(1234), htons(4321), htons(8), 0};
+    memcpy(udp, words, sizeof(words));
+    uint16_t checksum = htons(calc_full_udp_cksum6(&ip->src, &ip->dest, udp, 8));
+    memcpy(udp + 6, &checksum, sizeof(checksum));
+    struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 48};
+    handle_ip6(&p);
+    ssize_t length = recv(sv[1], response, sizeof(response), MSG_DONTWAIT);
+    unsigned offset = 0;
+#ifndef __linux__
+    offset = sizeof(struct tun_pi);
+    uint32_t family; memcpy(&family, response, sizeof(family));
+    assert(ntohl(family) == AF_INET);
+#endif
+    assert(length == (ssize_t)(offset + 28));
+    struct ip4 *out = (struct ip4 *)(response + offset);
+    assert(out->proto == IPPROTO_UDP && out->ttl == 63);
+    assert(ip_checksum(out, 20) == 0);
+    assert(ones_add(ip_checksum(out + 1, 8), ip4_checksum(out, 8, IPPROTO_UDP)) == 0);
+    close(sv[0]); close(sv[1]);
+    puts("PASS: IPv6 UDP data output has a valid IPv4 packet and TUN family");
+}
+
+static void test_icmp_echo_checksum_translation(void)
+{
+    struct ip4 ip4 = {0}; struct ip6 ip6 = {0};
+    inet_pton(AF_INET, "192.0.0.1", &ip4.src); inet_pton(AF_INET, "8.8.8.8", &ip4.dest);
+    inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6.src); inet_pton(AF_INET6, "64:ff9b::808:808", &ip6.dest);
+    ip4.length = htons(32);
+    alignas(4) uint8_t bytes[12] = {8, 0, 0, 0, 0x12, 0x34, 0, 1, 1, 2, 3, 4};
+    struct icmp *echo = (struct icmp *)bytes;
+    echo->cksum = ip_checksum(bytes, sizeof(bytes));
+    struct pkt p = {.ip4 = &ip4, .ip6 = &ip6, .icmp = echo, .data = bytes,
+                    .data_len = sizeof(bytes), .header_len = 20, .data_proto = IPPROTO_ICMP};
+    assert(xlate_payload_4to6(&p, &ip6, 0) == 0);
+    assert(echo->type == 128);
+    assert(ones_add(ip_checksum(bytes, sizeof(bytes)), ip6_checksum(&ip6, sizeof(bytes), IPPROTO_ICMPV6)) == 0);
+    p.data_proto = IPPROTO_ICMPV6; p.header_len = 0;
+    ip6.payload_length = htons(sizeof(bytes));
+    assert(xlate_payload_6to4(&p, &ip4, 0) == 0);
+    assert(echo->type == 8 && ip_checksum(bytes, sizeof(bytes)) == 0);
+    puts("PASS: ICMP echo checksum is valid in both translation directions");
+}
+
 static void test_tcp_zero_checksum_preserved(void)
 {
     struct ip4 ip4 = {0}; struct ip6 ip6 = {0};
@@ -762,6 +817,8 @@ static void test_embedded_routing_and_extension_limit(void)
 int main(void)
 {
 	printf("=== Running unit_udp_checksum test suite ===\n");
+	test_ipv6_udp_output_family();
+	test_icmp_echo_checksum_translation();
 	test_tcp_zero_checksum_preserved();
 	test_metadata_bounds();
 	test_complete_checksum_translation();

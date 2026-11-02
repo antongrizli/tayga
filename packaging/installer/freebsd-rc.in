@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# PROVIDE: tayga-managed
+# REQUIRE: NETWORKING DAEMON tayga-recovery
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+
+case ":${PATH:-}:" in *:/usr/local/sbin:*) ;; *) PATH="${PATH:-/sbin:/bin:/usr/sbin:/usr/bin}:/usr/local/sbin:/usr/local/bin"; export PATH ;; esac
+
+. /etc/rc.subr
+
+name="tayga_managed"
+rcvar="tayga_managed_enable"
+
+load_rc_config $name
+
+: ${tayga_managed_enable:="NO"}
+: ${tayga_managed_profile:="nat64"}
+
+profile=${tayga_managed_profile}
+pidfile="/var/run/tayga-managed-${profile}.pid"
+command="/usr/local/sbin/tayga"
+command_args="--config /etc/tayga/${profile}.conf --runtime-dir /var/run/tayga-managed-${profile} --pidfile ${pidfile}"
+
+start_precmd="tayga_start_pre"
+start_postcmd="tayga_start_post"
+stop_postcmd="tayga_stop_post"
+
+tayga_start_pre() {
+    case "$profile" in clat|nat64|siit) ;; *) err 1 "Invalid managed profile: $profile" ;; esac
+    mkdir -p "/var/lib/tayga" "/var/lib/tayga/${profile}" "/var/run/tayga-managed-${profile}"
+    chmod 0750 "/var/lib/tayga" "/var/lib/tayga/${profile}" "/var/run/tayga-managed-${profile}"
+    if [ -x /usr/local/libexec/tayga/tayga-dns64 ]; then
+        /usr/local/libexec/tayga/tayga-dns64 prepare "/etc/tayga/${profile}.conf" || return 1
+    fi
+    if [ -x /usr/local/libexec/tayga/tayga-host-dns ]; then
+        /usr/local/libexec/tayga/tayga-host-dns prepare "/etc/tayga/${profile}.conf" || return 1
+    fi
+    /usr/local/libexec/tayga/tayga-net-ctl up "/etc/tayga/${profile}.conf"
+}
+
+tayga_start_post() {
+    if ! /usr/local/libexec/tayga/tayga-verify "/etc/tayga/${profile}.conf"; then
+        if [ -f "$pidfile" ]; then kill -TERM "$(cat "$pidfile")" 2>/dev/null || :; fi
+        if [ -x /usr/local/libexec/tayga/tayga-dns64 ]; then
+            /usr/local/libexec/tayga/tayga-dns64 down "/etc/tayga/${profile}.conf" || :
+        fi
+        if [ -x /usr/local/libexec/tayga/tayga-host-dns ]; then
+            /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/${profile}.conf" || :
+        fi
+        /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/${profile}.conf"
+        return 1
+    fi
+}
+
+tayga_stop_post() {
+    if [ -x /usr/local/libexec/tayga/tayga-dns64 ]; then
+        /usr/local/libexec/tayga/tayga-dns64 down "/etc/tayga/${profile}.conf" || :
+    fi
+    if [ -x /usr/local/libexec/tayga/tayga-host-dns ]; then
+        /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/${profile}.conf" || :
+    fi
+    /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/${profile}.conf"
+}
+
+run_rc_command "$@"

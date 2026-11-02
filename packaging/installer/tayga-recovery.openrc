@@ -1,0 +1,9 @@
+#!/sbin/openrc-run
+name="TAYGA activation recovery"
+depend() {
+    need localmount
+    before networking net
+}
+start() {
+    /usr/local/libexec/tayga/tayga-boot-recover.sh
+}

@@ -35,8 +35,12 @@ before creating a tag. Supported tags are `v1.2.3`, `version-1.2.3`,
 Build metadata (`+suffix`) is not supported in container tags. The workflow never
 writes `VERSION`, commits changes or pushes to `main`.
 
-A tag push starts the pipeline. A manual run requires an **existing tag** in
-`ver`; selecting a workflow branch alone does not select the release source.
+A tag push starts the production pipeline. A manual production run requires
+`candidate_only=false` and an **existing tag** in `ver`; selecting a workflow
+branch alone does not select the release source. Manual dispatch defaults to
+unpublished candidate mode; see [the platform inventory](release-platforms.md).
+For production key setup and the isolated `signing_check_only` dispatch, see
+[release signing](release-signing.md).
 The resolver peels annotated tags, validates the committed metadata and records
 one full commit SHA in `release-source.json`. Every downstream checkout and image
 revision uses that SHA. Keep the release tag immutable throughout publication.
@@ -44,8 +48,11 @@ revision uses that SHA. Keep the release tag immutable throughout publication.
 The pipeline calls the compiler/platform and correctness workflows for that SHA,
 including FreeBSD, static architecture builds, sanitizers, portable/man checks and
 Linux kernel tests. Linux integration is also required. In parallel, it prepares
-standalone binaries and production/CLAT/NAT64 images for amd64, arm64 and armv7.
-Each architecture runs native or QEMU-assisted units, static-link and staged-install
+standalone binaries and DEB/RPM/Alpine APK packages for all seven Linux targets in
+the [platform contract](../../packaging/release-platforms.json), FreeBSD
+amd64/arm64 binaries, shell installers, and the required OpenWrt IPK/APK3 sets.
+Production/CLAT/NAT64 container images cover amd64, arm64 and armv7.
+Each Linux architecture runs native or QEMU-assisted units, static-link and staged-install
 checks, exact binary version/helper checks, image label/default-mode checks,
 diagnose and startup readiness smoke tests. Containers must create their TUN and
 run TAYGA; NAT64 must also run Unbound. These smoke tests do not substitute for
