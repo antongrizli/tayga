@@ -5,6 +5,11 @@ on:
     tags: ['v*', 'version*', '[0-9]*']
   workflow_dispatch:
     inputs:
+      signing_check_only:
+        description: 'Only test production signing credentials; never build or publish a release'
+        required: true
+        default: false
+        type: boolean
       ver:
         description: 'Prepared release tag; required only when candidate_only=false'
         required: false
@@ -28,7 +33,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  signing-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.signing_check_only
+    name: Check production signing credentials without publication
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign and verify an isolated test checksum list
+        env:
+          MINISIGN_KEY_DATA: ${{ secrets.MINISIGN_KEY_DATA }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBKEY: ${{ secrets.MINISIGN_PUBKEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import hashlib
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/ci')
+          from release_artifacts import sign_manifest
+          for name in ('MINISIGN_KEY_DATA', 'MINISIGN_PASSWORD', 'MINISIGN_PUBKEY'):
+              if not os.environ.get(name):
+                  raise SystemExit(f'Missing required signing secret: {name}')
+          with tempfile.TemporaryDirectory(prefix='tayga-signing-check-', dir=os.environ['RUNNER_TEMP']) as directory:
+              root = Path(directory)
+              (root / 'signing-test.txt').write_text('TAYGA signing credentials check\n' + os.environ['GITHUB_SHA'] + '\n')
+              sign_manifest(root, require_signature=True)
+          fingerprint = hashlib.sha256(os.environ['MINISIGN_PUBKEY'].strip().encode('ascii')).hexdigest()
+          print('Public key SHA256: ' + fingerprint)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Production signing check passed: private key/password and public key match. No release built or published.\n')
+              summary.write('Public key SHA256: `' + fingerprint + '`\n')
+          PY
+
   resolve:
+    if: github.event_name != 'workflow_dispatch' || !inputs.signing_check_only
     name: Resolve and validate immutable source
     runs-on: ubuntu-24.04
     outputs:
