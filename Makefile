@@ -53,7 +53,7 @@ release:
 
 RELEASE ?= $(DEFAULT_VERSION)
 # Fixed metadata; update deliberately when publishing a release.
-MAN_DATE ?= October 2026
+MAN_DATE ?= November 2026
 
 .PHONY: man check-man
 man:

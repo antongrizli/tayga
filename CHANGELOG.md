@@ -4,6 +4,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-11-02
+
 ### Changed
 
 - FreeBSD CLAT Proxy NDP now uses a proxy neighbor for the translated address and an owned uplink alias for the daemon identity, avoiding conflicting TUN assignments.
@@ -17,6 +19,7 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- Document the production Minisign public key and release verification procedure; provide an isolated manual signing-credential check without release publication.
 - A shared release platform contract drives seven Linux binary/SFX/native-package targets, FreeBSD installers, required OpenWrt IPK/APK3 subpackages and RouterOS assets; assembly rejects incomplete or unexpected bundles.
 - Read-only signed bundle preflight and candidate-only CI with temporary signing keys, immutable source SHA selection and independent publication guards.
 - Native archive metadata validation and real nFPM format/architecture gates; pinned SDK export checks OpenWrt package identity before publishing CI candidates.

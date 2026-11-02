@@ -190,10 +190,12 @@ In NAT64 mode, the bundled DNS64 resolver validates DNSSEC by default using the 
 
 ### Self-extracting installer
 
-Release assembly builds installers for Linux amd64/arm64/armv7 and FreeBSD
-amd64/arm64, plus `tayga-installer-universal.sh` with all five platforms.
+Release assembly builds installers for Linux amd64/arm64/armv7/armv6/riscv64/ppc64le/s390x
+and FreeBSD amd64/arm64, plus `tayga-installer-universal.sh` with all nine platforms.
 FreeBSD binaries are built and smoke-tested natively by CI before assembly.
-Check the release's `SHA256SUMS` before running an installer.
+Verify the Minisign signature on `SHA256SUMS`, then check the downloaded files
+before running an installer. See [release signature verification](docs/dev/release-signing.md)
+and the project's [public signing key](docs/release-signing.pub).
 
 ```sh
 # Interactive wizard (reads /dev/tty, also when the script is piped to sh).
