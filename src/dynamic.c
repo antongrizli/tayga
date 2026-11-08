@@ -16,6 +16,8 @@
  *  GNU General Public License for more details.
  */
 
+#include <fcntl.h>
+#include <unistd.h>
 #include "tayga.h"
 #include <inttypes.h>
 #include <limits.h>
@@ -67,6 +69,7 @@ static void move_to_mapped(struct map_dynamic *d, struct dynamic_pool *pool)
 
 static void move_to_dormant(struct map_dynamic *d, struct dynamic_pool *pool)
 {
+	addrmap_invalidate_front();
 	struct list_head *entry;
 	struct map_dynamic *s;
 
@@ -260,6 +263,12 @@ void load_dynamic(struct dynamic_pool *pool)
 	if (!pool)
 		return;
 
+	/* The file stores wall-clock epoch seconds; the runtime uses a
+	 * monotonic tick.  Convert via the age of each entry. */
+	time_t wall_now = time(NULL);
+	atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
+	time_t mono_now = atomic_load_explicit(&now, memory_order_relaxed);
+
 	in = fopen(MAP_FILE, "r");
 	if (!in) {
 		if (errno != ENOENT)
@@ -298,6 +307,7 @@ void load_dynamic(struct dynamic_pool *pool)
 #endif
 		if (last_use <= 0 || *end)
 			goto malformed;
+		last_use = mono_now - (wall_now - last_use);	/* future dates stay in the future */
 		load_map(pool, &addr6, &addr4, last_use);
 		continue;
 malformed:
@@ -306,7 +316,6 @@ malformed:
 	}
 	fclose(in);
 
-	atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
 	last_use = 0;
 	list_for_each(entry, &pool->dormant_list) {
 		d = list_entry(entry, struct map_dynamic, list);
@@ -344,24 +353,37 @@ struct dynamic_snapshot {
 
 static int write_to_file(const struct dynamic_snapshot *rows, size_t count, time_t written_at)
 {
-	FILE *out = fopen(TMP_MAP_FILE, "w");
-	if (!out) return -1;
+	/* Mapping database lists client addresses: owner-only, durable. */
+	int fd = open(TMP_MAP_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0) return -1;
+	FILE *out = fdopen(fd, "w");
+	if (!out) { close(fd); unlink(TMP_MAP_FILE); return -1; }
+	/* written_at and row times are in the monotonic domain: convert to
+	 * wall-clock epoch for the on-disk format (unchanged). */
+	time_t wall_now = time(NULL);
 	struct tm tm;
 	char timestamp[64];
-	gmtime_r(&written_at, &tm);
+	gmtime_r(&wall_now, &tm);
 	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S UTC", &tm);
 	fprintf(out, "### tayga dynamic map database\n### Last written: %s\n\n", timestamp);
 	for (size_t i = 0; i < count; i++) {
 		char v4[INET_ADDRSTRLEN], v6[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET, &rows[i].addr4, v4, sizeof(v4));
 		inet_ntop(AF_INET6, &rows[i].addr6, v6, sizeof(v6));
-		fprintf(out, "%s\t%s\t%" PRId64 "\n", v4, v6, (int64_t)rows[i].last_use);
+		fprintf(out, "%s\t%s\t%" PRId64 "\n", v4, v6,
+				(int64_t)(wall_now - (written_at - rows[i].last_use)));
 	}
-	int failed = ferror(out);
+	int failed = fflush(out) != 0 || ferror(out) || fsync(fileno(out)) != 0;
 	if (fclose(out)) failed = 1;
 	if (failed || rename(TMP_MAP_FILE, MAP_FILE)) {
 		unlink(TMP_MAP_FILE);
 		return -1;
+	}
+	/* Persist the rename itself so a power cut cannot leave an empty file. */
+	int dfd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd >= 0) {
+		(void)fsync(dfd);
+		close(dfd);
 	}
 	return 0;
 }

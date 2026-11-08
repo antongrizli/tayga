@@ -627,7 +627,6 @@ int tun_setup(int do_mktun, int do_rmtun)
 			gcfg.tun_offload_errno = errno;
 			slog(LOG_WARNING, "Unable to attach tun with IFF_VNET_HDR (%s), fallback to offload=off\n",
 				strerror(errno));
-			want_vnet = 0;
 			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 			if (gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
@@ -983,6 +982,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 		if (ioctl(fd, SIOCIFDESTROY, &ifr) < 0) {
 			slog(LOG_CRIT, "Unable to destroy interface %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
+			close(fd);
 			return ERROR_REJECT;
 		}
 
@@ -1002,7 +1002,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			return ERROR_REJECT;
 	}
 
-	slog(LOG_CRIT, "Multi-AF mode set on %s\n", gcfg.tundev);
+	slog(LOG_INFO, "Multi-AF mode set on %s\n", gcfg.tundev);
 
 	if(set_nonblock(gcfg.tun_fd)) return ERROR_REJECT;
 
@@ -1021,6 +1021,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 			slog(LOG_CRIT, "Unable to rename interface %s to %s, aborting: %s\n",
 					fdevname(gcfg.tun_fd), gcfg.tundev,
 					strerror(errno));
+			close(fd);
 			return ERROR_REJECT;
 		}
 	}
@@ -1030,11 +1031,17 @@ int tun_setup(int do_mktun, int do_rmtun)
 	if (ioctl(fd, SIOCGIFMTU, &ifr) < 0) {
 		slog(LOG_CRIT, "Unable to query MTU, aborting: %s\n",
 				strerror(errno));
+		close(fd);
 		return ERROR_REJECT;
 	}
 	close(fd);
 
 	gcfg.mtu = ifr.ifr_mtu;
+	if (gcfg.mtu < MTU_MIN) {
+		slog(LOG_CRIT, "TUN MTU %u on %s is below IPv6 minimum (%u), "
+				"aborting\n", gcfg.mtu, gcfg.tundev, MTU_MIN);
+		return ERROR_REJECT;
+	}
 
 	slog(LOG_INFO, "Using tun device %s with MTU %d\n", gcfg.tundev,
 			gcfg.mtu);
@@ -1163,11 +1170,11 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 #endif
 			if (ip_idx < iovcnt && iov[ip_idx].iov_len > 0) {
 				uint8_t ver = ((const uint8_t *)iov[ip_idx].iov_base)[0] >> 4;
-				uint32_t ip_bytes = (uint32_t)(total_len - (ip_idx > 0 ? iov[0].iov_len : 0));
+				uint32_t tx_bytes = (uint32_t)(total_len - (ip_idx > 0 ? iov[0].iov_len : 0));
 				if (ver == 4)
-					stats_tx4(ip_bytes);
+					stats_tx4(tx_bytes);
 				else if (ver == 6)
-					stats_tx6(ip_bytes);
+					stats_tx6(tx_bytes);
 			}
 			return ret;
 		}
@@ -1304,6 +1311,7 @@ int tun_process_frame(uint8_t *recv_buf,int ret,int tun_fd)
 		struct tun_pi *pi = (struct tun_pi *)(recv_buf + HEADROOM);
 		if ((size_t)ret < sizeof(struct tun_pi)) {
 			stats_drop(ret > 0 ? (uint32_t)ret : 0);
+			stats_packet_done();
 			stats_warn_limited(9, "short TUN packet", 0);
 			return TUN_READ_CONSUMED;
 		}

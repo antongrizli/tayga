@@ -6,6 +6,7 @@
  */
 
 #include "tayga.h"
+#include <fcntl.h>
 #include "stats.h"
 #include "experimental_io.h"
 #include "gso.h"
@@ -40,6 +41,31 @@ static void json_string(FILE *out, const char *value)
 	fputc('"', out);
 }
 
+/* The status directory is opened before chroot() so later snapshots can still
+ * be published with openat()/renameat() once the absolute path is unreachable. */
+static int g_status_dirfd = -1;
+static char g_status_base[256];
+
+void telemetry_prepare_dir(const char *path)
+{
+	if (!path || path[0] != '/')
+		return;
+	const char *slash = strrchr(path, '/');
+	char dir[768];
+	size_t dl = slash == path ? 1 : (size_t)(slash - path);
+	if (dl >= sizeof(dir) || strlen(slash + 1) + 1 >= sizeof(g_status_base) - 32)
+		return;
+	memcpy(dir, path, dl); dir[dl] = '\0';
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0) {
+		slog(LOG_WARNING, "Unable to open status directory %s: %s\n", dir, strerror(errno));
+		return;
+	}
+	if (g_status_dirfd >= 0) close(g_status_dirfd);
+	g_status_dirfd = fd;
+	strcpy(g_status_base, slash + 1);
+}
+
 void stats_write_json(const char *path, const char *state)
 {
 	/* The main packet loop must continue acknowledging a background exporter
@@ -53,7 +79,16 @@ void stats_write_json(const char *path, const char *state)
 	char tmp_path[832];
 	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%lu", path, (unsigned long)pthread_self());
 
-	FILE *f = fopen(tmp_path, "w");
+	const int use_dirfd = g_status_dirfd >= 0 && strcmp(path, g_telemetry_path) == 0;
+	char tmp_base[320];
+	snprintf(tmp_base, sizeof(tmp_base), "%s.tmp.%lu", g_status_base, (unsigned long)pthread_self());
+	FILE *f = NULL;
+	if (use_dirfd) {
+		int fd = openat(g_status_dirfd, tmp_base, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (fd >= 0 && !(f = fdopen(fd, "w"))) close(fd);
+	} else {
+		f = fopen(tmp_path, "w");
+	}
 	if (!f) {
 		slog(LOG_WARNING, "Unable to open %s for writing stats JSON: %s\n",
 			tmp_path, strerror(errno));
@@ -87,13 +122,13 @@ void stats_write_json(const char *path, const char *state)
 
 	const char *offload_str = tun_offload_name(gcfg.tun_offload);
 
-	time_t now = time(NULL);
+	time_t wall_now = time(NULL);
 
 	/* Cache /run/clat-info.json to prevent continuous disk reads */
 	static char pref64_source[64] = "configured";
 	static time_t last_info_read = 0;
-	if (last_info_read == 0 || now - last_info_read >= 30) {
-		last_info_read = now;
+	if (last_info_read == 0 || wall_now - last_info_read >= 30) {
+		last_info_read = wall_now;
 		FILE *info = fopen(gcfg.clat_info_path[0] ? gcfg.clat_info_path : "/run/clat-info.json", "r");
 		if (info) {
 			char line[256];
@@ -122,12 +157,12 @@ void stats_write_json(const char *path, const char *state)
 	struct tayga_stats s;
 	stats_get_snapshot(&s);
 
-	long uptime = (long)(now - s.start_time);
+	long uptime = (long)(wall_now - s.start_time);
 	if (uptime < 0) uptime = 0;
 
 	char ts_buf[64];
 	struct tm tm_info;
-	gmtime_r(&now, &tm_info);
+	gmtime_r(&wall_now, &tm_info);
 	strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
 
 	atomic_fetch_add_explicit(&g_stats_snapshot_seq, 1, memory_order_relaxed);
@@ -246,10 +281,13 @@ void stats_write_json(const char *path, const char *state)
 
 	int failed = ferror(f);
 	if (fclose(f)) failed = 1;
-	if (!failed) failed = rename(tmp_path, path);
+	if (!failed)
+		failed = use_dirfd ? renameat(g_status_dirfd, tmp_base, g_status_dirfd, g_status_base)
+		                   : rename(tmp_path, path);
 	if (failed) {
 		slog(LOG_WARNING, "Unable to publish stats JSON: %s\n", strerror(errno));
-		unlink(tmp_path);
+		if (use_dirfd) unlinkat(g_status_dirfd, tmp_base, 0);
+		else unlink(tmp_path);
 	}
 	pthread_mutex_unlock(&s_stats_export_mutex);
 }

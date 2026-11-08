@@ -16,6 +16,8 @@
  *  GNU General Public License for more details.
  */
 
+#include <stdatomic.h>
+#include <stdbool.h>
 #include "tayga.h"
 
 static inline uint16_t get_u16(const void *ptr)
@@ -78,7 +80,7 @@ struct ip4_error {
  */
 void log_pkt4(int err, struct pkt *p, const char *msg)
 {
-	const char * type = "";
+	const char *type;
 	if	   (gcfg.log_opts & err & LOG_OPT_SELF) 	type = "SELF";
 	else if(gcfg.log_opts & err & LOG_OPT_DROP) 	type = "DROP";
 	else if(gcfg.log_opts & err & LOG_OPT_REJECT) 	type = "REJECT";
@@ -114,7 +116,7 @@ void log_pkt4(int err, struct pkt *p, const char *msg)
  */
 void log_pkt6(int err, struct pkt *p, const char *msg)
 {
-	const char * type = "";
+	const char *type;
 	if	   (gcfg.log_opts & err & LOG_OPT_SELF) 	type = "SELF";
 	else if(gcfg.log_opts & err & LOG_OPT_DROP) 	type = "DROP";
 	else if(gcfg.log_opts & err & LOG_OPT_REJECT) 	type = "REJECT";
@@ -286,15 +288,97 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
 }
 
+/*
+ * Lock-free token bucket for originated ICMP errors (RFC 4443 2.4(f) MUST,
+ * RFC 1812 4.3.2.8).  Path-MTU signalling (Packet Too Big / Fragmentation
+ * Needed) has its own bucket so a TTL-expiry flood cannot starve PMTUD.
+ * Millisecond 32-bit timestamps keep the atomics lock-free on 32-bit CPUs.
+ */
+#define ICMP_RL_DEFAULT_RATE	1000u
+#define ICMP_RL_MAX_BURST	200u
+
+struct icmp_rate_limiter {
+	_Atomic uint32_t last_refill_ms;
+	_Atomic uint32_t tokens;
+};
+
+enum { ICMP_RL_V4, ICMP_RL_V4_PMTU, ICMP_RL_V6, ICMP_RL_V6_PMTU, ICMP_RL_COUNT };
+
+static struct icmp_rate_limiter g_icmp_rl[ICMP_RL_COUNT] = {
+	{ 0, ICMP_RL_MAX_BURST }, { 0, ICMP_RL_MAX_BURST },
+	{ 0, ICMP_RL_MAX_BURST }, { 0, ICMP_RL_MAX_BURST },
+};
+
+/* Test hook: refill all buckets and drop the cached timestamps. */
+void icmp_rate_limit_reset(void)
+{
+	for (int i = 0; i < ICMP_RL_COUNT; i++) {
+		atomic_store(&g_icmp_rl[i].last_refill_ms, 0);
+		atomic_store(&g_icmp_rl[i].tokens, ICMP_RL_MAX_BURST);
+	}
+}
+
+static bool icmp_allow_send(int which)
+{
+	uint32_t rate = gcfg.icmp_rate_limit;
+	if (rate == UINT32_MAX)
+		return true;
+	if (rate == 0)
+		rate = ICMP_RL_DEFAULT_RATE;
+	uint32_t burst = rate < ICMP_RL_MAX_BURST ? rate : ICMP_RL_MAX_BURST;
+	struct icmp_rate_limiter *rl = &g_icmp_rl[which];
+
+	uint32_t cur = atomic_load_explicit(&rl->tokens, memory_order_relaxed);
+	while (cur > 0) {
+		if (atomic_compare_exchange_weak_explicit(&rl->tokens, &cur, cur - 1,
+				memory_order_relaxed, memory_order_relaxed))
+			return true;
+	}
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint32_t now_ms = (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
+	uint32_t prev_ms = atomic_load_explicit(&rl->last_refill_ms, memory_order_relaxed);
+	uint32_t elapsed_ms = now_ms - prev_ms; /* wrap-safe */
+	uint64_t add = (uint64_t)elapsed_ms * rate / 1000u;
+	if (add == 0)
+		return false;
+	if (!atomic_compare_exchange_strong_explicit(&rl->last_refill_ms, &prev_ms, now_ms,
+			memory_order_relaxed, memory_order_relaxed))
+		return false;
+	if (add > burst)
+		add = burst;
+	atomic_store_explicit(&rl->tokens, (uint32_t)add - 1, memory_order_relaxed);
+	return true;
+}
+
 void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word,
 		struct pkt *orig)
 {
 	struct icmp icmp;
 	uint32_t orig_len;
 
+	if (!orig || !orig->ip4)
+		return;
+
+	/* RFC 1812 4.3.2.7: never answer a non-initial fragment. */
+	if (ntohs(orig->ip4->flags_offset) & IP4_F_MASK)
+		return;
+
+	/* ... nor a packet from/to a broadcast, multicast, loopback or
+	 * unspecified address. */
+	uint32_t src_h = ntohl(orig->ip4->src.s_addr);
+	uint32_t dst_h = ntohl(orig->ip4->dest.s_addr);
+	if (src_h == 0 || (src_h >> 24) == 127 || src_h >= 0xe0000000U ||
+			dst_h == 0xffffffffU || (dst_h & 0xf0000000U) == 0xe0000000U)
+		return;
+
 	/* Don't send ICMP errors in response to ICMP messages other than
 	   echo request */
-	if (orig->data_proto == 1 && orig->icmp->type != 8)
+	if (orig->data_proto == 1 && (!orig->icmp || orig->icmp->type != 8))
+		return;
+
+	if (!icmp_allow_send(type == 3 && code == 4 ? ICMP_RL_V4_PMTU : ICMP_RL_V4))
 		return;
 
 	orig_len = orig->header_len + orig->data_len;
@@ -639,13 +723,12 @@ static void xlate_4to6_data(struct pkt *p)
 
 static int parse_ip4(struct pkt *p, int em)
 {
-	p->ip4 = (struct ip4 *)(p->data);
-
-	/* Not long enough for IPv4 header */
-	if (p->data_len < sizeof(struct ip4)) {
-		log_pkt4(LOG_OPT_DROP,p,"IP Header Length");
+	/* Not long enough for IPv4 header: bail out before touching any field
+	 * (log_pkt4 would read 20 bytes past the end of the frame). */
+	if (p->data_len < sizeof(struct ip4))
 		return ERROR_DROP;
-	}
+
+	p->ip4 = (struct ip4 *)(p->data);
 
 	/* Read IHL field for actual header len */
 	p->header_len = (p->ip4->ver_ihl & 0x0f) * 4;
@@ -718,11 +801,14 @@ static unsigned int est_mtu(unsigned int too_big)
 static void xlate_4to6_icmp_error(struct pkt *p)
 {
 	struct ip6_error header;
-	struct iovec iov[2];
+	struct iovec iov[4];
 	struct pkt p_em;
 	uint32_t mtu;
 	uint16_t em_len;
 	char temp[64];
+	const uint8_t *ext_ptr = NULL;	/* RFC 4884 extension structure */
+	uint32_t ext_len = 0;
+	static const uint8_t zero_pad[128];
 
 	memset(&p_em, 0, sizeof(p_em));
 	p_em.data = p->data + sizeof(struct icmp);
@@ -733,7 +819,12 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		if (em_len) {
 			if (p_em.data_len < em_len) {
 				log_pkt4(LOG_OPT_DROP,p,"ICMP Option Length and Packet Too Short");
+				stats_drop(p->data_len);
 				return;
+			}
+			if (p_em.data_len > em_len) {
+				ext_ptr = p_em.data + em_len;
+				ext_len = p_em.data_len - em_len;
 			}
 			p_em.data_len = em_len;
 		}
@@ -741,11 +832,13 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 
 	if (parse_ip4(&p_em, 1) < 0) {
 		log_pkt4(LOG_OPT_DROP,p,"Failed to parse em packet");
+		stats_drop(p->data_len);
 		return;
 	}
 
 	if (p_em.data_proto == 1 && p_em.icmp->type != 8) {
 		log_pkt4(LOG_OPT_DROP,p,"ICMP Error of ICMP Error");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -759,6 +852,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 			map_ip4_to_ip6(&header.ip6_em.dest,
 					&p_em.ip4->dest)) {
 		log_pkt4(LOG_OPT_DROP,p,"ICMP Failed to map em src or em dest");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -833,6 +927,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		default:
 			sprintf(temp,"ICMP Unknown Dest Unreach Code %d",p->icmp->code);
 			log_pkt4(LOG_OPT_DROP,p,temp);
+			stats_drop(p->data_len);
 			return;
 		}
 		break;
@@ -844,16 +939,19 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	case 12: /* Parameter Problem */
 		if (p->icmp->code != 0 && p->icmp->code != 2) {
 			log_pkt4(LOG_OPT_DROP,p,"Parameter Problem Invalid Code");
+			stats_drop(p->data_len);
 			return;
 		}
 		static const int32_t new_ptr_tbl[] = {0,1,4,4,-1,-1,-1,-1,7,6,-1,-1,8,8,8,8,24,24,24,24};
 		uint32_t old_ptr = (uint32_t)ntohl(p->icmp->word) >> 24;
 		if(old_ptr > 19) {
 			log_pkt4(LOG_OPT_DROP,p,"Parameter Problem Invalid Pointer");
+			stats_drop(p->data_len);
 			return;
 		}
 		if(new_ptr_tbl[old_ptr] < 0) {
 			log_pkt4(LOG_OPT_DROP,p,"Parameter Problem Not Translatable");
+			stats_drop(p->data_len);
 			return;
 		}
 		header.icmp.type = 4;
@@ -863,11 +961,13 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	default:
 		sprintf(temp,"ICMP Unknown Type %d",p->icmp->type);
 		log_pkt4(LOG_OPT_DROP,p,temp);
+		stats_drop(p->data_len);
 		return;
 	}
 
 	if (xlate_payload_4to6(&p_em, &header.ip6_em,1) < 0) {
 		log_pkt4(LOG_OPT_DROP,p,"Unable to translate ICMP embedded payload");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -879,12 +979,39 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 
 	if (map_ip4_to_ip6(&header.ip6.dest, &p->ip4->dest)) {
 		log_pkt4(LOG_OPT_DROP,p,"Unable to map destination address");
+		stats_drop(p->data_len);
 		return;
 	}
 
+	/* RFC 4884 / RFC 7915 4.2: carry the extension structure across.  The
+	 * ICMPv6 original datagram must be zero-padded to a multiple of 8
+	 * octets and be at least 128 octets; the Length attribute counts
+	 * 8-octet units in the top byte of the ICMPv6 reserved word. */
+	uint32_t pad_len = 0;
+	if (ext_len >= 4 && (header.icmp.type == 1 || header.icmp.type == 3)) {
+		uint32_t orig_v6 = (uint32_t)(sizeof(header.ip6_em) + em_frag_len + p_em.data_len);
+		uint32_t target = orig_v6 < 128 ? 128 : ((orig_v6 + 7u) & ~7u);
+		if (target / 8 <= 255 &&
+		    sizeof(header.ip6) + sizeof(header.icmp) + target + ext_len <= MTU_MIN) {
+			pad_len = target - orig_v6;
+			header.icmp.word = htonl((target / 8) << 24);
+		} else {
+			ext_len = 0;
+		}
+	} else {
+		ext_len = 0;
+	}
+
 	xlate_header_4to6(p, &header.ip6,
-		sizeof(header.icmp) + sizeof(header.ip6_em) + em_frag_len + p_em.data_len);
+		sizeof(header.icmp) + sizeof(header.ip6_em) + em_frag_len + p_em.data_len +
+		pad_len + ext_len);
 	--header.ip6.hop_limit;
+
+	/* Zero padding adds nothing, and the padded original datagram is
+	 * 8-aligned, so the extension sum is independent of data_len parity. */
+	uint16_t em_sum = ip_checksum(p_em.data, p_em.data_len);
+	if (ext_len)
+		em_sum = ones_add(em_sum, ip_checksum((void *)ext_ptr, ext_len));
 
 	header.icmp.cksum = 0;
 	header.icmp.cksum = ones_add(ip6_checksum(&header.ip6,
@@ -892,7 +1019,7 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 			ones_add(ip_checksum(&header.icmp,
 						sizeof(header.icmp) +
 						sizeof(header.ip6_em) + em_frag_len),
-				ip_checksum(p_em.data, p_em.data_len)));
+				em_sum));
 
 	TUN_SET_PROTO(&header.pi,  ETH_P_IPV6);
 
@@ -905,13 +1032,23 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 #endif
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
+	int iovcnt = 2;
+	if (pad_len) {
+		iov[iovcnt].iov_base = (void *)zero_pad;
+		iov[iovcnt++].iov_len = pad_len;
+	}
+	if (ext_len) {
+		iov[iovcnt].iov_base = (void *)ext_ptr;
+		iov[iovcnt++].iov_len = ext_len;
+	}
 
-	tun_writev(p->tun_fd, iov, 2);
+	tun_writev(p->tun_fd, iov, iovcnt);
 }
 
 void handle_ip4(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
+		p->gso_sent_payload = 0;
 		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV4) {
@@ -922,8 +1059,9 @@ void handle_ip4(struct pkt *p)
 					return;
 			}
 		}
-		/* A rejected or partially emitted GSO aggregate is never a plain packet. */
-		stats_drop(p->data_len);
+		/* A rejected or partially emitted GSO aggregate is never a plain packet;
+		 * count only the payload that was not already sent. */
+		stats_drop(p->data_len - (p->gso_sent_payload < p->data_len ? p->gso_sent_payload : p->data_len));
 		return;
 	}
 
@@ -1006,9 +1144,25 @@ void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,
 	struct icmp icmp;
 	uint32_t orig_len;
 
+	if (!orig || !orig->ip6)
+		return;
+
+	/* RFC 4443 2.4(e): no errors for unspecified/multicast sources, nor
+	 * for multicast destinations, except Packet Too Big and Parameter
+	 * Problem code 2 (e.3). */
+	if (IN6_IS_ADDR_UNSPECIFIED(&orig->ip6->src) ||
+			orig->ip6->src.s6_addr[0] == 0xff)
+		return;
+	if (orig->ip6->dest.s6_addr[0] == 0xff &&
+			!(type == 2 || (type == 4 && code == 2)))
+		return;
+
 	/* Don't send ICMP errors in response to ICMP messages other than
 	   echo request */
-	if (orig->data_proto == 58 && orig->icmp->type != 128)
+	if (orig->data_proto == 58 && (!orig->icmp || orig->icmp->type != 128))
+		return;
+
+	if (!icmp_allow_send(type == 2 ? ICMP_RL_V6_PMTU : ICMP_RL_V6))
 		return;
 
 	orig_len = sizeof(struct ip6) + orig->header_len + orig->data_len;
@@ -1345,10 +1499,13 @@ static int parse_ip6(struct pkt *p,int em)
 	uint8_t seg_left = 0;
 	uint32_t seg_ptr = sizeof(struct ip6);
 
+	/* Bounds check before any header field (or log_pkt6) is read. */
+	if (p->data_len < sizeof(struct ip6))
+		return ERROR_DROP;
+
 	p->ip6 = (struct ip6 *)(p->data);
 
-	if (p->data_len < sizeof(struct ip6) ||
-			(ntohl(p->ip6->ver_tc_fl) >> 28) != 6 ||
+	if ((ntohl(p->ip6->ver_tc_fl) >> 28) != 6 ||
 			validate_ip6_addr(&p->ip6->src) ||
 			validate_ip6_addr(&p->ip6->dest)) {
 		/* Do not log if the src or dest was multicast */
@@ -1359,6 +1516,7 @@ static int parse_ip6(struct pkt *p,int em)
 	}
 
 	p->data_proto = p->ip6->next_header;
+	p->next_hdr_offset = 6; /* Next Header field of the base header */
 	p->data += sizeof(struct ip6);
 	p->data_len -= sizeof(struct ip6);
 
@@ -1384,6 +1542,7 @@ static int parse_ip6(struct pkt *p,int em)
 		if(!seg_left) seg_ptr += hdr_len;
 
 		/* Extract next header from extension header */
+		p->next_hdr_offset = (uint32_t)(p->data - (uint8_t *)p->ip6);
 		p->data_proto = p->data[0];
 		p->data += hdr_len;
 		p->data_len -= hdr_len;
@@ -1396,6 +1555,7 @@ static int parse_ip6(struct pkt *p,int em)
 			return ERROR_DROP;
 		}
 		p->ip6_frag = (struct ip6_frag *)p->data;
+		p->next_hdr_offset = (uint32_t)(p->data - (uint8_t *)p->ip6);
 		p->data_proto = p->ip6_frag->next_header;
 		p->data += sizeof(struct ip6_frag);
 		p->data_len -= sizeof(struct ip6_frag);
@@ -1448,10 +1608,13 @@ static int parse_ip6(struct pkt *p,int em)
 static void xlate_6to4_icmp_error(struct pkt *p)
 {
 	struct ip4_error header;
-	struct iovec iov[2];
+	struct iovec iov[4];
 	struct pkt p_em;
 	uint32_t mtu;
 	uint16_t em_len;
+	const uint8_t *ext_ptr = NULL;	/* RFC 4884 extension structure */
+	uint32_t ext_len = 0;
+	static const uint8_t zero_pad[128];
 
 	memset(&p_em, 0, sizeof(p_em));
 	p_em.data = p->data + sizeof(struct icmp);
@@ -1462,7 +1625,12 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		if (em_len) {
 			if (p_em.data_len < em_len) {
 				log_pkt6(LOG_OPT_DROP,p,"ICMP Length Too Short");
+				stats_drop(p->data_len);
 				return;
+			}
+			if (p_em.data_len > em_len) {
+				ext_ptr = p_em.data + em_len;
+				ext_len = p_em.data_len - em_len;
 			}
 			p_em.data_len = em_len;
 		}
@@ -1470,11 +1638,13 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 
 	if (parse_ip6(&p_em,1) < 0) {
 		log_pkt6(LOG_OPT_DROP,p,"ICMP Error Parsing Embedded Packet");
+		stats_drop(p->data_len);
 		return;
 	}
 
 	if (p_em.data_proto == 58 && p_em.icmp->type != 128) {
 		log_pkt6(LOG_OPT_DROP,p,"ICMP Error with ICMP Error");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -1503,6 +1673,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			header.icmp.code = 3; /* Port Unreachable */
 			break;
 		default:
+			stats_drop(p->data_len);
 			return;
 		}
 		break;
@@ -1512,6 +1683,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		mtu = ntohl(p->icmp->word);
 		if (mtu < 68 + MTU_ADJ) {
 			log_pkt6(LOG_OPT_DROP,p,"MTU below minimum in Packet Too Big");
+			stats_drop(p->data_len);
 			return;
 		}
 		if (mtu > gcfg.mtu)
@@ -1532,6 +1704,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			int32_t new_ptr;
 			if(old_ptr > 39) {
 				log_pkt6(LOG_OPT_DROP,p,"Parameter Problem Invalid Pointer");
+				stats_drop(p->data_len);
 				return;
 			} else if(old_ptr > 23) {
 				new_ptr = 16;
@@ -1542,6 +1715,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			}
 			if(new_ptr < 0) {
 				log_pkt6(LOG_OPT_DROP,p,"Parameter Problem Not Translatable");
+				stats_drop(p->data_len);
 				return;
 			}
 			header.icmp.type = 12;
@@ -1556,9 +1730,11 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			break;
 		}
 		log_pkt6(LOG_OPT_DROP,p,"Parameter Problem Unknown Code");
+		stats_drop(p->data_len);
 		return;
 	default:
 		log_pkt6(LOG_OPT_DROP,p,"ICMP Unknown Type");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -1566,13 +1742,23 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 			map_ip6_to_ip4(&header.ip4_em.dest,
 						&p_em.ip6->dest, 0)) {
 		log_pkt6(LOG_OPT_DROP,p,"Failed to map em src or dest");
+		stats_drop(p->data_len);
 		return;
 	}
-	xlate_header_6to4(&p_em, &header.ip4_em,
-		ntohs(p_em.ip6->payload_length) - p_em.header_len);
+	{
+		/* Clamp: a lying inner payload_length must neither underflow nor
+		 * overflow the 16-bit IPv4 total length. */
+		uint32_t raw_em_plen = ntohs(p_em.ip6->payload_length);
+		uint32_t em_l4_len = raw_em_plen >= p_em.header_len ?
+				raw_em_plen - p_em.header_len : p_em.data_len;
+		if (sizeof(struct ip4) + em_l4_len > UINT16_MAX)
+			em_l4_len = UINT16_MAX - sizeof(struct ip4);
+		xlate_header_6to4(&p_em, &header.ip4_em, (int)em_l4_len);
+	}
 
 	if(xlate_payload_6to4(&p_em, &header.ip4_em,1) < 0) {
 		log_pkt6(LOG_OPT_DROP,p,"Failed to translate em payload");
+		stats_drop(p->data_len);
 		return;
 	}
 
@@ -1589,20 +1775,45 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 
 	if (map_ip6_to_ip4(&header.ip4.dest, &p->ip6->dest, 0)) {
 		log_pkt6(LOG_OPT_DROP,p,"Failed to map dest");
+		stats_drop(p->data_len);
 		return;
 	}
 
+	/* RFC 4884 / RFC 7915 5.2: keep the extension structure.  ICMPv4
+	 * pads the original datagram to a multiple of 4 octets and at least
+	 * 128; Length counts 4-octet units in bits 16..23 of the word. */
+	uint32_t pad_len = 0;
+	if (ext_len >= 4 && (header.icmp.type == 3 || header.icmp.type == 11)) {
+		uint32_t orig_v4 = (uint32_t)(sizeof(header.ip4_em) + p_em.data_len);
+		uint32_t target = orig_v4 < 128 ? 128 : ((orig_v4 + 3u) & ~3u);
+		if (target / 4 <= 255 &&
+		    sizeof(header.ip4) + sizeof(header.icmp) + target + ext_len <= 576) {
+			pad_len = target - orig_v4;
+			header.icmp.word = htonl((target / 4) << 16);
+		} else {
+			ext_len = 0;
+		}
+	} else {
+		ext_len = 0;
+	}
+
 	xlate_header_6to4(p, &header.ip4, sizeof(header.icmp) +
-				sizeof(header.ip4_em) + p_em.data_len);
+				sizeof(header.ip4_em) + p_em.data_len + pad_len + ext_len);
 	--header.ip4.ttl;
 
 	header.ip4.cksum = ip4_header_checksum(&header.ip4);
+
+	/* Zero padding adds nothing; the padded original is 4-aligned so the
+	 * extension sum is independent of data_len parity. */
+	uint16_t em_sum = ip_checksum(p_em.data, p_em.data_len);
+	if (ext_len)
+		em_sum = ones_add(em_sum, ip_checksum((void *)ext_ptr, ext_len));
 
 	header.icmp.cksum = 0;
 	header.icmp.cksum = ones_add(ip_checksum(&header.icmp,
 							sizeof(header.icmp) +
 							sizeof(header.ip4_em)),
-				ip_checksum(p_em.data, p_em.data_len));
+				em_sum);
 
 	TUN_SET_PROTO(&header.pi, ETH_P_IP);
 
@@ -1615,13 +1826,23 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 #endif
 	iov[1].iov_base = p_em.data;
 	iov[1].iov_len = p_em.data_len;
+	int iovcnt = 2;
+	if (pad_len) {
+		iov[iovcnt].iov_base = (void *)zero_pad;
+		iov[iovcnt++].iov_len = pad_len;
+	}
+	if (ext_len) {
+		iov[iovcnt].iov_base = (void *)ext_ptr;
+		iov[iovcnt++].iov_len = ext_len;
+	}
 
-	tun_writev(p->tun_fd, iov, 2);
+	tun_writev(p->tun_fd, iov, iovcnt);
 }
 
 void handle_ip6(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
+		p->gso_sent_payload = 0;
 		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV6) {
@@ -1632,8 +1853,9 @@ void handle_ip6(struct pkt *p)
 					return;
 			}
 		}
-		/* A rejected or partially emitted GSO aggregate is never a plain packet. */
-		stats_drop(p->data_len);
+		/* A rejected or partially emitted GSO aggregate is never a plain packet;
+		 * count only the payload that was not already sent. */
+		stats_drop(p->data_len - (p->gso_sent_payload < p->data_len ? p->gso_sent_payload : p->data_len));
 		return;
 	}
 
@@ -1661,7 +1883,7 @@ void handle_ip6(struct pkt *p)
 			host_handle_icmp6(p);
 		else {
 			log_pkt6(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Unknown protocol to self");
-			host_send_icmp6_error(4, 1, 6, p);
+			host_send_icmp6_error(4, 1, p->next_hdr_offset, p);
 		}
 	} else {
 		if (unlikely(p->ip6->hop_limit == 1)) {

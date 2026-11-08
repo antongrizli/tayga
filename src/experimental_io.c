@@ -146,11 +146,11 @@ void dispatch_wait(unsigned worker,int timeout)
 void dispatch_release(unsigned slot) {pthread_mutex_lock(&dispatch.lock);dispatch_free_locked(slot);pthread_mutex_unlock(&dispatch.lock);}
 void dispatch_expire(void)
 {
-	uint64_t now=mono_seconds();if(now==dispatch.last_expire)return;dispatch.last_expire=now;
+	uint64_t cur=mono_seconds();if(cur==dispatch.last_expire)return;dispatch.last_expire=cur;
 	pthread_mutex_lock(&dispatch.lock);
 	for(unsigned i=0;i<DISPATCH_FRAGMENTS;i++) {
 		struct fragment_entry *f=&dispatch.fragments[i];
-		if(!f->used || f->resolved==2 || now<f->deadline)continue;
+		if(!f->used || f->resolved==2 || cur<f->deadline)continue;
 		for(int slot=f->first;slot>=0;) {
 			int next=dispatch.next[slot];dispatch_drop(dispatch.length[slot]);dispatch_free_locked(slot);slot=next;
 		}

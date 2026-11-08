@@ -84,6 +84,7 @@ void usage(int code) {
 }
 
 /* Used during argument parsing, before logging is setup */
+__attribute__((format(printf, 1, 2)))
 void die(const char *format, ...) {
 	va_list ap;
 	va_start(ap, format);
@@ -392,7 +393,7 @@ int main(int argc, char **argv)
 	/* Init config structure */
 	if(config_init() < 0) return 1;
 	stats_init();
-	atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
+	atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
 	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) ||
 	    pthread_mutex_init(&gcfg.map_mutex, NULL))
 		die("Failed to initialize mapping mutexes");
@@ -728,13 +729,13 @@ int main(int argc, char **argv)
 			exit(1);
 		}		
 		int len = 8 * sizeof(uint32_t);
-		int ret = read(urandom_fd, gcfg.rand, len);
-		if (ret < 0) {
+		int nread = read(urandom_fd, gcfg.rand, len);
+		if (nread < 0) {
 			slog(LOG_CRIT, "read /dev/urandom returned %s\n",
 					strerror(errno));
 			exit(1);
 		}
-		if (ret < len) {
+		if (nread < len) {
 			slog(LOG_CRIT, "read /dev/urandom returned EOF\n");
 			exit(1);
 		}
@@ -793,17 +794,10 @@ int main(int argc, char **argv)
 	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
 	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 
-#ifdef __linux__
-	for (int i = 0; i < gcfg.workers; i++) {
-		thread_ids[i] = i;
-		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
-		if (ret) { errno = ret; goto startup_failed; }
-		created_workers++;
-	}
-	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
-		usleep(1000);
-#endif
-
+	/* Confine and drop privileges BEFORE any thread exists: an error here
+	 * can then abort cleanly, and no thread can retain extra credentials. */
+	if (do_chroot)
+		telemetry_prepare_dir(gcfg.status_path);
 	if (do_chroot) {
 		if (chroot(gcfg.data_dir) < 0) {
 			slog(LOG_CRIT, "Unable to chroot to %s: %s\n",
@@ -835,7 +829,16 @@ int main(int argc, char **argv)
 		}
 	}
 
-
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		thread_ids[i] = i;
+		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
+		if (ret) { errno = ret; goto startup_failed; }
+		created_workers++;
+	}
+	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
+		usleep(1000);
+#endif
 
 	/* Print running information */
 	print_op_info();
@@ -918,7 +921,7 @@ int main(int argc, char **argv)
 			stats_flush_idle();
 			last_main_flush = main_mono_now;
 		}
-		atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
+		atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
 		if (gcfg.cache_size && (gcfg.last_cache_maint +
 						CACHE_CHECK_INTERVAL < now ||
 					gcfg.last_cache_maint > now)) {

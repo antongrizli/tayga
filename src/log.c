@@ -146,6 +146,7 @@ int notify(const char *message) {
 #define MESSAGE_SIZE 2048
 
 static int journal_fd = -1;
+static int journal_connected = 0;	/* connect()ed before chroot() */
 static const char *syslog_identifier = NULL;
 
 /* Open the systemd journal. Not threadsafe. */
@@ -165,6 +166,16 @@ int journal_init(const char *ident) {
     if (r < 0)
         return r;
 
+    /* Connect now: after chroot() the socket path is unreachable, but a
+     * connected datagram socket keeps working. */
+    {
+        struct sockaddr_un ja;
+        memset(&ja, 0, sizeof(ja));
+        ja.sun_family = AF_UNIX;
+        snprintf(ja.sun_path, sizeof(ja.sun_path), "%s", JOURNAL_SOCKET);
+        journal_connected = connect(fd, (struct sockaddr *)&ja, sizeof(ja)) == 0;
+    }
+
     journal_fd = fd;
     syslog_identifier = ident;
     return 0;
@@ -174,6 +185,7 @@ int journal_init(const char *ident) {
 void journal_cleanup(void) {
     close(journal_fd);
     journal_fd = -1;
+    journal_connected = 0;
 }
 
 /* Send a message to the systemd journal.
@@ -248,8 +260,10 @@ int journal_printv_with_location(
     };
 
     struct msghdr mh = {0};
-    mh.msg_name = (void *)&sa.sa;
-    mh.msg_namelen = offsetof(struct sockaddr_un, sun_path) + strlen(JOURNAL_SOCKET) + 1;
+    if (!journal_connected) {
+        mh.msg_name = (void *)&sa.sa;
+        mh.msg_namelen = offsetof(struct sockaddr_un, sun_path) + strlen(JOURNAL_SOCKET) + 1;
+    }
     mh.msg_iov = iov;
     mh.msg_iovlen = iovlen;
 

@@ -222,6 +222,62 @@ static int config_prefix(int ln, int arg_count, char **args)
 	return ERROR_NONE;
 }
 
+static int parse_bounded_long(const char *text, long lo, long hi, long *out)
+{
+	char *end = NULL;
+	errno = 0;
+	if (*text < '0' || *text > '9')
+		return -1;
+	long v = strtol(text, &end, 10);
+	if (errno || *end || v < lo || v > hi)
+		return -1;
+	*out = v;
+	return 0;
+}
+
+static int config_hash_bits(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	long v;
+	if (parse_bounded_long(args[0], 4, 24, &v)) {
+		slog(LOG_CRIT, "Error: hash-bits must be 4..24 on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	gcfg.hash_bits = (int)v;
+	return ERROR_NONE;
+}
+
+static int config_cache_size(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	long v;
+	if (parse_bounded_long(args[0], 0, 1 << 22, &v)) {
+		slog(LOG_CRIT, "Error: cache-size must be 0..4194304 on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	gcfg.cache_size = (int)v;
+	return ERROR_NONE;
+}
+
+static int config_icmp_rate_limit(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	if (!strcasecmp(args[0], "unlimited") || !strcmp(args[0], "0")) {
+		gcfg.icmp_rate_limit = UINT32_MAX;
+		return ERROR_NONE;
+	}
+	char *end = NULL;
+	errno = 0;
+	unsigned long v = strtoul(args[0], &end, 10);
+	if (errno || !end || *end || args[0][0] < '0' || args[0][0] > '9' ||
+			v == 0 || v >= UINT32_MAX) {
+		slog(LOG_CRIT, "Error: invalid value for icmp-rate-limit on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	gcfg.icmp_rate_limit = (uint32_t)v;
+	return ERROR_NONE;
+}
+
 static int config_wkpf_strict(int ln, int arg_count, char **args)
 {
 	//arg_count unused
@@ -308,136 +364,86 @@ static int config_tun_device(int ln, int arg_count, char **args)
 }
 
 
-static int config_tun_ip(int ln, int arg_count, char **args)
+/* Parse "addr[/len]" into a tun_ip4/tun_ip6 entry on the matching list.
+ * Strict: the length must be all digits and within range; the argument is
+ * not modified; each family gets its own correctly typed allocation. */
+static int parse_tun_addr(int ln, const char *what, const char *arg,
+		struct list_head *list4, struct list_head *list6)
 {
-	//arg_count unused
-	(void)arg_count;
+	char buf[INET6_ADDRSTRLEN + 8];
+	const char *slash = strchr(arg, '/');
+	size_t alen = slash ? (size_t)(slash - arg) : strlen(arg);
+	long prefix = -1;
 
-	struct tun_ip6 *ip6 = malloc(sizeof(struct tun_ip6));
-	if(!ip6) {
-		slog(LOG_CRIT,"Failed to allocate ip memory\n");
+	if (alen == 0 || alen >= INET6_ADDRSTRLEN) {
+		slog(LOG_CRIT, "Expected an IPv4 or IPv6 address but found "
+		     "\"%s\" on line %d\n", arg, ln);
 		return ERROR_REJECT;
 	}
-	//We will only use one of these two pointers
-	struct tun_ip4 *ip4 = (struct tun_ip4 *)ip6;
-
-	//Check if we have a slash, and get prefix length
-	char *slash;
-	slash = strchr(args[0], '/');
-	int prefix = -1;
+	memcpy(buf, arg, alen);
+	buf[alen] = '\0';
 	if (slash) {
-		prefix = atoi(slash+1);
-		//Additional check on zero answer
-		if(slash[1] > '9' || slash[1] < '0' || (!prefix && slash[1] != '0')) {
+		char *end = NULL;
+		const char *num = slash + 1;
+		errno = 0;
+		prefix = strtol(num, &end, 10);
+		if (*num < '0' || *num > '9' || *end || errno || prefix > 128) {
 			slog(LOG_CRIT, "Invalid prefix length in %s for "
-			     "address on line %d\n", args[0], ln);
-			free(ip6);
+			     "%s on line %d\n", arg, what, ln);
 			return ERROR_REJECT;
 		}
-		slash[0] = '\0';
 	}
 
-	//Try to decode as IPv6
-	if (inet_pton(AF_INET6, args[0], &ip6->addr)) {
-		//IP6 was valid, set prefix and insert into array
-		if(prefix < 0) prefix = 128;
-		if(prefix > 128) {
-			slog(LOG_CRIT, "Invalid prefix length %d for IPv6 "
-			     "address on line %d\n", prefix, ln);
-			free(ip6);
+	struct in6_addr a6;
+	struct in_addr a4;
+	if (inet_pton(AF_INET6, buf, &a6) == 1) {
+		if (prefix < 0) prefix = 128;
+		struct tun_ip6 *ip6 = malloc(sizeof(*ip6));
+		if (!ip6) {
+			slog(LOG_CRIT, "Failed to allocate %s memory\n", what);
 			return ERROR_REJECT;
 		}
-		ip6->prefix_len = prefix;
+		ip6->addr = a6;
+		ip6->prefix_len = (int)prefix;
 		INIT_LIST_HEAD(&ip6->list);
-		list_add(&ip6->list,&gcfg.tun_ip6_list);
+		list_add(&ip6->list, list6);
 		return ERROR_NONE;
 	}
-	//Then try as IPv4
-	if(inet_pton(AF_INET, args[0], &ip4->addr)) {
-		//IP4 was valid, set prefix and insert into array
-		if(prefix < 0) prefix = 32;
-		if(prefix > 32) {
-			slog(LOG_CRIT, "Invalid prefix length %d for IPv4 "
-			     "address on line %d\n", prefix, ln);
-			free(ip4);
+	if (inet_pton(AF_INET, buf, &a4) == 1) {
+		if (prefix < 0) prefix = 32;
+		if (prefix > 32) {
+			slog(LOG_CRIT, "Invalid prefix length %ld for IPv4 "
+			     "%s on line %d\n", prefix, what, ln);
 			return ERROR_REJECT;
 		}
-		ip4->prefix_len = prefix;
+		struct tun_ip4 *ip4 = malloc(sizeof(*ip4));
+		if (!ip4) {
+			slog(LOG_CRIT, "Failed to allocate %s memory\n", what);
+			return ERROR_REJECT;
+		}
+		ip4->addr = a4;
+		ip4->prefix_len = (int)prefix;
 		INIT_LIST_HEAD(&ip4->list);
-		list_add(&ip4->list,&gcfg.tun_ip4_list);
+		list_add(&ip4->list, list4);
 		return ERROR_NONE;
 	}
-	//Error handling
 	slog(LOG_CRIT, "Expected an IPv4 or IPv6 address but found \"%s\" on "
-		     "line %d\n", args[0], ln);
-	free(ip6);
+		     "line %d\n", arg, ln);
 	return ERROR_REJECT;
+}
+
+static int config_tun_ip(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	return parse_tun_addr(ln, "address", args[0],
+			&gcfg.tun_ip4_list, &gcfg.tun_ip6_list);
 }
 
 static int config_tun_route(int ln, int arg_count, char **args)
 {
-	//arg_count unused
 	(void)arg_count;
-
-	struct tun_ip6 *ip6 = malloc(sizeof(struct tun_ip6));
-	if(!ip6) {
-		slog(LOG_CRIT,"Failed to allocate route memory\n");
-		return ERROR_REJECT;
-	}
-	//We will only use one of these two pointers
-	struct tun_ip4 *ip4 = (struct tun_ip4 *)ip6;
-
-	//Check if we have a slash, and get prefix length
-	char *slash;
-	slash = strchr(args[0], '/');
-	int prefix = -1;
-	if (slash) {
-		prefix = atoi(slash+1);
-		//Additional check on zero answer
-		if(slash[1] > '9' || slash[1] < '0' || (!prefix && slash[1] != '0')) {
-			slog(LOG_CRIT, "Invalid prefix length in %s for "
-			     "route on line %d\n", args[0], ln);
-			free(ip6);
-			return ERROR_REJECT;
-		}
-		slash[0] = '\0';
-	}
-
-	//Try to decode as IPv6
-	if (inet_pton(AF_INET6, args[0], &ip6->addr)) {
-		//IP6 was valid, set prefix and insert into array
-		if(prefix < 0) prefix = 128;
-		if(prefix > 128) {
-			slog(LOG_CRIT, "Invalid prefix length %d for IPv6 "
-			     "route on line %d\n", prefix, ln);
-			free(ip6);
-			return ERROR_REJECT;
-		}
-		ip6->prefix_len = prefix;
-		INIT_LIST_HEAD(&ip6->list);
-		list_add(&ip6->list,&gcfg.tun_rt6_list);
-		return ERROR_NONE;
-	}
-	//Then try as IPv4
-	if(inet_pton(AF_INET, args[0], &ip4->addr)) {
-		//IP4 was valid, set prefix and insert into array
-		if(prefix < 0) prefix = 32;
-		if(prefix > 32) {
-			slog(LOG_CRIT, "Invalid prefix length %d for IPv4 "
-			     "route on line %d\n", prefix, ln);
-			free(ip4);
-			return ERROR_REJECT;
-		}
-		ip4->prefix_len = prefix;
-		INIT_LIST_HEAD(&ip4->list);
-		list_add(&ip4->list,&gcfg.tun_rt4_list);
-		return ERROR_NONE;
-	}
-	//Error handling
-	slog(LOG_CRIT, "Expected an IPv4 or IPv6 route but found \"%s\" on "
-		     "line %d\n", args[0], ln);
-	free(ip6);
-	return ERROR_REJECT;
+	return parse_tun_addr(ln, "route", args[0],
+			&gcfg.tun_rt4_list, &gcfg.tun_rt6_list);
 }
 
 
@@ -796,6 +802,9 @@ struct {
 	{ "ipv6-addr", 		config_ipv6_addr, 		1 },
 	{ "prefix", 		config_prefix, 			1 },
 	{ "wkpf-strict", 	config_wkpf_strict, 	1 },
+	{ "icmp-rate-limit", 	config_icmp_rate_limit, 	1 },
+	{ "hash-bits", 		config_hash_bits, 		1 },
+	{ "cache-size", 		config_cache_size, 		1 },
 	{ "udp-cksum-mode", config_udp_cksum_mode, 	1 },
 	{ "tun-up", 		config_tun_up, 			1 },
 	{ "tun-ip", 		config_tun_ip, 			1 },
@@ -888,7 +897,7 @@ int config_init(void)
 	gcfg.dyn_min_lease = 7200 + 4 * 60; /* just over two hours */
 	gcfg.dyn_max_lease = 14 * 86400;
 	gcfg.max_commit_delay = gcfg.dyn_max_lease / 4;
-	gcfg.hash_bits = 7;
+	gcfg.hash_bits = 14;
 	gcfg.cache_size = 8192;
 	INIT_LIST_HEAD(&gcfg.cache_pool);
 	INIT_LIST_HEAD(&gcfg.cache_active);

@@ -664,7 +664,6 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	gso_update_csum_seed_4to6(tcp, &src4, &dst4, &src6, &dst6, tcp_len);
 	if (ip4_hdr_len > sizeof(struct ip4)) {
 		memmove(p->data + sizeof(struct ip4), tcp, tcp_len);
-		tcp = (struct tcp_hdr *)(p->data + sizeof(struct ip4));
 	}
 
 	/* Use headroom before p->data to prepend 20 bytes for IPv6 header */
@@ -709,6 +708,37 @@ static uint16_t gso_df0_segments(uint32_t payload_len, uint32_t gso_size,
 		return (uint16_t)((payload_len + gso_size - 1) / gso_size);
 	uint32_t tail = payload_len % gso_size;
 	return tail && header_len + tail <= 1260 ? 1 : 0;
+}
+
+/*
+ * Send one software-GSO segment: L3/L4 header at seg_ip plus a payload slice.
+ * On BSD the 4-byte tun_pi (address family) must precede every packet; it is
+ * passed as a separate leading iovec, which tun_writev() recognises.  On Linux
+ * (IFF_NO_PI) this compiles to the plain two-iovec write.
+ */
+static inline ssize_t gso_send_segment(int tun_fd, int af, uint8_t *seg_ip,
+		size_t hdr_len, const uint8_t *data, size_t data_len)
+{
+	struct iovec iov[3];
+	int n = 0;
+#ifndef __linux__
+	struct tun_pi pi;
+	TUN_SET_PROTO(&pi, af);
+	iov[n].iov_base = &pi;
+	iov[n].iov_len = sizeof(pi);
+	n++;
+#else
+	(void)af;
+#endif
+	iov[n].iov_base = seg_ip;
+	iov[n].iov_len = hdr_len;
+	n++;
+	if (data_len > 0) {
+		iov[n].iov_base = (void *)data;
+		iov[n].iov_len = data_len;
+		n++;
+	}
+	return tun_writev(tun_fd, iov, n);
 }
 
 int gso_software_segment_and_send_6to4(struct pkt *p)
@@ -845,17 +875,13 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		                          ip4_checksum(ip4, seg_tcp_total_len, IPPROTO_TCP));
 
 		/* Send segment using zero-copy vectored writev */
-		struct iovec iov[2];
-		iov[0].iov_base = seg_ip;
-		iov[0].iov_len = sizeof(struct ip4) + tcp_hdr_len;
-		iov[1].iov_base = payload + offset;
-		iov[1].iov_len = seg_data_len;
-
-		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
+		ssize_t ret = gso_send_segment(p->tun_fd, AF_INET, seg_ip,
+				sizeof(struct ip4) + tcp_hdr_len, payload + offset, seg_data_len);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 		} else {
 			stats_gso_tun_write_error();
+			p->gso_sent_payload = (uint32_t)offset;
 			return -1;
 		}
 
@@ -904,7 +930,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 	if (gso_size == 0)
 		gso_size = payload_len > 0 ? payload_len : 1;
 
-	uint32_t max_seg_wire4 = ip4_hdr_len + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
+	uint32_t max_seg_wire4 = sizeof(struct ip4) + tcp_hdr_len + (payload_len > gso_size ? gso_size : payload_len);
 	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
 	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
 		p->ip4 = ip4;
@@ -983,17 +1009,13 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		                          ip6_checksum(ip6, seg_tcp_total_len, IPPROTO_TCP));
 
 		/* Send segment using zero-copy vectored writev */
-		struct iovec iov[2];
-		iov[0].iov_base = seg_ip;
-		iov[0].iov_len = sizeof(struct ip6) + tcp_hdr_len;
-		iov[1].iov_base = payload + offset;
-		iov[1].iov_len = seg_data_len;
-
-		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
+		ssize_t ret = gso_send_segment(p->tun_fd, AF_INET6, seg_ip,
+				sizeof(struct ip6) + tcp_hdr_len, payload + offset, seg_data_len);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 		} else {
 			stats_gso_tun_write_error();
+			p->gso_sent_payload = (uint32_t)offset;
 			return -1;
 		}
 
@@ -1126,18 +1148,14 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		if (seg_udp->cksum == 0)
 			seg_udp->cksum = 0xffff;
 
-		struct iovec iov[2];
-		iov[0].iov_base = seg_ip;
-		iov[0].iov_len = sizeof(struct ip4) + sizeof(struct udp_hdr);
-		iov[1].iov_base = payload + offset;
-		iov[1].iov_len = seg_data_len;
-
-		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
+		ssize_t ret = gso_send_segment(p->tun_fd, AF_INET, seg_ip,
+				sizeof(struct ip4) + sizeof(struct udp_hdr), payload + offset, seg_data_len);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 			stats_udp_gso_sw_segment();
 		} else {
 			stats_gso_tun_write_error();
+			p->gso_sent_payload = (uint32_t)offset;
 			return -1;
 		}
 
@@ -1194,7 +1212,7 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		return -1;
 	}
 
-	uint32_t max_seg_wire4 = ip4_hdr_len + sizeof(struct udp_hdr) + (payload_len > gso_size ? gso_size : payload_len);
+	uint32_t max_seg_wire4 = sizeof(struct ip4) + sizeof(struct udp_hdr) + (payload_len > gso_size ? gso_size : payload_len);
 	if (unlikely((ntohs(ip4->flags_offset) & IP4_F_DF) && gcfg.mtu > MTU_ADJ &&
 	             max_seg_wire4 > (uint32_t)(gcfg.mtu - MTU_ADJ))) {
 		p->ip4 = ip4;
@@ -1251,18 +1269,14 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		if (seg_udp->cksum == 0)
 			seg_udp->cksum = 0xffff;
 
-		struct iovec iov[2];
-		iov[0].iov_base = seg_ip;
-		iov[0].iov_len = sizeof(struct ip6) + sizeof(struct udp_hdr);
-		iov[1].iov_base = payload + offset;
-		iov[1].iov_len = seg_data_len;
-
-		ssize_t ret = tun_writev(p->tun_fd, iov, seg_data_len > 0 ? 2 : 1);
+		ssize_t ret = gso_send_segment(p->tun_fd, AF_INET6, seg_ip,
+				sizeof(struct ip6) + sizeof(struct udp_hdr), payload + offset, seg_data_len);
 		if (ret > 0) {
 			stats_gso_sw_seg_out(1);
 			stats_udp_gso_sw_segment();
 		} else {
 			stats_gso_tun_write_error();
+			p->gso_sent_payload = (uint32_t)offset;
 			return -1;
 		}
 

@@ -165,7 +165,7 @@ static int stats_sync_slots(bool *synced_out, uint64_t *unacked_mask_out, bool *
 		atomic_store_explicit(&g_stats_sync_ack[g_tls_priv.slot_idx], req, memory_order_release);
 	}
 
-	struct timespec start, now;
+	struct timespec start, now_ts;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	const uint64_t timeout_ns = 100000000ULL; /* 100 ms overall deadline */
 	uint64_t unacked_mask = 0;
@@ -192,9 +192,9 @@ static int stats_sync_slots(bool *synced_out, uint64_t *unacked_mask_out, bool *
 			return 0;
 		}
 
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t elapsed_ns = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ULL +
-		                      (uint64_t)(now.tv_nsec - start.tv_nsec);
+		clock_gettime(CLOCK_MONOTONIC, &now_ts);
+		uint64_t elapsed_ns = (uint64_t)(now_ts.tv_sec - start.tv_sec) * 1000000000ULL +
+		                      (uint64_t)(now_ts.tv_nsec - start.tv_nsec);
 		if (elapsed_ns >= timeout_ns) {
 			for (int i = 0; i < gcfg.workers && i < 64; i++) {
 				if (!(target_mask & (1ULL << i)))
