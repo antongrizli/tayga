@@ -11,7 +11,9 @@ RFC7915 describes the fundamental IP/ICMP Translation Algorithm used by TAYGA. T
 
 ### ICMP Extensions
 
-RFC7915 implies that we should translate IPv6 addresses in ICMP extensions. TAYGA does not do this. See [Issue #20](https://github.com/apalrd/tayga/issues/20)
+TAYGA preserves the RFC4884 multi-part extension structure of ICMP errors in both directions: the original datagram is padded (to 4 octets/128 minimum for ICMPv4, 8 octets/128 minimum for ICMPv6), the Length attribute is rewritten and the checksum recomputed. The extension is dropped (the error is still translated) if it would not fit in the minimum MTU (1280 for IPv6, 576 for IPv4).
+
+RFC7915 implies that we should also translate IPv6 addresses inside ICMP extension objects. TAYGA does not do this; the objects are passed through unchanged. See [Issue #20](https://github.com/apalrd/tayga/issues/20)
 
 ## RFC7757
 

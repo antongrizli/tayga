@@ -114,7 +114,7 @@ net_dns_up() {
     want_dns=0
     if [ "$mode" = nat64 ] && [ "$enable_dns64" = yes ]; then
         want_dns=1
-        pref64-discover --serve-dns64 127.0.0.1#5364 "$prefix" "$dns64_upstream" </dev/null >/dev/null 2>&1 8>&- &
+        pref64-discover --hosts-file /tmp/tayga-dns64.hosts --serve-dns64 127.0.0.1#5364 "$prefix" "$dns64_upstream" </dev/null >/dev/null 2>&1 8>&- &
         dns_pid=$!
         [ -r "/proc/$dns_pid/stat" ] || return 1
         dns_ticks=$(awk '{print $22}' "/proc/$dns_pid/stat" 2>/dev/null || :)

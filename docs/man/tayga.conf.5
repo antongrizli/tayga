@@ -129,6 +129,29 @@ composed of the Well\-Known Prefix and a non\-global IPv4 address
 Enabled by default
 .RE
 .TP
+\f[B]icmp\-rate\-limit\f[R] \f[I]packets_per_second|unlimited\f[R]
+Limit the rate of ICMPv4/ICMPv6 error messages that Tayga itself
+originates (Time Exceeded, Destination Unreachable, Parameter Problem),
+as required by RFC 4443 section 2.4(f).
+Packet Too Big and Fragmentation Needed have a separate budget so they
+are not starved by other errors.
+The burst size is the lower of the rate and 200.
+.RS
+.PP
+Defaults to 1000.
+A value of 0 or \f[B]unlimited\f[R] disables the limit.
+.RE
+.TP
+\f[B]cache\-size\f[R] \f[I]entries\f[R]
+Number of entries in the address translation cache used with
+\f[B]dynamic\-pool\f[R] and \f[B]map\-file\f[R].
+The cache is disabled automatically when all mappings are static.
+Defaults to 8192.
+.TP
+\f[B]hash\-bits\f[R] \f[I]bits\f[R]
+The cache hash tables have 2\[ha]bits buckets (4 to 24).
+Defaults to 14.
+.TP
 \f[B]map\f[R] \f[I]ipv4_address[/length] ipv6_address[/length]\f[R]
 Creates a static mapping between RFC 7757 compliant hosts or subnets
 \f[I]ipv4_address[/length]\f[R] and \f[I]ipv6_address[/length]\f[R] to

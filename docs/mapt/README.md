@@ -1,44 +1,52 @@
 # Mapping of Address and Port using Translation (MAP-T)
 
-TBD
+**Status: not implemented in TAYGA.** This page records what TAYGA does and
+does not provide so that MAP-T and stateful NAT64 designs can be planned
+correctly. It is not a configuration guide.
 
-## MAP Architecture
+## What TAYGA is
 
-The Stateful NAT64 architecture (described in RFC xxxx) permits multiple IPv6-only clients to access IPv4-only servers, via a stateful NAPT (Network Address and Port Translator) function. Multiple clients will be mapped to the same pubilc IPv4 address(s) using port translation, as is common with NAT44.
+TAYGA is a *stateless* IP/ICMP translator (RFC 7915). Every packet is
+translated independently, using only the address mappings configured with
+`prefix`, `map`, `map-file` and `dynamic-pool`. It keeps no per-flow state
+and never rewrites transport ports.
 
-Two different implementations are shown here, both rely on the Linux kernel to perform NAPT, as `tayga` is a stateless translator.
+## MAP-T (RFC 7599) versus TAYGA
 
-## MAP-T BR (Border Router)
+MAP-T gives each customer a *port set* of a shared public IPv4 address. The
+translator must therefore:
 
-## Data Path
+* derive the IPv6 address from the IPv4 address **and** the transport port
+  (the Embedded Address bits plus the PSID of RFC 7597), and
+* reject or forward packets by port set.
 
-In this example, two interfaces are used:
+TAYGA's EAM support (RFC 7757) maps whole IPv4 prefixes or hosts; it has no
+port-set (PSID) awareness. TAYGA therefore cannot act as a MAP-T BR or CE
+by itself.
 
-* `eth0` represents the WAN interface, where the public IPv4(s) are assigned
-* `eth1` represents the LAN interface, which receives traffic for the translation prefix
-* `nat64` is the name of the tunnel interface created by `tayga`
-This configuration does not require two interfaces, `tayga` may use the same interface for both functions. This example restricts nat64 functions to only clients on the LAN interface.
+## Stateful NAT64 (RFC 6146) versus TAYGA
 
-## MAP-T CPE (Customer Premises Equipment)
+A stateful NAT64 shares one IPv4 address between many IPv6 clients by
+translating ports (NAPT). TAYGA does not do this itself. The supported
+deployment is to let the operating system perform NAPT44 on the IPv4 side of
+the `tayga` tunnel interface:
 
-## Data Path
+* `tayga` with `dynamic-pool` gives each IPv6 client a private IPv4 address
+  from the pool (a 1:1, stateless mapping), and
+* `nftables`/`iptables` masquerade (or `pf` NAT on BSD) translates that pool
+  to the public address.
 
-In this example, two interfaces are used:
+The `container/` image and the installer's `nat64` mode are built this way.
+See `docs/nat64/` for the maintained configuration examples.
 
-* `eth0` represents the WAN interface, where the public IPv4(s) are assigned
-* `eth1` represents the LAN interface, which receives traffic for the translation prefix
-* `nat64` is the name of the tunnel interface created by `tayga`
-This configuration does not require two interfaces, `tayga` may use the same interface for both functions. This example restricts nat64 functions to only clients on the LAN interface.
+## Related supported modes
 
-## MAP-T to 464XLAT CE
+* **SIIT / SIIT-DC** (RFC 7915, RFC 7757): `docs/siit/`
+* **464XLAT CLAT** (RFC 6877): `docs/clat/`
+* **NAT64 with dynamic pool**: `docs/nat64/`
 
-When the MAP-T architecture, a (fractional) public IPv4 address is indirectly provided to the CPE. Ordinarily, the CPE would perform stateful NAPT from the internal dual stack clients to the MAP port range, and then translate resulting packets to IPv6. However, if we would like to then deploy NAT64 and/or 464xlat to internal clients (instead of or in addition to dual stack), we may 'shortcut' this process by simplifying the NAT64, NAPT44, and NAT46 into a single NAPT66 process.
+## Out of scope
 
-## Data Path
-
-In this example, two interfaces are used:
-
-* `eth0` represents the WAN interface, where the public IPv4(s) are assigned
-* `eth1` represents the LAN interface, which receives traffic for the translation prefix
-* `nat64` is the name of the tunnel interface created by `tayga`
-This configuration does not require two interfaces, `tayga` may use the same interface for both functions. This example restricts nat64 functions to only clients on the LAN interface.
+Implementing MAP-T would require port-set (PSID) mapping rules in the address
+mapper and a per-rule BMR/DMR configuration model. This is not currently
+planned.

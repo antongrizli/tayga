@@ -92,10 +92,23 @@ FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-true}"
 PREF64_SOURCE="manual"
 
 if [ "$PREF64" = "auto" ]; then
-  echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."
+  echo "==> Discovering NAT64 prefix (RFC 8781 RA, then RFC 7050 ipv4only.arpa)..."
   DISCOVERED=""
+  DISCOVERY_SOURCE="rfc7050_discovered"
   if [ -x /usr/local/sbin/pref64-discover ]; then
-    if [ -n "$UPLINK_DNS64" ]; then
+    # RFC 8781: PREF64 option in Router Advertisements. Needs CAP_NET_RAW;
+    # silently skipped otherwise. Set CLAT_DISCOVERY=dns64 to disable.
+    if [ "${CLAT_DISCOVERY:-auto}" != "dns64" ]; then
+      RA_IFACE="${UPLINK_IFACE:-$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')}"
+      case "$RA_IFACE" in
+        ''|*[!a-zA-Z0-9_.:-]*) RA_IFACE="" ;;
+      esac
+      if [ -n "$RA_IFACE" ]; then
+        DISCOVERED=$(/usr/local/sbin/pref64-discover -i "$RA_IFACE" -t 3 --ra-only 2>/dev/null || true)
+        [ -z "$DISCOVERED" ] || DISCOVERY_SOURCE="rfc8781_ra"
+      fi
+    fi
+    if [ -z "$DISCOVERED" ] && [ -n "$UPLINK_DNS64" ]; then
       echo "--> Querying uplink DNS64 server: $UPLINK_DNS64"
       DISCOVERED=$(/usr/local/sbin/pref64-discover -s "$UPLINK_DNS64" 2>/dev/null || true)
     fi
@@ -106,7 +119,7 @@ if [ "$PREF64" = "auto" ]; then
 
   if [ -n "$DISCOVERED" ]; then
     PREF64="$DISCOVERED"
-    PREF64_SOURCE="rfc7050_discovered"
+    PREF64_SOURCE="$DISCOVERY_SOURCE"
     echo "==> Discovered PREF64: $PREF64"
   else
     if [ "$FALLBACK_TO_WELL_KNOWN_PREFIX" = "true" ]; then

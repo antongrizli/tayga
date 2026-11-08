@@ -22,6 +22,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <netinet/icmp6.h>
 #include <strings.h>
 #include <time.h>
 #ifdef __linux__
@@ -37,6 +39,28 @@
 #define DEFAULT_DOMAIN "ipv4only.arpa"
 #define IPV4_WKA1_HEX 0xC00000AA /* 192.0.0.170 */
 #define IPV4_WKA2_HEX 0xC00000AB /* 192.0.0.171 */
+
+/* Optional hosts-file override for --serve-dns64 (set only via --hosts-file). */
+static const char *g_hosts_file __attribute__((unused)) = NULL;
+
+/* Unpredictable 16-bit DNS transaction ID (RFC 5452). Never falls back to a
+ * guessable value: if no entropy source works, return failure to the caller
+ * would be overkill for a probe, so mix several independent sources. */
+static uint16_t __attribute__((unused)) random_txid(void)
+{
+    uint16_t id = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, &id, sizeof(id));
+        close(fd);
+        if (n == (ssize_t)sizeof(id))
+            return id;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint16_t)((unsigned)ts.tv_nsec ^ ((unsigned)ts.tv_sec << 7) ^
+                      ((unsigned)getpid() << 3));
+}
 
 static const uint8_t wka1[4] = {192, 0, 0, 170};
 static const uint8_t wka2[4] = {192, 0, 0, 171};
@@ -325,7 +349,214 @@ int parse_dns_response(const uint8_t *resp, size_t rlen, uint16_t expected_id,
     return -1;
 }
 
+
+/*
+ * RFC 8781: PREF64 option in IPv6 Router Advertisements (ND option 38).
+ *
+ *  | Type=38 | Length=2 | Scaled Lifetime (13 bits) | PLC (3 bits) |
+ *  | Highest 96 bits of the prefix                                 |
+ *
+ * ra points at the ICMPv6 message (Type 134), ra_len is its length.  On
+ * success returns 0 and the longest-lived valid prefix; options with a zero
+ * lifetime (deprecation), reserved PLC values or an unusable prefix are skipped.
+ */
+#define ND_OPT_PREF64 38
+
+static int is_valid_pref64_prefix(const struct in6_addr *p, int plen)
+{
+    static const uint8_t zero[16] = {0};
+    const uint8_t *b = p->s6_addr;
+    if (!memcmp(b, zero, 16) || b[0] == 0xff || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80))
+        return 0;
+    return plen == 32 || plen == 40 || plen == 48 || plen == 56 || plen == 64 || plen == 96;
+}
+
+int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                           int *out_plen, uint32_t *out_lifetime_sec)
+{
+    static const int plc_to_plen[8] = { 96, 64, 56, 48, 40, 32, -1, -1 };
+    if (!ra || !out_prefix || !out_plen || ra_len < 16 || ra[0] != 134 || ra[1] != 0)
+        return -1;
+
+    size_t pos = 16;	/* fixed RA header */
+    int found = 0, best_plen = 0;
+    uint32_t best_life = 0;
+    struct in6_addr best;
+    memset(&best, 0, sizeof(best));
+
+    while (pos + 2 <= ra_len) {
+        uint8_t type = ra[pos];
+        size_t bytes = (size_t)ra[pos + 1] * 8;
+        if (bytes == 0 || pos + bytes > ra_len)
+            return -1;	/* RFC 4861 4.6: invalid option, discard the RA */
+        if (type == ND_OPT_PREF64 && bytes == 16) {
+            uint16_t v = (uint16_t)((ra[pos + 2] << 8) | ra[pos + 3]);
+            uint32_t life = (uint32_t)(v >> 3) * 8u;
+            int plen = plc_to_plen[v & 7];
+            if (plen > 0 && life > 0) {
+                struct in6_addr cand;
+                memset(&cand, 0, sizeof(cand));
+                memcpy(cand.s6_addr, ra + pos + 4, 12);
+                if (plen < 96)	/* bits beyond plen must be zero */
+                    memset(cand.s6_addr + plen / 8, 0, (size_t)(16 - plen / 8));
+                if (is_valid_pref64_prefix(&cand, plen) && (!found || life > best_life)) {
+                    best = cand; best_plen = plen; best_life = life; found = 1;
+                }
+            }
+        }
+        pos += bytes;
+    }
+    if (!found)
+        return -1;
+    *out_prefix = best;
+    *out_plen = best_plen;
+    if (out_lifetime_sec)
+        *out_lifetime_sec = best_life;
+    return 0;
+}
+
+/* Exported only for unit tests. */
+#ifdef PREF64_NO_MAIN
+#define HOSTS_LINKAGE
+#else
+#define HOSTS_LINKAGE static
+#endif
+HOSTS_LINKAGE size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
+                                     uint8_t v4_list[][4], size_t max_v4)
+{
+    if (!hosts_path) return 0;
+    /* Refuse symlinks, FIFOs/devices and files not owned by us or root, so an
+     * unprivileged user cannot inject or stall DNS answers. */
+    int hfd = open(hosts_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (hfd < 0) return 0;
+    struct stat hst;
+    if (fstat(hfd, &hst) < 0 || !S_ISREG(hst.st_mode) ||
+            (hst.st_uid != 0 && hst.st_uid != geteuid()) ||
+            (hst.st_mode & (S_IWGRP | S_IWOTH))) {
+        close(hfd);
+        return 0;
+    }
+    FILE *fp = fdopen(hfd, "r");
+    if (!fp) { close(hfd); return 0; }
+    char line[512];
+    size_t count = 0;
+    while (fgets(line, sizeof(line), fp) && count < max_v4) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *save = NULL;
+        char *ip_tok = strtok_r(line, " \t\r\n", &save);
+        if (!ip_tok) continue;
+        struct in_addr in4;
+        if (inet_pton(AF_INET, ip_tok, &in4) != 1)
+            continue;
+        char *host_tok = NULL;
+        while ((host_tok = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            if (strcasecmp(host_tok, qname) == 0) {
+                memcpy(v4_list[count++], &in4.s_addr, 4);
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    return count;
+}
+
 #ifndef PREF64_NO_MAIN
+#ifdef __linux__
+/*
+ * Solicit a Router Advertisement on ifname and read PREF64 from it.
+ * Needs CAP_NET_RAW; returns -2 when the socket cannot be opened so the
+ * caller can fall back to RFC 7050 silently.  RAs are only accepted from
+ * link-local sources with Hop Limit 255 (RFC 4861 6.1.2) on that interface.
+ */
+static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_addr *out,
+                              int *plen, uint32_t *lifetime)
+{
+    unsigned ifindex = if_nametoindex(ifname);
+    if (!ifindex)
+        return -1;
+    int fd = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_ICMPV6);
+    if (fd < 0)
+        return -2;
+
+    struct icmp6_filter filt;
+    ICMP6_FILTER_SETBLOCKALL(&filt);
+    ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filt);
+    int on = 1, hops = 255;
+    if (setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt)) < 0 ||
+        setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on)) < 0 ||
+        setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on)) < 0 ||
+        setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops)) < 0 ||
+        setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, sizeof(hops)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in6 dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "ff02::2", &dst.sin6_addr);
+    dst.sin6_scope_id = ifindex;
+    struct nd_router_solicit rs;
+    memset(&rs, 0, sizeof(rs));
+    rs.nd_rs_type = ND_ROUTER_SOLICIT;
+    int mreq_ok = 0;
+    {
+        struct ipv6_mreq mr;
+        memset(&mr, 0, sizeof(mr));
+        inet_pton(AF_INET6, "ff02::1", &mr.ipv6mr_multiaddr);
+        mr.ipv6mr_interface = ifindex;
+        mreq_ok = setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mr, sizeof(mr)) == 0;
+    }
+    (void)mreq_ok;
+    if (sendto(fd, &rs, sizeof(rs), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0)
+        { close(fd); return -1; }
+
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = (long)(timeout_sec * 1000) - ((now.tv_sec - t0.tv_sec) * 1000 +
+                                                   (now.tv_nsec - t0.tv_nsec) / 1000000);
+        if (left <= 0)
+            break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if (poll(&pfd, 1, (int)left) <= 0)
+            break;
+        uint8_t buf[1500], cbuf[256];
+        struct sockaddr_in6 from;
+        struct iovec iov = { buf, sizeof(buf) };
+        struct msghdr mh = { .msg_name = &from, .msg_namelen = sizeof(from),
+                             .msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
+        ssize_t n = recvmsg(fd, &mh, 0);
+        if (n < 16 || !IN6_IS_ADDR_LINKLOCAL(&from.sin6_addr))
+            continue;
+        int hl = -1;
+        unsigned idx = 0;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
+            if (c->cmsg_level != IPPROTO_IPV6)
+                continue;
+            if (c->cmsg_type == IPV6_HOPLIMIT)
+                memcpy(&hl, CMSG_DATA(c), sizeof(int));
+            else if (c->cmsg_type == IPV6_PKTINFO) {
+                struct in6_pktinfo pi;
+                memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+                idx = pi.ipi6_ifindex;
+            }
+        }
+        if (hl != 255 || idx != ifindex)
+            continue;
+        if (parse_ra_pref64_option(buf, (size_t)n, out, plen, lifetime) == 0) {
+            close(fd);
+            return 0;
+        }
+    }
+    close(fd);
+    return -1;
+}
+#endif
+
 static const char *const DEFAULT_PUBLIC_DNS64_SERVERS[] = {
     "2a00:1098:2c::1",       /* nat64.net Europe (London) */
     "2a01:4f8:c2c:123f::1",  /* nat64.net Europe (Nuremberg) */
@@ -346,6 +577,9 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -d <domain>        Domain to query (default: ipv4only.arpa)\n");
     fprintf(stderr, "  -c, --check <ip>   Directly test IPv6 address without DNS lookup\n");
     fprintf(stderr, "  -p, --public       Probe public NAT64 gateways and select lowest RTT\n");
+    fprintf(stderr, "  -i <ifname>        Try RFC 8781 (PREF64 in Router Advertisements) on this interface first\n");
+    fprintf(stderr, "  --ra-only          With -i: do not fall back to RFC 7050 when no RA PREF64 is found\n");
+    fprintf(stderr, "  --no-ra            Skip RFC 8781 even if -i is given\n");
     fprintf(stderr, "  -v, --verbose      Print probe details and RTT to stderr\n");
     fprintf(stderr, "  --json             Output discovered prefix and metadata as JSON\n");
     fprintf(stderr, "  -h, --help         Show this help message\n");
@@ -382,7 +616,7 @@ static int discover_public_pref64_parallel(const char *domain, int timeout_sec,
 
     uint8_t packet[512];
     memset(packet, 0, 12);
-    uint16_t tx_id = (uint16_t)((unsigned)time(NULL) ^ ((unsigned)getpid() << 8));
+    uint16_t tx_id = random_txid();
     packet[0] = (uint8_t)(tx_id >> 8);
     packet[1] = (uint8_t)tx_id;
     packet[2] = 0x01; packet[3] = 0x00; /* RD=1 */
@@ -531,15 +765,7 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
     if (encode_dns_name(domain, qname, &qpos) < 0)
         return -1;
 
-    uint16_t tx_id = 0;
-    int rnd_fd = open("/dev/urandom", O_RDONLY);
-    if (rnd_fd >= 0) {
-        if (read(rnd_fd, &tx_id, sizeof(tx_id)) != sizeof(tx_id))
-            tx_id = (uint16_t)(rand() ^ (getpid() << 8));
-        close(rnd_fd);
-    } else {
-        tx_id = (uint16_t)(rand() ^ (getpid() << 8));
-    }
+    uint16_t tx_id = random_txid();
 
     uint8_t packet[512];
     memset(packet, 0, sizeof(packet));
@@ -787,61 +1013,55 @@ static size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
     return pos;
 }
 
-static size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
-                              uint8_t v4_list[][4], size_t max_v4)
-{
-    FILE *fp = fopen(hosts_path, "r");
-    if (!fp) return 0;
-    char line[512];
-    size_t count = 0;
-    while (fgets(line, sizeof(line), fp) && count < max_v4) {
-        char *hash = strchr(line, '#');
-        if (hash) *hash = '\0';
-        char *save = NULL;
-        char *ip_tok = strtok_r(line, " \t\r\n", &save);
-        if (!ip_tok) continue;
-        struct in_addr in4;
-        if (inet_pton(AF_INET, ip_tok, &in4) != 1)
-            continue;
-        char *host_tok = NULL;
-        while ((host_tok = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
-            if (strcasecmp(host_tok, qname) == 0) {
-                memcpy(v4_list[count++], &in4.s_addr, 4);
-                break;
-            }
-        }
-    }
-    fclose(fp);
-    return count;
-}
+/* Upstream resolver address, resolved once and cached (no getaddrinfo()
+ * per query).  A hostname that failed to resolve is retried lazily. */
+struct dns_upstream {
+    const char *host, *port;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    int resolved;
+};
 
-static ssize_t forward_dns_udp(const char *up_host, const char *up_port,
-                               const uint8_t *pkt, size_t plen,
-                               uint8_t *resp, size_t resp_sz)
+static int upstream_resolve(struct dns_upstream *u)
 {
-    if (!up_host || !up_host[0] || strcmp(up_host, "none") == 0)
+    if (u->resolved)
+        return 0;
+    if (!u->host || !u->host[0] || strcmp(u->host, "none") == 0)
         return -1;
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(up_host, up_port, &hints, &res) != 0 || !res)
+    if (getaddrinfo(u->host, u->port, &hints, &res) != 0 || !res)
         return -1;
-    int fd = socket(res->ai_family, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        freeaddrinfo(res);
+    memcpy(&u->addr, res->ai_addr, res->ai_addrlen);
+    u->addrlen = res->ai_addrlen;
+    u->resolved = 1;
+    freeaddrinfo(res);
+    return 0;
+}
+
+static ssize_t forward_dns_udp(struct dns_upstream *u,
+                               const uint8_t *pkt, size_t plen,
+                               uint8_t *resp, size_t resp_sz)
+{
+    if (plen < 2 || upstream_resolve(u) < 0)
         return -1;
-    }
+    int fd = socket(u->addr.ss_family, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     ssize_t rlen = -1;
-    if (connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
+    if (connect(fd, (struct sockaddr *)&u->addr, u->addrlen) == 0 &&
         send(fd, pkt, plen, 0) == (ssize_t)plen) {
         rlen = recv(fd, resp, resp_sz, 0);
+        /* The reply must echo our transaction ID. */
+        if (rlen < 2 || resp[0] != pkt[0] || resp[1] != pkt[1])
+            rlen = -1;
     }
     close(fd);
-    freeaddrinfo(res);
     return rlen;
 }
 
@@ -901,6 +1121,8 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
     char lhost[128], lport[32], uhost[128], uport[32];
     split_host_port(listen_spec, "5364", lhost, sizeof(lhost), lport, sizeof(lport));
     split_host_port(upstream_spec, "53", uhost, sizeof(uhost), uport, sizeof(uport));
+    struct dns_upstream upstream = { .host = uhost, .port = uport };
+    (void)upstream_resolve(&upstream);	/* once at start; retried lazily if it fails */
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -976,7 +1198,7 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
         }
 
         uint8_t hosts_v4[8][4];
-        size_t hosts_cnt = (qclass == 1) ? lookup_hosts_v4("/tmp/tayga-dns64.hosts", qname, hosts_v4, 8) : 0;
+        size_t hosts_cnt = (qclass == 1) ? lookup_hosts_v4(g_hosts_file, qname, hosts_v4, 8) : 0;
         if (hosts_cnt > 0) {
             if (qtype == 28)
                 rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, 28, hosts_v4, hosts_cnt, 0, resp, sizeof(resp));
@@ -989,7 +1211,7 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
 
         if (qtype == 28 && qclass == 1) {
             uint8_t up_resp[1500];
-            ssize_t up_len = forward_dns_udp(uhost, uport, req, (size_t)qlen, up_resp, sizeof(up_resp));
+            ssize_t up_len = forward_dns_udp(&upstream, req, (size_t)qlen, up_resp, sizeof(up_resp));
             if (up_len >= 12 && extract_dns_records(up_resp, (size_t)up_len, 28, NULL, 0) > 0) {
                 sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
                 continue;
@@ -1000,12 +1222,23 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
                 a_req[0] = req[0];
                 a_req[1] = req[1];
                 a_req[2] = 0x01;
+                a_req[3] = req[3] & 0x10; /* preserve CD (RFC 6147 5.1) */
                 a_req[5] = 1;
                 memcpy(a_req + 12, req + 12, qsec_len);
                 a_req[12 + qsec_len - 4] = 0x00;
                 a_req[12 + qsec_len - 3] = 0x01;
+                size_t a_len_req = 12 + qsec_len;
+                /* Keep a client's EDNS0 OPT record (buffer size, DO bit) on the
+                 * synthesized A query: root name, TYPE 41, 11+ bytes. */
+                size_t extra = (size_t)qlen > a_len_req ? (size_t)qlen - a_len_req : 0;
+                if (extra >= 11 && extra <= 64 && a_len_req + extra <= sizeof(a_req) &&
+                    req[a_len_req] == 0 && req[a_len_req + 1] == 0 && req[a_len_req + 2] == 41) {
+                    memcpy(a_req + a_len_req, req + a_len_req, extra);
+                    a_len_req += extra;
+                    a_req[11] = 1;
+                }
                 uint8_t a_resp[1500];
-                ssize_t a_len = forward_dns_udp(uhost, uport, a_req, 12 + qsec_len, a_resp, sizeof(a_resp));
+                ssize_t a_len = forward_dns_udp(&upstream, a_req, a_len_req, a_resp, sizeof(a_resp));
                 uint8_t up_v4[16][4];
                 size_t v4_cnt = (a_len >= 12) ? extract_dns_records(a_resp, (size_t)a_len, 1, up_v4, 16) : 0;
                 if (v4_cnt > 0) {
@@ -1022,7 +1255,7 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
             }
         } else {
             uint8_t up_resp[1500];
-            ssize_t up_len = forward_dns_udp(uhost, uport, req, (size_t)qlen, up_resp, sizeof(up_resp));
+            ssize_t up_len = forward_dns_udp(&upstream, req, (size_t)qlen, up_resp, sizeof(up_resp));
             if (up_len >= 12) {
                 sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
                 continue;
@@ -1238,6 +1471,9 @@ int main(int argc, char **argv)
     const char *cli_dst = NULL;
     int cli_fam = 0;
 #endif
+    const char *ra_iface = NULL;
+    int no_ra = 0;
+    int ra_only = 0;
     int timeout_sec = 3;
     int probe_public_only = 0;
     int verbose = 0;
@@ -1256,6 +1492,14 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "--synthesize") && i + 2 < argc) {
             syn_prefix = argv[++i];
             syn_ipv4 = argv[++i];
+        } else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
+            ra_iface = argv[++i];
+        } else if (!strcmp(argv[i], "--no-ra")) {
+            no_ra = 1;
+        } else if (!strcmp(argv[i], "--ra-only")) {
+            ra_only = 1;
+        } else if (!strcmp(argv[i], "--hosts-file") && i + 1 < argc) {
+            g_hosts_file = argv[++i];
         } else if (!strcmp(argv[i], "--serve-dns64") && i + 3 < argc) {
             serve_listen = argv[++i];
             serve_prefix = argv[++i];
@@ -1354,6 +1598,34 @@ int main(int argc, char **argv)
     int plen = 0;
     char winning_server[INET6_ADDRSTRLEN] = "";
     double winning_rtt = 0.0;
+
+#ifdef __linux__
+    if (ra_iface && !no_ra) {
+        uint32_t life = 0;
+        int rc = discover_ra_pref64(ra_iface, timeout_sec, &out, &plen, &life);
+        if (rc == 0) {
+            char pbuf[INET6_ADDRSTRLEN];
+            if (inet_ntop(AF_INET6, &out, pbuf, sizeof(pbuf))) {
+                if (verbose)
+                    fprintf(stderr, "[RFC 8781] PREF64 %s/%d from RA on %s (lifetime %us)\n",
+                            pbuf, plen, ra_iface, life);
+                if (json_output)
+                    printf("{\n  \"prefix\": \"%s\",\n  \"length\": %d,\n  \"source\": \"rfc8781\",\n  \"lifetime\": %u\n}\n",
+                           pbuf, plen, life);
+                else
+                    printf("%s/%d\n", pbuf, plen);
+                return 0;
+            }
+        }
+        if (verbose)
+            fprintf(stderr, "[RFC 8781] %s; falling back to RFC 7050\n",
+                    rc == -2 ? "no CAP_NET_RAW" : "no PREF64 RA option seen");
+        if (ra_only)
+            return 1;
+    }
+#else
+    (void)ra_iface; (void)no_ra; (void)ra_only;
+#endif
 
     if (dns_server) {
         struct timespec t1, t2;

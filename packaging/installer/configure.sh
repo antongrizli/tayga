@@ -114,9 +114,20 @@ if [ "$pref64" = auto ] || [ "$pref64" = public ]; then
     elif [ "$pref64" = public ]; then
         pref64=$("$helper" -p) || fail 'Public NAT64 discovery failed; specify --pref64 explicitly'
     else
-        pref64=$("$helper" 2>/dev/null || "$helper" -p) || fail 'RFC 7050 discovery failed; specify --pref64 explicitly'
+        # RFC 8781 first (Linux, needs CAP_NET_RAW), then RFC 7050 via DNS.
+        ra_if=
+        if [ "$(uname -s)" = Linux ]; then
+            ra_if=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+            case "$ra_if" in *[!a-zA-Z0-9_.:-]*) ra_if= ;; esac
+        fi
+        pref64=
+        if [ -n "$ra_if" ] && pref64=$("$helper" -i "$ra_if" -t 3 --ra-only 2>/dev/null) && [ -n "$pref64" ]; then
+            pref64_source=rfc8781
+        else
+            pref64=$("$helper" 2>/dev/null || "$helper" -p) || fail 'PREF64 discovery failed (RFC 8781 and RFC 7050); specify --pref64 explicitly'
+        fi
     fi
-    pref64_source=rfc7050
+    [ "$pref64_source" != manual ] || pref64_source=rfc7050
 fi
 if [ -z "$addr4" ]; then
     if [ "$mode" = clat ]; then addr4=192.0.0.2; else addr4=192.168.240.1; fi

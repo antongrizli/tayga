@@ -108,6 +108,23 @@ tayga.conf.
 
     Enabled by default
 
+**icmp-rate-limit** *packets_per_second|unlimited*
+:   Limit the rate of ICMPv4/ICMPv6 error messages that Tayga itself
+    originates (Time Exceeded, Destination Unreachable, Parameter
+    Problem), as required by RFC 4443 section 2.4(f). Packet Too Big and
+    Fragmentation Needed have a separate budget so they are not starved
+    by other errors. The burst size is the lower of the rate and 200.
+
+    Defaults to 1000. A value of 0 or **unlimited** disables the limit.
+
+**cache-size** *entries*
+:   Number of entries in the address translation cache used with
+    **dynamic-pool** and **map-file**. The cache is disabled
+    automatically when all mappings are static. Defaults to 8192.
+
+**hash-bits** *bits*
+:   The cache hash tables have 2^bits buckets (4 to 24). Defaults to 14.
+
 **map** *ipv4_address[/length] ipv6_address[/length]*
 :   Creates a static mapping between RFC 7757 compliant hosts or
     subnets *ipv4_address[/length]* and *ipv6_address[/length]* to be
