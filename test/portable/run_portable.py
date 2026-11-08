@@ -17,7 +17,7 @@ MODULES = (
     "test_image_cache", "test_lima_retention", "test_benchmark_cleanup", "test_udp_batch_endpoint",
     "test_udp_drain_guard", "test_iperf_start_gate", "test_iperf_read_diagnostic",
     "test_protocols_compatibility", "test_throughput_diagnostics", "test_release_pipeline", "test_release_platforms", "test_package_metadata",
-    "test_openwrt_release", "test_openwrt_release_runner", "test_installer_bundle", "test_installer_network", "test_installer_lifecycle", "test_installer_dns", "test_installer_dependencies", "test_installer_packages", "test_installer_openwrt",
+    "test_openwrt_release", "test_openwrt_release_runner", "test_installer_bundle", "test_installer_network", "test_installer_lifecycle", "test_installer_dns", "test_installer_dependencies", "test_installer_packages", "test_installer_openwrt", "test_container_nat64_start",
 )
 if __name__ == "__main__":
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(MODULES))

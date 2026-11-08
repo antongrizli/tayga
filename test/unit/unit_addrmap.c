@@ -173,8 +173,40 @@ static void test_dynamic_dump(void)
     puts("PASS: concurrent dynamic lookup, maintenance, disk snapshot and atomic clock");
 }
 
+extern uint32_t hash_ip4(const struct in_addr *addr4);
+extern uint32_t hash_ip6(const struct in6_addr *addr6);
+
+/* PERF-001: clients that differ only in low bits must spread evenly. */
+static void test_hash_distribution(void)
+{
+    enum { BITS = 14, N = 8192 };
+    static unsigned bucket6[1u << BITS], bucket4[1u << BITS];
+    memset(&gcfg, 0, sizeof(gcfg));
+    gcfg.hash_bits = BITS; gcfg.rand[0] = 0x9e3779b1u; gcfg.rand[1] = 0x85ebca6bu;
+    gcfg.rand[2] = 0xc2b2ae35u; gcfg.rand[3] = 0x27d4eb2fu;
+    struct in6_addr a6; struct in_addr a4;
+    assert(inet_pton(AF_INET6, "2001:db8:1:2::", &a6) == 1);
+    unsigned max6 = 0, max4 = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        struct in6_addr x = a6;
+        x.s6_addr[14] = (uint8_t)(i >> 8); x.s6_addr[15] = (uint8_t)i;
+        uint32_t h = hash_ip6(&x); assert(h < (1u << BITS));
+        if (++bucket6[h] > max6) max6 = bucket6[h];
+        a4.s_addr = htonl(0xc0a80000u + i);
+        h = hash_ip4(&a4); assert(h < (1u << BITS));
+        if (++bucket4[h] > max4) max4 = bucket4[h];
+    }
+    /* Load factor 0.5: a sound hash keeps the longest chain tiny
+     * (the old 7-bit XOR hash produced chains of hundreds). */
+    assert(max6 <= 10 && max4 <= 10);
+    gcfg.hash_bits = 0;
+    assert(hash_ip6(&a6) == 0 && hash_ip4(&a4) == 0);
+    printf("PASS: address hash distribution (max chain v6=%u v4=%u)\n", max6, max4);
+}
+
 int main(void)
 {
+    test_hash_distribution();
     boundary_masks(); assert(config_init() == 0);
     assert(pthread_mutex_init(&gcfg.map_mutex, NULL) == 0);
     assert(pthread_mutex_init(&gcfg.cache_mutex, NULL) == 0);
@@ -217,6 +249,17 @@ int main(void)
     int count = 0; struct list_head *item;
     list_for_each(item, &gcfg.cache_active) count++;
     assert(count == 1);
+    /* Per-thread front cache: a reload within the same clock second must be seen at once. */
+    {
+        struct in_addr a4, e4; struct in6_addr o6, e6; inet_pton(AF_INET, "192.0.2.9", &a4);
+        for (int i = 0; i < 3; i++) assert(map_ip4_to_ip6(&o6, &a4) == 0); /* warms this thread's table */
+        write_maps("map 192.0.2.9 2001:db8::77\n"); assert(addrmap_reload() == 0);
+        assert(map_ip4_to_ip6(&o6, &a4) == 0); inet_pton(AF_INET6, "2001:db8::77", &e6);
+        assert(IN6_ARE_ADDR_EQUAL(&o6, &e6));
+        assert(map_ip6_to_ip4(&e4, &e6, 0) == 0 && e4.s_addr == a4.s_addr);
+        write_maps("map 192.0.2.9 2001:db8::78\n"); assert(addrmap_reload() == 0);
+        assert(map_ip6_to_ip4(&e4, &e6, 0) != 0 || e4.s_addr != a4.s_addr); /* old v6 side no longer maps */
+    }
     write_maps(""); assert(addrmap_reload() == 0); unlink(gcfg.map_file);
     free(cache_storage); free(gcfg.hash_table4); free(gcfg.hash_table6);
     pthread_mutex_destroy(&gcfg.map_mutex); pthread_mutex_destroy(&gcfg.cache_mutex);

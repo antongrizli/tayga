@@ -590,6 +590,249 @@ static void setup_quote_maps(void)
     }
 }
 
+/* RFC-002/003: no ICMP errors for non-first fragments or multicast, and
+ * originated errors are rate limited with a separate PMTU budget. */
+static int drain_count(int fd)
+{
+	uint8_t b[2048];
+	int n = 0;
+	while (recv(fd, b, sizeof(b), MSG_DONTWAIT) > 0)
+		n++;
+	return n;
+}
+
+static void test_icmp_error_suppression_and_rate_limit(void)
+{
+	setup_quote_maps();
+	gcfg.mtu = 1500;
+	icmp_rate_limit_reset();
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	int sz = 1 << 20;
+	setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+	setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+
+	alignas(8) uint8_t b4[HEADROOM + 64] = {0};
+	struct ip4 *ip4 = (struct ip4 *)(b4 + HEADROOM);
+	ip4->ver_ihl = 0x45; ip4->ttl = 1; ip4->proto = IPPROTO_UDP;
+	ip4->length = htons(28);
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "8.8.8.8", &ip4->dest);
+	struct pkt p4 = {.tun_fd = sv[0], .ip4 = ip4, .data = (uint8_t *)ip4 + 20,
+	                 .data_len = 8, .header_len = 20, .data_proto = IPPROTO_UDP};
+
+	ip4->flags_offset = htons(100); /* non-first fragment */
+	host_send_icmp4_error(11, 0, 0, &p4);
+	assert(drain_count(sv[1]) == 0);
+	ip4->flags_offset = 0;
+	inet_pton(AF_INET, "224.0.0.1", &ip4->src); /* multicast source */
+	host_send_icmp4_error(11, 0, 0, &p4);
+	assert(drain_count(sv[1]) == 0);
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+
+	gcfg.icmp_rate_limit = 10;	/* burst 10, +10/s */
+	int sent = 0;
+	for (int i = 0; i < 1000; i++) {
+		host_send_icmp4_error(11, 0, 0, &p4);
+		sent += drain_count(sv[1]);	/* unix dgram queues are short */
+	}
+	assert(sent >= 200 && sent <= 260);	/* initial burst, ~+10/s */
+	/* Exhausted TTL budget must not starve Fragmentation Needed. */
+	gcfg.icmp_rate_limit = 0;
+	host_send_icmp4_error(3, 4, 1480, &p4);
+	assert(drain_count(sv[1]) == 1);
+
+	icmp_rate_limit_reset();
+	gcfg.icmp_rate_limit = UINT32_MAX;
+	sent = 0;
+	for (int i = 0; i < 500; i++) {
+		host_send_icmp4_error(11, 0, 0, &p4);
+		sent += drain_count(sv[1]);
+	}
+	assert(sent == 500);
+	gcfg.icmp_rate_limit = 0;
+	icmp_rate_limit_reset();
+
+	alignas(8) uint8_t b6[HEADROOM + 64] = {0};
+	struct ip6 *ip6 = (struct ip6 *)(b6 + HEADROOM);
+	ip6->ver_tc_fl = htonl(0x60000000); ip6->next_header = IPPROTO_UDP;
+	ip6->payload_length = htons(8); ip6->hop_limit = 1;
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->src);
+	inet_pton(AF_INET6, "ff02::1", &ip6->dest);
+	struct pkt p6 = {.tun_fd = sv[0], .ip6 = ip6, .data = (uint8_t *)ip6 + 40,
+	                 .data_len = 8, .header_len = 0, .data_proto = IPPROTO_UDP};
+	host_send_icmp6_error(3, 0, 0, &p6); /* multicast dest: suppressed */
+	assert(drain_count(sv[1]) == 0);
+	host_send_icmp6_error(2, 0, 1280, &p6); /* PTB exception */
+	assert(drain_count(sv[1]) == 1);
+	memset(&ip6->src, 0, sizeof(ip6->src)); /* unspecified src */
+	host_send_icmp6_error(2, 0, 1280, &p6);
+	assert(drain_count(sv[1]) == 0);
+	close(sv[0]); close(sv[1]);
+	puts("PASS: ICMP error suppression and rate limiting");
+}
+
+/* RFC-001: an ICMPv4 Time Exceeded carrying an RFC 4884 extension keeps it
+ * (padded to 128 octets, Length in 8-octet units) with a valid checksum. */
+static void test_rfc4884_ext_4to6(void)
+{
+	setup_quote_maps(); gcfg.mtu = 1500;
+	icmp_rate_limit_reset();
+	int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(8) uint8_t buf[HEADROOM + 256] = {0};
+	uint8_t resp[512];
+	struct ip4 *ip = (struct ip4 *)(buf + HEADROOM);
+	uint8_t *icmp = (uint8_t *)(ip + 1);
+	uint8_t *inner = icmp + 8;
+	enum { ORIG = 128, EXT = 8 };
+	ip->ver_ihl = 0x45; ip->ttl = 64; ip->proto = IPPROTO_ICMP;
+	ip->length = htons(20 + 8 + ORIG + EXT);
+	inet_pton(AF_INET, "8.8.4.4", &ip->src);
+	inet_pton(AF_INET, "192.0.0.1", &ip->dest);
+	ip->cksum = ip_checksum(ip, 20);
+	icmp[0] = 11; icmp[1] = 0; icmp[5] = ORIG / 4;
+	struct ip4 *in = (struct ip4 *)inner;
+	in->ver_ihl = 0x45; in->ttl = 1; in->proto = IPPROTO_UDP;
+	in->length = htons(28);
+	inet_pton(AF_INET, "192.0.0.1", &in->src);
+	inet_pton(AF_INET, "8.8.8.8", &in->dest);
+	in->cksum = ip_checksum(in, 20);
+	uint8_t *ext = inner + ORIG;
+	const uint8_t extdata[EXT] = {0x20, 0, 0, 0, 0, 8, 1, 1};
+	memcpy(ext, extdata, EXT);
+	uint16_t c = ip_checksum(icmp, 8 + ORIG + EXT);
+	memcpy(icmp + 2, &c, 2);
+	struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 20 + 8 + ORIG + EXT};
+	handle_ip4(&p);
+	ssize_t n = recv(sv[1], resp, sizeof(resp), MSG_DONTWAIT);
+	unsigned off = 0;
+#ifndef __linux__
+	off = sizeof(struct tun_pi);
+#endif
+	assert(n == (ssize_t)(off + 40 + 8 + 128 + EXT));
+	struct ip6 *o6 = (struct ip6 *)(resp + off);
+	uint8_t *oi = (uint8_t *)(o6 + 1);
+	assert(o6->next_header == IPPROTO_ICMPV6 && oi[0] == 3);
+	assert(oi[4] == 128 / 8);		/* RFC 4884 Length attribute */
+	assert(memcmp(oi + 8 + 128, extdata, EXT) == 0);
+	assert(ones_add(ip_checksum(oi, ntohs(o6->payload_length)),
+	                ip6_checksum(o6, ntohs(o6->payload_length), 58)) == 0);
+	close(sv[0]); close(sv[1]);
+	puts("PASS: RFC 4884 extension preserved in ICMPv4->ICMPv6 error");
+}
+
+static void test_rfc4884_ext_6to4(void)
+{
+	setup_quote_maps(); gcfg.mtu = 1500;
+	icmp_rate_limit_reset();
+	int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(8) uint8_t buf[HEADROOM + 400] = {0};
+	uint8_t resp[512];
+	enum { ORIG = 128, EXT = 8 };
+	struct ip6 *ip = (struct ip6 *)(buf + HEADROOM);
+	struct icmp *ic = (struct icmp *)(ip + 1);
+	struct ip6 *in = (struct ip6 *)(ic + 1);
+	uint8_t *ext = (uint8_t *)in + ORIG;
+	const uint8_t extdata[EXT] = {0x20, 0, 0, 0, 0, 8, 1, 1};
+	ip->ver_tc_fl = htonl(0x60000000); ip->hop_limit = 64;
+	ip->next_header = IPPROTO_ICMPV6;
+	ip->payload_length = htons(8 + ORIG + EXT);
+	inet_pton(AF_INET6, "64:ff9b::808:404", &ip->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip->dest);
+	ic->type = 3; ic->code = 0; ic->word = htonl((ORIG / 8) << 24);
+	in->ver_tc_fl = htonl(0x60000000); in->hop_limit = 1;
+	in->next_header = IPPROTO_UDP; in->payload_length = htons(8);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &in->src);
+	inet_pton(AF_INET6, "64:ff9b::808:808", &in->dest);
+	memcpy(ext, extdata, EXT);
+	ic->cksum = 0;
+	ic->cksum = ones_add(ip_checksum(ic, 8 + ORIG + EXT),
+	                     ip6_checksum(ip, 8 + ORIG + EXT, 58));
+	struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip,
+	                .data_len = 40 + 8 + ORIG + EXT};
+	handle_ip6(&p);
+	ssize_t n = recv(sv[1], resp, sizeof(resp), MSG_DONTWAIT);
+	unsigned off = 0;
+#ifndef __linux__
+	off = sizeof(struct tun_pi);
+#endif
+	assert(n == (ssize_t)(off + 20 + 8 + 128 + EXT));
+	struct ip4 *o4 = (struct ip4 *)(resp + off);
+	uint8_t *oi = (uint8_t *)(o4 + 1);
+	assert(o4->proto == IPPROTO_ICMP && oi[0] == 11);
+	assert(oi[5] == 128 / 4);		/* RFC 4884 Length attribute */
+	assert(memcmp(oi + 8 + 128, extdata, EXT) == 0);
+	assert(ip_checksum(oi, 8 + 128 + EXT) == 0);
+	close(sv[0]); close(sv[1]);
+	puts("PASS: RFC 4884 extension preserved in ICMPv6->ICMPv4 error");
+}
+
+/* RFC 6946: an IPv6 "atomic fragment" (fragment header, offset 0, M=0) is
+ * translated on its own (RFC 7915 5.1): DF cleared, ID from the header. */
+static void test_ipv6_atomic_fragment(void)
+{
+	setup_quote_maps(); gcfg.mtu = 1500;
+	int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(4) uint8_t buffer[HEADROOM + 128] = {0}, response[128];
+	struct ip6 *ip = (struct ip6 *)(buffer + HEADROOM);
+	ip->ver_tc_fl = htonl(0x60000000); ip->hop_limit = 64;
+	ip->next_header = 44; ip->payload_length = htons(16);
+	inet_pton(AF_INET6, "64:ff9b::808:808", &ip->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip->dest);
+	uint8_t *fh = (uint8_t *)(ip + 1);
+	fh[0] = IPPROTO_UDP;			/* offset 0, MF 0 */
+	uint32_t ident = htonl(0x12345678);
+	memcpy(fh + 4, &ident, 4);
+	uint8_t *udp = fh + 8;
+	uint16_t words[4] = {htons(1234), htons(4321), htons(8), 0};
+	memcpy(udp, words, sizeof(words));
+	uint16_t checksum = htons(calc_full_udp_cksum6(&ip->src, &ip->dest, udp, 8));
+	memcpy(udp + 6, &checksum, sizeof(checksum));
+	struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip, .data_len = 40 + 16};
+	handle_ip6(&p);
+	ssize_t length = recv(sv[1], response, sizeof(response), MSG_DONTWAIT);
+	unsigned offset = 0;
+#ifndef __linux__
+	offset = sizeof(struct tun_pi);
+#endif
+	assert(length == (ssize_t)(offset + 28));
+	struct ip4 *out = (struct ip4 *)(response + offset);
+	assert(out->proto == IPPROTO_UDP && out->ttl == 63);
+	assert((ntohs(out->flags_offset) & (IP4_F_DF | IP4_F_MF | IP4_F_MASK)) == 0);
+	assert(ntohs(out->ident) == 0x5678);
+	assert(ip_checksum(out, 20) == 0);
+	close(sv[0]); close(sv[1]);
+	puts("PASS: IPv6 atomic fragment translated as an unfragmented packet");
+}
+
+/* STAB-001: truncated frames must be dropped without reading past data_len.
+ * Exact-size heap buffers make ASan flag any OOB header/log read. */
+static void test_truncated_ip_headers(void)
+{
+	setup_quote_maps();
+	gcfg.log_opts = LOG_OPT_DROP;
+	for (unsigned v = 4; v <= 6; v += 2) {
+		unsigned max = v == 4 ? 20 : 40;
+		for (unsigned len = 0; len < max; len++) {
+			uint8_t *buf = malloc(len ? len : 1);
+			assert(buf);
+			memset(buf, 0, len ? len : 1);
+			if (len)
+				buf[0] = (uint8_t)(v << 4 | (v == 4 ? 5 : 0));
+			if (len > 8 && v == 6)
+				buf[8] = 0xff;
+			struct pkt p = {.tun_fd = -1, .data = buf, .data_len = len};
+			if (v == 4)
+				handle_ip4(&p);
+			else
+				handle_ip6(&p);
+			free(buf);
+		}
+	}
+	gcfg.log_opts = 0;
+	puts("PASS: truncated IPv4/IPv6 frames dropped without OOB reads");
+}
+
 /* Exercise the complete data output path, including BSD's TUN family header. */
 static void test_ipv6_udp_output_family(void)
 {
@@ -818,6 +1061,11 @@ int main(void)
 {
 	printf("=== Running unit_udp_checksum test suite ===\n");
 	test_ipv6_udp_output_family();
+	test_truncated_ip_headers();
+	test_ipv6_atomic_fragment();
+	test_rfc4884_ext_4to6();
+	test_rfc4884_ext_6to4();
+	test_icmp_error_suppression_and_rate_limit();
 	test_icmp_echo_checksum_translation();
 	test_tcp_zero_checksum_preserved();
 	test_metadata_bounds();

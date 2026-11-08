@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -20,6 +21,13 @@
  * Keep the receive capacity an array so sizeof still gives the buffer size. */
 #define RX_BUFFER(name, size) \
     struct { alignas(4) uint8_t padding[2]; uint8_t data[size]; } name
+
+/* BSD software-segmented packets are preceded by a 4-byte tun_pi. */
+#ifdef __linux__
+#define SW_PI 0
+#else
+#define SW_PI sizeof(struct tun_pi)
+#endif
 
 static inline void get_gso_snapshot(struct tayga_stats *s) {
 	stats_flush_worker();
@@ -688,6 +696,49 @@ static void test_gso_ipv4_options(void)
 	printf("PASS: IPv4 option compaction and source-route rejection\n");
 }
 
+/* Options are stripped on translation, so the DF/MTU check must use the
+ * 20-byte header, not the on-wire IHL (PR-2). */
+static void test_gso_ipv4_options_mtu(void)
+{
+	printf("Testing PTB check ignores stripped IPv4 options...\n");
+	setup_test_mapping();
+	gcfg.mtu = 1040 + MTU_ADJ; /* limit == 20 + 20 + 1000 exactly */
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(4) uint8_t pkt_buf[HEADROOM + 24 + sizeof(struct tcp_hdr) + 1000] = {0};
+	uint8_t *raw = pkt_buf + HEADROOM;
+	struct ip4 *ip4 = (struct ip4 *)raw;
+	struct tcp_hdr *tcp = (struct tcp_hdr *)(raw + 24);
+	ip4->ver_ihl = 0x46;
+	ip4->length = htons(24 + sizeof(*tcp) + 1000);
+	ip4->flags_offset = htons(IP4_F_DF);
+	ip4->ttl = 64;
+	ip4->proto = IPPROTO_TCP;
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "198.51.100.2", &ip4->dest);
+	memset(raw + 20, 1, 4);
+	tcp->src_port = htons(12345);
+	tcp->dst_port = htons(443);
+	tcp->doff_res = 5 << 4;
+	tcp->flags = TCP_FLAG_ACK;
+	ip4->cksum = ip_checksum(ip4, 24);
+	struct pkt p = {.tun_fd = sv[0], .data = raw,
+		.data_len = 24 + sizeof(*tcp) + 1000, .has_vhdr = 1};
+	p.vhdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	p.vhdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+	p.vhdr.gso_size = 1000;
+	p.vhdr.hdr_len = 24 + sizeof(*tcp);
+	p.vhdr.csum_start = 24;
+	p.vhdr.csum_offset = 16;
+	assert(gso_translate_tcp_4to6(&p) == 0);
+	RX_BUFFER(rx, 2048);
+	ssize_t n = recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT);
+	assert(n == 10 + sizeof(struct ip6) + sizeof(*tcp) + 1000); /* translated, not PTB */
+	close(sv[0]);
+	close(sv[1]);
+	printf("PASS: options do not inflate the MTU check\n");
+}
+
 static void test_gso_ecn_cwr(void)
 {
 	printf("Testing RFC 3168 ECN / CWR semantics (CWR on head only, cleared on tail/subsequent)...\n");
@@ -810,16 +861,16 @@ static void test_gso_ecn_cwr(void)
 		RX_BUFFER(rx_buf, 2048);
 		/* Segment 1: offset == 0, carries CWR */
 		ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
-		assert(n1 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
+		assert(n1 == 10 + SW_PI + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
+		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + SW_PI + sizeof(struct ip4));
 		assert((seg1_tcp->flags & TCP_FLAG_CWR) != 0);
 		assert((seg1_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg1_tcp->flags & (TCP_FLAG_FIN | TCP_FLAG_PSH)) == 0);
 
 		/* Segment 2: offset > 0, CWR cleared, FIN/PSH preserved */
 		ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
-		assert(n2 == 10 + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip4));
+		assert(n2 == 10 + SW_PI + sizeof(struct ip4) + sizeof(struct tcp_hdr) + 1000);
+		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + SW_PI + sizeof(struct ip4));
 		assert((seg2_tcp->flags & TCP_FLAG_CWR) == 0);
 		assert((seg2_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg2_tcp->flags & TCP_FLAG_FIN) != 0);
@@ -870,16 +921,16 @@ static void test_gso_ecn_cwr(void)
 		RX_BUFFER(rx_buf, 2048);
 		/* Segment 1: offset == 0, carries CWR */
 		ssize_t n1 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
-		assert(n1 == 10 + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip6));
+		assert(n1 == 10 + SW_PI + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
+		struct tcp_hdr *seg1_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + SW_PI + sizeof(struct ip6));
 		assert((seg1_tcp->flags & TCP_FLAG_CWR) != 0);
 		assert((seg1_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg1_tcp->flags & (TCP_FLAG_FIN | TCP_FLAG_PSH)) == 0);
 
 		/* Segment 2: offset > 0, CWR cleared, FIN/PSH preserved */
 		ssize_t n2 = recv(sv[1], rx_buf.data, sizeof(rx_buf.data), 0);
-		assert(n2 == 10 + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
-		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + sizeof(struct ip6));
+		assert(n2 == 10 + SW_PI + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 1000);
+		struct tcp_hdr *seg2_tcp = (struct tcp_hdr *)(rx_buf.data + 10 + SW_PI + sizeof(struct ip6));
 		assert((seg2_tcp->flags & TCP_FLAG_CWR) == 0);
 		assert((seg2_tcp->flags & TCP_FLAG_ECE) != 0);
 		assert((seg2_tcp->flags & TCP_FLAG_FIN) != 0);
@@ -1441,8 +1492,8 @@ static void test_gso_udp_uso(void)
 		/* Segment 1: 3000 payload */
 		RX_BUFFER(rx1, 4096);
 		ssize_t n1 = recv(sv[1], rx1.data, sizeof(rx1.data), 0);
-		assert(n1 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
-		uint8_t *seg1 = rx1.data + gcfg.vnet_hdr_sz;
+		assert(n1 == (ssize_t)(gcfg.vnet_hdr_sz + SW_PI + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
+		uint8_t *seg1 = rx1.data + gcfg.vnet_hdr_sz + SW_PI;
 		struct ip4 *ip4_1 = (struct ip4 *)seg1;
 		struct udp_hdr *udp_1 = (struct udp_hdr *)(seg1 + sizeof(struct ip4));
 		assert(ntohs(udp_1->length) == sizeof(struct udp_hdr) + 3000);
@@ -1452,8 +1503,8 @@ static void test_gso_udp_uso(void)
 		/* Segment 2: 3000 payload */
 		RX_BUFFER(rx2, 4096);
 		ssize_t n2 = recv(sv[1], rx2.data, sizeof(rx2.data), 0);
-		assert(n2 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
-		uint8_t *seg2 = rx2.data + gcfg.vnet_hdr_sz;
+		assert(n2 == (ssize_t)(gcfg.vnet_hdr_sz + SW_PI + sizeof(struct ip4) + sizeof(struct udp_hdr) + 3000));
+		uint8_t *seg2 = rx2.data + gcfg.vnet_hdr_sz + SW_PI;
 		struct ip4 *ip4_2 = (struct ip4 *)seg2;
 		struct udp_hdr *udp_2 = (struct udp_hdr *)(seg2 + sizeof(struct ip4));
 		assert(ntohs(udp_2->length) == sizeof(struct udp_hdr) + 3000);
@@ -1463,8 +1514,8 @@ static void test_gso_udp_uso(void)
 		/* Segment 3: 100 payload */
 		RX_BUFFER(rx3, 4096);
 		ssize_t n3 = recv(sv[1], rx3.data, sizeof(rx3.data), 0);
-		assert(n3 == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip4) + sizeof(struct udp_hdr) + 100));
-		uint8_t *seg3 = rx3.data + gcfg.vnet_hdr_sz;
+		assert(n3 == (ssize_t)(gcfg.vnet_hdr_sz + SW_PI + sizeof(struct ip4) + sizeof(struct udp_hdr) + 100));
+		uint8_t *seg3 = rx3.data + gcfg.vnet_hdr_sz + SW_PI;
 		struct ip4 *ip4_3 = (struct ip4 *)seg3;
 		struct udp_hdr *udp_3 = (struct udp_hdr *)(seg3 + sizeof(struct ip4));
 		assert(ntohs(udp_3->length) == sizeof(struct udp_hdr) + 100);
@@ -1520,8 +1571,8 @@ static void test_gso_udp_uso(void)
 			RX_BUFFER(rx, 4096);
 			ssize_t nr = recv(sv[1], rx.data, sizeof(rx.data), 0);
 			uint32_t udp_segment_len = sizeof(struct udp_hdr) + segment_sizes[i];
-			assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + udp_segment_len));
-			struct ip6 *ip6 = (struct ip6 *)(rx.data + gcfg.vnet_hdr_sz);
+			assert(nr == (ssize_t)(gcfg.vnet_hdr_sz + SW_PI + sizeof(struct ip6) + udp_segment_len));
+			struct ip6 *ip6 = (struct ip6 *)(rx.data + gcfg.vnet_hdr_sz + SW_PI);
 			struct udp_hdr *rx_udp = (struct udp_hdr *)((uint8_t *)ip6 + sizeof(struct ip6));
 			assert(ip6->next_header == IPPROTO_UDP);
 			assert(ntohs(ip6->payload_length) == udp_segment_len);
@@ -1672,8 +1723,8 @@ static void test_gso_sw_seg_4to6_jumbo_mss(void)
 	for (unsigned segment = 0; segment < 2; ++segment) {
 		RX_BUFFER(received, 8192);
 		ssize_t length = recv(sv[1], received.data, sizeof(received.data), 0);
-		assert(length == (ssize_t)(gcfg.vnet_hdr_sz + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 4000));
-		struct ip6 *out = (struct ip6 *)(received.data + gcfg.vnet_hdr_sz);
+		assert(length == (ssize_t)(gcfg.vnet_hdr_sz + SW_PI + sizeof(struct ip6) + sizeof(struct tcp_hdr) + 4000));
+		struct ip6 *out = (struct ip6 *)(received.data + gcfg.vnet_hdr_sz + SW_PI);
 		struct tcp_hdr *out_tcp = (struct tcp_hdr *)(out + 1);
 		assert(ntohs(out->payload_length) == sizeof(struct tcp_hdr) + 4000);
 		assert(ntohl(out_tcp->seq) == 1 + segment * 4000);
@@ -1813,7 +1864,7 @@ static void test_gso_uint16_overflow_6to4(void)
 		ssize_t n = recv(sv[1], received.data, sizeof(received.data), MSG_DONTWAIT);
 		if (n <= 0) break;
 		segments_received++;
-		struct ip4 *out = (struct ip4 *)(received.data + gcfg.vnet_hdr_sz);
+		struct ip4 *out = (struct ip4 *)(received.data + gcfg.vnet_hdr_sz + SW_PI);
 		uint16_t out_len = ntohs(out->length);
 		assert(out_len <= 1440 + sizeof(struct ip4) + sizeof(struct tcp_hdr));
 		assert(out_len > sizeof(struct ip4) + sizeof(struct tcp_hdr));
@@ -1845,6 +1896,43 @@ static void test_gso_uint16_overflow_6to4(void)
 
 /* Exercise the emitter, not just the shared allocator: short/empty segments
  * must reserve IDs even when the advertised MSS would produce DF=1. */
+#ifdef __linux__
+/* GSO-004: when the TUN queue fills mid-aggregate, the caller must learn how
+ * many payload bytes already left so that drops count only the remainder. */
+static void test_software_partial_send_accounting(void)
+{
+	printf("Testing partial software GSO send accounting...\n");
+	setup_test_mapping(); gcfg.mtu = 65535;
+	int sv[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	int sndbuf = 8192; setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	int fl = fcntl(sv[0], F_GETFL); fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
+	uint8_t filler[1500] = {0};
+	int queued = 0;
+	while (send(sv[0], filler, sizeof(filler), 0) > 0) ++queued;
+	assert(queued > 2);
+	uint8_t sink[2048];
+	for (int i = 0; i < 2; ++i) assert(recv(sv[1], sink, sizeof(sink), 0) > 0); /* room for ~2 segments */
+	const unsigned bytes = 14000, mss = 1400;
+	uint8_t *storage = calloc(1, HEADROOM + 40 + sizeof(struct tcp_hdr) + bytes); assert(storage);
+	struct ip6 *ip6 = (void *)(storage + HEADROOM);
+	ip6->ver_tc_fl = htonl(0x60000000);
+	ip6->payload_length = htons(sizeof(struct tcp_hdr) + bytes);
+	ip6->next_header = IPPROTO_TCP; ip6->hop_limit = 64;
+	inet_pton(AF_INET6, "64:ff9b::198.51.100.2", &ip6->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->dest);
+	struct tcp_hdr *t = (void *)(ip6 + 1); t->doff_res = 5 << 4; t->flags = TCP_FLAG_ACK;
+	struct pkt packet = {.tun_fd = sv[0], .data = (void *)ip6,
+		.data_len = 40 + sizeof(*t) + bytes, .has_vhdr = 1,
+		.vhdr = {.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM, .gso_type = VIRTIO_NET_HDR_GSO_TCPV6,
+			.hdr_len = 40 + sizeof(*t), .gso_size = mss, .csum_start = 40, .csum_offset = 16}};
+	assert(gso_software_segment_and_send_6to4(&packet) == -1);
+	assert(packet.gso_sent_payload > 0 && packet.gso_sent_payload < bytes);
+	assert(packet.gso_sent_payload % mss == 0);
+	free(storage); close(sv[0]); close(sv[1]);
+	puts("PASS: partial software GSO send reports sent payload");
+}
+#endif
+
 static void test_software_segment_ids(void)
 {
     const struct { unsigned payload, mss; } cases[] = {
@@ -1882,11 +1970,19 @@ static void test_software_segment_ids(void)
             do {
                 RX_BUFFER(rx, 4096);
                 ssize_t length = recv(sv[1], rx.data, sizeof(rx.data), MSG_DONTWAIT);
-                assert(length > 10);
-                struct ip4 *out = (void *)(rx.data + 10);
+                /* BSD software segments carry a leading tun_pi (address family). */
+                unsigned pi_len = 0;
+#ifndef __linux__
+                pi_len = sizeof(struct tun_pi);
+#endif
+                assert(length > (ssize_t)(10 + pi_len));
+                struct ip4 *out = (void *)(rx.data + 10 + pi_len);
+#ifndef __linux__
+                { struct tun_pi pi; memcpy(&pi, rx.data + 10, sizeof(pi)); assert(TUN_GET_PROTO(&pi) == ETH_P_IP); }
+#endif
                 unsigned chunk = bytes - offset;
                 if (chunk > cases[c].mss) chunk = cases[c].mss;
-                assert(length == (ssize_t)(10 + sizeof(struct ip4) + transport + chunk));
+                assert(length == (ssize_t)(10 + pi_len + sizeof(struct ip4) + transport + chunk));
                 assert(ntohs(out->length) == sizeof(struct ip4) + transport + chunk);
                 assert(ip_checksum(out, sizeof(*out)) == 0);
                 if (sizeof(struct ip4) + transport + chunk <= 1260) {
@@ -2035,6 +2131,9 @@ int main(void)
 	stats_init();
 	test_software_input_contract();
 	test_software_segment_ids();
+#ifdef __linux__
+	test_software_partial_send_accounting();
+#endif
 	test_gso_error_parity();
 	test_gso_validate();
 	test_single_tcp_gso_metadata();
@@ -2048,6 +2147,7 @@ int main(void)
 	test_gso_boundary_1260_1261();
 	test_gso_tcp_options();
 	test_gso_ipv4_options();
+	test_gso_ipv4_options_mtu();
 	test_gso_ecn_cwr();
 	test_gso_ttl_hop_limit();
 	test_gso_mock_write_error();

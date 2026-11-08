@@ -267,7 +267,7 @@ void test_config_init(void) {
     tcfg.dyn_min_lease = 7440;
     tcfg.dyn_max_lease = 1209600;
     tcfg.max_commit_delay = 302400;
-    tcfg.hash_bits = 7;
+    tcfg.hash_bits = 14;
     tcfg.cache_size = 1<<13;
     tcfg.wkpf_strict = 1;
     tcfg.workers = -1;
@@ -1447,6 +1447,38 @@ void test_config_validate() {
     expects(gcfg.data_dir,"/var/lib/tayga",15,"data_dir");
 }
 
+/* MEM-002/STAB-005: strict prefix-length parsing for tun-ip / tun-route. */
+static void test_tun_prefix_parse(void) {
+    static const struct { const char *line; int ok; } cases[] = {
+        {"tun-ip 192.0.2.1/24\n", 1},
+        {"tun-ip 2001:db8::1/64\n", 1},
+        {"tun-ip 192.0.2.1\n", 1},
+        {"tun-ip 192.0.2.1/0\n", 1},
+        {"tun-ip 192.0.2.1/33\n", 0},
+        {"tun-ip 2001:db8::1/129\n", 0},
+        {"tun-ip 192.0.2.1/4294967297\n", 0},	/* int overflow used to wrap to 1 */
+        {"tun-ip 192.0.2.1/-1\n", 0},
+        {"tun-ip 192.0.2.1/ 8\n", 0},
+        {"tun-ip 192.0.2.1/8x\n", 0},
+        {"tun-ip 192.0.2.1/\n", 0},
+        {"tun-route 10.0.0.0/8\n", 1},
+        {"tun-route 10.0.0.0/99999999999\n", 0},
+        {"tun-route not-an-address/8\n", 0},
+    };
+    char *conffile = "unit_conffile.conf";
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *fd = fopen(conffile, "w");
+        expect((long)fd, "fopen");
+        if (!fd) return;
+        fputs(cases[i].line, fd);
+        fclose(fd);
+        config_init();
+        int rc = config_read(conffile);
+        if (!print_fail_only) printf("TEST CASE: %s", cases[i].line);
+        expect(cases[i].ok ? !rc : rc, cases[i].ok ? "accepted" : "rejected");
+    }
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* Test function or config_init */
@@ -1454,6 +1486,7 @@ int main(void) {
 
     /* Test function for config_read */
     test_config_read();
+    test_tun_prefix_parse();
 
     /* Test function for config_validate */
     test_config_validate();

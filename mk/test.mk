@@ -82,3 +82,25 @@ $(TESTOBJDIR)/tcp_split_tail.o: test/system/tcp_split_tail.c $(GENDIR)/version.h
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -MMD -MP -c -o $@ $<
 $(TESTBINDIR)/tcp_split_tail: $(TESTOBJDIR)/tcp_split_tail.o $(TEST_LIB) | $(TESTBINDIR)
 	$(CC) -o $@ $^ $(TEST_LDFLAGS) $(LDLIBS)
+
+# libFuzzer smoke run (needs clang): `make fuzz-check` builds every harness in
+# test/fuzz with ASan+UBSan and runs it for FUZZ_TIME seconds.
+FUZZ_TIME ?= 10
+FUZZ_TARGETS := fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_pref64 fuzz_conffile
+FUZZ_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+.PHONY: fuzz-check
+fuzz-check:
+	@command -v clang >/dev/null || { echo 'fuzz-check requires clang'; exit 1; }
+	$(MAKE) CC=clang BUILDDIR=$(BUILDDIR)/fuzz CFLAGS='$(FUZZ_FLAGS) -fsanitize=fuzzer-no-link' LDFLAGS='' fuzz-run
+
+.PHONY: fuzz-run
+fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
+	@mkdir -p $(BUILDDIR)/fuzz-bin $(BUILDDIR)/fuzz-run
+	@set -eu; for t in fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_conffile; do \
+	  $(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -Isrc -I$(GENDIR) -Itest/fuzz -o $(BUILDDIR)/fuzz-bin/$$t test/fuzz/$$t.c $(TEST_LIB) $(LDLIBS); \
+	done
+	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(TESTOBJDIR)/pref64.o
+	@set -eu; for t in $(FUZZ_TARGETS); do \
+	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; \
+	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 >/dev/null); \
+	done; echo 'fuzz-check passed'

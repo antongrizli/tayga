@@ -2,6 +2,7 @@
 #include "tayga.h"
 #include <assert.h>
 #include <unistd.h>
+#include <sys/stat.h>
 _Atomic time_t now = 10000;
 
 static void configure(const char *extra)
@@ -75,6 +76,45 @@ static void test_circular_pool(void)
     assert(assign_dynamic(&other));
     reclaim();
     puts("PASS: colliding final-slot allocations wrap, exhaust, then reuse dormant leases");
+}
+
+/* STAB-003/004: leases are aged on a monotonic tick (a wall-clock jump does
+ * not expire them); dynamic.map is 0600, keeps the wall-epoch format, and
+ * survives a reload. */
+static void test_dynamic_persistence(void)
+{
+    configure("prefix fd64::/96\ndynamic-pool 198.18.0.0/29\n");
+    snprintf(gcfg.data_dir, sizeof(gcfg.data_dir), "%s", ".");
+    struct in6_addr client;
+    assert(inet_pton(AF_INET6, "2001:db8::77", &client) == 1);
+    struct map6 *m = assign_dynamic(&client);
+    assert(m);
+    struct map_dynamic *d = container_of(m, struct map_dynamic, map6);
+    struct in_addr leased = d->map4.addr;
+    d->last_use = now - 100;	/* idle for 100 monotonic seconds */
+    dynamic_maint(gcfg.dynamic_pool, 1);
+
+    struct stat st;
+    assert(stat("dynamic.map", &st) == 0 && (st.st_mode & 0777) == 0600);
+    FILE *f = fopen("dynamic.map", "r"); assert(f);
+    char line[256], a4[64], a6[64]; long long stamp = 0; int rows = 0;
+    while (fgets(line, sizeof(line), f))
+        if (line[0] != '#' && sscanf(line, "%63s %63s %lld", a4, a6, &stamp) == 3) rows++;
+    fclose(f);
+    assert(rows == 1);
+    /* Wall-clock epoch, aged by the 100 s idle time (not the tick value). */
+    long long wall = (long long)time(NULL);
+    assert(stamp <= wall - 99 && stamp >= wall - 105);
+
+    reclaim();
+    configure("prefix fd64::/96\ndynamic-pool 198.18.0.0/29\n");
+    load_dynamic(gcfg.dynamic_pool);
+    struct in_addr again;
+    assert(map_ip6_to_ip4(&again, &client, 0) == 0 && again.s_addr == leased.s_addr);
+    assert(unlink("dynamic.map") == 0);
+    reclaim();
+    gcfg.data_dir[0] = 0;
+    puts("PASS: dynamic.map is 0600 wall-epoch and survives reload with monotonic ageing");
 }
 
 static void check_pair(const char *v4, const char *v6)
@@ -178,5 +218,5 @@ int main(void)
     fputs("192.0.2.1 2001:db8::1 10000\n", stale); assert(fclose(stale) == 0);
     load_dynamic(NULL);
     assert(unlink("dynamic.map") == 0);
-    test_circular_pool(); test_eam(); return 0;
+    test_circular_pool(); test_dynamic_persistence(); test_eam(); return 0;
 }
