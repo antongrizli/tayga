@@ -204,6 +204,50 @@ static void test_hash_distribution(void)
     printf("PASS: address hash distribution (max chain v6=%u v4=%u)\n", max6, max4);
 }
 
+static atomic_bool fc_stop;
+static void *fc_lookup(void *dir)
+{
+    struct in_addr v4, back; struct in6_addr v6, a, b;
+    inet_pton(AF_INET, "192.0.2.9", &v4);
+    inet_pton(AF_INET6, "2001:db8::9", &a); inet_pton(AF_INET6, "2001:db8::10", &b);
+    while (!atomic_load(&fc_stop)) {
+        if (dir) {
+            /* Whichever mapping is current, the reverse lookup must succeed for it or be a clean miss. */
+            int rc = map_ip6_to_ip4(&back, &a, 0);
+            assert(rc == 0 || rc < 0);
+            if (rc == 0) assert(back.s_addr == htonl(0xc0000209) || back.s_addr == htonl(0xc000020a));
+        } else {
+            assert(map_ip4_to_ip6(&v6, &v4) == 0);
+            assert(IN6_ARE_ADDR_EQUAL(&v6, &a) || IN6_ARE_ADDR_EQUAL(&v6, &b));
+        }
+    }
+    return NULL;
+}
+static void *fc_clock(void *unused)
+{
+    (void)unused;
+    for (int i = 0; !atomic_load(&fc_stop); i++) atomic_store_explicit(&now, 100 + i % 3, memory_order_relaxed);
+    return NULL;
+}
+/* 16 lookup threads with per-thread front caches race reloads and a ticking clock. */
+static void test_front_cache_concurrency(void)
+{
+    pthread_t th[16], clk, rl;
+    atomic_store(&fc_stop, false);
+    for (int i = 0; i < 16; i++) assert(pthread_create(&th[i], NULL, fc_lookup, (void *)(intptr_t)(i % 2)) == 0);
+    assert(pthread_create(&clk, NULL, fc_clock, NULL) == 0);
+    for (int i = 0; i < 200; i++) {
+        write_maps(i % 2 ? "map 192.0.2.9 2001:db8::9\n" : "map 192.0.2.9 2001:db8::10\n");
+        assert(addrmap_reload() == 0);
+    }
+    write_maps("map 192.0.2.9 2001:db8::10\n"); assert(addrmap_reload() == 0);
+    atomic_store(&fc_stop, true);
+    for (int i = 0; i < 16; i++) pthread_join(th[i], NULL);
+    pthread_join(clk, NULL); (void)rl;
+    struct in_addr v4; struct in6_addr v6, b; inet_pton(AF_INET, "192.0.2.9", &v4); inet_pton(AF_INET6, "2001:db8::10", &b);
+    assert(map_ip4_to_ip6(&v6, &v4) == 0 && IN6_ARE_ADDR_EQUAL(&v6, &b));
+    puts("PASS: 16 threads with front caches race reloads without stale results");
+}
 int main(void)
 {
     test_hash_distribution();
@@ -249,6 +293,7 @@ int main(void)
     int count = 0; struct list_head *item;
     list_for_each(item, &gcfg.cache_active) count++;
     assert(count == 1);
+    test_front_cache_concurrency();
     /* Per-thread front cache: a reload within the same clock second must be seen at once. */
     {
         struct in_addr a4, e4; struct in6_addr o6, e6; inet_pton(AF_INET, "192.0.2.9", &a4);

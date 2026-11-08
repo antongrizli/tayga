@@ -672,6 +672,53 @@ static void test_icmp_error_suppression_and_rate_limit(void)
 	puts("PASS: ICMP error suppression and rate limiting");
 }
 
+/* RFC-005c: "Unrecognized Next Header" points at the Next Header field that
+ * named the unknown protocol, not at a constant 6 (RFC 4443 section 3.4). */
+static void test_icmp6_unknown_next_header_pointer(void)
+{
+	setup_quote_maps();
+	gcfg.mtu = 1500;
+	gcfg.icmp_rate_limit = UINT32_MAX;
+	icmp_rate_limit_reset();
+	const unsigned pi = 
+#ifdef __linux__
+		0;
+#else
+		sizeof(struct tun_pi);
+#endif
+	for (int ext = 0; ext < 2; ++ext) {
+		int sv[2];
+		assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+		alignas(8) uint8_t buf[HEADROOM + 96] = {0};
+		struct ip6 *ip6 = (struct ip6 *)(buf + HEADROOM);
+		unsigned payload = ext ? 8 + 8 : 8;
+		ip6->ver_tc_fl = htonl(0x60000000);
+		ip6->payload_length = htons(payload);
+		ip6->next_header = ext ? 0 /* Hop-by-Hop */ : 99;
+		ip6->hop_limit = 64;
+		inet_pton(AF_INET6, "fd9b:64:1:ff::10", &ip6->src);
+		ip6->dest = gcfg.local_addr6;
+		uint8_t *l4 = (uint8_t *)(ip6 + 1);
+		if (ext) { l4[0] = 99; l4[1] = 0; l4[2] = 1; l4[3] = 4; } /* HBH: next=99, 6 bytes PadN */
+		struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)ip6,
+			.data_len = sizeof(struct ip6) + payload};
+		handle_ip6(&p);
+		uint8_t out[512];
+		ssize_t n = recv(sv[1], out, sizeof(out), MSG_DONTWAIT);
+		assert(n > (ssize_t)(pi + sizeof(struct ip6) + 8));
+		/* Skip the optional vnet header prefix (10 bytes when negotiated). */
+		size_t base = gcfg.vnet_hdr_sz ? (size_t)gcfg.vnet_hdr_sz : 0;
+		struct ip6 *rep = (struct ip6 *)(out + base + pi);
+		assert(rep->next_header == 58);
+		struct icmp *ic = (struct icmp *)(rep + 1);
+		assert(ic->type == 4 && ic->code == 1);
+		assert(ntohl(ic->word) == (ext ? 40u : 6u));
+		close(sv[0]); close(sv[1]);
+	}
+	icmp_rate_limit_reset();
+	puts("PASS: Unrecognized Next Header pointer follows the extension chain");
+}
+
 /* RFC-001: an ICMPv4 Time Exceeded carrying an RFC 4884 extension keeps it
  * (padded to 128 octets, Length in 8-octet units) with a valid checksum. */
 static void test_rfc4884_ext_4to6(void)
@@ -1066,6 +1113,7 @@ int main(void)
 	test_rfc4884_ext_4to6();
 	test_rfc4884_ext_6to4();
 	test_icmp_error_suppression_and_rate_limit();
+	test_icmp6_unknown_next_header_pointer();
 	test_icmp_echo_checksum_translation();
 	test_tcp_zero_checksum_preserved();
 	test_metadata_bounds();
