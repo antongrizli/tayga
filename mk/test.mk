@@ -100,7 +100,9 @@ fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 	  $(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -Isrc -I$(GENDIR) -Itest/fuzz -o $(BUILDDIR)/fuzz-bin/$$t test/fuzz/$$t.c $(TEST_LIB) $(LDLIBS); \
 	done
 	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(TESTOBJDIR)/pref64.o
+	@python3 test/fuzz/make_seeds.py $(BUILDDIR)/fuzz-seeds >/dev/null
 	@set -eu; for t in $(FUZZ_TARGETS); do \
-	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; \
-	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 >/dev/null); \
+	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; seeds=; \
+	  [ -d $(BUILDDIR)/fuzz-seeds/$$t ] && seeds=$(abspath $(BUILDDIR))/fuzz-seeds/$$t; \
+	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null); \
 	done; echo 'fuzz-check passed'
