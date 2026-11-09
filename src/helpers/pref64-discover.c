@@ -26,9 +26,9 @@
 #include <netinet/icmp6.h>
 #include <strings.h>
 #include <time.h>
-#ifdef __linux__
 #include <sys/ioctl.h>
 #include <net/if.h>
+#ifdef __linux__
 #include <linux/if_tun.h>
 #endif
 
@@ -462,7 +462,7 @@ HOSTS_LINKAGE size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
 }
 
 #ifndef PREF64_NO_MAIN
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 /*
  * Solicit a Router Advertisement on ifname and read PREF64 from it.
  * Needs CAP_NET_RAW; returns -2 when the socket cannot be opened so the
@@ -1599,7 +1599,7 @@ int main(int argc, char **argv)
     char winning_server[INET6_ADDRSTRLEN] = "";
     double winning_rtt = 0.0;
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     if (ra_iface && !no_ra) {
         uint32_t life = 0;
         int rc = discover_ra_pref64(ra_iface, timeout_sec, &out, &plen, &life);

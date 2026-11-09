@@ -114,12 +114,13 @@ if [ "$pref64" = auto ] || [ "$pref64" = public ]; then
     elif [ "$pref64" = public ]; then
         pref64=$("$helper" -p) || fail 'Public NAT64 discovery failed; specify --pref64 explicitly'
     else
-        # RFC 8781 first (Linux, needs CAP_NET_RAW), then RFC 7050 via DNS.
+        # RFC 8781 first (Linux and FreeBSD, needs raw ICMPv6), then RFC 7050 via DNS.
         ra_if=
-        if [ "$(uname -s)" = Linux ]; then
-            ra_if=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
-            case "$ra_if" in *[!a-zA-Z0-9_.:-]*) ra_if= ;; esac
-        fi
+        case "$(uname -s)" in
+            Linux) ra_if=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}') ;;
+            FreeBSD) ra_if=$(route -n get -inet6 default 2>/dev/null | awk '/interface:/{print $2; exit}') ;;
+        esac
+        case "$ra_if" in *[!a-zA-Z0-9_.:-]*) ra_if= ;; esac
         pref64=
         if [ -n "$ra_if" ] && pref64=$("$helper" -i "$ra_if" -t 3 --ra-only 2>/dev/null) && [ -n "$pref64" ]; then
             pref64_source=rfc8781

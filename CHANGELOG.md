@@ -6,6 +6,7 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- RFC 8781 PREF64 discovery from Router Advertisements now also works on FreeBSD (`pref64-discover -i <if>`); the installer picks the IPv6 default-route interface via `route(8)`.
 - `flow-label zero|compute` (RFC 6437): optional keyed-hash IPv6 Flow Label for IPv4-to-IPv6 translation, including the GSO paths; default stays `zero` per RFC 7915.
 - Flat per-prefix-length index for immutable configurations with at least 9 static maps; `find_map4`/`find_map6` become O(lengths x log N) instead of a linear list scan (about 30x faster at 3000 entries).
 - Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). With them every received packet satisfies `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
