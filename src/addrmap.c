@@ -358,7 +358,126 @@ static struct cache_entry *cache_insert(const struct in_addr *addr4,
  * @param addr4 IPv4 address to check
  * @returns Cache entry, or NULL if none found
  */
-struct map4 *find_map4(const struct in_addr *addr4)
+/*
+ * Flat prefix index for immutable configurations with many static maps
+ * (SIIT-DC EAM tables).  The linked lists are scanned linearly, which costs
+ * O(N) per cold lookup once the address cache is disabled.  The index keeps one
+ * sorted array per distinct prefix length, longest first, and is only built
+ * after configuration is final, so it needs no locking.
+ */
+#define PFX_INDEX_MIN_ENTRIES 9
+
+struct idx4_ent { uint32_t addr; struct map4 *m; };
+struct idx4_len { uint32_t mask; size_t n; struct idx4_ent *e; };
+struct idx6_ent { uint64_t hi, lo; struct map6 *m; };
+struct idx6_len { uint64_t mhi, mlo; size_t n; struct idx6_ent *e; };
+
+static struct idx4_len *g_idx4;
+static size_t g_idx4_n;
+static struct idx6_len *g_idx6;
+static size_t g_idx6_n;
+
+static int idx4_cmp(const void *a, const void *b)
+{
+	uint32_t x = ((const struct idx4_ent *)a)->addr, y = ((const struct idx4_ent *)b)->addr;
+	return x < y ? -1 : x > y;
+}
+
+static int idx6_cmp(const void *a, const void *b)
+{
+	const struct idx6_ent *x = a, *y = b;
+	if (x->hi != y->hi) return x->hi < y->hi ? -1 : 1;
+	return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+static uint64_t load_be64(const uint8_t *p)
+{
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+	return v;
+}
+
+void addrmap_free_index(void)
+{
+	for (size_t i = 0; i < g_idx4_n; i++) free(g_idx4[i].e);
+	for (size_t i = 0; i < g_idx6_n; i++) free(g_idx6[i].e);
+	free(g_idx4); free(g_idx6);
+	g_idx4 = NULL; g_idx6 = NULL; g_idx4_n = g_idx6_n = 0;
+}
+
+/* Build the index from the (final, immutable) lists; 0 = built or not needed. */
+int addrmap_build_index(void)
+{
+	size_t n4 = 0, n6 = 0;
+	struct list_head *entry;
+
+	addrmap_free_index();
+	list_for_each(entry, &gcfg.map4_list) n4++;
+	list_for_each(entry, &gcfg.map6_list) n6++;
+	if (n4 < PFX_INDEX_MIN_ENTRIES && n6 < PFX_INDEX_MIN_ENTRIES)
+		return 0;
+
+	/* IPv4: one group per prefix length, 32 down to 0 */
+	struct idx4_len *g4 = calloc(33, sizeof(*g4));
+	struct idx6_len *g6 = calloc(129, sizeof(*g6));
+	if (!g4 || !g6) goto oom;
+	list_for_each(entry, &gcfg.map4_list) {
+		struct map4 *m = list_entry(entry, struct map4, list);
+		g4[m->prefix_len].n++;
+	}
+	list_for_each(entry, &gcfg.map6_list) {
+		struct map6 *m = list_entry(entry, struct map6, list);
+		g6[m->prefix_len].n++;
+	}
+	for (int l = 0; l <= 32; l++) {
+		if (!g4[l].n) continue;
+		g4[l].e = malloc(g4[l].n * sizeof(*g4[l].e));
+		if (!g4[l].e) goto oom;
+		g4[l].mask = l ? 0xffffffffu << (32 - l) : 0;
+		g4[l].n = 0;
+	}
+	for (int l = 0; l <= 128; l++) {
+		if (!g6[l].n) continue;
+		g6[l].e = malloc(g6[l].n * sizeof(*g6[l].e));
+		if (!g6[l].e) goto oom;
+		g6[l].mhi = l >= 64 ? ~0ull : (l ? ~0ull << (64 - l) : 0);
+		g6[l].mlo = l <= 64 ? 0 : (l >= 128 ? ~0ull : ~0ull << (128 - l));
+		g6[l].n = 0;
+	}
+	list_for_each(entry, &gcfg.map4_list) {
+		struct map4 *m = list_entry(entry, struct map4, list);
+		struct idx4_len *g = &g4[m->prefix_len];
+		g->e[g->n].addr = ntohl(m->addr.s_addr) & g->mask;
+		g->e[g->n++].m = m;
+	}
+	list_for_each(entry, &gcfg.map6_list) {
+		struct map6 *m = list_entry(entry, struct map6, list);
+		struct idx6_len *g = &g6[m->prefix_len];
+		g->e[g->n].hi = load_be64(m->addr.s6_addr) & g->mhi;
+		g->e[g->n].lo = load_be64(m->addr.s6_addr + 8) & g->mlo;
+		g->e[g->n++].m = m;
+	}
+	for (int l = 0; l <= 32; l++) if (g4[l].n) qsort(g4[l].e, g4[l].n, sizeof(*g4[l].e), idx4_cmp);
+	for (int l = 0; l <= 128; l++) if (g6[l].n) qsort(g6[l].e, g6[l].n, sizeof(*g6[l].e), idx6_cmp);
+	/* Compact into longest-first arrays of non-empty groups. */
+	struct idx4_len *c4 = calloc(33, sizeof(*c4));
+	struct idx6_len *c6 = calloc(129, sizeof(*c6));
+	if (!c4 || !c6) { free(c4); free(c6); goto oom; }
+	for (int l = 32; l >= 0; l--) if (g4[l].n) c4[g_idx4_n++] = g4[l];
+	for (int l = 128; l >= 0; l--) if (g6[l].n) c6[g_idx6_n++] = g6[l];
+	free(g4); free(g6);
+	g_idx4 = c4; g_idx6 = c6;
+	return 0;
+oom:
+	if (g4) for (int l = 0; l <= 32; l++) free(g4[l].e);
+	if (g6) for (int l = 0; l <= 128; l++) free(g6[l].e);
+	free(g4); free(g6);
+	g_idx4_n = g_idx6_n = 0;
+	slog(LOG_WARNING, "Unable to allocate prefix index; using linear map lookup\n");
+	return 0;
+}
+
+static struct map4 *find_map4_linear(const struct in_addr *addr4)
 {
 	struct list_head *entry;
 	struct map4 *m;
@@ -369,6 +488,21 @@ struct map4 *find_map4(const struct in_addr *addr4)
 			return m;
 	}
 	return NULL;
+}
+
+struct map4 *find_map4(const struct in_addr *addr4)
+{
+	if (g_idx4) {
+		uint32_t a = ntohl(addr4->s_addr);
+		for (size_t i = 0; i < g_idx4_n; i++) {
+			const struct idx4_len *g = &g_idx4[i];
+			struct idx4_ent key = { a & g->mask, NULL };
+			const struct idx4_ent *hit = bsearch(&key, g->e, g->n, sizeof(*g->e), idx4_cmp);
+			if (hit) return hit->m;
+		}
+		return NULL;
+	}
+	return find_map4_linear(addr4);
 }
 /**
  * @brief Check if an IPv6 address is in the cache
@@ -381,6 +515,16 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 	struct list_head *entry;
 	struct map6 *m;
 
+	if (g_idx6) {
+		uint64_t hi = load_be64(addr6->s6_addr), lo = load_be64(addr6->s6_addr + 8);
+		for (size_t i = 0; i < g_idx6_n; i++) {
+			const struct idx6_len *g = &g_idx6[i];
+			struct idx6_ent key = { hi & g->mhi, lo & g->mlo, NULL };
+			const struct idx6_ent *hit = bsearch(&key, g->e, g->n, sizeof(*g->e), idx6_cmp);
+			if (hit) return hit->m;
+		}
+		return NULL;
+	}
 	list_for_each(entry, &gcfg.map6_list) {
 		m = list_entry(entry, struct map6, list);
 		if (IN6_IS_IN_NET(addr6, &m->addr, &m->mask))

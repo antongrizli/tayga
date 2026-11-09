@@ -248,10 +248,75 @@ static void test_front_cache_concurrency(void)
     assert(map_ip4_to_ip6(&v6, &v4) == 0 && IN6_ARE_ADDR_EQUAL(&v6, &b));
     puts("PASS: 16 threads with front caches race reloads without stale results");
 }
+
+/* The flat prefix index must return exactly what the linear list scan returns. */
+static void test_prefix_index_matches_linear(void)
+{
+    enum { N4 = 3000, N6 = 3000, Q = 200000 };
+    struct map4 *e4[N4 * 2]; struct map6 *e6[N6]; int n4 = 0, n6 = 0;
+    srand(12345);
+    INIT_LIST_HEAD(&gcfg.map4_list); INIT_LIST_HEAD(&gcfg.map6_list);
+    for (int i = 0; i < N4; i++) {
+        struct map_static *m = calloc(1, sizeof(*m)); assert(m);
+        int plen = (i % 7 == 0) ? 16 + rand() % 8 : 24 + rand() % 9;   /* nested prefixes */
+        uint32_t a = (uint32_t)rand() << 8 ^ (uint32_t)rand();
+        a &= plen ? 0xffffffffu << (32 - plen) : 0;
+        m->map4.addr.s_addr = htonl(a); assert(calc_ip4_mask(&m->map4.mask, &m->map4.addr, plen) == 0);
+        m->map4.prefix_len = plen; m->map4.type = MAP_TYPE_STATIC; INIT_LIST_HEAD(&m->map4.list);
+        if (insert_map4(&m->map4, NULL) < 0) { free(m); continue; }
+        e4[n4++] = &m->map4;
+    }
+    for (int i = 0; i < N6; i++) {
+        struct map_static *m = calloc(1, sizeof(*m)); assert(m);
+        int plen = 48 + rand() % 81;
+        for (int b = 0; b < 16; b++) m->map6.addr.s6_addr[b] = (uint8_t)rand();
+        m->map6.addr.s6_addr[0] = 0x20;
+        for (int b = 0; b < 16; b++) { int keep = plen - b * 8; m->map6.addr.s6_addr[b] &= keep >= 8 ? 0xff : keep <= 0 ? 0 : (uint8_t)(0xff << (8 - keep)); }
+        assert(calc_ip6_mask(&m->map6.mask, &m->map6.addr, plen) == 0);
+        m->map6.prefix_len = plen; m->map6.type = MAP_TYPE_STATIC; INIT_LIST_HEAD(&m->map6.list);
+        if (insert_map6(&m->map6, NULL) < 0) { free(m); continue; }
+        e6[n6++] = &m->map6;
+    }
+    assert(n4 > 2000 && n6 > 2000);
+    static struct map4 *r4[Q]; static struct map6 *r6[Q];
+    static struct in_addr q4[Q]; static struct in6_addr q6[Q];
+    for (int i = 0; i < Q; i++) {
+        if (i % 2 && n4) {   /* hit: inside a known prefix */
+            struct map4 *m = e4[rand() % n4]; q4[i].s_addr = m->addr.s_addr | (htonl((uint32_t)rand()) & ~m->mask.s_addr);
+        } else q4[i].s_addr = htonl((uint32_t)rand() << 8 ^ (uint32_t)rand());
+        if (i % 2 && n6) {
+            struct map6 *m = e6[rand() % n6];
+            for (int b = 0; b < 16; b++) q6[i].s6_addr[b] = m->addr.s6_addr[b] | ((uint8_t)rand() & ~m->mask.s6_addr[b]);
+        } else for (int b = 0; b < 16; b++) q6[i].s6_addr[b] = (uint8_t)rand();
+        r4[i] = find_map4(&q4[i]); r6[i] = find_map6(&q6[i]);
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < Q; i++) (void)find_map4(&q4[i]), (void)find_map6(&q6[i]);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert(addrmap_build_index() == 0);
+    int hits4 = 0, hits6 = 0;
+    for (int i = 0; i < Q; i++) {
+        assert(find_map4(&q4[i]) == r4[i]); assert(find_map6(&q6[i]) == r6[i]);
+        hits4 += r4[i] != NULL; hits6 += r6[i] != NULL;
+    }
+    assert(hits4 > Q / 4 && hits6 > Q / 4);
+    double lin = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec), idx;
+    {   struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int i = 0; i < Q; i++) (void)find_map4(&q4[i]), (void)find_map6(&q6[i]);
+        clock_gettime(CLOCK_MONOTONIC, &b); idx = (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec); }
+    printf("INFO: v4+v6 lookup linear %.0f ns, indexed %.0f ns per pair\n", lin / Q, idx / Q);
+    addrmap_free_index();
+    for (int i = 0; i < n4; i++) { list_del(&e4[i]->list); free(container_of(e4[i], struct map_static, map4)); }
+    for (int i = 0; i < n6; i++) { list_del(&e6[i]->list); free(container_of(e6[i], struct map_static, map6)); }
+    printf("PASS: prefix index equals linear scan (%d/%d v4/v6 entries, %d/%d hits)\n", n4, n6, hits4, hits6);
+}
+
 int main(void)
 {
     test_hash_distribution();
     boundary_masks(); assert(config_init() == 0);
+    test_prefix_index_matches_linear();
     assert(pthread_mutex_init(&gcfg.map_mutex, NULL) == 0);
     assert(pthread_mutex_init(&gcfg.cache_mutex, NULL) == 0);
     gcfg.cache_size = 16; gcfg.hash_bits = 2; gcfg.rand[0] = 1;

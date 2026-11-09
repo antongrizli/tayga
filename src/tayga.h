@@ -510,7 +510,9 @@ enum {
 /* TAYGA function prototypes */
 extern struct config gcfg;
 extern _Atomic time_t now;
-void addrmap_invalidate_front(void); /* drop per-thread map lookup caches */
+void addrmap_invalidate_front(void);
+int addrmap_build_index(void);
+void addrmap_free_index(void);
 
 /* Runtime tick for lease/cache ageing: monotonic, so NTP/RTC jumps cannot
  * expire live leases.  Wall-clock time is only used at the dynamic.map file

@@ -828,6 +828,8 @@ void config_free(void)
 {
 	struct list_head *entry, *next;
 
+	addrmap_free_index();
+
 	if (gcfg.map4_list.next && gcfg.map4_list.next != &gcfg.map4_list) {
 		list_for_each_safe(entry, next, &gcfg.map4_list) {
 			struct map4 *m = list_entry(entry, struct map4, list);
@@ -1128,6 +1130,10 @@ int config_validate(void)
 		slog(LOG_CRIT, "Error: no tun-device directive found\n");
 		return ERROR_REJECT;
 	}
+
+	/* Immutable tables with many entries get a flat per-length prefix index. */
+	if (gcfg.maps_immutable)
+		addrmap_build_index();
 
 	/* Guess there are no errors? */
 	return ERROR_NONE;
