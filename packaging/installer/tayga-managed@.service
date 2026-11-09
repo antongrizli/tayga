@@ -3,6 +3,8 @@ Description=TAYGA managed network profile %i
 Requires=tayga-recovery.service
 Wants=network-online.target
 After=tayga-recovery.service network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 # Type=notify: tayga sends READY=1 (with --journal) only after the TUN device is
@@ -22,6 +24,20 @@ ExecStopPost=/usr/local/libexec/tayga/tayga-dns64 down /etc/tayga/%i.conf
 ExecStopPost=-/usr/local/libexec/tayga/tayga-host-dns down /etc/tayga/%i.conf
 ExecStopPost=/usr/local/libexec/tayga/tayga-net-ctl down /etc/tayga/%i.conf
 TimeoutStopSec=30
+# A crash must not leave the host without NAT64/DNS64: restart, but give up
+# after StartLimitBurst failures so tayga-recovery.service can take over.
+Restart=on-failure
+RestartSec=2
+
+# Hardening that does not interfere with the helper scripts (they need to
+# change routes, nftables, resolver files and sysctl, so ProtectSystem/
+# ProtectKernelTunables are deliberately not set here).
+NoNewPrivileges=true
+ProtectHostname=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
