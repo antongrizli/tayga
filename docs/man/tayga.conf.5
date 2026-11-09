@@ -267,6 +267,22 @@ Per RFC7915, we can either \f[B][drop]\f[R] the packet, or calculating
 Additionally, Tayga also allows the option of forwarding \f[B][fwd]\f[R]
 the packet anyway
 .TP
+\f[B]flow\-label\f[R] \f[I]zero|compute\f[R]
+IPv6 Flow Label on IPv4\-to\-IPv6 translated packets.
+\f[B]zero\f[R] (default) sets the label to 0 as RFC 7915 specifies.
+\f[B]compute\f[R] derives a 20\-bit non\-zero label (RFC 6437) from a
+keyed hash of the IPv4 addresses, protocol and, for unfragmented TCP and
+UDP, the ports, so that IPv6 transit networks can balance flows (ECMP).
+All fragments of a datagram share one label.
+.TP
+\f[B]worker\-affinity\f[R] \f[I]on|off\f[R]
+Linux only.
+When \f[B]on\f[R], worker thread \f[I]i\f[R] is pinned to the
+\f[I]i\f[R]\-th CPU in the process\[cq]s allowed CPU set (wrapping
+around).
+Default \f[B]off\f[R], which leaves placement to the scheduler.
+Useful together with NIC/queue IRQ pinning; measure before enabling.
+.TP
 \f[B]log\f[R] \f[I]drop|reject|self\f[R]
 Configure logging of packets.
 By default, Tayga only logs errors within Tayga itself.

@@ -131,8 +131,6 @@ jobs:
           sudo python3 test/system/test_ra_pref64.py build/pref64-discover
       - name: RA supervisor lifetime and process lifecycle
         run: sudo python3 test/system/test_ra_supervisor.py --helper "$PWD/build/pref64-discover" --output /tmp/review-results/ra-supervisor
-      - name: Scapy translation integration suite
-        run: sudo make integration
       - name: Async kernel wire gate when io_uring is available
         run: |
           sudo mkdir -p /tmp/review-results && sudo chown -R "$USER:$USER" /tmp/review-results
@@ -143,6 +141,10 @@ jobs:
             sudo python3 test/system/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
             sudo python3 test/system/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
           fi
+      # Runs last: `make integration` rebuilds ./tayga without WITH_URING, which would
+      # make the io_uring gate above fail if it ran afterwards.
+      - name: Scapy translation integration suite
+        run: sudo make integration
       - uses: actions/upload-artifact@v7
         if: always()
         with:

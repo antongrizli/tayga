@@ -328,6 +328,7 @@ static int config_worker_affinity(int ln, int arg_count, char **args)
 	}
 	return ERROR_NONE;
 #else
+	(void)args;
 	slog(LOG_CRIT, "Error: `worker-affinity` (line %d) not supported on this platform\n", ln);
 	return ERROR_REJECT;
 #endif
