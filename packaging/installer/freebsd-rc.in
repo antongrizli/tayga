@@ -20,11 +20,13 @@ load_rc_config $name
 profile=${tayga_managed_profile}
 pidfile="/var/run/tayga-managed-${profile}.pid"
 command="/usr/sbin/daemon"
-procname="/usr/local/sbin/tayga"
-if awk '$1=="#" && $2=="installer-pref64-interface" {found=1} END {exit !found}' "/etc/tayga/${profile}.conf" 2>/dev/null; then
-    procname="/usr/local/sbin/pref64-discover"
-fi
-command_args="-p ${pidfile} /usr/local/sbin/pref64-discover --supervise-ra /etc/tayga/${profile}.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl -- /usr/local/sbin/tayga --config /etc/tayga/${profile}.conf --runtime-dir /var/run/tayga-managed-${profile} --nodetach"
+# The pidfile holds the daemon(8) supervisor, which restarts the runner after any
+# exit (the rc.d counterpart of systemd Restart=).
+procname="/usr/sbin/daemon"
+rcscript="/usr/local/etc/rc.d/tayga-managed"
+extra_commands="runner"
+runner_cmd="tayga_runner"
+command_args="-r -R 3 -P ${pidfile} /bin/sh ${rcscript} onerunner"
 
 start_precmd="tayga_start_pre"
 start_postcmd="tayga_start_post"
@@ -40,10 +42,15 @@ tayga_start_pre() {
     if [ -x /usr/local/libexec/tayga/tayga-host-dns ]; then
         /usr/local/libexec/tayga/tayga-host-dns prepare "/etc/tayga/${profile}.conf" || return 1
     fi
-    /usr/local/libexec/tayga/tayga-net-ctl up "/etc/tayga/${profile}.conf"
 }
 
 tayga_start_post() {
+    dev=$(awk '$1=="tun-device" {print $2; exit}' "/etc/tayga/${profile}.conf")
+    n=0
+    until ifconfig "$dev" 2>/dev/null | grep -q 'flags=.*<.*\bUP\b' && pgrep -x tayga >/dev/null; do
+        n=$((n + 1)); [ "$n" -le 60 ] || break
+        sleep 1
+    done
     if ! /usr/local/libexec/tayga/tayga-verify "/etc/tayga/${profile}.conf"; then
         if [ -f "$pidfile" ]; then kill -TERM "$(cat "$pidfile")" 2>/dev/null || :; fi
         if [ -x /usr/local/libexec/tayga/tayga-dns64 ]; then
@@ -65,6 +72,27 @@ tayga_stop_post() {
         /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/${profile}.conf" || :
     fi
     /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/${profile}.conf"
+}
+
+# Runs under daemon(8): rebuild the owned network state before every (re)start,
+# because FreeBSD drops the addresses and UP flag of a tun(4) whose process died.
+# After 5 starts within 120 s give up so tayga-recovery can take over.
+tayga_runner() {
+    config="/etc/tayga/${profile}.conf"
+    net=/usr/local/libexec/tayga/tayga-net-ctl
+    starts="/var/run/tayga-managed-${profile}/starts"
+    now=$(date +%s)
+    recent=$(awk -v n="$now" '$1 > n - 120' "$starts" 2>/dev/null || :)
+    if [ -n "$recent" ] && [ "$(printf '%s\n' "$recent" | wc -l)" -ge 5 ]; then
+        echo "tayga-managed: restart limit reached, stopping" >&2
+        "$net" down "$config" || :
+        kill -TERM "$PPID"
+        exit 0
+    fi
+    { [ -z "$recent" ] || printf '%s\n' "$recent"; echo "$now"; } > "$starts"
+    "$net" down "$config" || :
+    "$net" up "$config" || exit 1
+    exec /usr/local/sbin/pref64-discover --supervise-ra "$config" --network-controller "$net" -- /usr/local/sbin/tayga --config "$config" --runtime-dir "/var/run/tayga-managed-${profile}" --nodetach
 }
 
 run_rc_command "$@"

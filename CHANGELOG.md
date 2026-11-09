@@ -21,6 +21,7 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Fixed
 
+- FreeBSD managed profile now restarts a crashed translator (`daemon -r`, 3 s delay, at most 5 starts per 120 s) and rebuilds the tun(4) addresses, routes and PF anchor before every start, because FreeBSD drops them when the translator dies; `service tayga-managed status` now reports the supervisor correctly.
 - OpenRC managed profile now restarts a crashed translator through `supervise-daemon` (2 s delay, at most 5 restarts per 120 s, like the systemd unit) and clears stale network state before a manual restart.
 - Prepare systemd readiness sockets before chroot and send READY independently of the logging destination.
 - Honor the configured initial ICMP burst and preserve fractional token refill; retain separate PMTU budgets.
