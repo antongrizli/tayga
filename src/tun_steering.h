@@ -77,9 +77,15 @@ static int steering_program_ext(unsigned queues, int flow_aware, char *log, size
 		unsigned is_frag = SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,0);
 		/* proto is at r10-55 (off 9) */
 		SE(BPF_LDX|BPF_MEM|BPF_B,1,10,-55,0);
-		unsigned is_tcp = SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,6);
+		/* TCP, DCCP(33), SCTP(132), UDP-Lite(136) and UDP all carry src/dst
+		 * ports in the first four bytes. */
+		unsigned is_l4[4] = {
+			SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,6),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,33),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,132),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,1,0,0,136) };
 		unsigned not_udp = SE(BPF_JMP|BPF_JNE|BPF_K,1,0,0,17);
-		PATCH(is_tcp, b.n);
+		for (int i=0;i<4;i++) PATCH(is_l4[i], b.n);
 		/* IHL is in byte 0 at r10-64 */
 		SE(BPF_LDX|BPF_MEM|BPF_B,2,10,-64,0);
 		ALUI(BPF_AND,2,0x0f);
@@ -110,9 +116,13 @@ static int steering_program_ext(unsigned queues, int flow_aware, char *log, size
 		SE(BPF_ALU|BPF_XOR|BPF_X,7,1,0,0); ALUI(BPF_MUL,7,16777619);
 	}
 	if (flow_aware) {
-		unsigned is_tcp6 = SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,6);
+		unsigned is_l46[4] = {
+			SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,6),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,33),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,132),
+			SE(BPF_JMP|BPF_JEQ|BPF_K,9,0,0,136) };
 		unsigned not_udp6 = SE(BPF_JMP|BPF_JNE|BPF_K,9,0,0,17);
-		PATCH(is_tcp6, b.n);
+		for (int i=0;i<4;i++) PATCH(is_l46[i], b.n);
 		/* Unfragmented TCP or UDP: ports are at fixed offset 40 */
 		MOVR(1,6); MOVI(2,40); MOVR(3,10); ALUI(BPF_ADD,3,-64); MOVI(4,4);
 		CALL(BPF_FUNC_skb_load_bytes);

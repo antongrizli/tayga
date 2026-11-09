@@ -11,6 +11,10 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 - Flat per-prefix-length index for immutable configurations with at least 9 static maps; `find_map4`/`find_map6` become O(lengths x log N) instead of a linear list scan (about 30x faster at 3000 entries).
 - Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). With them every received packet satisfies `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
 
+### Changed
+
+- eBPF `tun-steering=flows` now hashes the ports of DCCP (33), SCTP (132) and UDP-Lite (136) in addition to TCP/UDP, so those flows spread across queues instead of sticking to one address-pair bucket.
+
 ### Fixed
 
 - Packets rejected with an ICMP error (Time Exceeded, Packet Too Big, unknown protocol to self) and unknown ICMP types addressed to the daemon are now counted as drops, consistently with the other reject paths.
