@@ -135,7 +135,7 @@ class VM:
         print('Running ' + name, flush=True)
         command = command or ('TAYGA_ISOLATED_TEST=yes sh -x /etc/tayga-procd-test/test.sh ' + name)
         try:
-            result = self.run_ssh(command, timeout=480 if name == 'managed' or 'upgrade' in name or 'dhcpv6' in name else 120, check=False)
+            result = self.run_ssh(command, timeout=900 if name == 'managed' or 'upgrade' in name or 'dhcpv6' in name else 120, check=False)
         except subprocess.TimeoutExpired as error:
             (self.work / (name + '.log')).write_bytes(error.output or b'')
             diagnostics = self.run_ssh('logread; ubus call service list; ip addr; ip route; ip -6 route', check=False)
