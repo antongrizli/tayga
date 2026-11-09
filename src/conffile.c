@@ -314,6 +314,25 @@ static int config_flow_label(int ln, int arg_count, char **args)
 	return ERROR_NONE;
 }
 
+static int config_worker_affinity(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+#ifdef __linux__
+	if (!strcasecmp(args[0], "on") || !strcasecmp(args[0], "yes"))
+		gcfg.worker_affinity = 1;
+	else if (!strcasecmp(args[0], "off") || !strcasecmp(args[0], "no"))
+		gcfg.worker_affinity = 0;
+	else {
+		slog(LOG_CRIT, "Error: invalid value for worker-affinity on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	return ERROR_NONE;
+#else
+	slog(LOG_CRIT, "Error: `worker-affinity` (line %d) not supported on this platform\n", ln);
+	return ERROR_REJECT;
+#endif
+}
+
 static int config_udp_cksum_mode(int ln, int arg_count, char **args)
 {
 	//arg_count unused
@@ -821,6 +840,7 @@ struct {
 	{ "cache-size", 		config_cache_size, 		1 },
 	{ "udp-cksum-mode", config_udp_cksum_mode, 	1 },
 	{ "flow-label", 			config_flow_label, 		   1 },
+	{ "worker-affinity", 		config_worker_affinity, 	   1 },
 	{ "tun-up", 		config_tun_up, 			1 },
 	{ "tun-ip", 		config_tun_ip, 			1 },
 	{ "tun-route", 		config_tun_route, 		1 },

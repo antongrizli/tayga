@@ -16,6 +16,12 @@
  *  GNU General Public License for more details.
  */
 
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#endif
 #include "tayga.h"
 #include "stats.h"
 #include "gso.h"
@@ -277,6 +283,19 @@ static void * worker(void * arg)
 	int idx = *(int *)arg;
 	uint8_t *recv_buf = worker_buffers[idx];
 	stats_thread_init(idx);
+	if (gcfg.worker_affinity) {
+		cpu_set_t allowed, one;
+		if (!sched_getaffinity(0, sizeof(allowed), &allowed)) {
+			int want = idx % CPU_COUNT(&allowed);
+			for (int c = 0; c < CPU_SETSIZE; c++) {
+				if (!CPU_ISSET(c, &allowed) || want--) continue;
+				CPU_ZERO(&one); CPU_SET(c, &one);
+				if (pthread_setaffinity_np(pthread_self(), sizeof(one), &one))
+					slog(LOG_WARNING, "worker %d: cannot pin to CPU %d\n", idx, c);
+				break;
+			}
+		}
+	}
 	atomic_fetch_add_explicit(&workers_ready, 1, memory_order_release);
 	int gate;
 	while (!(gate = atomic_load_explicit(&worker_start_gate, memory_order_acquire)))

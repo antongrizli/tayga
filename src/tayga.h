@@ -444,6 +444,7 @@ struct config {
 
 	//Multiqueue related
 	int workers;
+	int worker_affinity;	/* pin worker i to the i-th allowed CPU (Linux) */
 	pthread_mutex_t cache_mutex;
 	pthread_mutex_t map_mutex;
 	pthread_t threads[MAX_WORKERS];

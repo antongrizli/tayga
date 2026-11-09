@@ -13,6 +13,7 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Changed
 
+- New `worker-affinity on|off` directive (Linux, default off): pins worker thread i to the i-th allowed CPU. Verified on a live daemon (4 workers on CPUs 0-3); no throughput A/B was run.
 - eBPF `tun-steering=flows` now hashes the ports of DCCP (33), SCTP (132) and UDP-Lite (136) in addition to TCP/UDP, so those flows spread across queues instead of sticking to one address-pair bucket.
 
 ### Fixed

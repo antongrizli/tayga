@@ -224,6 +224,12 @@ tayga.conf.
     transit networks can balance flows (ECMP). All fragments of a datagram
     share one label.
 
+**worker-affinity** *on|off*
+:   Linux only. When **on**, worker thread *i* is pinned to the *i*-th CPU in
+    the process's allowed CPU set (wrapping around). Default **off**, which
+    leaves placement to the scheduler. Useful together with NIC/queue IRQ
+    pinning; measure before enabling.
+
 **log** *drop|reject|self*
 :   Configure logging of packets. By default, Tayga only logs errors
     within Tayga itself. To log errors in packet translation, list one

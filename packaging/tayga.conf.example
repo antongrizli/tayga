@@ -185,6 +185,10 @@ dynamic-pool 192.168.255.0/24
 # If multiqueue support is not compiled in, this has no effect
 #workers 4
 
+# (Linux only) Pin worker thread i to the i-th CPU of the allowed set.
+# Default value: off
+#worker-affinity off
+
 #
 # Map File
 #
