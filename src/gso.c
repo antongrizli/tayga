@@ -739,7 +739,10 @@ static inline ssize_t gso_send_segment(int tun_fd, int af, uint8_t *seg_ip,
 		iov[n].iov_len = data_len;
 		n++;
 	}
-	return tun_writev(tun_fd, iov, n);
+	g_tx_drop_deferred = true;
+	ssize_t result = tun_writev(tun_fd, iov, n);
+	g_tx_drop_deferred = false;
+	return result;
 }
 
 int gso_software_segment_and_send_6to4(struct pkt *p)

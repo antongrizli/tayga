@@ -18,6 +18,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include "icmp_rate_limit.h"
 #include "tayga.h"
 
 static inline uint16_t get_u16(const void *ptr)
@@ -285,72 +286,52 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 #endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
+	g_tx_originated_icmp = true;
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
-	stats_icmp_sent();
+	g_tx_originated_icmp = false;
 }
 
 /*
- * Lock-free token bucket for originated ICMP errors (RFC 4443 2.4(f) MUST,
+ * Serialized token bucket for originated ICMP errors (RFC 4443 2.4(f) MUST,
  * RFC 1812 4.3.2.8).  Path-MTU signalling (Packet Too Big / Fragmentation
  * Needed) has its own bucket so a TTL-expiry flood cannot starve PMTUD.
- * Millisecond 32-bit timestamps keep the atomics lock-free on 32-bit CPUs.
+ * A short atomic-flag critical section keeps refill and debit consistent.
  */
 #define ICMP_RL_DEFAULT_RATE	1000u
-#define ICMP_RL_MAX_BURST	200u
 
 struct icmp_rate_limiter {
-	_Atomic uint32_t last_refill_ms;
-	_Atomic uint32_t tokens;
+    atomic_flag lock;
+    struct icmp_bucket bucket;
 };
-
 enum { ICMP_RL_V4, ICMP_RL_V4_PMTU, ICMP_RL_V6, ICMP_RL_V6_PMTU, ICMP_RL_COUNT };
-
 static struct icmp_rate_limiter g_icmp_rl[ICMP_RL_COUNT] = {
-	{ 0, ICMP_RL_MAX_BURST }, { 0, ICMP_RL_MAX_BURST },
-	{ 0, ICMP_RL_MAX_BURST }, { 0, ICMP_RL_MAX_BURST },
+    { .lock = ATOMIC_FLAG_INIT }, { .lock = ATOMIC_FLAG_INIT },
+    { .lock = ATOMIC_FLAG_INIT }, { .lock = ATOMIC_FLAG_INIT }
 };
 
-/* Test hook: refill all buckets and drop the cached timestamps. */
 void icmp_rate_limit_reset(void)
 {
-	for (int i = 0; i < ICMP_RL_COUNT; i++) {
-		atomic_store(&g_icmp_rl[i].last_refill_ms, 0);
-		atomic_store(&g_icmp_rl[i].tokens, ICMP_RL_MAX_BURST);
-	}
+    for (int i = 0; i < ICMP_RL_COUNT; i++) {
+        struct icmp_rate_limiter *rl = &g_icmp_rl[i];
+        while (atomic_flag_test_and_set_explicit(&rl->lock, memory_order_acquire)) {}
+        rl->bucket = (struct icmp_bucket){0};
+        atomic_flag_clear_explicit(&rl->lock, memory_order_release);
+    }
 }
 
 static bool icmp_allow_send(int which)
 {
-	uint32_t rate = gcfg.icmp_rate_limit;
-	if (rate == UINT32_MAX)
-		return true;
-	if (rate == 0)
-		rate = ICMP_RL_DEFAULT_RATE;
-	uint32_t burst = rate < ICMP_RL_MAX_BURST ? rate : ICMP_RL_MAX_BURST;
-	struct icmp_rate_limiter *rl = &g_icmp_rl[which];
-
-	uint32_t cur = atomic_load_explicit(&rl->tokens, memory_order_relaxed);
-	while (cur > 0) {
-		if (atomic_compare_exchange_weak_explicit(&rl->tokens, &cur, cur - 1,
-				memory_order_relaxed, memory_order_relaxed))
-			return true;
-	}
-
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	uint32_t now_ms = (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
-	uint32_t prev_ms = atomic_load_explicit(&rl->last_refill_ms, memory_order_relaxed);
-	uint32_t elapsed_ms = now_ms - prev_ms; /* wrap-safe */
-	uint64_t add = (uint64_t)elapsed_ms * rate / 1000u;
-	if (add == 0)
-		return false;
-	if (!atomic_compare_exchange_strong_explicit(&rl->last_refill_ms, &prev_ms, now_ms,
-			memory_order_relaxed, memory_order_relaxed))
-		return false;
-	if (add > burst)
-		add = burst;
-	atomic_store_explicit(&rl->tokens, (uint32_t)add - 1, memory_order_relaxed);
-	return true;
+    uint32_t rate = gcfg.icmp_rate_limit;
+    if (rate == UINT32_MAX) return true;
+    if (!rate) rate = ICMP_RL_DEFAULT_RATE;
+    struct icmp_rate_limiter *rl = &g_icmp_rl[which];
+    while (atomic_flag_test_and_set_explicit(&rl->lock, memory_order_acquire)) {}
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t tick = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    bool allow = icmp_bucket_take(&rl->bucket, rate, tick);
+    atomic_flag_clear_explicit(&rl->lock, memory_order_release);
+    return allow;
 }
 
 void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word,
@@ -1173,8 +1154,9 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 #endif
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
+	g_tx_originated_icmp = true;
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
-	stats_icmp_sent();
+	g_tx_originated_icmp = false;
 }
 
 void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,

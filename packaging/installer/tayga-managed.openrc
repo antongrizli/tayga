@@ -2,8 +2,8 @@
 name='TAYGA managed profile'
 description='TAYGA CLAT/NAT64 with owned network setup and readiness verification'
 profile=${profile:-nat64}
-command=/usr/local/sbin/tayga
-command_args="--config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
+command=/usr/local/sbin/pref64-discover
+command_args="--supervise-ra /etc/tayga/$profile.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl -- /usr/local/sbin/tayga --config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
 command_background=yes
 pidfile=/run/tayga-managed.pid
 

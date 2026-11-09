@@ -182,7 +182,7 @@ struct async_context {
 	struct packet_frame_token tokens[ASYNC_FRAMES]; struct packet_frame_pool pool;
 	unsigned queue[ASYNC_FRAMES], head, tail, count, cursor, outstanding;
 	int fd[ASYNC_FRAMES], initialized, failed;
-	unsigned char failure_counted[ASYNC_FRAMES];
+	unsigned char failure_counted[ASYNC_FRAMES], originated_icmp[ASYNC_FRAMES];
 	uint8_t *storage;
 };
 static struct async_context contexts[EXP_WORKERS];
@@ -215,8 +215,13 @@ int async_tun_service(void)
 		if(cqe->res!=(int)f->length) {
 			atomic_fetch_add(&async_errors,1);
 			c->failure_counted[slot]=1;
+			bool saved_origin = g_tx_originated_icmp, saved_defer = g_tx_drop_deferred;
+			g_tx_drop_deferred = false;
+			g_tx_originated_icmp = c->originated_icmp[slot];
 			stats_tx_failure(cqe->res < 0 ? -cqe->res : EIO,
 				f->length >= (size_t)gcfg.vnet_hdr_sz ? f->length-gcfg.vnet_hdr_sz : 0, cqe->res >= 0);
+			g_tx_originated_icmp = saved_origin;
+			g_tx_drop_deferred = saved_defer;
 			/* Match sync policy: short/backpressure/other failures drop one
 			 * frame; failed device descriptors stop the service. */
 			if(cqe->res==-EBADF || cqe->res==-ENODEV || cqe->res==-EIO || cqe->res==-ESHUTDOWN)c->failed=1;
@@ -226,6 +231,7 @@ int async_tun_service(void)
 				unsigned ver=f->storage[header]>>4;
 				if(ver==4)stats_tx4(f->length-header);else if(ver==6)stats_tx6(f->length-header);
 			}
+			if(c->originated_icmp[slot])stats_icmp_sent();
 			atomic_fetch_add(&async_completed,1);
 		}
 		packet_frame_transition(&c->pool,c->tokens[slot],PACKET_FRAME_COMPLETED);
@@ -261,7 +267,7 @@ ssize_t async_tun_submit(int fd,const struct iovec *iov,int count)
 	if(packet_frame_acquire(&c->pool,slot,&c->tokens[slot]))return -1;
 	c->cursor=(slot+1)%ASYNC_FRAMES;
 	size_t pos=0;for(int i=0;i<count;i++){memcpy(c->frames[slot].storage+pos,iov[i].iov_base,iov[i].iov_len);pos+=iov[i].iov_len;}
-	c->frames[slot].length=total;c->fd[slot]=fd;c->failure_counted[slot]=0;
+	c->frames[slot].length=total;c->fd[slot]=fd;c->failure_counted[slot]=0;c->originated_icmp[slot]=g_tx_originated_icmp;
 	packet_frame_transition(&c->pool,c->tokens[slot],PACKET_FRAME_TRANSLATING);
 	packet_frame_transition(&c->pool,c->tokens[slot],PACKET_FRAME_PENDING_TX);
 	c->queue[c->tail++%ASYNC_FRAMES]=slot;c->count++;atomic_fetch_add(&async_accepted,1);
@@ -285,7 +291,12 @@ int async_tun_finish(void)
 			if(!current->failure_counted[i] &&
 			   (f->state==PACKET_FRAME_PENDING_TX || f->state==PACKET_FRAME_TX_SUBMITTED)) {
 				current->failure_counted[i]=1;atomic_fetch_add(&async_errors,1);
+				bool saved_origin = g_tx_originated_icmp, saved_defer = g_tx_drop_deferred;
+				g_tx_drop_deferred = false;
+				g_tx_originated_icmp = current->originated_icmp[i];
 				stats_tx_failure(ECANCELED, f->length >= (size_t)gcfg.vnet_hdr_sz ? f->length-gcfg.vnet_hdr_sz : 0, false);
+				g_tx_originated_icmp = saved_origin;
+				g_tx_drop_deferred = saved_defer;
 			}
 		}
 		return -1;

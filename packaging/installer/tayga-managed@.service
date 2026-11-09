@@ -7,16 +7,17 @@ StartLimitIntervalSec=120
 StartLimitBurst=5
 
 [Service]
-# Type=notify: tayga sends READY=1 (with --journal) only after the TUN device is
+# Type=notify: tayga sends READY=1 only after the TUN device is
 # configured, so ExecStartPost checks never race tun_setup().
 Type=notify
+NotifyAccess=all
 RuntimeDirectory=tayga-managed-%i
 RuntimeDirectoryMode=0750
 ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/tayga/%i
 ExecStartPre=/usr/local/libexec/tayga/tayga-dns64 prepare /etc/tayga/%i.conf
 ExecStartPre=/usr/local/libexec/tayga/tayga-host-dns prepare /etc/tayga/%i.conf
 ExecStartPre=/usr/local/libexec/tayga/tayga-net-ctl up /etc/tayga/%i.conf
-ExecStart=/usr/local/sbin/tayga --config /etc/tayga/%i.conf --runtime-dir /run/tayga-managed-%i --journal --nodetach
+ExecStart=/usr/local/sbin/pref64-discover --supervise-ra /etc/tayga/%i.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl -- /usr/local/sbin/tayga --config /etc/tayga/%i.conf --runtime-dir /run/tayga-managed-%i --journal --nodetach
 ExecStartPost=/usr/local/libexec/tayga/tayga-dns64 up /etc/tayga/%i.conf
 ExecStartPost=/usr/local/libexec/tayga/tayga-host-dns up /etc/tayga/%i.conf
 ExecStartPost=/usr/local/libexec/tayga/tayga-verify /etc/tayga/%i.conf

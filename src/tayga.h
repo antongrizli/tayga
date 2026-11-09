@@ -588,6 +588,7 @@ uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto);
 void slog_impl(int priority, const char *file, const char *line, const char *func, const char *format, ...)
 	__attribute__((format(printf, 5, 6)));
 int notify(const char *msg);
+int notify_prepare(void);
 int journal_init(const char *progname);
 void journal_cleanup(void);
 int journal_printv_with_location(

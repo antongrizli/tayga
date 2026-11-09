@@ -117,6 +117,10 @@ jobs:
       - name: Multi-protocol end-to-end system test
         run: |
           sudo python3 test/system/test_protocols_e2e.py --binary "$PWD/tayga" --output /tmp/review-results/protocols-e2e
+      - name: ICMP wire behavior and packet accounting
+        run: |
+          sudo python3 test/system/test_icmp_wire.py --binary "$PWD/tayga" --output /tmp/review-results/icmp-wire
+          sudo python3 test/system/test_stats_balance.py --binary "$PWD/tayga" --output /tmp/review-results/stats-balance
       - name: Embedded DNS64 server (fake upstream, CD and EDNS0 preserved)
         run: |
           make pref64-discover
@@ -125,6 +129,8 @@ jobs:
         run: |
           make pref64-discover
           sudo python3 test/system/test_ra_pref64.py build/pref64-discover
+      - name: RA supervisor lifetime and process lifecycle
+        run: sudo python3 test/system/test_ra_supervisor.py --helper "$PWD/build/pref64-discover" --output /tmp/review-results/ra-supervisor
       - name: Scapy translation integration suite
         run: sudo make integration
       - name: Async kernel wire gate when io_uring is available

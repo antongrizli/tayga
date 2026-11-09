@@ -19,8 +19,12 @@ load_rc_config $name
 
 profile=${tayga_managed_profile}
 pidfile="/var/run/tayga-managed-${profile}.pid"
-command="/usr/local/sbin/tayga"
-command_args="--config /etc/tayga/${profile}.conf --runtime-dir /var/run/tayga-managed-${profile} --pidfile ${pidfile}"
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/tayga"
+if awk '$1=="#" && $2=="installer-pref64-interface" {found=1} END {exit !found}' "/etc/tayga/${profile}.conf" 2>/dev/null; then
+    procname="/usr/local/sbin/pref64-discover"
+fi
+command_args="-p ${pidfile} /usr/local/sbin/pref64-discover --supervise-ra /etc/tayga/${profile}.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl -- /usr/local/sbin/tayga --config /etc/tayga/${profile}.conf --runtime-dir /var/run/tayga-managed-${profile} --nodetach"
 
 start_precmd="tayga_start_pre"
 start_postcmd="tayga_start_post"

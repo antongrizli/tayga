@@ -12,6 +12,9 @@
 #include <pthread.h>
 #include <unistd.h>
 
+__thread bool g_tx_originated_icmp;
+__thread bool g_tx_drop_deferred;
+
 struct worker_pub_stats g_worker_pub[STATS_MAX_SLOTS] __attribute__((aligned(128)));
 __thread struct worker_priv_stats g_tls_priv;
 time_t g_stats_start_time = 0;
@@ -48,7 +51,7 @@ void stats_tx_failure(int error, uint32_t ip_bytes, bool short_write)
 	int saved = errno;
 	unsigned reason = 6;
 	stats_error();
-	stats_drop(ip_bytes);
+	if (!g_tx_originated_icmp && !g_tx_drop_deferred) stats_drop(ip_bytes);
 	g_tls_priv.tx_failed_frames++;
 	if (short_write) { g_tls_priv.tx_short++; reason = 4; }
 	else if (error == EAGAIN || error == EWOULDBLOCK) { g_tls_priv.tx_eagain++; reason = 1; }

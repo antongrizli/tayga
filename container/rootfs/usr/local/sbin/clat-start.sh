@@ -249,5 +249,10 @@ cat > "$TAYGA_RUNTIME_DIR/clat-info.json" <<INFO_EOF
 }
 INFO_EOF
 
+if [ "$PREF64_SOURCE" = rfc8781_ra ]; then
+  printf '# installer-pref64-interface %s\n' "$RA_IFACE" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  exec /usr/local/sbin/pref64-discover --supervise-ra "$TAYGA_RUNTIME_DIR/clat.conf" -- /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d
+fi
+
 echo "==> Launching TAYGA daemon in foreground..."
 exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d

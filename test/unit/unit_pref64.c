@@ -69,6 +69,31 @@ static size_t build_ra(uint8_t *ra, unsigned lifetime_units, unsigned plc, const
     return 32;
 }
 
+extern int parse_ra_pref64_update(const uint8_t *, size_t, struct in6_addr *,
+                                  int *, uint32_t *, const struct in6_addr *, int);
+static void test_ra_updates(void)
+{
+    uint8_t ra[64], other[64];
+    struct in6_addr active, out;
+    int plen;
+    uint32_t life;
+    assert(inet_pton(AF_INET6, "64:ff9b::", &active) == 1);
+    build_ra(ra, 1, 0, "64:ff9b::");
+    build_ra(other, 500, 0, "2001:db8:aaaa::");
+    memcpy(ra + 32, other + 16, 16);
+    assert(parse_ra_pref64_update(ra, 48, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 8 && !memcmp(&out, &active, sizeof(out)));
+    /* A withdrawal of the active prefix selects a live alternative. */
+    ra[18] = ra[19] = 0;
+    assert(parse_ra_pref64_update(ra, 48, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 4000 && memcmp(&out, &active, sizeof(out)));
+    assert(parse_ra_pref64_update(ra, 32, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 0 && !memcmp(&out, &active, sizeof(out)));
+    build_ra(ra, 0, 0, "2001:db8:aaaa::");
+    assert(parse_ra_pref64_update(ra, 32, &out, &plen, &life, &active, 96) != 0);
+    assert(parse_ra_pref64_option(ra, 32, &out, &plen, &life) != 0);
+}
+
 static void test_ra(void)
 {
     static const int plen[6] = {96, 64, 56, 48, 40, 32};
@@ -158,6 +183,7 @@ int main(void)
 {
     printf("Running unit_pref64 tests...\n");
     test_ra();
+    test_ra_updates();
     test_hosts_file();
 
     /* /96 with 64:ff9b:: and Telekom/ISP-style */

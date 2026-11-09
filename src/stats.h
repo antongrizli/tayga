@@ -322,4 +322,9 @@ static inline void stats_udp_gso_sw_segment(void) {
 }
 #endif
 
+
+/* TX context: synthetic output is not an additional dropped input packet. */
+extern __thread bool g_tx_originated_icmp;
+extern __thread bool g_tx_drop_deferred;
+
 #endif /* __TAYGA_STATS_H__ */

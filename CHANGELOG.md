@@ -6,10 +6,13 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- RA prefix supervision for managed CLAT profiles: lifetime renewal, withdrawal/expiry shutdown, foreground translator restart on prefix change, and forwarding of service signals. Managed NAT66 prefix changes stop the translator while the network controller rebuilds owned rules; failed replacement attempts restore the saved network profile and exit without starting a stale translator.
+- Deterministic ICMP token accounting regressions and a Linux RA-supervisor lifecycle scenario; extended DNS64 regressions cover all RFC 6052 prefix lengths and large/non-first EDNS OPT records. These additions have not been executed in this change session.
+
 - RFC 8781 PREF64 discovery from Router Advertisements now also works on FreeBSD (`pref64-discover -i <if>`); the installer picks the IPv6 default-route interface via `route(8)`.
 - `flow-label zero|compute` (RFC 6437): optional keyed-hash IPv6 Flow Label for IPv4-to-IPv6 translation, including the GSO paths; default stays `zero` per RFC 7915.
 - Flat per-prefix-length index for immutable configurations with at least 9 static maps; `find_map4`/`find_map6` become O(lengths x log N) instead of a linear list scan (about 30x faster at 3000 entries).
-- Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). With them every received packet satisfies `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
+- Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). For scalar one-input/one-output traffic these counters support `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
 
 ### Changed
 
@@ -17,6 +20,14 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 - eBPF `tun-steering=flows` now hashes the ports of DCCP (33), SCTP (132) and UDP-Lite (136) in addition to TCP/UDP, so those flows spread across queues instead of sticking to one address-pair bucket.
 
 ### Fixed
+
+- Prepare systemd readiness sockets before chroot and send READY independently of the logging destination.
+- Honor the configured initial ICMP burst and preserve fractional token refill; retain separate PMTU budgets.
+- Require operating-system entropy for DNS discovery TXIDs and preserve larger EDNS OPT records in synthesized A queries.
+- Support non-/96 DNS64 prefixes in managed readiness and translated HTTP verification.
+- Count originated ICMP only after successful TX/completion and avoid duplicate synchronous software-GSO drop accounting.
+- Save dynamic mappings with unique owner-only temporary files and report directory synchronization failures.
+- Retain a controller-owned configuration for network undo, including FreeBSD TUN removal after an RA supervisor snapshot has been deleted.
 
 - Packets rejected with an ICMP error (Time Exceeded, Packet Too Big, unknown protocol to self) and unknown ICMP types addressed to the daemon are now counted as drops, consistently with the other reject paths.
 

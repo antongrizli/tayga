@@ -122,6 +122,7 @@ case "$action" in
         field() { awk -v key="$1" '$1==key {print $2}' "$config"; }
         meta() { awk -v key="$1" '$1=="#" && $2==key {print $3}' "$config"; }
         PREF64=$(field prefix)
+        if [ "$(meta installer-pref64-source)" = rfc8781 ]; then PREF64=auto; fi
         TAYGA_IPV4=$(field ipv4-addr)
         TAYGA_IPV6=$(field ipv6-addr)
         DYNAMIC_POOL=$(field dynamic-pool)

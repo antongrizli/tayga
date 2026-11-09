@@ -1,7 +1,7 @@
 # Unit objects, libraries, binaries and fixtures are isolated per BUILDDIR.
 UNIT_TESTS := unit_addrmap unit_mapping unit_netlink unit_dispatch unit_conffile unit_checksum \
               unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats \
-              unit_packet_io unit_packet_io_lifetime
+              unit_packet_io unit_packet_io_lifetime unit_icmp_rate_limit
 TEST_BINS := $(addprefix $(TESTBINDIR)/,$(UNIT_TESTS))
 TEST_LIB := $(BUILDDIR)/libtayga_test.a
 TEST_SOURCES := $(filter-out src/tayga.c,$(SOURCES))
@@ -35,7 +35,7 @@ $(TESTBINDIR)/unit_conffile: $(TESTOBJDIR)/unit_conffile.o $(TESTOBJDIR)/unit.o 
 $(TESTBINDIR)/unit_tun: $(TESTOBJDIR)/unit_tun.o $(TEST_LIB) | $(TESTBINDIR)
 	$(CC) -o $@ $^ -Wl,--wrap=write -Wl,--wrap=writev $(TEST_LDFLAGS) $(LDLIBS)
 
-STANDALONE_TESTS := unit_packet_io unit_packet_io_lifetime unit_netlink unit_checksum
+STANDALONE_TESTS := unit_icmp_rate_limit unit_packet_io unit_packet_io_lifetime unit_netlink unit_checksum
 $(addprefix $(TESTBINDIR)/,$(STANDALONE_TESTS)): $(TESTBINDIR)/%: $(TESTOBJDIR)/%.o | $(TESTBINDIR)
 	$(CC) -o $@ $< $(TEST_LDFLAGS)
 $(TESTBINDIR)/unit_pref64: $(TESTOBJDIR)/unit_pref64.o $(TESTOBJDIR)/pref64.o | $(TESTBINDIR)
@@ -55,8 +55,8 @@ test: $(TEST_BINS)
 	@mkdir -p $(TESTOUTDIR)/unit
 	@set -eu; for binary in $(abspath $(TEST_BINS)); do (cd $(TESTOUTDIR)/unit && "$$binary"); done
 
-test-portable:
-	python3 test/portable/run_portable.py
+test-portable: $(BUILDDIR)/pref64-discover
+	TAYGA_PREF64_DISCOVER="$(abspath $(BUILDDIR)/pref64-discover)" python3 test/portable/run_portable.py
 
 test-linux-tools: bench-tools
 	python3 -m unittest discover -s bench/tests -p 'test_*.py'
@@ -70,7 +70,7 @@ endif
 integration: tayga
 	TAYGA_BIN="$(abspath $(BUILDDIR)/tayga)" TAYGA_TEST_OUT="$(abspath $(TESTOUTDIR)/integration)" IP="$(IP)" python3 test/run-integration.py $(if $(WITH_BIG_ENDIAN),--big-endian,)
 
-system-test: tayga fault-shims
+system-test: tayga pref64-discover fault-shims
 	python3 test/run-system.py --binary "$(abspath $(BUILDDIR)/tayga)" --output "$(abspath $(TESTOUTDIR)/system)"
 
 -include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d)

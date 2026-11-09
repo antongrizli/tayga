@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <netinet/icmp6.h>
 #include <strings.h>
 #include <time.h>
@@ -43,23 +44,20 @@
 /* Optional hosts-file override for --serve-dns64 (set only via --hosts-file). */
 static const char *g_hosts_file __attribute__((unused)) = NULL;
 
-/* Unpredictable 16-bit DNS transaction ID (RFC 5452). Never falls back to a
- * guessable value: if no entropy source works, return failure to the caller
- * would be overkill for a probe, so mix several independent sources. */
-static uint16_t __attribute__((unused)) random_txid(void)
+/* Fail closed if the operating system cannot provide DNS entropy. */
+static int __attribute__((unused)) random_txid(uint16_t *id)
 {
-    uint16_t id = 0;
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        ssize_t n = read(fd, &id, sizeof(id));
-        close(fd);
-        if (n == (ssize_t)sizeof(id))
-            return id;
+    if (fd < 0) return -1;
+    size_t used = 0;
+    while (used < sizeof(*id)) {
+        ssize_t n = read(fd, (uint8_t *)id + used, sizeof(*id) - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return -1; }
+        used += (size_t)n;
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint16_t)((unsigned)ts.tv_nsec ^ ((unsigned)ts.tv_sec << 7) ^
-                      ((unsigned)getpid() << 3));
+    close(fd);
+    return 0;
 }
 
 static const uint8_t wka1[4] = {192, 0, 0, 170};
@@ -371,15 +369,16 @@ static int is_valid_pref64_prefix(const struct in6_addr *p, int plen)
     return plen == 32 || plen == 40 || plen == 48 || plen == 56 || plen == 64 || plen == 96;
 }
 
-int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
-                           int *out_plen, uint32_t *out_lifetime_sec)
+int parse_ra_pref64_update(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                           int *out_plen, uint32_t *out_lifetime_sec,
+                           const struct in6_addr *active, int active_len)
 {
     static const int plc_to_plen[8] = { 96, 64, 56, 48, 40, 32, -1, -1 };
     if (!ra || !out_prefix || !out_plen || ra_len < 16 || ra[0] != 134 || ra[1] != 0)
         return -1;
 
     size_t pos = 16;	/* fixed RA header */
-    int found = 0, best_plen = 0;
+    int found = 0, best_plen = 0, best_rank = 0;
     uint32_t best_life = 0;
     struct in6_addr best;
     memset(&best, 0, sizeof(best));
@@ -393,14 +392,17 @@ int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *ou
             uint16_t v = (uint16_t)((ra[pos + 2] << 8) | ra[pos + 3]);
             uint32_t life = (uint32_t)(v >> 3) * 8u;
             int plen = plc_to_plen[v & 7];
-            if (plen > 0 && life > 0) {
+            if (plen > 0) {
                 struct in6_addr cand;
                 memset(&cand, 0, sizeof(cand));
                 memcpy(cand.s6_addr, ra + pos + 4, 12);
                 if (plen < 96)	/* bits beyond plen must be zero */
                     memset(cand.s6_addr + plen / 8, 0, (size_t)(16 - plen / 8));
-                if (is_valid_pref64_prefix(&cand, plen) && (!found || life > best_life)) {
-                    best = cand; best_plen = plen; best_life = life; found = 1;
+                int same = active && active_len == plen && !memcmp(active, &cand, sizeof(cand));
+                int rank = life ? (same ? 3 : 2) : (same ? 1 : 0);
+                if (rank && is_valid_pref64_prefix(&cand, plen) &&
+                    (!found || rank > best_rank || (rank == best_rank && life > best_life))) {
+                    best = cand; best_plen = plen; best_life = life; found = 1; best_rank = rank;
                 }
             }
         }
@@ -413,6 +415,12 @@ int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *ou
     if (out_lifetime_sec)
         *out_lifetime_sec = best_life;
     return 0;
+}
+
+int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                           int *out_plen, uint32_t *out_lifetime_sec)
+{
+    return parse_ra_pref64_update(ra, ra_len, out_prefix, out_plen, out_lifetime_sec, NULL, 0);
 }
 
 /* Exported only for unit tests. */
@@ -469,8 +477,7 @@ HOSTS_LINKAGE size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
  * caller can fall back to RFC 7050 silently.  RAs are only accepted from
  * link-local sources with Hop Limit 255 (RFC 4861 6.1.2) on that interface.
  */
-static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_addr *out,
-                              int *plen, uint32_t *lifetime)
+static int open_ra_socket(const char *ifname)
 {
     unsigned ifindex = if_nametoindex(ifname);
     if (!ifindex)
@@ -512,6 +519,13 @@ static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_ad
     if (sendto(fd, &rs, sizeof(rs), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0)
         { close(fd); return -1; }
 
+    return fd;
+}
+
+static int receive_ra_pref64(int fd, unsigned ifindex, int timeout_sec,
+                              struct in6_addr *out, int *plen, uint32_t *lifetime,
+                              const struct in6_addr *active, int active_len)
+{
     struct timespec t0, now;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
@@ -530,16 +544,17 @@ static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_ad
                              .msg_iov = &iov, .msg_iovlen = 1,
                              .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
         ssize_t n = recvmsg(fd, &mh, 0);
-        if (n < 16 || !IN6_IS_ADDR_LINKLOCAL(&from.sin6_addr))
+        if (n < 16 || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+            !IN6_IS_ADDR_LINKLOCAL(&from.sin6_addr))
             continue;
         int hl = -1;
         unsigned idx = 0;
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
             if (c->cmsg_level != IPPROTO_IPV6)
                 continue;
-            if (c->cmsg_type == IPV6_HOPLIMIT)
+            if (c->cmsg_type == IPV6_HOPLIMIT && c->cmsg_len >= CMSG_LEN(sizeof(int)))
                 memcpy(&hl, CMSG_DATA(c), sizeof(int));
-            else if (c->cmsg_type == IPV6_PKTINFO) {
+            else if (c->cmsg_type == IPV6_PKTINFO && c->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
                 struct in6_pktinfo pi;
                 memcpy(&pi, CMSG_DATA(c), sizeof(pi));
                 idx = pi.ipi6_ifindex;
@@ -547,14 +562,22 @@ static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_ad
         }
         if (hl != 255 || idx != ifindex)
             continue;
-        if (parse_ra_pref64_option(buf, (size_t)n, out, plen, lifetime) == 0) {
-            close(fd);
+        if (parse_ra_pref64_update(buf, (size_t)n, out, plen, lifetime, active, active_len) == 0) {
             return 0;
         }
     }
-    close(fd);
     return -1;
 }
+static int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_addr *out,
+                              int *plen, uint32_t *lifetime)
+{
+    int fd = open_ra_socket(ifname);
+    if (fd < 0) return fd;
+    int result = receive_ra_pref64(fd, if_nametoindex(ifname), timeout_sec, out, plen, lifetime, NULL, 0);
+    close(fd);
+    return result;
+}
+
 #endif
 
 static const char *const DEFAULT_PUBLIC_DNS64_SERVERS[] = {
@@ -577,6 +600,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -d <domain>        Domain to query (default: ipv4only.arpa)\n");
     fprintf(stderr, "  -c, --check <ip>   Directly test IPv6 address without DNS lookup\n");
     fprintf(stderr, "  -p, --public       Probe public NAT64 gateways and select lowest RTT\n");
+    fprintf(stderr, "  --supervise-ra CONFIG [--network-controller PATH] -- COMMAND...  Renew RA prefix and supervise translator\n");
     fprintf(stderr, "  -i <ifname>        Try RFC 8781 (PREF64 in Router Advertisements) on this interface first\n");
     fprintf(stderr, "  --ra-only          With -i: do not fall back to RFC 7050 when no RA PREF64 is found\n");
     fprintf(stderr, "  --no-ra            Skip RFC 8781 even if -i is given\n");
@@ -616,7 +640,8 @@ static int discover_public_pref64_parallel(const char *domain, int timeout_sec,
 
     uint8_t packet[512];
     memset(packet, 0, 12);
-    uint16_t tx_id = random_txid();
+    uint16_t tx_id;
+    if (random_txid(&tx_id) < 0) return -1;
     packet[0] = (uint8_t)(tx_id >> 8);
     packet[1] = (uint8_t)tx_id;
     packet[2] = 0x01; packet[3] = 0x00; /* RD=1 */
@@ -765,7 +790,8 @@ static int query_dns_server(const char *server, const char *domain, int timeout_
     if (encode_dns_name(domain, qname, &qpos) < 0)
         return -1;
 
-    uint16_t tx_id = random_txid();
+    uint16_t tx_id;
+    if (random_txid(&tx_id) < 0) return -1;
 
     uint8_t packet[512];
     memset(packet, 0, sizeof(packet));
@@ -1216,7 +1242,7 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
                 sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
                 continue;
             }
-            uint8_t a_req[512];
+            uint8_t a_req[sizeof(req)];
             if (12 + qsec_len <= sizeof(a_req)) {
                 memset(a_req, 0, 12);
                 a_req[0] = req[0];
@@ -1228,14 +1254,30 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
                 a_req[12 + qsec_len - 4] = 0x00;
                 a_req[12 + qsec_len - 3] = 0x01;
                 size_t a_len_req = 12 + qsec_len;
-                /* Keep a client's EDNS0 OPT record (buffer size, DO bit) on the
-                 * synthesized A query: root name, TYPE 41, 11+ bytes. */
-                size_t extra = (size_t)qlen > a_len_req ? (size_t)qlen - a_len_req : 0;
-                if (extra >= 11 && extra <= 64 && a_len_req + extra <= sizeof(a_req) &&
-                    req[a_len_req] == 0 && req[a_len_req + 1] == 0 && req[a_len_req + 2] == 41) {
-                    memcpy(a_req + a_len_req, req + a_len_req, extra);
-                    a_len_req += extra;
-                    a_req[11] = 1;
+                /* Locate OPT by walking all records; never copy compressed
+                 * names whose offsets would change in the rebuilt query. */
+                size_t pos = 12 + qsec_len;
+                unsigned records = ((unsigned)req[6] << 8 | req[7]) +
+                    ((unsigned)req[8] << 8 | req[9]) +
+                    ((unsigned)req[10] << 8 | req[11]);
+                for (unsigned r = 0; r < records; r++) {
+                    size_t start = pos;
+                    ssize_t end = skip_dns_name(req, (size_t)qlen, pos);
+                    if (end < 0 || (size_t)end + 10 > (size_t)qlen) break;
+                    pos = (size_t)end;
+                    unsigned type = (unsigned)req[pos] << 8 | req[pos + 1];
+                    size_t rdlen = (size_t)req[pos + 8] << 8 | req[pos + 9];
+                    if (rdlen > (size_t)qlen - pos - 10) break;
+                    if (type == 41 && req[start] == 0 && pos == start + 1) {
+                        size_t bytes = 11 + rdlen;
+                        if (bytes <= sizeof(a_req) - a_len_req) {
+                            memcpy(a_req + a_len_req, req + start, bytes);
+                            a_len_req += bytes;
+                            a_req[11] = 1;
+                        }
+                        break;
+                    }
+                    pos += 10 + rdlen;
                 }
                 uint8_t a_resp[1500];
                 ssize_t a_len = forward_dns_udp(&upstream, a_req, a_len_req, a_resp, sizeof(a_resp));
@@ -1453,8 +1495,228 @@ static int tun_client6(const char *dev, const char *src_str, const char *dst_str
 }
 #endif
 
+static volatile sig_atomic_t supervisor_hup, supervisor_usr1, supervisor_usr2;
+static void supervisor_signal(int sig)
+{
+    if (sig == SIGHUP) supervisor_hup = 1;
+    else if (sig == SIGUSR1) supervisor_usr1 = 1;
+    else if (sig == SIGUSR2) supervisor_usr2 = 1;
+    else dns64_stop = 1;
+}
+
+#if defined(__linux__) || defined(__FreeBSD__)
+/* The controller owns journalled network mutations. Run it only while the
+ * translator is stopped, in its own process group, with a bounded lifetime. */
+static int ra_network_action(const char *controller, const char *action, const char *config)
+{
+    if (dns64_stop) return -1;
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (!pid) {
+        if (setpgid(0, 0) < 0) _exit(126);
+        unsetenv("NOTIFY_SOCKET");
+        execl(controller, controller, action, config, (char *)NULL);
+        _exit(127);
+    }
+    (void)setpgid(pid, pid);
+    struct timespec started, current;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    int stopping = 0, status;
+    for (;;) {
+        pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0 && !stopping ? 0 : -1;
+        if (done < 0 && errno != EINTR) return -1;
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        if (!stopping && (dns64_stop || current.tv_sec - started.tv_sec >= 30)) {
+            kill(-pid, SIGTERM);
+            started = current;
+            stopping = 1;
+        }
+        if (stopping && current.tv_sec - started.tv_sec >= 5) {
+            kill(-pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return -1;
+        }
+        (void)poll(NULL, 0, 50);
+    }
+}
+
+static void stop_ra_child(pid_t child)
+{
+    /* Keep the PID reserved until the child is reaped. ECHILD means there
+     * is no owned process left to signal, including after an earlier reap. */
+    int status;
+    pid_t done = waitpid(child, &status, WNOHANG);
+    if (done == child || (done < 0 && errno == ECHILD)) return;
+    kill(child, SIGTERM);
+    for (int i = 0; i < 50; i++) {
+        done = waitpid(child, &status, WNOHANG);
+        if (done == child || (done < 0 && errno == ECHILD)) return;
+        usleep(100000);
+    }
+    kill(child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+}
+#endif
+
+/* Control-plane supervisor. The configured file stays unchanged; each child
+ * reads a private snapshot with the currently advertised translation prefix. */
+static int supervise_ra(int argc, char **argv)
+{
+    int command = 4;
+    const char *controller = NULL;
+    if (argc >= 7 && !strcmp(argv[3], "--network-controller")) {
+        controller = argv[4];
+        if (controller[0] != '/' || strcmp(argv[5], "--")) return 2;
+        command = 6;
+    } else if (argc < 5 || strcmp(argv[3], "--")) return 2;
+    const char *config = argv[2];
+    if (config[0] != '/') return 2;
+    FILE *in = fopen(config, "r");
+    if (!in) return 1;
+    char line[1024], iface[IF_NAMESIZE] = "", configured[INET6_ADDRSTRLEN + 8] = "";
+    int nat66 = 0;
+    while (fgets(line, sizeof(line), in)) {
+        char value[IF_NAMESIZE];
+        if (sscanf(line, "# installer-pref64-interface %15s", value) == 1)
+            snprintf(iface, sizeof(iface), "%s", value);
+        if (sscanf(line, "# installer-clat-address-mode %15s", value) == 1 && !strcmp(value, "nat66")) nat66 = 1;
+        (void)sscanf(line, "prefix %53s", configured);
+    }
+    int read_failed = ferror(in);
+    fclose(in);
+    if (read_failed) return 1;
+    if (!iface[0]) { execvp(argv[command], argv + command); return 1; }
+#if defined(__linux__) || defined(__FreeBSD__)
+    int ra_fd = open_ra_socket(iface);
+    if (ra_fd < 0) return 1;
+    char snapshot[1024];
+    if (snprintf(snapshot, sizeof(snapshot), "%s.ra.XXXXXX", config) >= (int)sizeof(snapshot)) { close(ra_fd); return 1; }
+    int fd = mkstemp(snapshot);
+    if (fd < 0) { close(ra_fd); return 1; }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) { close(fd); close(ra_fd); unlink(snapshot); return 1; }
+    int config_arg = 0;
+    for (int i = command; i < argc; i++) if (!strcmp(argv[i], config)) config_arg = 1;
+    if (!config_arg) { close(fd); close(ra_fd); unlink(snapshot); return 2; }
+    for (int i = command; i < argc; i++) if (!strcmp(argv[i], config)) argv[i] = snapshot;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = supervisor_signal;
+    sigfillset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL); sigaction(SIGUSR1, &sa, NULL); sigaction(SIGUSR2, &sa, NULL);
+    pid_t child = -1;
+    struct in6_addr active;
+    memset(&active, 0, sizeof(active));
+    int active_len = 0, result = 1;
+    time_t deadline = 0;
+    while (!dns64_stop) {
+        if (child > 0) {
+            int status;
+            pid_t done = waitpid(child, &status, WNOHANG);
+            if (done == child || (done < 0 && errno == ECHILD)) { child = -1; break; }
+            if (supervisor_hup) { supervisor_hup = 0; kill(child, SIGHUP); }
+            if (supervisor_usr1) { supervisor_usr1 = 0; kill(child, SIGUSR1); }
+            if (supervisor_usr2) { supervisor_usr2 = 0; kill(child, SIGUSR2); }
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if (child > 0 && ts.tv_sec >= deadline) break;
+        struct in6_addr prefix;
+        int plen;
+        uint32_t life;
+        int timeout = child > 0 && deadline - ts.tv_sec < 3 ? (int)(deadline - ts.tv_sec) : 3;
+        if (receive_ra_pref64(ra_fd, if_nametoindex(iface), timeout, &prefix, &plen, &life, child > 0 ? &active : NULL, active_len)) {
+            if (child < 0) break;
+            continue;
+        }
+        if (!life) {
+            if (child > 0 && plen == active_len && !memcmp(&prefix, &active, sizeof(prefix))) break;
+            continue;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        /* A prefix-dependent firewall must change while no translator runs. */
+        int change_network = 0;
+        if (nat66) {
+            struct in6_addr installed_prefix;
+            int installed_len;
+            const struct in6_addr *expected = &active;
+            int expected_len = active_len;
+            if (!active_len) {
+                if (parse_prefix_spec(configured, &installed_prefix, &installed_len)) break;
+                expected = &installed_prefix;
+                expected_len = installed_len;
+            }
+            change_network = expected_len != plen || memcmp(expected, &prefix, sizeof(prefix));
+            if (change_network && !controller) {
+                fprintf(stderr, "RA prefix changed: a network controller is required for NAT66\n");
+                break;
+            }
+        }
+        deadline = ts.tv_sec + (time_t)life;
+        if (child > 0 && plen == active_len && !memcmp(&prefix, &active, sizeof(prefix))) continue;
+        if (child > 0) {
+            stop_ra_child(child);
+            child = -1;
+        }
+        if (dns64_stop) break;
+        in = fopen(config, "r");
+        if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) { if (in) fclose(in); break; }
+        int copy_fd = dup(fd);
+        FILE *out = copy_fd >= 0 ? fdopen(copy_fd, "w") : NULL;
+        if (!out && copy_fd >= 0) close(copy_fd);
+        if (!in || !out) { if (in) fclose(in); if (out) fclose(out); break; }
+        char text[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &prefix, text, sizeof(text));
+        int replaced = 0;
+        while (fgets(line, sizeof(line), in)) {
+            char key[64];
+            if (sscanf(line, "%63s", key) == 1 && !strcmp(key, "prefix")) {
+                fprintf(out, "prefix %s/%d\n", text, plen); replaced++;
+            } else fputs(line, out);
+        }
+        int failed = ferror(in) || ferror(out);
+        if (fclose(in)) failed = 1;
+        if (fclose(out)) failed = 1;
+        if (failed || replaced != 1) break;
+        if (change_network) {
+            /* down uses the existing undo journal, including the actual live
+             * prefix. up validates the snapshot and rolls back partial setup.
+             * If replacement fails, restore the saved profile without starting
+             * a translator on an unconfirmed/expired old prefix. */
+            if (ra_network_action(controller, "down", config)) {
+                fprintf(stderr, "RA network teardown failed; retaining controller journal for recovery\n");
+                break;
+            }
+            if (ra_network_action(controller, "up", snapshot)) {
+                fprintf(stderr, "RA network replacement failed; restoring saved profile\n");
+                if (!dns64_stop && ra_network_action(controller, "up", config))
+                    fprintf(stderr, "RA network restore failed; service cleanup/recovery is required\n");
+                break;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if (dns64_stop || ts.tv_sec >= deadline) break;
+        child = fork();
+        if (child < 0) break;
+        if (!child) { execvp(argv[command], argv + command); _exit(127); }
+        active = prefix; active_len = plen;
+    }
+    if (child > 0) stop_ra_child(child);
+    if (dns64_stop) result = 0;
+    close(fd);
+    close(ra_fd);
+    unlink(snapshot);
+    return result;
+#else
+    (void)configured; (void)nat66; (void)supervisor_signal; (void)controller;
+    return 1;
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--supervise-ra")) return supervise_ra(argc, argv);
     signal(SIGPIPE, SIG_IGN);
     const char *domain = DEFAULT_DOMAIN;
     const char *check_ip = NULL;

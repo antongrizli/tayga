@@ -105,6 +105,7 @@ done
 case "$mode" in clat|nat64|siit) ;; *) fail 'Mode must be clat, nat64 or siit' ;; esac
 [ -n "$out" ] || fail 'An output path is required'
 pref64_source=manual
+ra_if=
 if [ "$pref64" = auto ] || [ "$pref64" = public ]; then
     [ "$mode" = clat ] || fail 'PREF64 discovery is only valid for CLAT'
     helper=${PREF64_HELPER:-pref64-discover}
@@ -290,6 +291,7 @@ trap 'exit 1' HUP INT TERM
     printf '# installer-clat-address-mode %s\n' "$address_mode"
     [ -z "$nat66_address" ] || printf '# installer-nat66-address %s\n' "$nat66_address"
     printf '# installer-host-dns %s\n' "$host_dns"
+    [ "$pref64_source" != rfc8781 ] || printf '# installer-pref64-interface %s\n' "$ra_if"
     printf '# installer-pref64-source %s\n' "$pref64_source"
     if [ "$mode" = clat ] && [ -n "$management4" ]; then
         printf '# installer-management4 %s\n' "$management4"

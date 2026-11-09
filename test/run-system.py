@@ -33,6 +33,9 @@ def main():
                  'recovery_ports', 'protocols_e2e', 'stats_balance', 'icmp_wire'):
         subprocess.run([sys.executable, str(root / f'test_{name}.py'), '--binary', binary,
                         '--output', str(args.output.resolve() / name)], check=True)
+    subprocess.run([sys.executable, str(root / 'test_ra_supervisor.py'),
+                    '--helper', str(Path(binary).with_name('pref64-discover')),
+                    '--output', str(args.output.resolve() / 'ra_supervisor')], check=True)
     for mode in ('groups', 'flows'):
         subprocess.run([sys.executable, str(root / 'test_tun_steering.py'), '--steering', mode], check=True)
         subprocess.run([sys.executable, str(root / 'test_tun_steering_lifecycle.py'),

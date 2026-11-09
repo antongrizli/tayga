@@ -813,6 +813,9 @@ int main(int argc, char **argv)
 	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
 	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 
+	ret = notify_prepare();
+	if (ret < 0) { errno = -ret; goto startup_failed; }
+
 	/* Confine and drop privileges BEFORE any thread exists: an error here
 	 * can then abort cleanly, and no thread can retain extra credentials. */
 	if (do_chroot)
@@ -876,7 +879,7 @@ int main(int argc, char **argv)
 	atomic_store_explicit(&worker_start_gate, 1, memory_order_release);
 #endif
 	telemetry_start(gcfg.status_path, 5);
-	if (gcfg.log_out == LOG_TO_JOURNAL) {
+	{
 		int r = notify("READY=1");
 		if (r < 0) slog(LOG_WARNING, "Readiness notification failed: %s\n", strerror(-r));
 	}

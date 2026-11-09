@@ -631,12 +631,16 @@ static void test_icmp_error_suppression_and_rate_limit(void)
 	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
 
 	gcfg.icmp_rate_limit = 10;	/* burst 10, +10/s */
+	struct timespec begin, end;
+	clock_gettime(CLOCK_MONOTONIC, &begin);
 	int sent = 0;
 	for (int i = 0; i < 1000; i++) {
 		host_send_icmp4_error(11, 0, 0, &p4);
 		sent += drain_count(sv[1]);	/* unix dgram queues are short */
 	}
-	assert(sent >= 200 && sent <= 260);	/* initial burst, ~+10/s */
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double elapsed = (double)(end.tv_sec - begin.tv_sec) + (double)(end.tv_nsec - begin.tv_nsec) / 1e9;
+	assert(sent >= 10 && (double)sent <= 11 + elapsed * 10);
 	/* Exhausted TTL budget must not starve Fragmentation Needed. */
 	gcfg.icmp_rate_limit = 0;
 	host_send_icmp4_error(3, 4, 1480, &p4);

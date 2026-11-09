@@ -57,3 +57,46 @@ If the host participates in dynamic routing, we can instead assign a routed addr
 * `2001:db8:abcd::64/127` is reserved for translation (any /127 may be used)
 * `2001:db8:abcd::65` is used as the IPv6 address of `tayga` itself
 * `2001:db8:abcd::64` is used as the IPv6 address for translated user traffic
+
+
+## RA prefix lifetime in managed profiles
+
+When automatic discovery selects RFC 8781, managed profiles record
+`# installer-pref64-interface IFACE`. Their service starts
+`pref64-discover --supervise-ra CONFIG -- tayga --config CONFIG --nodetach`.
+The supervisor keeps an ICMPv6 receive socket open, renews the prefix lifetime
+using a monotonic clock and restarts the foreground translator with a private
+configuration snapshot when the advertised prefix changes. The saved profile
+is preserved. Withdrawal or expiry stops translation and exits with failure;
+restart behavior follows the service or container policy.
+
+The supervisor forwards HUP and USR signals to the translator. Systemd managed
+units use `NotifyAccess=all` so readiness can come from that child. Raw ICMPv6
+permissions and write access to the configuration directory (for its private
+snapshot) are required. Profiles without RA metadata directly execute TAYGA.
+
+NAT66 rules include the destination prefix. Managed systemd, OpenRC and
+FreeBSD rc services pass
+`--network-controller /usr/local/libexec/tayga/tayga-net-ctl` to the supervisor.
+On a prefix change, the translator is stopped and reaped before the controller
+removes the previous owned network state and sets up the new snapshot. The new
+translator starts only after setup succeeds and the advertised lifetime remains
+valid. The operation causes a translation outage; it is not an atomic live
+migration and existing connections to the previous prefix are interrupted.
+
+If setup fails, the controller rolls back partial mutations; the supervisor
+attempts to restore the saved profile's network state and exits with failure.
+It does not restart a translator on the old prefix, which may already be invalid.
+A failed teardown/restore leaves the undo journal for service cleanup/recovery.
+Each controller invocation is limited to 30 seconds plus up to 5 seconds for
+termination. A concurrent external network operation can cause the change to
+fail; it must be retried through normal service/profile lifecycle.
+
+The controller retains its own mode-0600 configuration until network cleanup,
+so the FreeBSD TUN removal fallback can work after the supervisor deletes its
+private snapshot. Profiles without an explicit network controller still stop
+on a NAT66 prefix mismatch. The container CLAT path does not configure NAT66
+and therefore does not need that controller.
+
+`tayga-ctl clat reconfigure` preserves RA automatic discovery. Manual prefixes
+do not acquire an RA expiry timer.

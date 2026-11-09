@@ -1176,6 +1176,7 @@ ssize_t tun_writev(int tun_fd, const struct iovec *iov, int iovcnt)
 				else if (ver == 6)
 					stats_tx6(tx_bytes);
 			}
+			if (g_tx_originated_icmp) stats_icmp_sent();
 			return ret;
 		}
 		if (ret < 0 && errno == EINTR) continue;

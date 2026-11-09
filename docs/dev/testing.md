@@ -11,9 +11,9 @@ ASAN_OPTIONS=detect_leaks=1 build/asan/test-bin/unit_addrmap
 ASAN_OPTIONS=detect_leaks=1 build/asan/test-bin/unit_mapping
 ```
 
-Legacy config fixtures retain allocations: run their general sanitizer suite with
-`ASAN_OPTIONS=detect_leaks=0`; that is not evidence that all configuration lifetimes
-are leak-free. Mapping regressions must separately pass leak detection.
+The review-gates workflow runs all unit tests with `ASAN_OPTIONS=detect_leaks=1`.
+Keep leak detection enabled for the full sanitizer suite; investigate retained
+fixtures rather than treating a run with leak detection disabled as acceptance.
 
 On an isolated Linux system with root, Scapy, pyroute2, iproute2 and tcpdump:
 
@@ -46,3 +46,6 @@ and verifies checksum completion after kernel segmentation on disposable veth
 links. Payload integrity/PMTUD can additionally exercise unmodified production
 startup with `run-steering-integrity.py --production-startup --steering flows` in
 the prepared benchmark VM; that runner restores the installed files afterwards.
+
+See [the audit acceptance scenarios](audit-acceptance.md) for the pending Linux/FreeBSD
+RA-supervisor, service lifecycle, DNS64, TX accounting and persistence matrix.

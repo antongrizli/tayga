@@ -36,12 +36,10 @@ if [ "$mode" = siit ]; then
     exit 0
 fi
 # Probe NAT64 through its IPv6 translation route, never through native IPv4.
-# A hexadecimal dotted-quad suffix is valid only for a /96 prefix.
+# Use the same RFC 6052 synthesis as the translator for every supported length.
 if [ "$mode" = nat64 ]; then
     prefix=$(awk '$1=="prefix" {print $2}' "$config")
-    case "$prefix" in */96) ;; *) echo 'Automatic NAT64 verification currently requires /96' >&2; exit 1 ;; esac
-    address=${prefix%/96}
-    case "$address" in *::) target=${address}101:101 ;; *) echo 'Verification requires a canonical /96 prefix ending in ::' >&2; exit 1 ;; esac
+    target=$(pref64-discover --synthesize "$prefix" 1.1.1.1) || exit 1
     family=-6
     url=http://[$target]/
 else

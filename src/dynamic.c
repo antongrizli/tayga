@@ -17,13 +17,13 @@
  */
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "tayga.h"
 #include <inttypes.h>
 #include <limits.h>
 
 #define MAP_FILE	"dynamic.map"
-#define TMP_MAP_FILE	"dynamic.map~~"
 
 static struct map_dynamic *alloc_map_dynamic(const struct in6_addr *addr6,
 		const struct in_addr *addr4, struct free_addr *f)
@@ -354,10 +354,12 @@ struct dynamic_snapshot {
 static int write_to_file(const struct dynamic_snapshot *rows, size_t count, time_t written_at)
 {
 	/* Mapping database lists client addresses: owner-only, durable. */
-	int fd = open(TMP_MAP_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	char tmp_name[] = "dynamic.map.XXXXXX";
+	int fd = mkstemp(tmp_name);
 	if (fd < 0) return -1;
+	if (fchmod(fd, 0600) < 0) { int saved = errno; close(fd); unlink(tmp_name); errno = saved; return -1; }
 	FILE *out = fdopen(fd, "w");
-	if (!out) { close(fd); unlink(TMP_MAP_FILE); return -1; }
+	if (!out) { close(fd); unlink(tmp_name); return -1; }
 	/* written_at and row times are in the monotonic domain: convert to
 	 * wall-clock epoch for the on-disk format (unchanged). */
 	time_t wall_now = time(NULL);
@@ -375,17 +377,18 @@ static int write_to_file(const struct dynamic_snapshot *rows, size_t count, time
 	}
 	int failed = fflush(out) != 0 || ferror(out) || fsync(fileno(out)) != 0;
 	if (fclose(out)) failed = 1;
-	if (failed || rename(TMP_MAP_FILE, MAP_FILE)) {
-		unlink(TMP_MAP_FILE);
+	if (failed || rename(tmp_name, MAP_FILE)) {
+		unlink(tmp_name);
 		return -1;
 	}
 	/* Persist the rename itself so a power cut cannot leave an empty file. */
 	int dfd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dfd >= 0) {
-		(void)fsync(dfd);
-		close(dfd);
-	}
-	return 0;
+	if (dfd < 0) return -1;
+	int result = fsync(dfd);
+	int saved = errno;
+	close(dfd);
+	errno = saved;
+	return result;
 }
 
 void dynamic_maint(struct dynamic_pool *pool, int shutdown)
