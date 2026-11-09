@@ -130,6 +130,15 @@ dynamic-pool 192.168.255.0/24
 
 
 #
+# IPv6 Flow Label for IPv4->IPv6 packets: zero (RFC 7915 default) or
+# compute (RFC 6437 keyed hash of the flow; helps ECMP in the IPv6 core).
+#
+# Default value: zero
+#
+#flow-label zero
+
+
+#
 # Logging packet errors and events
 #
 # List each option you would like to log with a space

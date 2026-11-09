@@ -300,6 +300,20 @@ static int config_wkpf_strict(int ln, int arg_count, char **args)
 	return ERROR_NONE;
 }
 
+static int config_flow_label(int ln, int arg_count, char **args)
+{
+	(void)arg_count;
+	if (!strcasecmp(args[0], "zero"))
+		gcfg.flow_label_mode = FLOW_LABEL_ZERO;
+	else if (!strcasecmp(args[0], "compute"))
+		gcfg.flow_label_mode = FLOW_LABEL_COMPUTE;
+	else {
+		slog(LOG_CRIT, "Error: invalid value for flow-label on line %d\n", ln);
+		return ERROR_REJECT;
+	}
+	return ERROR_NONE;
+}
+
 static int config_udp_cksum_mode(int ln, int arg_count, char **args)
 {
 	//arg_count unused
@@ -806,6 +820,7 @@ struct {
 	{ "hash-bits", 		config_hash_bits, 		1 },
 	{ "cache-size", 		config_cache_size, 		1 },
 	{ "udp-cksum-mode", config_udp_cksum_mode, 	1 },
+	{ "flow-label", 			config_flow_label, 		   1 },
 	{ "tun-up", 		config_tun_up, 			1 },
 	{ "tun-ip", 		config_tun_ip, 			1 },
 	{ "tun-route", 		config_tun_route, 		1 },

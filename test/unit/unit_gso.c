@@ -2125,10 +2125,35 @@ static void test_single_tcp_gso_metadata(void)
     puts("PASS: single TCP output clears GSO, retains checksum offload and preserves multi-segment aggregates");
 }
 
+static void test_flow_label_4to6(void)
+{
+	uint8_t pkt[40] = {0x45, 0, 0, 40, 0, 1, 0x40, 0, 64, IPPROTO_TCP, 0, 0,
+			   10, 0, 0, 1, 10, 0, 0, 2, 0x30, 0x39, 0, 80};
+	uint8_t other[40]; memcpy(other, pkt, sizeof(pkt)); other[21] ^= 1;	/* different source port */
+	gcfg.rand[4] = 0x12345678;
+	gcfg.flow_label_mode = FLOW_LABEL_ZERO;
+	assert(flow_label_4to6(pkt, sizeof(pkt)) == 0);
+	gcfg.flow_label_mode = FLOW_LABEL_COMPUTE;
+	uint32_t a = flow_label_4to6(pkt, sizeof(pkt));
+	assert(a != 0 && a <= 0xfffff && a == flow_label_4to6(pkt, sizeof(pkt)));
+	assert(flow_label_4to6(other, sizeof(other)) != a);
+	assert(flow_label_4to6(pkt, 10) == 0);			/* truncated header */
+	/* All fragments of one datagram share a label whatever the ports are. */
+	uint8_t f1[40], f2[40]; memcpy(f1, pkt, sizeof(pkt)); memcpy(f2, other, sizeof(other));
+	f1[6] = 0x20; f2[6] = 0x00; f2[7] = 0x10;	/* MF set / nonzero offset */
+	assert(flow_label_4to6(f1, sizeof(f1)) == flow_label_4to6(f2, sizeof(f2)));
+	/* Different key, different label. */
+	gcfg.rand[4] = 0x9abcdef0;
+	assert(flow_label_4to6(pkt, sizeof(pkt)) != a);
+	gcfg.flow_label_mode = FLOW_LABEL_ZERO;
+	printf("PASS: flow label compute/zero, port and fragment handling\n");
+}
+
 int main(void)
 {
 	printf("=== Running unit_gso test suite ===\n");
 	stats_init();
+	test_flow_label_4to6();
 	test_software_input_contract();
 	test_software_segment_ids();
 #ifdef __linux__

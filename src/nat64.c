@@ -414,10 +414,42 @@ static void host_handle_icmp4(struct pkt *p)
 }
 
 
+/*
+ * RFC 6437 Flow Label for IPv4->IPv6 translation (flow-label compute).
+ * A keyed hash of the IPv4 addresses, protocol and, for unfragmented TCP/UDP,
+ * the ports gives transit IPv6 ECMP something to balance on.  Fragmented
+ * datagrams use the 3-tuple only so every fragment carries the same label.
+ * Returns 0 (the RFC 7915 default) unless the mode is enabled.
+ */
+uint32_t flow_label_4to6(const uint8_t *ip4, uint32_t len)
+{
+	if (likely(gcfg.flow_label_mode != FLOW_LABEL_COMPUTE) || len < sizeof(struct ip4))
+		return 0;
+	uint32_t ihl = (uint32_t)(ip4[0] & 15) * 4;
+	uint8_t key[20];
+	uint32_t proto = ip4[9];
+	memcpy(key, &gcfg.rand[4], 4);
+	memcpy(key + 4, ip4 + 12, 8);	/* src + dst */
+	key[12] = (uint8_t)proto;
+	memset(key + 13, 0, 7);
+	int fragmented = (ip4[6] & 0x20) || ((ip4[6] & 0x1f) | ip4[7]);
+	if (!fragmented && (proto == IPPROTO_TCP || proto == IPPROTO_UDP) &&
+			ihl >= sizeof(struct ip4) && len >= ihl + 4)
+		memcpy(key + 13, ip4 + ihl, 4);	/* source + destination port */
+	uint64_t h = 14695981039346656037ull;
+	for (size_t i = 0; i < sizeof(key); i++)
+		h = (h ^ key[i]) * 1099511628211ull;
+	h ^= h >> 32;
+	h *= 0x9e3779b97f4a7c15ull;
+	uint32_t label = (uint32_t)(h >> 44) & 0xfffff;
+	return label ? label : 1;
+}
+
 static void xlate_header_4to6(struct pkt *p, struct ip6 *ip6,
 		int payload_length)
 {
-	ip6->ver_tc_fl = htonl((0x6 << 28) | (p->ip4->tos << 20));
+	ip6->ver_tc_fl = htonl((0x6 << 28) | (p->ip4->tos << 20) |
+			flow_label_4to6((const uint8_t *)p->ip4, p->header_len + p->data_len));
 	ip6->payload_length = htons(payload_length);
 	ip6->next_header = p->data_proto == 1 ? 58 : p->data_proto;
 	ip6->hop_limit = p->ip4->ttl;

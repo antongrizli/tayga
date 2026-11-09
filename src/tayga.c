@@ -721,7 +721,7 @@ int main(int argc, char **argv)
 	slog(LOG_DEBUG, "Compiled from " TAYGA_BRANCH "\n");
 	slog(LOG_DEBUG, "Commit " TAYGA_COMMIT "\n");
 
-	if (gcfg.cache_size) {
+	if (gcfg.cache_size || gcfg.flow_label_mode == FLOW_LABEL_COMPUTE) {
 		int urandom_fd = open("/dev/urandom", O_RDONLY);
 		if (urandom_fd < 0) {
 			slog(LOG_CRIT, "Unable to open /dev/urandom, "

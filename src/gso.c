@@ -653,6 +653,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	 * immediately follow the synthesized 40-byte IPv6 header. */
 	uint8_t tos = ip4->tos;
 	uint8_t ttl = ip4->ttl;
+	uint32_t flow_label = flow_label_4to6((const uint8_t *)ip4, p->data_len);
 	struct in_addr src4 = ip4->src, dst4 = ip4->dest;
 	struct in6_addr src6, dst6;
 	int map_rc = gso_map_4to6_with_icmp(p, ip4, ip4_hdr_len, IPPROTO_TCP, &src6, &dst6);
@@ -669,7 +670,7 @@ int gso_translate_tcp_4to6(struct pkt *p)
 	/* Use headroom before p->data to prepend 20 bytes for IPv6 header */
 	uint8_t *out = p->data - (sizeof(struct ip6) - sizeof(struct ip4));
 	struct ip6 *ip6 = (struct ip6 *)out;
-	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
+	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20) | flow_label);
 	ip6->payload_length = htons((uint16_t)tcp_len);
 	ip6->next_header = IPPROTO_TCP;
 	ip6->hop_limit = ttl - 1;
@@ -926,6 +927,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		return -1;
 	uint8_t *payload = p->data + ip4_hdr_len + tcp_hdr_len;
 	uint32_t payload_len = p->data_len - ip4_hdr_len - tcp_hdr_len;
+	uint32_t flow_label = flow_label_4to6((const uint8_t *)ip4, p->data_len);
 	uint32_t gso_size = p->vhdr.gso_size;
 	if (gso_size == 0)
 		gso_size = payload_len > 0 ? payload_len : 1;
@@ -994,7 +996,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 
 		/* IPv6 Header */
 		struct ip6 *ip6 = (struct ip6 *)seg_ip;
-		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)ip4->tos << 20));
+		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)ip4->tos << 20) | flow_label);
 		ip6->payload_length = htons((uint16_t)seg_tcp_total_len);
 		ip6->next_header = IPPROTO_TCP;
 		ip6->hop_limit = ip4->ttl - 1;
@@ -1197,6 +1199,7 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 	}
 
 	uint8_t tos = ip4->tos, ttl = ip4->ttl;
+	uint32_t flow_label = flow_label_4to6((const uint8_t *)ip4, p->data_len);
 	struct udp_hdr *orig_udp = (struct udp_hdr *)(p->data + ip4_hdr_len);
 	uint8_t *payload = (uint8_t *)orig_udp + sizeof(struct udp_hdr);
 	uint32_t udp_len = p->data_len - ip4_hdr_len;
@@ -1255,7 +1258,7 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		seg_udp->length = htons((uint16_t)seg_udp_total);
 		seg_udp->cksum = 0;
 
-		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
+		ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20) | flow_label);
 		ip6->payload_length = htons((uint16_t)seg_udp_total);
 		ip6->next_header = IPPROTO_UDP;
 		ip6->hop_limit = ttl - 1;
@@ -1487,6 +1490,7 @@ int gso_translate_udp_4to6(struct pkt *p)
 		return map_rc > 0 ? 0 : -1;
 
 	uint8_t tos = ip4->tos;
+	uint32_t flow_label = flow_label_4to6((const uint8_t *)ip4, p->data_len);
 	uint8_t hop_limit = ip4->ttl - 1;
 
 	uint16_t seed = gso_calc_udp_pseudo6(&src6, &dst6, udp_len);
@@ -1496,7 +1500,7 @@ int gso_translate_udp_4to6(struct pkt *p)
 
 	/* Zero-copy IPv6 header placement in headroom (20 bytes before p->data) */
 	struct ip6 *ip6 = (struct ip6 *)(p->data - (sizeof(struct ip6) - sizeof(struct ip4)));
-	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20));
+	ip6->ver_tc_fl = htonl(0x60000000 | ((uint32_t)tos << 20) | flow_label);
 	ip6->payload_length = htons((uint16_t)(udp_len <= 65535 ? udp_len : 0));
 	ip6->next_header = IPPROTO_UDP;
 	ip6->hop_limit = hop_limit;

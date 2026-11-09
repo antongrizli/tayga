@@ -216,6 +216,14 @@ tayga.conf.
     checksum. Additionally, Tayga also allows the option of forwarding
     **\[fwd\]** the packet anyway
 
+**flow-label** *zero|compute*
+:   IPv6 Flow Label on IPv4-to-IPv6 translated packets. **zero** (default)
+    sets the label to 0 as RFC 7915 specifies. **compute** derives a 20-bit
+    non-zero label (RFC 6437) from a keyed hash of the IPv4 addresses,
+    protocol and, for unfragmented TCP and UDP, the ports, so that IPv6
+    transit networks can balance flows (ECMP). All fragments of a datagram
+    share one label.
+
 **log** *drop|reject|self*
 :   Configure logging of packets. By default, Tayga only logs errors
     within Tayga itself. To log errors in packet translation, list one

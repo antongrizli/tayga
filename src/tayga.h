@@ -369,6 +369,11 @@ enum {
 };
 
 /// UDP Checksum options
+enum flow_label_mode {
+	FLOW_LABEL_ZERO,	/* RFC 7915 default */
+	FLOW_LABEL_COMPUTE	/* RFC 6437 hash of the IPv4 flow */
+};
+
 enum udp_cksum_mode {
 	UDP_CKSUM_DROP,
 	UDP_CKSUM_CALC,
@@ -429,6 +434,7 @@ struct config {
 	int wkpf_strict;
 	uint32_t icmp_rate_limit;	/* originated ICMP errors/s; 0 = default (1000), UINT32_MAX = unlimited */
 	int log_opts;
+	enum flow_label_mode flow_label_mode;
 	enum udp_cksum_mode udp_cksum_mode;	
 	enum {
 		LOG_TO_SYSLOG = 0,
@@ -512,6 +518,7 @@ extern struct config gcfg;
 extern _Atomic time_t now;
 void addrmap_invalidate_front(void);
 int addrmap_build_index(void);
+uint32_t flow_label_4to6(const uint8_t *ip4, uint32_t len);
 void addrmap_free_index(void);
 
 /* Runtime tick for lease/cache ageing: monotonic, so NTP/RTC jumps cannot
