@@ -213,6 +213,11 @@ int main(void)
 	stats_error();
 	stats_get_snapshot(&s);
 	assert(s.error_pkts == 1);
+	stats_icmp_sent();
+	stats_icmp_sent();
+	stats_self();
+	stats_get_snapshot(&s);
+	assert(s.icmp_sent_pkts == 2 && s.self_pkts == 1);
 	printf("PASS: per-worker counter increments work correctly\n");
 
 	/* Test 3: Multi-threaded concurrent worker test */

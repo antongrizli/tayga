@@ -4,6 +4,14 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Added
+
+- Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). With them every received packet satisfies `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
+
+### Fixed
+
+- Packets rejected with an ICMP error (Time Exceeded, Packet Too Big, unknown protocol to self) and unknown ICMP types addressed to the daemon are now counted as drops, consistently with the other reject paths.
+
 ## [0.9.15] - 2026-11-02
 
 ### Changed

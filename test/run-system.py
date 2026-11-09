@@ -30,7 +30,7 @@ def main():
     lock_file.touch(exist_ok=True)
     for name in ('auto_negotiation', 'auto_persistent', 'startup_rollback',
                  'worker_burst', 'napi_initialization', 'udp_gso_kernel', 'tcp_split_tail_kernel',
-                 'recovery_ports', 'protocols_e2e'):
+                 'recovery_ports', 'protocols_e2e', 'stats_balance'):
         subprocess.run([sys.executable, str(root / f'test_{name}.py'), '--binary', binary,
                         '--output', str(args.output.resolve() / name)], check=True)
     for mode in ('groups', 'flows'):

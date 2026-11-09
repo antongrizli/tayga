@@ -44,6 +44,8 @@ struct worker_pub_stats {
 	_Atomic uint64_t tx_fatal;
 	_Atomic uint64_t tx_other;
 	_Atomic uint64_t warnings_suppressed;
+	_Atomic uint64_t icmp_sent_pkts;
+	_Atomic uint64_t self_pkts;
 
 
 	/* GSO telemetry integrated per worker */
@@ -91,6 +93,8 @@ struct worker_priv_stats {
 	uint64_t tx_fatal;
 	uint64_t tx_other;
 	uint64_t warnings_suppressed;
+	uint64_t icmp_sent_pkts;
+	uint64_t self_pkts;
 
 
 	uint64_t gso_rx_pkts;
@@ -137,6 +141,8 @@ struct tayga_stats {
 	uint64_t tx_fatal;
 	uint64_t tx_other;
 	uint64_t warnings_suppressed;
+	uint64_t icmp_sent_pkts;
+	uint64_t self_pkts;
 
 
 	uint64_t gso_rx_pkts;
@@ -195,6 +201,8 @@ static inline void stats_rx6(uint32_t bytes) { (void)bytes; }
 static inline void stats_tx6(uint32_t bytes) { (void)bytes; }
 static inline void stats_drop(uint32_t bytes) { (void)bytes; }
 static inline void stats_error(void) {}
+static inline void stats_icmp_sent(void) {}
+static inline void stats_self(void) {}
 static inline void stats_gso_rx(uint32_t bytes) { (void)bytes; }
 static inline void stats_gso_tx(uint32_t bytes) { (void)bytes; }
 static inline void stats_gso_split_tail(void) {}
@@ -248,6 +256,16 @@ static inline void stats_drop(uint32_t bytes) {
 
 static inline void stats_error(void) {
 	g_tls_priv.error_pkts++;
+}
+
+/* ICMP error/echo reply originated by the daemon itself (not a translation) */
+static inline void stats_icmp_sent(void) {
+	g_tls_priv.icmp_sent_pkts++;
+}
+
+/* Packet addressed to the daemon itself and answered locally (echo reply) */
+static inline void stats_self(void) {
+	g_tls_priv.self_pkts++;
 }
 
 /* GSO fast-path hooks */

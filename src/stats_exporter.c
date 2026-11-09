@@ -232,6 +232,8 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f, "    \"tx_bytes_v6\": %llu,\n", (unsigned long long)s.tx_bytes_v6);
 	fprintf(f, "    \"dropped_packets\": %llu,\n", (unsigned long long)s.dropped_pkts);
 	fprintf(f, "    \"dropped_bytes\": %llu,\n", (unsigned long long)s.dropped_bytes);
+	fprintf(f, "    \"self_packets\": %llu,\n", (unsigned long long)s.self_pkts);
+	fprintf(f, "    \"icmp_sent_packets\": %llu,\n", (unsigned long long)s.icmp_sent_pkts);
 	fprintf(f, "    \"errors\": %llu\n", (unsigned long long)s.error_pkts);
 	fprintf(f, "  },\n");
 	fprintf(f, "  \"gso\": {\n");

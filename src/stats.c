@@ -250,6 +250,8 @@ void stats_flush_worker(void)
 	atomic_store_explicit(&p->tx_fatal, g_tls_priv.tx_fatal, memory_order_relaxed);
 	atomic_store_explicit(&p->tx_other, g_tls_priv.tx_other, memory_order_relaxed);
 	atomic_store_explicit(&p->warnings_suppressed, g_tls_priv.warnings_suppressed, memory_order_relaxed);
+	atomic_store_explicit(&p->icmp_sent_pkts, g_tls_priv.icmp_sent_pkts, memory_order_relaxed);
+	atomic_store_explicit(&p->self_pkts, g_tls_priv.self_pkts, memory_order_relaxed);
 
 
 	atomic_store_explicit(&p->gso_rx_pkts, g_tls_priv.gso_rx_pkts, memory_order_relaxed);
@@ -302,6 +304,8 @@ void stats_get_snapshot(struct tayga_stats *out)
 		out->tx_fatal += atomic_load_explicit(&p->tx_fatal, memory_order_relaxed);
 		out->tx_other += atomic_load_explicit(&p->tx_other, memory_order_relaxed);
 		out->warnings_suppressed += atomic_load_explicit(&p->warnings_suppressed, memory_order_relaxed);
+		out->icmp_sent_pkts += atomic_load_explicit(&p->icmp_sent_pkts, memory_order_relaxed);
+		out->self_pkts += atomic_load_explicit(&p->self_pkts, memory_order_relaxed);
 
 
 		out->gso_rx_pkts += atomic_load_explicit(&p->gso_rx_pkts, memory_order_relaxed);

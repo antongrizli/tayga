@@ -286,6 +286,7 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
+	stats_icmp_sent();
 }
 
 /*
@@ -401,11 +402,13 @@ static void host_handle_icmp4(struct pkt *p)
 	case 8:
 		p->icmp->type = 0;
 		log_pkt4(LOG_OPT_SELF,p,"Echo Request");
+		stats_self();
 		host_send_icmp4(p->ip4->tos, &p->ip4->dest, &p->ip4->src,
 				p->icmp, p->data, p->data_len, p->tun_fd);
 		break;
 	default:
 		sprintf(temp,"ICMP Unknown Type %d",p->icmp->type);
+		stats_drop(p->data_len + (uint32_t)sizeof(struct icmp));
 		log_pkt4(LOG_OPT_SELF | LOG_OPT_DROP,p,temp);
 	}
 }
@@ -624,6 +627,7 @@ static void xlate_4to6_data(struct pkt *p)
 	if ((off & (IP4_F_MASK | IP4_F_MF)) == 0) {
 		if (off & IP4_F_DF) {
 			if (sizeof(struct ip6) + p->data_len > gcfg.mtu) {
+				stats_drop(p->data_len);
 				log_pkt4(LOG_OPT_ICMP,p,"Packet Too Big");
 				host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
 				return;
@@ -1087,11 +1091,13 @@ void handle_ip4(struct pkt *p)
 		if (p->data_proto == 1)
 			host_handle_icmp4(p);
 		else {
+			stats_drop(p->data_len);
 			log_pkt4(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Unknown protocol to self");
 			host_send_icmp4_error(3, 2, 0, p);
 		}
 	} else {
 		if (unlikely(p->ip4->ttl == 1)) {
+			stats_drop(p->data_len);
 			log_pkt4(LOG_OPT_ICMP,p,"Time Exceeded");
 			host_send_icmp4_error(11, 0, 0, p);
 			return;
@@ -1136,6 +1142,7 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 	iov[1].iov_base = data;
 	iov[1].iov_len = data_len;
 	tun_writev(tun_fd, iov, data_len ? 2 : 1);
+	stats_icmp_sent();
 }
 
 void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word,
@@ -1185,12 +1192,14 @@ static void host_handle_icmp6(struct pkt *p)
 	case 128:
 		p->icmp->type = 129;
 		log_pkt6(LOG_OPT_SELF,p,"Echo Request");
+		stats_self();
 		host_send_icmp6((ntohl(p->ip6->ver_tc_fl) >> 20) & 0xff,
 				&p->ip6->dest, &p->ip6->src,
 				p->icmp, p->data, p->data_len, p->tun_fd);
 		break;
 	default:
 		sprintf(temp,"ICMP Unknown Type %d",p->icmp->type);
+		stats_drop(p->data_len + (uint32_t)sizeof(struct icmp));
 		log_pkt6(LOG_OPT_SELF | LOG_OPT_DROP,p,temp);
 		break;
 	}
@@ -1453,6 +1462,7 @@ static void xlate_6to4_data(struct pkt *p)
 	}
 
 	if (sizeof(struct ip6) + p->data_len > gcfg.mtu) {
+		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_ICMP,p,"Packet Too Big");
 		host_send_icmp6_error(2, 0, gcfg.mtu, p);
 		return;
@@ -1882,11 +1892,13 @@ void handle_ip6(struct pkt *p)
 		if (p->data_proto == 58)
 			host_handle_icmp6(p);
 		else {
+			stats_drop(p->data_len);
 			log_pkt6(LOG_OPT_SELF | LOG_OPT_REJECT,p,"Unknown protocol to self");
 			host_send_icmp6_error(4, 1, p->next_hdr_offset, p);
 		}
 	} else {
 		if (unlikely(p->ip6->hop_limit == 1)) {
+			stats_drop(p->data_len);
 			log_pkt6(LOG_OPT_ICMP,p,"Time Exceeded");
 			host_send_icmp6_error(3, 0, 0, p);
 			return;
