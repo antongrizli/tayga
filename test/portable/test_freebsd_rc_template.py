@@ -28,6 +28,16 @@ class FreeBsdRcTemplateTests(unittest.TestCase):
         pre = self.text.split('tayga_start_pre() {', 1)[1].split('tayga_start_post()', 1)[0]
         self.assertNotIn('tayga-net-ctl up', pre)
 
+    def test_explicit_start_resets_restart_budget(self):
+        pre = self.text.split('tayga_start_pre() {', 1)[1].split('tayga_start_post()', 1)[0]
+        self.assertIn('/starts"', pre)
+        self.assertIn('rm -f', pre)
+
+    def test_status_never_signals_the_daemon_supervisor(self):
+        ctl = (TEMPLATE.parent / 'tayga-ctl.sh').read_text()
+        self.assertIn('pgrep -P', ctl)
+        self.assertNotIn('kill -USR2 "$(cat', ctl)
+
 
 if __name__ == '__main__':
     unittest.main()

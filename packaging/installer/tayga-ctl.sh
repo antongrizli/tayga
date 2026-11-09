@@ -97,8 +97,12 @@ case "$action" in
         if [ "$(uname -s)" = FreeBSD ]; then
             netstat -rn -f inet | grep "$dev" || :
             netstat -rn -f inet6 | grep "$dev" || :
+            # The pidfile holds the daemon(8) supervisor, which exits on SIGUSR2;
+            # ask only its child (the translator) to refresh the status file.
             if [ -f "/var/run/tayga-managed-$profile.pid" ]; then
-                kill -USR2 "$(cat "/var/run/tayga-managed-$profile.pid")" 2>/dev/null || :
+                for child in $(pgrep -P "$(cat "/var/run/tayga-managed-$profile.pid")" 2>/dev/null); do
+                    kill -USR2 "$child" 2>/dev/null || :
+                done
             fi
             if [ -r "/var/run/tayga-managed-$profile/tayga-status.json" ]; then cat "/var/run/tayga-managed-$profile/tayga-status.json"; fi
             exec service tayga-managed onestatus

@@ -36,6 +36,8 @@ tayga_start_pre() {
     case "$profile" in clat|nat64|siit) ;; *) err 1 "Invalid managed profile: $profile" ;; esac
     mkdir -p "/var/lib/tayga" "/var/lib/tayga/${profile}" "/var/run/tayga-managed-${profile}"
     chmod 0750 "/var/lib/tayga" "/var/lib/tayga/${profile}" "/var/run/tayga-managed-${profile}"
+    # An explicit start (installer, rollback, administrator) gets a fresh restart budget.
+    rm -f "/var/run/tayga-managed-${profile}/starts"
     if [ -x /usr/local/libexec/tayga/tayga-dns64 ]; then
         /usr/local/libexec/tayga/tayga-dns64 prepare "/etc/tayga/${profile}.conf" || return 1
     fi
