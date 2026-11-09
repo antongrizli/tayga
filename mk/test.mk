@@ -104,5 +104,6 @@ fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 	@set -eu; for t in $(FUZZ_TARGETS); do \
 	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; seeds=; \
 	  [ -d $(BUILDDIR)/fuzz-seeds/$$t ] && seeds=$(abspath $(BUILDDIR))/fuzz-seeds/$$t; \
+	  [ -d test/fuzz/regress/$$t ] && seeds="$$seeds $(abspath test/fuzz/regress)/$$t"; \
 	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null); \
 	done; echo 'fuzz-check passed'
