@@ -672,6 +672,68 @@ static void test_icmp_error_suppression_and_rate_limit(void)
 	puts("PASS: ICMP error suppression and rate limiting");
 }
 
+/* xlate_6to4_icmp_error clamps the quoted datagram's IPv4 total length: a lying
+ * inner payload_length must neither overflow 16 bits nor underflow when the
+ * inner header carries extension headers. Observable as the inner Total Length. */
+static unsigned quoted_total_len(unsigned inner_plen, int with_hbh)
+{
+	setup_quote_maps();
+	gcfg.mtu = 1500;
+	gcfg.icmp_rate_limit = UINT32_MAX;
+	icmp_rate_limit_reset();
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	alignas(8) uint8_t buf[HEADROOM + 256] = {0};
+	struct ip6 *o = (struct ip6 *)(buf + HEADROOM);
+	unsigned inner_len = sizeof(struct ip6) + (with_hbh ? 8 : 0) + 8;
+	o->ver_tc_fl = htonl(0x60000000);
+	o->payload_length = htons(sizeof(struct icmp) + inner_len);
+	o->next_header = 58; o->hop_limit = 64;
+	inet_pton(AF_INET6, "64:ff9b::808:808", &o->src);
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &o->dest);
+	struct icmp *ic = (struct icmp *)(o + 1);
+	ic->type = 3; ic->code = 0;
+	struct ip6 *in = (struct ip6 *)(ic + 1);
+	in->ver_tc_fl = htonl(0x60000000);
+	in->payload_length = htons((uint16_t)inner_plen);
+	in->next_header = with_hbh ? 0 : IPPROTO_UDP; in->hop_limit = 5;
+	inet_pton(AF_INET6, "fd9b:64:1:ff::10", &in->src);
+	inet_pton(AF_INET6, "64:ff9b::808:808", &in->dest);
+	uint8_t *l4 = (uint8_t *)(in + 1);
+	if (with_hbh) { l4[0] = IPPROTO_UDP; l4[1] = 0; l4[2] = 1; l4[3] = 4; l4 += 8; }
+	l4[0] = 0x10; l4[1] = 0x00; l4[2] = 0x20; l4[3] = 0x00; l4[4] = 0; l4[5] = 8; /* UDP, truncated */
+	ic->cksum = 0;
+	ic->cksum = ones_add(ip_checksum(ic, ntohs(o->payload_length)),
+			ip6_checksum(o, ntohs(o->payload_length), 58));
+	struct pkt p = {.tun_fd = sv[0], .data = (uint8_t *)o, .data_len = sizeof(struct ip6) + sizeof(struct icmp) + inner_len};
+	handle_ip6(&p);
+	uint8_t out[1024];
+	ssize_t n = recv(sv[1], out, sizeof(out), MSG_DONTWAIT);
+	close(sv[0]); close(sv[1]);
+	if (n <= 0) return 0;
+	size_t base = gcfg.vnet_hdr_sz ? (size_t)gcfg.vnet_hdr_sz : 0;
+#ifndef __linux__
+	base += sizeof(struct tun_pi);
+#endif
+	struct ip4 *oip = (struct ip4 *)(out + base);
+	assert(oip->proto == 1);
+	struct ip4 *qip = (struct ip4 *)((uint8_t *)(oip + 1) + sizeof(struct icmp));
+	return ntohs(qip->length);
+}
+
+static void test_icmp6to4_quoted_length_clamp(void)
+{
+	/* Honest large datagram quoted truncated: 20 + payload_length. */
+	assert(quoted_total_len(1000, 0) == 1020);
+	/* A lying maximum payload_length is clamped to the 16-bit IPv4 limit. */
+	assert(quoted_total_len(65535, 0) == 65535);
+	/* payload_length smaller than the inner extension headers falls back to
+	 * the quoted length instead of underflowing. */
+	unsigned q = quoted_total_len(4, 1);
+	assert(q == 0 || (q >= 20 && q <= 20 + 16));	/* dropped, or a bounded length */
+	printf("PASS: ICMPv6->ICMPv4 quoted total length clamp (1020, 65535, no underflow)\n");
+}
+
 /* RFC-005c: "Unrecognized Next Header" points at the Next Header field that
  * named the unknown protocol, not at a constant 6 (RFC 4443 section 3.4). */
 static void test_icmp6_unknown_next_header_pointer(void)
@@ -1114,6 +1176,7 @@ int main(void)
 	test_rfc4884_ext_6to4();
 	test_icmp_error_suppression_and_rate_limit();
 	test_icmp6_unknown_next_header_pointer();
+	test_icmp6to4_quoted_length_clamp();
 	test_icmp_echo_checksum_translation();
 	test_tcp_zero_checksum_preserved();
 	test_metadata_bounds();
