@@ -86,7 +86,7 @@ $(TESTBINDIR)/tcp_split_tail: $(TESTOBJDIR)/tcp_split_tail.o $(TEST_LIB) | $(TES
 # libFuzzer smoke run (needs clang): `make fuzz-check` builds every harness in
 # test/fuzz with ASan+UBSan and runs it for FUZZ_TIME seconds.
 FUZZ_TIME ?= 10
-FUZZ_TARGETS := fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_pref64 fuzz_conffile
+FUZZ_TARGETS := fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_pref64 fuzz_conffile fuzz_flow fuzz_maps
 FUZZ_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
 .PHONY: fuzz-check
 fuzz-check:
@@ -96,7 +96,7 @@ fuzz-check:
 .PHONY: fuzz-run
 fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 	@mkdir -p $(BUILDDIR)/fuzz-bin $(BUILDDIR)/fuzz-run
-	@set -eu; for t in fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_conffile; do \
+	@set -eu; for t in fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_conffile fuzz_flow fuzz_maps; do \
 	  $(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -Isrc -I$(GENDIR) -Itest/fuzz -o $(BUILDDIR)/fuzz-bin/$$t test/fuzz/$$t.c $(TEST_LIB) $(LDLIBS); \
 	done
 	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(TESTOBJDIR)/pref64.o

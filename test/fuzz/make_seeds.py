@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate valid-looking seed inputs for the libFuzzer packet harnesses.
 
-usage: make_seeds.py OUTDIR   (creates OUTDIR/{fuzz_pkt4,fuzz_pkt6,fuzz_gso}/*)
+usage: make_seeds.py OUTDIR   (creates OUTDIR/{fuzz_pkt4,fuzz_pkt6,fuzz_gso,fuzz_flow,fuzz_maps}/*)
 Packets use the addresses of fuzz_common.h: 192.0.0.1 <-> fd9b:64:1:ff::10 and
 the 64:ff9b::/96 prefix.  Checksums are real for the IPv4 header and TCP/UDP
 (complete-checksum variants) so deeper code than the parsers is reached.
@@ -43,7 +43,7 @@ def vhdr(gso, size, hdr, cstart, coff, needs=True):
 
 GSO = {"none": 0, "tcp4": 1, "udp": 3, "tcp6": 4}
 out = sys.argv[1]
-for d in ("fuzz_pkt4", "fuzz_pkt6", "fuzz_gso"):
+for d in ("fuzz_pkt4", "fuzz_pkt6", "fuzz_gso", "fuzz_flow", "fuzz_maps"):
     os.makedirs(os.path.join(out, d), exist_ok=True)
 def save(d, name, data): open(os.path.join(out, d, name), "wb").write(data)
 
@@ -85,4 +85,17 @@ for name, (pkt, vh) in list(cases4.items()) + list(cases6.items()):
         save("fuzz_gso", f"{name}_{'6' if v6 else '4'}_mtu{mtu}_tr", bytes([mtu, f]) + vh + pkt)
         f = (7 if udp else 5) if v6 else (6 if udp else 4)
         save("fuzz_gso", f"{name}_{'6' if v6 else '4'}_mtu{mtu}_sw", bytes([mtu | 4, f]) + vh + pkt)
+# fuzz_flow: the bare IP packet; fuzz_maps: map-file text
+for name, (pkt, vh) in list(cases4.items()) + list(cases6.items()):
+    save("fuzz_flow", name, pkt)
+maps = {
+    "basic": "map 192.0.2.9 2001:db8::9\nmap 192.0.2.10 2001:db8::a\n",
+    "prefix": "map 198.51.100.0/24 2001:db8:1::/120\nmap 198.51.100.7 2001:db8:2::7\n",
+    "nested": "map 10.0.0.0/8 2001:db8:a::/72\nmap 10.1.0.0/16 2001:db8:b::/112\nmap 10.1.2.3 2001:db8:c::3\n",
+    "comments": "# comment\n\nmap 192.0.2.1 2001:db8::1 # trailing\n",
+    "bad": "map 999.1.1.1 2001:db8::1\nmap 192.0.2.1\nmap 192.0.2.2/33 2001:db8::2\n",
+    "many": "".join(f"map 203.0.113.{i} 2001:db8:100::{i:x}\n" for i in range(1, 40)),
+}
+for name, text in maps.items():
+    save("fuzz_maps", name, text.encode())
 print("seeds written to", out)
