@@ -33,10 +33,11 @@ tun-device nat64
 ipv4-addr 192.168.255.1
 ipv6-addr 2001:db8:255::1
 prefix 64:ff9b::/96
-dynamic-pool 192.168.255.128/25
+dynamic-pool ${POOL:-192.168.255.128/25}
 data-dir $D
 workers $WORKERS
 udp-cksum-mode calc
+${CACHE_SIZE:+cache-size $CACHE_SIZE}
 EOF
 [ "${MODE:-pktgen}" = tcp ] || ip netns exec s4 nft -f - <<'EOF'
 table ip t {
@@ -55,6 +56,8 @@ ip -n nt addr add 192.168.255.254/32 dev nat64 2>/dev/null || true
 ip -n nt route add 192.168.255.0/24 dev nat64
 ip -n nt -6 route add 64:ff9b::/96 dev nat64
 ip -n nt route replace 8.8.8.0/24 dev n1
+# many destinations: next hop through the sink, otherwise each one would need its own ARP entry
+[ -z "${DST_COUNT:-}" ] || ip -n nt route replace 8.8.0.0/16 via 8.8.8.2
 sleep 1
 ip netns exec c6 ping -6 -c2 -W2 64:ff9b::808:802 >$D/ping.txt 2>&1 || true; [ -n "${DEBUG:-}" ] && { cat $D/ping.txt; ip -n nt -s link show nat64 | tr "\n" " "; ip netns exec nt sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.n1.rp_filter; ip netns exec c6 ip -6 route; tail -3 $D/log; } || true   # prime dynamic mapping
 if [ "${MODE:-pktgen}" = tcp ]; then
@@ -82,7 +85,7 @@ P3
 fi
 dmac=$(ip -n nt -o link show n0 | sed -n 's/.*link\/ether \([0-9a-f:]*\).*/\1/p')
 PG=/proc/net/pktgen
-pg() { echo "$2" > "$PG/$1"; }
+pg() { echo "$2" > "$PG/$1" || echo "pktgen rejected: $1 $2" >&2; }
 echo reset > $PG/pgctrl
 IFS=- read -r lo hi <<<"$GEN_CPUS"
 # pktgen can only use devices of its own netns, so move c0 out of c6
@@ -97,13 +100,21 @@ for i in $(seq 0 $((GEN-1))); do
   pg $dev "count 0"; pg $dev "pkt_size $SIZE"; pg $dev "delay 0"; pg $dev "clone_skb 0"
   pg $dev "dst_mac $dmac"; pg $dev "dst6 64:ff9b::808:802"
   pg $dev "src6 2001:db8:1::$(printf %x $((0x10+i)))"   # one source per generator thread
+  if [ -n "${DST_COUNT:-}" ]; then
+    # pktgen cannot vary an IPv6 source, but it can vary the destination: DST_COUNT (<= 65536)
+    # distinct 64:ff9b::808:x addresses cycled per packet, so every packet maps a different
+    # IPv4 destination and misses the per-thread front cache.
+    pg $dev "dst6_min 64:ff9b::808:0"; pg $dev "dst6_max 64:ff9b::808:$(printf %x $((DST_COUNT - 1)))"
+  fi
   pg $dev "udp_src_min ${PORT_MIN:-1024}"; pg $dev "udp_src_max ${PORT_MAX:-60000}"; pg $dev "udp_dst_min 9"; pg $dev "udp_dst_max 9"
   pg $dev "flag UDPSRC_RND"; pg $dev "flag QUEUE_MAP_CPU"
 done
 rx() { ip netns exec s4 cat /sys/class/net/s0/statistics/rx_packets; }
 cpu_ticks() { awk '{print $14+$15}' /proc/$tp/stat; }
 echo start > $PG/pgctrl & pgp=$!
-sleep 2; r0=$(rx); c0t=$(cpu_ticks); sleep "$SECS"; r1=$(rx); c1t=$(cpu_ticks)
+sleep 2; r0=$(rx); c0t=$(cpu_ticks)
+[ -z "${PERF_OUT:-}" ] || { perf record -q -g -p "$tp" -o "$PERF_OUT" -- sleep "$SECS" >/dev/null 2>&1 & }
+sleep "$SECS"; r1=$(rx); c1t=$(cpu_ticks)
 echo stop > $PG/pgctrl 2>/dev/null || true; kill $pgp 2>/dev/null || true
 [ -n "${DEBUG:-}" ] && { cat $PG/c0@0 | head -30; for l in "nt n0" "nt nat64" "nt n1" "s4 s0"; do set -- $l; ip -n $1 -s link show $2 | tr "\n" " "; echo; done; tail -5 $D/log; sleep 5.5; grep -E "dropped|error|rx_packets_v6|tx_packets_v4|icmp" $D/s.json | head -20; ip -6 neigh show dev c0; } || true
 sent=0; for i in $(seq 0 $((GEN-1))); do sent=$((sent + $(sed -n 's/.*pkts-sofar: \([0-9]*\).*/\1/p' $PG/c0@$i | head -1))); done

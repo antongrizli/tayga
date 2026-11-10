@@ -95,8 +95,8 @@ and the NAT64 readiness probe read it, because the installed profile keeps the
 prefix chosen at installation. The container passes the prefix and remaining
 lifetime it just discovered with `--initial-prefix` and `--initial-lifetime`,
 so translation starts at once; the first real advertisement supersedes it.
-A NAT64 or SIIT profile installs its routes for the configured prefix: after an
-RA-driven prefix change run `tayga-ctl reconfigure` so routes and DNS64 follow.
+Automatic RFC 8781 discovery is CLAT-only (the installer rejects it for NAT64
+and SIIT), so no route or DNS64 configuration depends on an RA-driven prefix.
 
 The supervisor forwards HUP and USR signals to the translator. Systemd managed
 units use `NotifyAccess=all` so readiness can come from that child. Raw ICMPv6
