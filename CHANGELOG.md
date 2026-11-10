@@ -4,6 +4,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-11-10
+
 ### Added
 
 - RA prefix supervision for managed CLAT profiles: lifetime renewal, withdrawal/expiry shutdown, foreground translator restart on prefix change, and forwarding of service signals. Managed NAT66 prefix changes stop the translator while the network controller rebuilds owned rules; failed replacement attempts restore the saved network profile and exit without starting a stale translator.
