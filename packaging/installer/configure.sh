@@ -105,6 +105,7 @@ done
 case "$mode" in clat|nat64|siit) ;; *) fail 'Mode must be clat, nat64 or siit' ;; esac
 [ -n "$out" ] || fail 'An output path is required'
 pref64_source=manual
+ra_if=
 if [ "$pref64" = auto ] || [ "$pref64" = public ]; then
     [ "$mode" = clat ] || fail 'PREF64 discovery is only valid for CLAT'
     helper=${PREF64_HELPER:-pref64-discover}
@@ -114,9 +115,21 @@ if [ "$pref64" = auto ] || [ "$pref64" = public ]; then
     elif [ "$pref64" = public ]; then
         pref64=$("$helper" -p) || fail 'Public NAT64 discovery failed; specify --pref64 explicitly'
     else
-        pref64=$("$helper" 2>/dev/null || "$helper" -p) || fail 'RFC 7050 discovery failed; specify --pref64 explicitly'
+        # RFC 8781 first (Linux and FreeBSD, needs raw ICMPv6), then RFC 7050 via DNS.
+        ra_if=
+        case "$(uname -s)" in
+            Linux) ra_if=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}') ;;
+            FreeBSD) ra_if=$(route -n get -inet6 default 2>/dev/null | awk '/interface:/{print $2; exit}') ;;
+        esac
+        case "$ra_if" in *[!a-zA-Z0-9_.:-]*) ra_if= ;; esac
+        pref64=
+        if [ -n "$ra_if" ] && pref64=$("$helper" -i "$ra_if" -t 3 --ra-only 2>/dev/null) && [ -n "$pref64" ]; then
+            pref64_source=rfc8781
+        else
+            pref64=$("$helper" 2>/dev/null || "$helper" -p) || fail 'PREF64 discovery failed (RFC 8781 and RFC 7050); specify --pref64 explicitly'
+        fi
     fi
-    pref64_source=rfc7050
+    [ "$pref64_source" != manual ] || pref64_source=rfc7050
 fi
 if [ -z "$addr4" ]; then
     if [ "$mode" = clat ]; then addr4=192.0.0.2; else addr4=192.168.240.1; fi
@@ -278,6 +291,7 @@ trap 'exit 1' HUP INT TERM
     printf '# installer-clat-address-mode %s\n' "$address_mode"
     [ -z "$nat66_address" ] || printf '# installer-nat66-address %s\n' "$nat66_address"
     printf '# installer-host-dns %s\n' "$host_dns"
+    [ "$pref64_source" != rfc8781 ] || printf '# installer-pref64-interface %s\n' "$ra_if"
     printf '# installer-pref64-source %s\n' "$pref64_source"
     if [ "$mode" = clat ] && [ -n "$management4" ]; then
         printf '# installer-management4 %s\n' "$management4"

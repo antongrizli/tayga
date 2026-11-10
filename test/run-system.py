@@ -30,9 +30,16 @@ def main():
     lock_file.touch(exist_ok=True)
     for name in ('auto_negotiation', 'auto_persistent', 'startup_rollback',
                  'worker_burst', 'napi_initialization', 'udp_gso_kernel', 'tcp_split_tail_kernel',
-                 'recovery_ports', 'protocols_e2e'):
+                 'recovery_ports', 'protocols_e2e', 'stats_balance', 'icmp_wire', 'notify_optional'):
         subprocess.run([sys.executable, str(root / f'test_{name}.py'), '--binary', binary,
                         '--output', str(args.output.resolve() / name)], check=True)
+    subprocess.run([sys.executable, str(root / 'test_ra_supervisor.py'),
+                    '--helper', str(Path(binary).with_name('pref64-discover')),
+                    '--output', str(args.output.resolve() / 'ra_supervisor')], check=True)
+    # Real tayga-net-ctl + nftables: a prefix change must leave rules for the new prefix only.
+    subprocess.run([sys.executable, str(root / 'test_nat66_prefix_change.py'), '--binary', binary,
+                    '--helper', str(Path(binary).with_name('pref64-discover')),
+                    '--output', str(args.output.resolve() / 'nat66_prefix_change')], check=True)
     for mode in ('groups', 'flows'):
         subprocess.run([sys.executable, str(root / 'test_tun_steering.py'), '--steering', mode], check=True)
         subprocess.run([sys.executable, str(root / 'test_tun_steering_lifecycle.py'),

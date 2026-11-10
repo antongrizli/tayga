@@ -112,15 +112,20 @@ jobs:
           curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-rootfs.tar.gz" -o /tmp/openwrt-rootfs.tar.gz
           echo '5f430f5b30c9ea6dc472710356c139abf916b7ebd5de14e108e9cc204f40a2a4  /tmp/openwrt-sdk.tar.zst' | sha256sum -c -
           echo 'eab7e31f508ff0af1d47afc779eb08f237bb0f1cec5014592afe4893a06318a3  /tmp/openwrt-rootfs.tar.gz' | sha256sum -c -
-          curl -fL --retry 3 "$base/kmods/6.6.144-1-0b532dfcba2e5fa16405c5387dd37cae/kmod-tun_6.6.144-r1_aarch64_generic.ipk" -o /tmp/openwrt-kmod-tun.ipk
-          echo '9bbbf77e4762077d8bd49602ccb1fff1767c0e540de9f24507dcc5355f150caa  /tmp/openwrt-kmod-tun.ipk' | sha256sum -c -
-          curl -fL --retry 3 'https://downloads.openwrt.org/releases/24.10.8/packages/aarch64_generic/base/flock_2.40.2-r1_aarch64_generic.ipk' -o /tmp/openwrt-flock.ipk
-          echo 'a0718db1870b45db97dbfe79f0a53ed6fe784a92520be08024a1da7a84edfa17  /tmp/openwrt-flock.ipk' | sha256sum -c -
-          feed=https://downloads.openwrt.org/releases/24.10.8/packages/aarch64_generic/packages
-          curl -fL --retry 3 "$feed/coreutils_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-coreutils.ipk
-          curl -fL --retry 3 "$feed/coreutils-timeout_9.7-r1_aarch64_generic.ipk" -o /tmp/openwrt-timeout.ipk
-          echo 'e15a5c623f701152d8e1dc1544ba3fee7fce636f5b719f81bda1b9f0ebedba26  /tmp/openwrt-coreutils.ipk' | sha256sum -c -
-          echo 'b06c5f269829047447db2c8c4d08afdc6d7ac102e5098b00595d60bc30a45b57  /tmp/openwrt-timeout.ipk' | sha256sum -c -
+          # Feed packages are not pinned by hash: OpenWrt rebuilds a feed without
+          # changing versions.  Each one is taken from the feed index, whose usign
+          # signature is verified against the release key in scripts/ci/openwrt-keys/
+          # (that key is itself checked against the pinned rootfs below).
+          key=scripts/ci/openwrt-keys/d310c6f2833e97f7
+          release=https://downloads.openwrt.org/releases/24.10.8
+          python3 scripts/ci/openwrt_feed.py fetch --key "$key" --package kmod-tun --version 6.6.144-r1 \
+            --feed "$base/kmods/6.6.144-1-0b532dfcba2e5fa16405c5387dd37cae" --output /tmp/openwrt-kmod-tun.ipk
+          python3 scripts/ci/openwrt_feed.py fetch --key "$key" --package flock --version 2.40.2-r1 \
+            --feed "$release/packages/aarch64_generic/base" --output /tmp/openwrt-flock.ipk
+          python3 scripts/ci/openwrt_feed.py fetch --key "$key" --package coreutils --version 9.7-r1 \
+            --feed "$release/packages/aarch64_generic/packages" --output /tmp/openwrt-coreutils.ipk
+          python3 scripts/ci/openwrt_feed.py fetch --key "$key" --package coreutils-timeout --version 9.7-r1 \
+            --feed "$release/packages/aarch64_generic/packages" --output /tmp/openwrt-timeout.ipk
           curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-kernel.bin" -o /tmp/openwrt-kernel.bin
           curl -fL --retry 3 "$base/openwrt-24.10.8-armsr-armv8-generic-squashfs-combined-efi.img.gz" -o /tmp/openwrt-squashfs.img.gz
           echo 'ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e  /tmp/openwrt-kernel.bin' | sha256sum -c -
@@ -128,6 +133,8 @@ jobs:
           mkdir -p /tmp/openwrt-sdk /tmp/openwrt-rootfs
           tar --zstd -xf /tmp/openwrt-sdk.tar.zst -C /tmp/openwrt-sdk --strip-components=1
           sudo tar -xzf /tmp/openwrt-rootfs.tar.gz -C /tmp/openwrt-rootfs
+          # The trusted feed key must be the one the pinned release image ships.
+          cmp scripts/ci/openwrt-keys/d310c6f2833e97f7 /tmp/openwrt-rootfs/etc/opkg/keys/d310c6f2833e97f7
       - name: Build target-specific OpenWrt packages
         run: |
           printf '%s\n' '# CONFIG_ALL is not set' '# CONFIG_ALL_KMODS is not set' '# CONFIG_ALL_NONSHARED is not set' > /tmp/openwrt-sdk/.config

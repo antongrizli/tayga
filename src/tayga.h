@@ -245,6 +245,9 @@ struct pkt {
 	uint8_t *data;
 	uint32_t data_len;
 	uint32_t header_len; /* inc IP hdr for v4 but excl IP hdr for v6 */
+	uint32_t gso_sent_payload; /* software GSO: payload bytes already emitted before a failure */
+	uint32_t gso_unsent_segments; /* software GSO: segments not emitted because of that failure */
+	uint32_t next_hdr_offset; /* v6: offset of the Next Header field naming data_proto */
 	struct virtio_net_hdr_raw vhdr;
 	int has_vhdr;
 };
@@ -366,7 +369,14 @@ enum {
 	CACHE_F_REP_AGEOUT	= (1<<3),
 };
 
+#define WORKER_CPU_MAX 64
+
 /// UDP Checksum options
+enum flow_label_mode {
+	FLOW_LABEL_ZERO,	/* RFC 7915 default */
+	FLOW_LABEL_COMPUTE	/* RFC 6437 hash of the IPv4 flow */
+};
+
 enum udp_cksum_mode {
 	UDP_CKSUM_DROP,
 	UDP_CKSUM_CALC,
@@ -425,7 +435,9 @@ struct config {
 	//Other config parameters
 	uint32_t ipv6_offlink_mtu;
 	int wkpf_strict;
+	uint32_t icmp_rate_limit;	/* originated ICMP errors/s; 0 = default (1000), UINT32_MAX = unlimited */
 	int log_opts;
+	enum flow_label_mode flow_label_mode;
 	enum udp_cksum_mode udp_cksum_mode;	
 	enum {
 		LOG_TO_SYSLOG = 0,
@@ -435,6 +447,9 @@ struct config {
 
 	//Multiqueue related
 	int workers;
+	int worker_affinity;	/* 0 off, 1 worker i -> i-th allowed CPU, 2 explicit list (Linux) */
+	int worker_cpu_count;
+	int worker_cpu[WORKER_CPU_MAX];	/* worker i -> worker_cpu[i % count] when worker_affinity == 2 */
 	pthread_mutex_t cache_mutex;
 	pthread_mutex_t map_mutex;
 	pthread_t threads[MAX_WORKERS];
@@ -507,6 +522,20 @@ enum {
 /* TAYGA function prototypes */
 extern struct config gcfg;
 extern _Atomic time_t now;
+void addrmap_invalidate_front(void);
+int addrmap_build_index(void);
+uint32_t flow_label_4to6(const uint8_t *ip4, uint32_t len);
+void addrmap_free_index(void);
+
+/* Runtime tick for lease/cache ageing: monotonic, so NTP/RTC jumps cannot
+ * expire live leases.  Wall-clock time is only used at the dynamic.map file
+ * boundary (see load_dynamic()/write_to_file()). */
+static inline time_t tayga_mono_sec(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (time_t)ts.tv_sec;
+}
 
 /* addrmap.c */
 int validate_ip4_addr(const struct in_addr *a);
@@ -547,6 +576,7 @@ void log_pkt4(int err, struct pkt *p, const char *msg);
 void log_pkt6(int err, struct pkt *p, const char *msg);
 void host_send_icmp4_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
 void host_send_icmp6_error(uint8_t type, uint8_t code, uint32_t word, struct pkt *orig);
+void icmp_rate_limit_reset(void);
 uint16_t next_ip4_ident(void);
 /* Reserve count consecutive host-order IDs for one immediately emitted aggregate. */
 uint16_t reserve_ip4_ident(uint16_t count);
@@ -560,13 +590,16 @@ uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto);
 #define STRINGIFY_IMPL(x) #x
 #define STRINGIFY(x) STRINGIFY_IMPL(x)
 #define slog(prio, ...) slog_impl(prio, "CODE_FILE=" __FILE__, "CODE_LINE=" STRINGIFY(__LINE__), __func__, __VA_ARGS__)
-void slog_impl(int priority, const char *file, const char *line, const char *func, const char *format, ...);
+void slog_impl(int priority, const char *file, const char *line, const char *func, const char *format, ...)
+	__attribute__((format(printf, 5, 6)));
 int notify(const char *msg);
+int notify_prepare(void);
 int journal_init(const char *progname);
 void journal_cleanup(void);
 int journal_printv_with_location(
         int priority, const char *file, const char *line, const char *func,
-        const char *format, va_list ap);
+        const char *format, va_list ap)
+        __attribute__((format(printf, 5, 0)));
 
 #define TUN_READ_CONSUMED    0
 #define TUN_READ_WOULDBLOCK  1
@@ -600,6 +633,7 @@ ssize_t tun_writev_vnet(int tun_fd, const struct virtio_net_hdr_raw *vhdr, const
 
 
 /* stats_exporter.c */
+void telemetry_prepare_dir(const char *status_path); /* call before chroot() */
 void telemetry_start(const char *status_path, int interval_sec);
 void telemetry_stop(void);
 void telemetry_trigger(void);

@@ -130,6 +130,15 @@ dynamic-pool 192.168.255.0/24
 
 
 #
+# IPv6 Flow Label for IPv4->IPv6 packets: zero (RFC 7915 default) or
+# compute (RFC 6437 keyed hash of the flow; helps ECMP in the IPv6 core).
+#
+# Default value: zero
+#
+#flow-label zero
+
+
+#
 # Logging packet errors and events
 #
 # List each option you would like to log with a space
@@ -175,6 +184,10 @@ dynamic-pool 192.168.255.0/24
 # Default value: number of CPU cores, max 64
 # If multiqueue support is not compiled in, this has no effect
 #workers 4
+
+# (Linux only) Pin worker thread i to the i-th CPU of the allowed set.
+# Default value: off
+#worker-affinity off
 
 #
 # Map File

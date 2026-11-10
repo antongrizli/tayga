@@ -3,16 +3,21 @@ Description=TAYGA managed network profile %i
 Requires=tayga-recovery.service
 Wants=network-online.target
 After=tayga-recovery.service network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
-Type=simple
+# Type=notify: tayga sends READY=1 only after the TUN device is
+# configured, so ExecStartPost checks never race tun_setup().
+Type=notify
+NotifyAccess=all
 RuntimeDirectory=tayga-managed-%i
 RuntimeDirectoryMode=0750
 ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/tayga/%i
 ExecStartPre=/usr/local/libexec/tayga/tayga-dns64 prepare /etc/tayga/%i.conf
 ExecStartPre=/usr/local/libexec/tayga/tayga-host-dns prepare /etc/tayga/%i.conf
 ExecStartPre=/usr/local/libexec/tayga/tayga-net-ctl up /etc/tayga/%i.conf
-ExecStart=/usr/local/sbin/tayga --config /etc/tayga/%i.conf --runtime-dir /run/tayga-managed-%i --nodetach
+ExecStart=/usr/local/sbin/pref64-discover --supervise-ra /etc/tayga/%i.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl --runtime-dir /run/tayga-managed-%i -- /usr/local/sbin/tayga --config /etc/tayga/%i.conf --runtime-dir /run/tayga-managed-%i --journal --nodetach
 ExecStartPost=/usr/local/libexec/tayga/tayga-dns64 up /etc/tayga/%i.conf
 ExecStartPost=/usr/local/libexec/tayga/tayga-host-dns up /etc/tayga/%i.conf
 ExecStartPost=/usr/local/libexec/tayga/tayga-verify /etc/tayga/%i.conf
@@ -20,6 +25,20 @@ ExecStopPost=/usr/local/libexec/tayga/tayga-dns64 down /etc/tayga/%i.conf
 ExecStopPost=-/usr/local/libexec/tayga/tayga-host-dns down /etc/tayga/%i.conf
 ExecStopPost=/usr/local/libexec/tayga/tayga-net-ctl down /etc/tayga/%i.conf
 TimeoutStopSec=30
+# A crash must not leave the host without NAT64/DNS64: restart, but give up
+# after StartLimitBurst failures so tayga-recovery.service can take over.
+Restart=on-failure
+RestartSec=2
+
+# Hardening that does not interfere with the helper scripts (they need to
+# change routes, nftables, resolver files and sysctl, so ProtectSystem/
+# ProtectKernelTunables are deliberately not set here).
+NoNewPrivileges=true
+ProtectHostname=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target

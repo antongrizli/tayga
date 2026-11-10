@@ -49,3 +49,4 @@ __pycache__/
 
 # Unit sources are tracked even though compatibility binaries use unit_* names.
 !test/unit/unit_mapping.c
+!test/unit/unit_icmp_rate_limit.c

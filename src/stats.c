@@ -12,9 +12,13 @@
 #include <pthread.h>
 #include <unistd.h>
 
+__thread bool g_tx_originated_icmp;
+__thread bool g_tx_drop_deferred;
+
 struct worker_pub_stats g_worker_pub[STATS_MAX_SLOTS] __attribute__((aligned(128)));
 __thread struct worker_priv_stats g_tls_priv;
 time_t g_stats_start_time = 0;
+time_t g_stats_start_mono = 0;
 atomic_uint_fast64_t g_stats_sync_req = 0;
 atomic_uint_fast64_t g_stats_sync_ack[STATS_MAX_SLOTS] = {0};
 atomic_uint_fast64_t g_stats_snapshot_seq = 0;
@@ -48,7 +52,7 @@ void stats_tx_failure(int error, uint32_t ip_bytes, bool short_write)
 	int saved = errno;
 	unsigned reason = 6;
 	stats_error();
-	stats_drop(ip_bytes);
+	if (!g_tx_originated_icmp && !g_tx_drop_deferred) stats_drop(ip_bytes);
 	g_tls_priv.tx_failed_frames++;
 	if (short_write) { g_tls_priv.tx_short++; reason = 4; }
 	else if (error == EAGAIN || error == EWOULDBLOCK) { g_tls_priv.tx_eagain++; reason = 1; }
@@ -70,6 +74,7 @@ void stats_init(void)
 	memset(&g_tls_priv, 0, sizeof(g_tls_priv));
 	g_tls_priv.slot_idx = 0;
 	g_stats_start_time = time(NULL);
+	g_stats_start_mono = tayga_mono_sec();
 	atomic_store_explicit(&g_stats_sync_req, 0, memory_order_relaxed);
 	for (int i = 0; i < STATS_MAX_SLOTS; i++) {
 		atomic_store_explicit(&g_stats_sync_ack[i], 0, memory_order_relaxed);
@@ -165,7 +170,7 @@ static int stats_sync_slots(bool *synced_out, uint64_t *unacked_mask_out, bool *
 		atomic_store_explicit(&g_stats_sync_ack[g_tls_priv.slot_idx], req, memory_order_release);
 	}
 
-	struct timespec start, now;
+	struct timespec start, now_ts;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	const uint64_t timeout_ns = 100000000ULL; /* 100 ms overall deadline */
 	uint64_t unacked_mask = 0;
@@ -192,9 +197,9 @@ static int stats_sync_slots(bool *synced_out, uint64_t *unacked_mask_out, bool *
 			return 0;
 		}
 
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t elapsed_ns = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ULL +
-		                      (uint64_t)(now.tv_nsec - start.tv_nsec);
+		clock_gettime(CLOCK_MONOTONIC, &now_ts);
+		uint64_t elapsed_ns = (uint64_t)(now_ts.tv_sec - start.tv_sec) * 1000000000ULL +
+		                      (uint64_t)(now_ts.tv_nsec - start.tv_nsec);
 		if (elapsed_ns >= timeout_ns) {
 			for (int i = 0; i < gcfg.workers && i < 64; i++) {
 				if (!(target_mask & (1ULL << i)))
@@ -250,6 +255,9 @@ void stats_flush_worker(void)
 	atomic_store_explicit(&p->tx_fatal, g_tls_priv.tx_fatal, memory_order_relaxed);
 	atomic_store_explicit(&p->tx_other, g_tls_priv.tx_other, memory_order_relaxed);
 	atomic_store_explicit(&p->warnings_suppressed, g_tls_priv.warnings_suppressed, memory_order_relaxed);
+	atomic_store_explicit(&p->icmp_sent_pkts, g_tls_priv.icmp_sent_pkts, memory_order_relaxed);
+	atomic_store_explicit(&p->self_pkts, g_tls_priv.self_pkts, memory_order_relaxed);
+	atomic_store_explicit(&p->gso_dropped_segments, g_tls_priv.gso_dropped_segments, memory_order_relaxed);
 
 
 	atomic_store_explicit(&p->gso_rx_pkts, g_tls_priv.gso_rx_pkts, memory_order_relaxed);
@@ -302,6 +310,9 @@ void stats_get_snapshot(struct tayga_stats *out)
 		out->tx_fatal += atomic_load_explicit(&p->tx_fatal, memory_order_relaxed);
 		out->tx_other += atomic_load_explicit(&p->tx_other, memory_order_relaxed);
 		out->warnings_suppressed += atomic_load_explicit(&p->warnings_suppressed, memory_order_relaxed);
+		out->icmp_sent_pkts += atomic_load_explicit(&p->icmp_sent_pkts, memory_order_relaxed);
+		out->self_pkts += atomic_load_explicit(&p->self_pkts, memory_order_relaxed);
+		out->gso_dropped_segments += atomic_load_explicit(&p->gso_dropped_segments, memory_order_relaxed);
 
 
 		out->gso_rx_pkts += atomic_load_explicit(&p->gso_rx_pkts, memory_order_relaxed);

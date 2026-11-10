@@ -173,9 +173,150 @@ static void test_dynamic_dump(void)
     puts("PASS: concurrent dynamic lookup, maintenance, disk snapshot and atomic clock");
 }
 
+extern uint32_t hash_ip4(const struct in_addr *addr4);
+extern uint32_t hash_ip6(const struct in6_addr *addr6);
+
+/* PERF-001: clients that differ only in low bits must spread evenly. */
+static void test_hash_distribution(void)
+{
+    enum { BITS = 14, N = 8192 };
+    static unsigned bucket6[1u << BITS], bucket4[1u << BITS];
+    memset(&gcfg, 0, sizeof(gcfg));
+    gcfg.hash_bits = BITS; gcfg.rand[0] = 0x9e3779b1u; gcfg.rand[1] = 0x85ebca6bu;
+    gcfg.rand[2] = 0xc2b2ae35u; gcfg.rand[3] = 0x27d4eb2fu;
+    struct in6_addr a6; struct in_addr a4;
+    assert(inet_pton(AF_INET6, "2001:db8:1:2::", &a6) == 1);
+    unsigned max6 = 0, max4 = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        struct in6_addr x = a6;
+        x.s6_addr[14] = (uint8_t)(i >> 8); x.s6_addr[15] = (uint8_t)i;
+        uint32_t h = hash_ip6(&x); assert(h < (1u << BITS));
+        if (++bucket6[h] > max6) max6 = bucket6[h];
+        a4.s_addr = htonl(0xc0a80000u + i);
+        h = hash_ip4(&a4); assert(h < (1u << BITS));
+        if (++bucket4[h] > max4) max4 = bucket4[h];
+    }
+    /* Load factor 0.5: a sound hash keeps the longest chain tiny
+     * (the old 7-bit XOR hash produced chains of hundreds). */
+    assert(max6 <= 10 && max4 <= 10);
+    gcfg.hash_bits = 0;
+    assert(hash_ip6(&a6) == 0 && hash_ip4(&a4) == 0);
+    printf("PASS: address hash distribution (max chain v6=%u v4=%u)\n", max6, max4);
+}
+
+static atomic_bool fc_stop;
+static void *fc_lookup(void *dir)
+{
+    struct in_addr v4, back; struct in6_addr v6, a, b;
+    inet_pton(AF_INET, "192.0.2.9", &v4);
+    inet_pton(AF_INET6, "2001:db8::9", &a); inet_pton(AF_INET6, "2001:db8::10", &b);
+    while (!atomic_load(&fc_stop)) {
+        if (dir) {
+            /* Whichever mapping is current, the reverse lookup must succeed for it or be a clean miss. */
+            int rc = map_ip6_to_ip4(&back, &a, 0);
+            assert(rc == 0 || rc < 0);
+            if (rc == 0) assert(back.s_addr == htonl(0xc0000209) || back.s_addr == htonl(0xc000020a));
+        } else {
+            assert(map_ip4_to_ip6(&v6, &v4) == 0);
+            assert(IN6_ARE_ADDR_EQUAL(&v6, &a) || IN6_ARE_ADDR_EQUAL(&v6, &b));
+        }
+    }
+    return NULL;
+}
+static void *fc_clock(void *unused)
+{
+    (void)unused;
+    for (int i = 0; !atomic_load(&fc_stop); i++) atomic_store_explicit(&now, 100 + i % 3, memory_order_relaxed);
+    return NULL;
+}
+/* 16 lookup threads with per-thread front caches race reloads and a ticking clock. */
+static void test_front_cache_concurrency(void)
+{
+    pthread_t th[16], clk, rl;
+    atomic_store(&fc_stop, false);
+    for (int i = 0; i < 16; i++) assert(pthread_create(&th[i], NULL, fc_lookup, (void *)(intptr_t)(i % 2)) == 0);
+    assert(pthread_create(&clk, NULL, fc_clock, NULL) == 0);
+    for (int i = 0; i < 200; i++) {
+        write_maps(i % 2 ? "map 192.0.2.9 2001:db8::9\n" : "map 192.0.2.9 2001:db8::10\n");
+        assert(addrmap_reload() == 0);
+    }
+    write_maps("map 192.0.2.9 2001:db8::10\n"); assert(addrmap_reload() == 0);
+    atomic_store(&fc_stop, true);
+    for (int i = 0; i < 16; i++) pthread_join(th[i], NULL);
+    pthread_join(clk, NULL); (void)rl;
+    struct in_addr v4; struct in6_addr v6, b; inet_pton(AF_INET, "192.0.2.9", &v4); inet_pton(AF_INET6, "2001:db8::10", &b);
+    assert(map_ip4_to_ip6(&v6, &v4) == 0 && IN6_ARE_ADDR_EQUAL(&v6, &b));
+    puts("PASS: 16 threads with front caches race reloads without stale results");
+}
+
+/* The flat prefix index must return exactly what the linear list scan returns. */
+static void test_prefix_index_matches_linear(void)
+{
+    enum { N4 = 3000, N6 = 3000, Q = 200000 };
+    struct map4 *e4[N4 * 2]; struct map6 *e6[N6]; int n4 = 0, n6 = 0;
+    srand(12345);
+    INIT_LIST_HEAD(&gcfg.map4_list); INIT_LIST_HEAD(&gcfg.map6_list);
+    for (int i = 0; i < N4; i++) {
+        struct map_static *m = calloc(1, sizeof(*m)); assert(m);
+        int plen = (i % 7 == 0) ? 16 + rand() % 8 : 24 + rand() % 9;   /* nested prefixes */
+        uint32_t a = (uint32_t)rand() << 8 ^ (uint32_t)rand();
+        a &= plen ? 0xffffffffu << (32 - plen) : 0;
+        m->map4.addr.s_addr = htonl(a); assert(calc_ip4_mask(&m->map4.mask, &m->map4.addr, plen) == 0);
+        m->map4.prefix_len = plen; m->map4.type = MAP_TYPE_STATIC; INIT_LIST_HEAD(&m->map4.list);
+        if (insert_map4(&m->map4, NULL) < 0) { free(m); continue; }
+        e4[n4++] = &m->map4;
+    }
+    for (int i = 0; i < N6; i++) {
+        struct map_static *m = calloc(1, sizeof(*m)); assert(m);
+        int plen = 48 + rand() % 81;
+        for (int b = 0; b < 16; b++) m->map6.addr.s6_addr[b] = (uint8_t)rand();
+        m->map6.addr.s6_addr[0] = 0x20;
+        for (int b = 0; b < 16; b++) { int keep = plen - b * 8; m->map6.addr.s6_addr[b] &= keep >= 8 ? 0xff : keep <= 0 ? 0 : (uint8_t)(0xff << (8 - keep)); }
+        assert(calc_ip6_mask(&m->map6.mask, &m->map6.addr, plen) == 0);
+        m->map6.prefix_len = plen; m->map6.type = MAP_TYPE_STATIC; INIT_LIST_HEAD(&m->map6.list);
+        if (insert_map6(&m->map6, NULL) < 0) { free(m); continue; }
+        e6[n6++] = &m->map6;
+    }
+    assert(n4 > 2000 && n6 > 2000);
+    static struct map4 *r4[Q]; static struct map6 *r6[Q];
+    static struct in_addr q4[Q]; static struct in6_addr q6[Q];
+    for (int i = 0; i < Q; i++) {
+        if (i % 2 && n4) {   /* hit: inside a known prefix */
+            struct map4 *m = e4[rand() % n4]; q4[i].s_addr = m->addr.s_addr | (htonl((uint32_t)rand()) & ~m->mask.s_addr);
+        } else q4[i].s_addr = htonl((uint32_t)rand() << 8 ^ (uint32_t)rand());
+        if (i % 2 && n6) {
+            struct map6 *m = e6[rand() % n6];
+            for (int b = 0; b < 16; b++) q6[i].s6_addr[b] = m->addr.s6_addr[b] | ((uint8_t)rand() & ~m->mask.s6_addr[b]);
+        } else for (int b = 0; b < 16; b++) q6[i].s6_addr[b] = (uint8_t)rand();
+        r4[i] = find_map4(&q4[i]); r6[i] = find_map6(&q6[i]);
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < Q; i++) (void)find_map4(&q4[i]), (void)find_map6(&q6[i]);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert(addrmap_build_index() == 0);
+    int hits4 = 0, hits6 = 0;
+    for (int i = 0; i < Q; i++) {
+        assert(find_map4(&q4[i]) == r4[i]); assert(find_map6(&q6[i]) == r6[i]);
+        hits4 += r4[i] != NULL; hits6 += r6[i] != NULL;
+    }
+    assert(hits4 > Q / 4 && hits6 > Q / 4);
+    double lin = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec), idx;
+    {   struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int i = 0; i < Q; i++) (void)find_map4(&q4[i]), (void)find_map6(&q6[i]);
+        clock_gettime(CLOCK_MONOTONIC, &b); idx = (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec); }
+    printf("INFO: v4+v6 lookup linear %.0f ns, indexed %.0f ns per pair\n", lin / Q, idx / Q);
+    addrmap_free_index();
+    for (int i = 0; i < n4; i++) { list_del(&e4[i]->list); free(container_of(e4[i], struct map_static, map4)); }
+    for (int i = 0; i < n6; i++) { list_del(&e6[i]->list); free(container_of(e6[i], struct map_static, map6)); }
+    printf("PASS: prefix index equals linear scan (%d/%d v4/v6 entries, %d/%d hits)\n", n4, n6, hits4, hits6);
+}
+
 int main(void)
 {
+    test_hash_distribution();
     boundary_masks(); assert(config_init() == 0);
+    test_prefix_index_matches_linear();
     assert(pthread_mutex_init(&gcfg.map_mutex, NULL) == 0);
     assert(pthread_mutex_init(&gcfg.cache_mutex, NULL) == 0);
     gcfg.cache_size = 16; gcfg.hash_bits = 2; gcfg.rand[0] = 1;
@@ -217,6 +358,18 @@ int main(void)
     int count = 0; struct list_head *item;
     list_for_each(item, &gcfg.cache_active) count++;
     assert(count == 1);
+    test_front_cache_concurrency();
+    /* Per-thread front cache: a reload within the same clock second must be seen at once. */
+    {
+        struct in_addr a4, e4; struct in6_addr o6, e6; inet_pton(AF_INET, "192.0.2.9", &a4);
+        for (int i = 0; i < 3; i++) assert(map_ip4_to_ip6(&o6, &a4) == 0); /* warms this thread's table */
+        write_maps("map 192.0.2.9 2001:db8::77\n"); assert(addrmap_reload() == 0);
+        assert(map_ip4_to_ip6(&o6, &a4) == 0); inet_pton(AF_INET6, "2001:db8::77", &e6);
+        assert(IN6_ARE_ADDR_EQUAL(&o6, &e6));
+        assert(map_ip6_to_ip4(&e4, &e6, 0) == 0 && e4.s_addr == a4.s_addr);
+        write_maps("map 192.0.2.9 2001:db8::78\n"); assert(addrmap_reload() == 0);
+        assert(map_ip6_to_ip4(&e4, &e6, 0) != 0 || e4.s_addr != a4.s_addr); /* old v6 side no longer maps */
+    }
     write_maps(""); assert(addrmap_reload() == 0); unlink(gcfg.map_file);
     free(cache_storage); free(gcfg.hash_table4); free(gcfg.hash_table6);
     pthread_mutex_destroy(&gcfg.map_mutex); pthread_mutex_destroy(&gcfg.cache_mutex);

@@ -42,7 +42,7 @@ class LifecycleTests(unittest.TestCase):
             path = self.root / 'bin/flock'
             path.write_text('#!' + sys.executable + '\nimport fcntl,os,sys\na=sys.argv[1:]\nassert a.pop(0)=="-n"\nfd=os.open(a.pop(0),os.O_CREAT|os.O_RDWR,0o600)\ntry: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(1)\nos.set_inheritable(fd,True)\nos.execvp(a[0],a)\n')
             path.chmod(0o755)
-        if not Path('/proc/self').exists():
+        if not Path('/proc/self').exists() or not shutil.which('ps'):
             path = self.root / 'bin/ps'
             path.write_text('#!' + sys.executable + '''
 import os, sys
@@ -77,6 +77,13 @@ if pid is not None:
         self.log = self.root / 'log'
         self.env = {**os.environ, 'TAYGA_TEST_ROOT': str(self.root), 'TAYGA_TESTING': '1',
                     'PATH': str(self.root / 'bin') + os.pathsep + os.environ['PATH'], 'TEST_LOG': str(self.log)}
+        # FreeBSD-path helpers must not depend on net-tools/pf being installed
+        # in a minimal CI container; the tests only check call ordering.
+        for name in ('ifconfig', 'route', 'pfctl', 'sysrc'):
+            if not shutil.which(name):
+                path = self.root / 'bin' / name
+                path.write_text('#!/bin/sh\nexit 0\n')
+                path.chmod(0o755)
         for name in ('id', 'ip', 'iptables', 'ip6tables', 'sysctl', 'curl', 'systemctl'):
             script = 'exit 0'
             if name == 'id': script = 'echo 0'

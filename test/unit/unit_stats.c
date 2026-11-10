@@ -34,6 +34,66 @@ void dynamic_get_stats(const struct dynamic_pool *pool, uint32_t *mapped, uint32
 	}
 }
 
+/* Hold an older snapshot after collection but before filesystem I/O. A newer
+ * writer must complete while it is held, and remain published after release. */
+static pthread_mutex_t export_gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t export_cond = PTHREAD_COND_INITIALIZER;
+static bool older_waiting, release_older;
+static void await_export(bool *flag)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 10;
+    while (!*flag) assert(!pthread_cond_timedwait(&export_cond, &export_gate, &deadline));
+}
+void stats_export_test_before_io(const char *state)
+{
+    if (!state || strcmp(state, "older")) return;
+    pthread_mutex_lock(&export_gate);
+    older_waiting = true;
+    pthread_cond_broadcast(&export_cond);
+    await_export(&release_older);
+    pthread_mutex_unlock(&export_gate);
+}
+static void *older_export(void *path)
+{
+    stats_thread_init(-1);
+    stats_write_json(path, "older");
+    return NULL;
+}
+static void test_export_publication_order(void)
+{
+    char dir[] = "/tmp/tayga-export-XXXXXX";
+    assert(mkdtemp(dir));
+    char path[256], other[256];
+    snprintf(path, sizeof(path), "%s/status.json", dir);
+    snprintf(other, sizeof(other), "%s/other.json", dir);
+    older_waiting = release_older = false;
+    pthread_t old;
+    assert(!pthread_create(&old, NULL, older_export, path));
+    pthread_mutex_lock(&export_gate);
+    await_export(&older_waiting);
+    pthread_mutex_unlock(&export_gate);
+    stats_write_json(path, "newer");
+    stats_write_json(other, "independent");
+    pthread_mutex_lock(&export_gate);
+    release_older = true;
+    pthread_cond_broadcast(&export_cond);
+    pthread_mutex_unlock(&export_gate);
+    assert(!pthread_join(old, NULL));
+    FILE *f = fopen(path, "r");
+    assert(f);
+    char data[16384];
+    size_t n = fread(data, 1, sizeof(data) - 1, f);
+    data[n] = 0;
+    assert(!fclose(f));
+    assert(strstr(data, "\"state\": \"newer\""));
+    assert(!strstr(data, "\"state\": \"older\""));
+    assert(!access(other, R_OK));
+    assert(!unlink(path) && !unlink(other) && !rmdir(dir));
+    puts("PASS: slow JSON I/O does not hold collection lock or overwrite newer export");
+}
+
 static void *thread_worker_test(void *arg)
 {
 	int id = *(int *)arg;
@@ -213,6 +273,11 @@ int main(void)
 	stats_error();
 	stats_get_snapshot(&s);
 	assert(s.error_pkts == 1);
+	stats_icmp_sent();
+	stats_icmp_sent();
+	stats_self();
+	stats_get_snapshot(&s);
+	assert(s.icmp_sent_pkts == 2 && s.self_pkts == 1);
 	printf("PASS: per-worker counter increments work correctly\n");
 
 	/* Test 3: Multi-threaded concurrent worker test */
@@ -402,6 +467,47 @@ int main(void)
 	unlink(telem_json);
 	printf("PASS: telemetry background worker, trigger, and stop function correctly\n");
 
+	/* Test 9b: JSON strings keep valid UTF-8 and escape everything else */
+	{
+		const char *utf = "/tmp/test-telem-utf8.json";
+		unlink(utf);
+		stats_write_json(utf, "caf\xc3\xa9 \"q\" \xff");
+		f = fopen(utf, "r");
+		assert(f != NULL);
+		n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = '\0';
+		assert(strstr(buf, "\"state\": \"caf\xc3\xa9 \\\"q\\\" \\ufffd\"") != NULL);
+		assert(strstr(buf, "\"uptime_sec\": ") != NULL);
+		unlink(utf);
+		printf("PASS: JSON strings stay valid for UTF-8 and invalid bytes\n");
+	}
+
+	/* Test 9c: status temporaries of dead writers are removed at start-up */
+	{
+		char dir[] = "/tmp/tayga-stale-XXXXXX";
+		assert(mkdtemp(dir) != NULL);
+		char stale[300], live[300], other[300], path[300];
+		snprintf(stale, sizeof(stale), "%s/.tayga-status.99999999.7", dir);
+		snprintf(live, sizeof(live), "%s/.tayga-status.%ld.7", dir, (long)getppid());
+		snprintf(other, sizeof(other), "%s/unrelated", dir);
+		snprintf(path, sizeof(path), "%s/status.json", dir);
+		const char *files[] = { stale, live, other };
+		for (int i = 0; i < 3; i++) {
+			FILE *t = fopen(files[i], "w");
+			assert(t != NULL);
+			fclose(t);
+		}
+		telemetry_start(path, 60);
+		telemetry_stop();
+		assert(access(stale, F_OK) != 0);	/* writer is gone */
+		assert(access(live, F_OK) == 0);	/* writer still alive: another daemon's file */
+		assert(access(other, F_OK) == 0);
+		unlink(live); unlink(other); unlink(path);
+		rmdir(dir);
+		printf("PASS: stale status temporaries are removed, live ones kept\n");
+	}
+
 	/* Test 10: Low-rate continuous packet streaming interval flush */
 	printf("Testing low-rate continuous packet streaming interval flush...\n");
 	stats_init();
@@ -428,6 +534,7 @@ int main(void)
 	test_idle_sync();
 #endif
 	test_main_sync();
+	test_export_publication_order();
 	printf("All stats unit tests PASSED.\n");
 	return 0;
 }

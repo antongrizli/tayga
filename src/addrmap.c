@@ -17,6 +17,7 @@
  */
 
 #include "tayga.h"
+#include <stdatomic.h>
 
 /**
  * @brief Check if an IPv4 address is valid
@@ -183,20 +184,45 @@ int calc_ip6_mask(struct in6_addr *mask, const struct in6_addr *addr, int len)
 	return 0;
 }
 
-static uint32_t hash_ip4(const struct in_addr *addr4)
+/* 64-bit finalizer (Murmur3 fmix64): every input bit affects every output
+ * bit, so clients sharing a /64 prefix and differing only in low bits still
+ * spread over all buckets.  The secret gcfg.rand seed keeps bucket placement
+ * unpredictable to remote senders (hash-flooding). */
+static inline uint64_t mix64(uint64_t k)
 {
-	return ((uint32_t)(addr4->s_addr *
-				gcfg.rand[0])) >> (32 - gcfg.hash_bits);
+	k ^= k >> 33;
+	k *= 0xff51afd7ed558ccdULL;
+	k ^= k >> 33;
+	k *= 0xc4ceb9fe1a85ec53ULL;
+	k ^= k >> 33;
+	return k;
 }
 
-static uint32_t hash_ip6(const struct in6_addr *addr6)
+#ifdef ADDRMAP_TEST_HOOK
+#define HASH_LINKAGE
+#else
+#define HASH_LINKAGE static
+#endif
+
+HASH_LINKAGE uint32_t hash_ip4(const struct in_addr *addr4)
 {
-	uint32_t h;
-	h = addr6->s6_addr32[0] + gcfg.rand[0];
-	h ^= addr6->s6_addr32[1] + gcfg.rand[1];
-	h ^= addr6->s6_addr32[2] + gcfg.rand[2];
-	h ^= addr6->s6_addr32[3] + gcfg.rand[3];
-	return h >> (32 - gcfg.hash_bits);
+	if (!gcfg.hash_bits)
+		return 0;
+	uint64_t seed = ((uint64_t)gcfg.rand[0] << 32) | gcfg.rand[1];
+	return (uint32_t)(mix64((uint64_t)addr4->s_addr ^ seed) >> (64 - gcfg.hash_bits));
+}
+
+HASH_LINKAGE uint32_t hash_ip6(const struct in6_addr *addr6)
+{
+	if (!gcfg.hash_bits)
+		return 0;
+	uint64_t w0, w1;
+	memcpy(&w0, &addr6->s6_addr[0], sizeof(w0));
+	memcpy(&w1, &addr6->s6_addr[8], sizeof(w1));
+	uint64_t s0 = ((uint64_t)gcfg.rand[0] << 32) | gcfg.rand[1];
+	uint64_t s1 = ((uint64_t)gcfg.rand[2] << 32) | gcfg.rand[3];
+	uint64_t h = mix64(w0 ^ s0) ^ mix64(w1 ^ s1);
+	return (uint32_t)(mix64(h) >> (64 - gcfg.hash_bits));
 }
 
 static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
@@ -227,6 +253,7 @@ static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
  */
 int create_cache(void)
 {
+	addrmap_invalidate_front();
 	int i, hash_size = 1 << gcfg.hash_bits;
 	struct list_head *entry;
 	struct cache_entry *c;
@@ -269,6 +296,33 @@ int create_cache(void)
 	return 0;
 }
 
+
+/* Per-thread front cache (PERF-001). Every worker used to take cache_mutex on
+ * each packet, which collapsed throughput as threads were added. A thread now
+ * remembers recent pairs privately and only revalidates against the shared
+ * cache once per clock second (which also refreshes the shared last_use that
+ * cache ageing and dynamic leases rely on). Anything that can change or remove
+ * a mapping bumps g_map_gen, instantly invalidating all thread tables. */
+atomic_uint g_map_gen = 1;
+#define FC_BITS 8
+struct fc_ent { struct in_addr a4; struct in6_addr a6; time_t ts; unsigned gen; };
+static __thread struct fc_ent fc_tab4[1u << FC_BITS], fc_tab6[1u << FC_BITS];
+
+void addrmap_invalidate_front(void)
+{
+	atomic_fetch_add_explicit(&g_map_gen, 1, memory_order_release);
+}
+static inline unsigned fc_idx4(const struct in_addr *a)
+{
+	return (a->s_addr * 0x9E3779B1u) >> (32 - FC_BITS);
+}
+static inline unsigned fc_idx6(const struct in6_addr *a)
+{
+	uint32_t h = a->s6_addr32[0] ^ (a->s6_addr32[1] * 0x85ebca6bu) ^ (a->s6_addr32[2] * 0xc2b2ae35u)
+		^ (a->s6_addr32[3] * 0x9E3779B1u);
+	return (h * 0x9E3779B1u) >> (32 - FC_BITS);
+}
+
 /* This must be called within cache mutex lock */
 static struct cache_entry *cache_insert(const struct in_addr *addr4,
 		const struct in6_addr *addr6,
@@ -304,7 +358,126 @@ static struct cache_entry *cache_insert(const struct in_addr *addr4,
  * @param addr4 IPv4 address to check
  * @returns Cache entry, or NULL if none found
  */
-struct map4 *find_map4(const struct in_addr *addr4)
+/*
+ * Flat prefix index for immutable configurations with many static maps
+ * (SIIT-DC EAM tables).  The linked lists are scanned linearly, which costs
+ * O(N) per cold lookup once the address cache is disabled.  The index keeps one
+ * sorted array per distinct prefix length, longest first, and is only built
+ * after configuration is final, so it needs no locking.
+ */
+#define PFX_INDEX_MIN_ENTRIES 9
+
+struct idx4_ent { uint32_t addr; struct map4 *m; };
+struct idx4_len { uint32_t mask; size_t n; struct idx4_ent *e; };
+struct idx6_ent { uint64_t hi, lo; struct map6 *m; };
+struct idx6_len { uint64_t mhi, mlo; size_t n; struct idx6_ent *e; };
+
+static struct idx4_len *g_idx4;
+static size_t g_idx4_n;
+static struct idx6_len *g_idx6;
+static size_t g_idx6_n;
+
+static int idx4_cmp(const void *a, const void *b)
+{
+	uint32_t x = ((const struct idx4_ent *)a)->addr, y = ((const struct idx4_ent *)b)->addr;
+	return x < y ? -1 : x > y;
+}
+
+static int idx6_cmp(const void *a, const void *b)
+{
+	const struct idx6_ent *x = a, *y = b;
+	if (x->hi != y->hi) return x->hi < y->hi ? -1 : 1;
+	return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+static uint64_t load_be64(const uint8_t *p)
+{
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+	return v;
+}
+
+void addrmap_free_index(void)
+{
+	for (size_t i = 0; i < g_idx4_n; i++) free(g_idx4[i].e);
+	for (size_t i = 0; i < g_idx6_n; i++) free(g_idx6[i].e);
+	free(g_idx4); free(g_idx6);
+	g_idx4 = NULL; g_idx6 = NULL; g_idx4_n = g_idx6_n = 0;
+}
+
+/* Build the index from the (final, immutable) lists; 0 = built or not needed. */
+int addrmap_build_index(void)
+{
+	size_t n4 = 0, n6 = 0;
+	struct list_head *entry;
+
+	addrmap_free_index();
+	list_for_each(entry, &gcfg.map4_list) n4++;
+	list_for_each(entry, &gcfg.map6_list) n6++;
+	if (n4 < PFX_INDEX_MIN_ENTRIES && n6 < PFX_INDEX_MIN_ENTRIES)
+		return 0;
+
+	/* IPv4: one group per prefix length, 32 down to 0 */
+	struct idx4_len *g4 = calloc(33, sizeof(*g4));
+	struct idx6_len *g6 = calloc(129, sizeof(*g6));
+	if (!g4 || !g6) goto oom;
+	list_for_each(entry, &gcfg.map4_list) {
+		struct map4 *m = list_entry(entry, struct map4, list);
+		g4[m->prefix_len].n++;
+	}
+	list_for_each(entry, &gcfg.map6_list) {
+		struct map6 *m = list_entry(entry, struct map6, list);
+		g6[m->prefix_len].n++;
+	}
+	for (int l = 0; l <= 32; l++) {
+		if (!g4[l].n) continue;
+		g4[l].e = malloc(g4[l].n * sizeof(*g4[l].e));
+		if (!g4[l].e) goto oom;
+		g4[l].mask = l ? 0xffffffffu << (32 - l) : 0;
+		g4[l].n = 0;
+	}
+	for (int l = 0; l <= 128; l++) {
+		if (!g6[l].n) continue;
+		g6[l].e = malloc(g6[l].n * sizeof(*g6[l].e));
+		if (!g6[l].e) goto oom;
+		g6[l].mhi = l >= 64 ? ~0ull : (l ? ~0ull << (64 - l) : 0);
+		g6[l].mlo = l <= 64 ? 0 : (l >= 128 ? ~0ull : ~0ull << (128 - l));
+		g6[l].n = 0;
+	}
+	list_for_each(entry, &gcfg.map4_list) {
+		struct map4 *m = list_entry(entry, struct map4, list);
+		struct idx4_len *g = &g4[m->prefix_len];
+		g->e[g->n].addr = ntohl(m->addr.s_addr) & g->mask;
+		g->e[g->n++].m = m;
+	}
+	list_for_each(entry, &gcfg.map6_list) {
+		struct map6 *m = list_entry(entry, struct map6, list);
+		struct idx6_len *g = &g6[m->prefix_len];
+		g->e[g->n].hi = load_be64(m->addr.s6_addr) & g->mhi;
+		g->e[g->n].lo = load_be64(m->addr.s6_addr + 8) & g->mlo;
+		g->e[g->n++].m = m;
+	}
+	for (int l = 0; l <= 32; l++) if (g4[l].n) qsort(g4[l].e, g4[l].n, sizeof(*g4[l].e), idx4_cmp);
+	for (int l = 0; l <= 128; l++) if (g6[l].n) qsort(g6[l].e, g6[l].n, sizeof(*g6[l].e), idx6_cmp);
+	/* Compact into longest-first arrays of non-empty groups. */
+	struct idx4_len *c4 = calloc(33, sizeof(*c4));
+	struct idx6_len *c6 = calloc(129, sizeof(*c6));
+	if (!c4 || !c6) { free(c4); free(c6); goto oom; }
+	for (int l = 32; l >= 0; l--) if (g4[l].n) c4[g_idx4_n++] = g4[l];
+	for (int l = 128; l >= 0; l--) if (g6[l].n) c6[g_idx6_n++] = g6[l];
+	free(g4); free(g6);
+	g_idx4 = c4; g_idx6 = c6;
+	return 0;
+oom:
+	if (g4) for (int l = 0; l <= 32; l++) free(g4[l].e);
+	if (g6) for (int l = 0; l <= 128; l++) free(g6[l].e);
+	free(g4); free(g6);
+	g_idx4_n = g_idx6_n = 0;
+	slog(LOG_WARNING, "Unable to allocate prefix index; using linear map lookup\n");
+	return 0;
+}
+
+static struct map4 *find_map4_linear(const struct in_addr *addr4)
 {
 	struct list_head *entry;
 	struct map4 *m;
@@ -315,6 +488,21 @@ struct map4 *find_map4(const struct in_addr *addr4)
 			return m;
 	}
 	return NULL;
+}
+
+struct map4 *find_map4(const struct in_addr *addr4)
+{
+	if (g_idx4) {
+		uint32_t a = ntohl(addr4->s_addr);
+		for (size_t i = 0; i < g_idx4_n; i++) {
+			const struct idx4_len *g = &g_idx4[i];
+			struct idx4_ent key = { a & g->mask, NULL };
+			const struct idx4_ent *hit = bsearch(&key, g->e, g->n, sizeof(*g->e), idx4_cmp);
+			if (hit) return hit->m;
+		}
+		return NULL;
+	}
+	return find_map4_linear(addr4);
 }
 /**
  * @brief Check if an IPv6 address is in the cache
@@ -327,6 +515,16 @@ struct map6 *find_map6(const struct in6_addr *addr6)
 	struct list_head *entry;
 	struct map6 *m;
 
+	if (g_idx6) {
+		uint64_t hi = load_be64(addr6->s6_addr), lo = load_be64(addr6->s6_addr + 8);
+		for (size_t i = 0; i < g_idx6_n; i++) {
+			const struct idx6_len *g = &g_idx6[i];
+			struct idx6_ent key = { hi & g->mhi, lo & g->mlo, NULL };
+			const struct idx6_ent *hit = bsearch(&key, g->e, g->n, sizeof(*g->e), idx6_cmp);
+			if (hit) return hit->m;
+		}
+		return NULL;
+	}
 	list_for_each(entry, &gcfg.map6_list) {
 		m = list_entry(entry, struct map6, list);
 		if (IN6_IS_IN_NET(addr6, &m->addr, &m->mask))
@@ -498,7 +696,17 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 	struct map_static *s;
 	struct map_dynamic *d = NULL;
 
+	unsigned gen = 0;
+	time_t t_now = 0;
+	struct fc_ent *fe = NULL;
 	if (gcfg.cache_size) {
+		gen = atomic_load_explicit(&g_map_gen, memory_order_acquire);
+		t_now = atomic_load_explicit(&now, memory_order_relaxed);
+		fe = &fc_tab4[fc_idx4(addr4)];
+		if (fe->gen == gen && fe->ts == t_now && fe->a4.s_addr == addr4->s_addr) {
+			*addr6 = fe->a6;
+			return 0;
+		}
 		hash = hash_ip4(addr4);
 
 		pthread_mutex_lock(&gcfg.cache_mutex);
@@ -506,8 +714,10 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 			c = list_entry(entry, struct cache_entry, hash4);
 			if (addr4->s_addr == c->addr4.s_addr) {
 				*addr6 = c->addr6;
-				c->last_use = now;
+				if (c->last_use != now)	/* avoid dirtying the line on every hit */
+					c->last_use = now;
 				pthread_mutex_unlock(&gcfg.cache_mutex);
+				fe->a4 = *addr4; fe->a6 = *addr6; fe->ts = t_now; fe->gen = gen;
 				return 0;
 			}
 		}
@@ -601,6 +811,7 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 				c->flags |= CACHE_F_REP_AGEOUT;
 		}
 		pthread_mutex_unlock(&gcfg.cache_mutex);
+		if (c && fe) { fe->a4 = *addr4; fe->a6 = *addr6; fe->ts = t_now; fe->gen = gen; }
 	}
 
 	if (!gcfg.maps_immutable)
@@ -676,7 +887,17 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 	struct map_static *s;
 	struct map_dynamic *d = NULL;
 
+	unsigned gen = 0;
+	time_t t_now = 0;
+	struct fc_ent *fe = NULL;
 	if (gcfg.cache_size) {
+		gen = atomic_load_explicit(&g_map_gen, memory_order_acquire);
+		t_now = atomic_load_explicit(&now, memory_order_relaxed);
+		fe = &fc_tab6[fc_idx6(addr6)];
+		if (fe->gen == gen && fe->ts == t_now && IN6_ARE_ADDR_EQUAL(&fe->a6, addr6)) {
+			*addr4 = fe->a4;
+			return 0;
+		}
 		hash = hash_ip6(addr6);
 
 		pthread_mutex_lock(&gcfg.cache_mutex);
@@ -684,8 +905,10 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 			c = list_entry(entry, struct cache_entry, hash6);
 			if (IN6_ARE_ADDR_EQUAL(addr6, &c->addr6)) {
 				*addr4 = c->addr4;
-				c->last_use = now;
+				if (c->last_use != now)	/* avoid dirtying the line on every hit */
+					c->last_use = now;
 				pthread_mutex_unlock(&gcfg.cache_mutex);
+				fe->a4 = *addr4; fe->a6 = *addr6; fe->ts = t_now; fe->gen = gen;
 				return 0;
 			}
 		}
@@ -790,6 +1013,7 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 				c->flags |= CACHE_F_REP_AGEOUT;
 		}
 		pthread_mutex_unlock(&gcfg.cache_mutex);
+		if (c && fe) { fe->a4 = *addr4; fe->a6 = *addr6; fe->ts = t_now; fe->gen = gen; }
 	}
 
 	if (!gcfg.maps_immutable)
@@ -993,6 +1217,7 @@ int addrmap_reload(void)
 			list_del(&c->hash6);
 			list_add(&c->list, &gcfg.cache_pool);
 		}
+		addrmap_invalidate_front();
 		pthread_mutex_unlock(&gcfg.cache_mutex);
 		pthread_mutex_unlock(&gcfg.map_mutex);
 	}

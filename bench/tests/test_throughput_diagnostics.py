@@ -6,6 +6,7 @@ import tempfile
 import sys
 import os
 import subprocess
+import shutil
 import unittest
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -174,6 +175,9 @@ class CollectorFailureTests(unittest.TestCase):
             self.assertFalse(installed.exists())
 
     def test_default_recovery_reaches_evaluator_on_system_bash(self):
+        bash = shutil.which('bash')
+        if bash is None:
+            self.skipTest('bash is not installed')
         repo=Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);harness=root/'harness';(harness/'bench/lima').mkdir(parents=True)
@@ -189,7 +193,7 @@ class CollectorFailureTests(unittest.TestCase):
                      BASELINE_STEERING='kernel',CANDIDATE_STEERING='flows')
             for purpose in ('acceptance','diagnostic'):
                 env['RECOVERY_PURPOSE']=purpose
-                proc=subprocess.run(['/bin/bash',str(repo/'bench/lima/run-recovery.sh')],env=env,capture_output=True,text=True,timeout=30)
+                proc=subprocess.run([bash,str(repo/'bench/lima/run-recovery.sh')],env=env,capture_output=True,text=True,timeout=30)
                 self.assertEqual(proc.returncode,0,proc.stderr)
                 args=json.loads(output.read_text())
                 self.assertEqual('--diagnostic' in args,purpose=='diagnostic')

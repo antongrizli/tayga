@@ -16,6 +16,12 @@
  *  GNU General Public License for more details.
  */
 
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#endif
 #include "tayga.h"
 #include "stats.h"
 #include "gso.h"
@@ -84,6 +90,7 @@ void usage(int code) {
 }
 
 /* Used during argument parsing, before logging is setup */
+__attribute__((format(printf, 1, 2)))
 void die(const char *format, ...) {
 	va_list ap;
 	va_start(ap, format);
@@ -276,6 +283,32 @@ static void * worker(void * arg)
 	int idx = *(int *)arg;
 	uint8_t *recv_buf = worker_buffers[idx];
 	stats_thread_init(idx);
+	if (gcfg.worker_affinity) {
+		cpu_set_t allowed, one;
+		if (!sched_getaffinity(0, sizeof(allowed), &allowed)) {
+			int target = -1;
+			if (gcfg.worker_affinity == 2 && gcfg.worker_cpu_count > 0) {
+				/* explicit list: worker i -> list[i % count] */
+				int c = gcfg.worker_cpu[idx % gcfg.worker_cpu_count];
+				if (c < CPU_SETSIZE && CPU_ISSET(c, &allowed))
+					target = c;
+				else
+					slog(LOG_WARNING, "worker %d: CPU %d is not in the allowed set; not pinned\n", idx, c);
+			} else {
+				int want = idx % CPU_COUNT(&allowed);
+				for (int c = 0; c < CPU_SETSIZE; c++) {
+					if (!CPU_ISSET(c, &allowed) || want--) continue;
+					target = c;
+					break;
+				}
+			}
+			if (target >= 0) {
+				CPU_ZERO(&one); CPU_SET(target, &one);
+				if (pthread_setaffinity_np(pthread_self(), sizeof(one), &one))
+					slog(LOG_WARNING, "worker %d: cannot pin to CPU %d\n", idx, target);
+			}
+		}
+	}
 	atomic_fetch_add_explicit(&workers_ready, 1, memory_order_release);
 	int gate;
 	while (!(gate = atomic_load_explicit(&worker_start_gate, memory_order_acquire)))
@@ -392,7 +425,7 @@ int main(int argc, char **argv)
 	/* Init config structure */
 	if(config_init() < 0) return 1;
 	stats_init();
-	atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
+	atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
 	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) ||
 	    pthread_mutex_init(&gcfg.map_mutex, NULL))
 		die("Failed to initialize mapping mutexes");
@@ -720,7 +753,7 @@ int main(int argc, char **argv)
 	slog(LOG_DEBUG, "Compiled from " TAYGA_BRANCH "\n");
 	slog(LOG_DEBUG, "Commit " TAYGA_COMMIT "\n");
 
-	if (gcfg.cache_size) {
+	if (gcfg.cache_size || gcfg.flow_label_mode == FLOW_LABEL_COMPUTE) {
 		int urandom_fd = open("/dev/urandom", O_RDONLY);
 		if (urandom_fd < 0) {
 			slog(LOG_CRIT, "Unable to open /dev/urandom, "
@@ -728,13 +761,13 @@ int main(int argc, char **argv)
 			exit(1);
 		}		
 		int len = 8 * sizeof(uint32_t);
-		int ret = read(urandom_fd, gcfg.rand, len);
-		if (ret < 0) {
+		int nread = read(urandom_fd, gcfg.rand, len);
+		if (nread < 0) {
 			slog(LOG_CRIT, "read /dev/urandom returned %s\n",
 					strerror(errno));
 			exit(1);
 		}
-		if (ret < len) {
+		if (nread < len) {
 			slog(LOG_CRIT, "read /dev/urandom returned EOF\n");
 			exit(1);
 		}
@@ -793,17 +826,17 @@ int main(int argc, char **argv)
 	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
 	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 
-#ifdef __linux__
-	for (int i = 0; i < gcfg.workers; i++) {
-		thread_ids[i] = i;
-		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
-		if (ret) { errno = ret; goto startup_failed; }
-		created_workers++;
-	}
-	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
-		usleep(1000);
-#endif
+	/* Readiness notification is optional (sd_notify): an unusable
+	 * NOTIFY_SOCKET inherited from the environment must not stop the translator. */
+	ret = notify_prepare();
+	if (ret < 0)
+		slog(LOG_WARNING, "Readiness socket unavailable (%s); continuing without notification\n",
+				strerror(-ret));
 
+	/* Confine and drop privileges BEFORE any thread exists: an error here
+	 * can then abort cleanly, and no thread can retain extra credentials. */
+	if (do_chroot)
+		telemetry_prepare_dir(gcfg.status_path);
 	if (do_chroot) {
 		if (chroot(gcfg.data_dir) < 0) {
 			slog(LOG_CRIT, "Unable to chroot to %s: %s\n",
@@ -835,7 +868,16 @@ int main(int argc, char **argv)
 		}
 	}
 
-
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		thread_ids[i] = i;
+		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
+		if (ret) { errno = ret; goto startup_failed; }
+		created_workers++;
+	}
+	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
+		usleep(1000);
+#endif
 
 	/* Print running information */
 	print_op_info();
@@ -854,7 +896,7 @@ int main(int argc, char **argv)
 	atomic_store_explicit(&worker_start_gate, 1, memory_order_release);
 #endif
 	telemetry_start(gcfg.status_path, 5);
-	if (gcfg.log_out == LOG_TO_JOURNAL) {
+	{
 		int r = notify("READY=1");
 		if (r < 0) slog(LOG_WARNING, "Readiness notification failed: %s\n", strerror(-r));
 	}
@@ -918,7 +960,7 @@ int main(int argc, char **argv)
 			stats_flush_idle();
 			last_main_flush = main_mono_now;
 		}
-		atomic_store_explicit(&now, time(NULL), memory_order_relaxed);
+		atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
 		if (gcfg.cache_size && (gcfg.last_cache_maint +
 						CACHE_CHECK_INTERVAL < now ||
 					gcfg.last_cache_maint > now)) {

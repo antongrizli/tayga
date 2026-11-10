@@ -45,9 +45,9 @@ validate_uint "TAYGA_WORKERS" "$TAYGA_WORKERS"
 validate_uint "TAYGA_OFFLINK_MTU" "$TAYGA_OFFLINK_MTU"
 
 case "$TAYGA_OFFLOAD" in
-  off|tcp|auto) ;;
+  off|tcp|udp|auto) ;;
   *)
-    echo "ERROR: TAYGA_OFFLOAD must be 'off', 'tcp', or 'auto' (got '$TAYGA_OFFLOAD')" >&2
+    echo "ERROR: TAYGA_OFFLOAD must be 'off', 'tcp', 'udp', or 'auto' (got '$TAYGA_OFFLOAD')" >&2
     exit 64
     ;;
 esac
@@ -101,6 +101,20 @@ if [ "$ENABLE_DNS64" = "yes" ] || [ "$ENABLE_DNS64" = "true" ]; then
     off) UNBOUND_MODULES="dns64 iterator"; UNBOUND_DNSSEC_BLOCK="" ;;
     *) echo "ERROR: DNS64_DNSSEC must be 'validate' or 'off' (got '$DNS64_DNSSEC')" >&2; exit 64 ;;
   esac
+  # Never run an open recursive resolver: allow only loopback/private/ULA/
+  # link-local sources unless the operator lists CIDRs explicitly.
+  DNS64_ALLOW_CIDRS="${DNS64_ALLOW_CIDRS:-127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 ::1/128 fc00::/7 fe80::/10}"
+  UNBOUND_ACCESS_BLOCK=""
+  for cidr in $(echo "$DNS64_ALLOW_CIDRS" | tr ',' ' '); do
+    case "$cidr" in
+      ''|*[!0-9a-fA-F:./]*|*/|/*) echo "ERROR: invalid DNS64_ALLOW_CIDRS entry '$cidr'" >&2; exit 64 ;;
+    esac
+    UNBOUND_ACCESS_BLOCK="${UNBOUND_ACCESS_BLOCK}    access-control: ${cidr} allow
+"
+  done
+  [ -n "$UNBOUND_ACCESS_BLOCK" ] || { echo "ERROR: DNS64_ALLOW_CIDRS is empty" >&2; exit 64; }
+  UNBOUND_ACCESS_BLOCK="${UNBOUND_ACCESS_BLOCK%
+}"
   mkdir -p "$TAYGA_RUNTIME_DIR"/unbound
   cat > "$TAYGA_RUNTIME_DIR/unbound.conf" <<CONF_EOF
 server:
@@ -115,8 +129,7 @@ server:
     do-tcp: yes
     edns-buffer-size: 1232
     max-udp-size: 1232
-    access-control: 0.0.0.0/0 allow
-    access-control: ::0/0 allow
+${UNBOUND_ACCESS_BLOCK}
     module-config: "${UNBOUND_MODULES}"
     dns64-prefix: ${TAYGA_PREF64}
     dns64-synthall: no
@@ -135,6 +148,10 @@ CONF_EOF
   for upstream in $DNS64_UPSTREAM; do
     trimmed=$(echo "$upstream" | tr -d ' ')
     if [ -n "$trimmed" ]; then
+      # Only IP literals with optional @port / #name; blocks config injection.
+      case "$trimmed" in
+        *[!0-9a-zA-Z:.@#_-]*) echo "ERROR: invalid DNS64_UPSTREAM entry '$trimmed'" >&2; exit 64 ;;
+      esac
       echo "    forward-addr: $trimmed" >> "$TAYGA_RUNTIME_DIR/unbound.conf"
     fi
   done

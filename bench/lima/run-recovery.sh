@@ -10,6 +10,9 @@ RECOVERY_MODE="${RECOVERY_MODE:-configuration}"
 RECOVERY_PURPOSE="${RECOVERY_PURPOSE:-acceptance}"
 BASELINE_STEERING="${BASELINE_STEERING:-kernel}"
 CANDIDATE_STEERING="${CANDIDATE_STEERING:-flows}"
+# Optional per-arm worker CPU pinning (on|off); empty leaves the daemon default.
+BASELINE_WORKER_AFFINITY="${BASELINE_WORKER_AFFINITY:-}"
+CANDIDATE_WORKER_AFFINITY="${CANDIDATE_WORKER_AFFINITY:-}"
 ROOT="${PERF_SESSION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tayga/perf-sessions}"
 STAMP="${RECOVERY_STAMP:-recovery-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPEATS="${REPEATS:-5}"
@@ -33,10 +36,10 @@ for ((trial=1; trial<=REPEATS; trial++)); do
     session="$ROOT/$name-lima-debian13-arm64"
     [ ! -e "$session" ] || { echo "Refusing to overwrite session: $session" >&2; exit 64; }
     if [ "$arm" = baseline ]; then
-      baselines+=("$session"); arm_repo="$BASELINE_REPO"; mode="$BASELINE_STEERING"
+      baselines+=("$session"); arm_repo="$BASELINE_REPO"; mode="$BASELINE_STEERING"; affinity="$BASELINE_WORKER_AFFINITY"
       revision="${BASELINE_REVISION:-$(git -C "$arm_repo" rev-parse HEAD 2>/dev/null || printf unknown)}"
     else
-      candidates+=("$session"); arm_repo="$CANDIDATE_REPO"; mode="$CANDIDATE_STEERING"
+      candidates+=("$session"); arm_repo="$CANDIDATE_REPO"; mode="$CANDIDATE_STEERING"; affinity="$CANDIDATE_WORKER_AFFINITY"
       revision="${CANDIDATE_REVISION:-$(git -C "$arm_repo" rev-parse HEAD 2>/dev/null || printf unknown)}"
     fi
     echo "Recovery trial $trial/$REPEATS: $arm ($mode)"
@@ -45,7 +48,7 @@ for ((trial=1; trial<=REPEATS; trial++)); do
       CLIENTS=4 FLOWS=1 WORKERS=3 CLIENT_PORT_BASE="$((40000 + trial * 100))" \
       DURATION=20 WARMUP=5 DIRECTIONS='download upload' PERF_MODES=none \
       PROTOCOL=tcp CLAT_OFFLOAD=auto CLAT_OFFLINK_MTU=1280 \
-      CLAT_STEERING="$mode" SESSION_STAMP="$name" \
+      CLAT_STEERING="$mode" CLAT_WORKER_AFFINITY="$affinity" SESSION_STAMP="$name" \
       "$HARNESS_REPO/bench/lima/run-host.sh" || echo "Retained failed trial: $name" >&2
   done
 done

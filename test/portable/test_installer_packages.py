@@ -296,11 +296,27 @@ exit "${TEST_VERIFY_RC:-0}"
         lock_dir = self.state / 'operation.lock'
         lock_dir.mkdir(parents=True, exist_ok=True)
         (lock_dir / 'pid').write_text(str(os.getpid()))
-        boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip() if Path('/proc/sys/kernel/random/boot_id').is_file() else 'boot-unknown'
-        (lock_dir / 'boot_id').write_text(boot_id)
+        # A live PID must block even before the owner publishes boot_id.
+        # Do not invent a Linux-only boot identity on FreeBSD: it would turn
+        # this into the different foreign-stale-lock case.
+
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn('Another operation is currently in progress', res.stderr)
+        self.assertEqual((lock_dir / 'pid').read_text(), str(os.getpid()))
+        self.assertTrue(lock_dir.is_dir())
+
+    def test_upgrade_preserves_foreign_lock_from_another_boot(self):
+        lock_dir = self.state / 'operation.lock'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'pid').write_text(str(os.getpid()))
+        (lock_dir / 'boot_id').write_text('foreign-test-boot')
+        res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],
+                             env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Refusing to remove a foreign operation lock', res.stderr)
+        self.assertEqual((lock_dir / 'boot_id').read_text(), 'foreign-test-boot')
+        self.assertFalse((lock_dir / 'package-upgrade').exists())
 
     def test_upgrade_preflight_validates_package_identity(self):
         res = subprocess.run(['sh', str(self.upgrader), 'apply', str(self.pkg)],

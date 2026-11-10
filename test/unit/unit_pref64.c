@@ -13,7 +13,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "../../src/helpers/pref64_ra.h"
 
+extern int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                                  int *out_plen, uint32_t *out_lifetime_sec);
+extern size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
+                              uint8_t v4_list[][4], size_t max_v4);
 extern int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_len);
 
 static void test_case(const char *in_str, const char *expected_pref, int expected_len)
@@ -47,9 +56,242 @@ static void test_case(const char *in_str, const char *expected_pref, int expecte
     printf("PASS: %s -> %s/%d\n", in_str, out_str, plen);
 }
 
+/* Build an RA (16-byte header) followed by one PREF64 option. */
+static size_t build_ra(uint8_t *ra, unsigned lifetime_units, unsigned plc, const char *prefix96)
+{
+    memset(ra, 0, 64);
+    ra[0] = 134;
+    ra[16] = 38; ra[17] = 2;
+    uint16_t v = (uint16_t)((lifetime_units << 3) | plc);
+    ra[18] = (uint8_t)(v >> 8); ra[19] = (uint8_t)v;
+    struct in6_addr a;
+    assert(inet_pton(AF_INET6, prefix96, &a) == 1);
+    memcpy(ra + 20, a.s6_addr, 12);
+    return 32;
+}
+
+extern int parse_ra_pref64_update(const uint8_t *, size_t, struct in6_addr *,
+                                  int *, uint32_t *, const struct in6_addr *, int);
+static void test_ra_updates(void)
+{
+    uint8_t ra[64], other[64];
+    struct in6_addr active, out;
+    int plen;
+    uint32_t life;
+    assert(inet_pton(AF_INET6, "64:ff9b::", &active) == 1);
+    build_ra(ra, 1, 0, "64:ff9b::");
+    build_ra(other, 500, 0, "2001:db8:aaaa::");
+    memcpy(ra + 32, other + 16, 16);
+    assert(parse_ra_pref64_update(ra, 48, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 8 && !memcmp(&out, &active, sizeof(out)));
+    /* A withdrawal of the active prefix selects a live alternative. */
+    ra[18] = ra[19] = 0;
+    assert(parse_ra_pref64_update(ra, 48, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 4000 && memcmp(&out, &active, sizeof(out)));
+    assert(parse_ra_pref64_update(ra, 32, &out, &plen, &life, &active, 96) == 0);
+    assert(life == 0 && !memcmp(&out, &active, sizeof(out)));
+    build_ra(ra, 0, 0, "2001:db8:aaaa::");
+    assert(parse_ra_pref64_update(ra, 32, &out, &plen, &life, &active, 96) != 0);
+    assert(parse_ra_pref64_option(ra, 32, &out, &plen, &life) != 0);
+}
+
+static void test_ra(void)
+{
+    static const int plen[6] = {96, 64, 56, 48, 40, 32};
+    uint8_t ra[64];
+    struct in6_addr out;
+    int pl;
+    uint32_t life = 0;
+    for (unsigned plc = 0; plc < 6; plc++) {
+        size_t n = build_ra(ra, 100, plc, "2001:db8:1:2:3:4:ffff:ffff");
+        assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) == 0);
+        assert(pl == plen[plc] && life == 800);
+        for (int i = pl / 8; i < 16; i++)
+            assert(out.s6_addr[i] == 0);	/* bits beyond plen cleared */
+    }
+    size_t n = build_ra(ra, 100, 0, "64:ff9b::");
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) == 0 && pl == 96);
+    n = build_ra(ra, 100, 6, "64:ff9b::");		/* reserved PLC */
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    n = build_ra(ra, 100, 7, "64:ff9b::");
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    n = build_ra(ra, 0, 0, "64:ff9b::");		/* lifetime 0 = deprecated */
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    n = build_ra(ra, 100, 0, "ff02::");		/* multicast prefix */
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    n = build_ra(ra, 100, 0, "64:ff9b::");
+    assert(parse_ra_pref64_option(ra, n - 8, &out, &pl, &life) != 0);	/* truncated */
+    ra[17] = 0;					/* zero-length option */
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    ra[17] = 2; ra[0] = 133;			/* not an RA */
+    assert(parse_ra_pref64_option(ra, n, &out, &pl, &life) != 0);
+    assert(parse_ra_pref64_option(ra, 15, &out, &pl, &life) != 0);
+    /* Two options: the longer lifetime wins. */
+    uint8_t two[80];
+    memset(two, 0, sizeof(two));
+    two[0] = 134;
+    for (int k = 0; k < 2; k++) {
+        uint8_t *o = two + 16 + 16 * k;
+        o[0] = 38; o[1] = 2;
+        uint16_t v = (uint16_t)(((k ? 500 : 100) << 3));
+        o[2] = (uint8_t)(v >> 8); o[3] = (uint8_t)v;
+        struct in6_addr a;
+        inet_pton(AF_INET6, k ? "2001:db8:aaaa::" : "64:ff9b::", &a);
+        memcpy(o + 4, a.s6_addr, 12);
+    }
+    assert(parse_ra_pref64_option(two, 48, &out, &pl, &life) == 0 && life == 4000);
+    printf("PASS: RFC 8781 PREF64 RA option parsing\n");
+}
+
+/* SEC-002: hosts-file override must ignore symlinks, FIFOs and unsafe modes. */
+static void test_hosts_file(void)
+{
+    char dir[] = "/tmp/pref64-hosts-XXXXXX";
+    assert(mkdtemp(dir));
+    char path[256], link[256], fifo[256], wr[256];
+    uint8_t v4[8][4];
+    snprintf(path, sizeof(path), "%s/hosts", dir);
+    snprintf(link, sizeof(link), "%s/link", dir);
+    snprintf(fifo, sizeof(fifo), "%s/fifo", dir);
+    snprintf(wr, sizeof(wr), "%s/writable", dir);
+
+    FILE *f = fopen(path, "w"); assert(f);
+    fputs("# comment\n10.0.3.2 v4gw.example v4gw.example.lan\nbad line\n", f);
+    fclose(f);
+    assert(chmod(path, 0644) == 0);
+    assert(lookup_hosts_v4(path, "V4GW.example", v4, 8) == 1);		/* case-insensitive */
+    assert(v4[0][0] == 10 && v4[0][3] == 2);
+    assert(lookup_hosts_v4(path, "other.example", v4, 8) == 0);
+    assert(lookup_hosts_v4(NULL, "v4gw.example", v4, 8) == 0);		/* no implicit file */
+    assert(lookup_hosts_v4("/nonexistent/hosts", "v4gw.example", v4, 8) == 0);
+
+    assert(symlink(path, link) == 0);
+    assert(lookup_hosts_v4(link, "v4gw.example", v4, 8) == 0);		/* symlink refused */
+
+    assert(mkfifo(fifo, 0600) == 0);
+    assert(lookup_hosts_v4(fifo, "v4gw.example", v4, 8) == 0);		/* FIFO must not block */
+
+    f = fopen(wr, "w"); assert(f);
+    fputs("10.9.9.9 v4gw.example\n", f); fclose(f);
+    assert(chmod(wr, 0666) == 0);
+    assert(lookup_hosts_v4(wr, "v4gw.example", v4, 8) == 0);		/* world-writable refused */
+
+    unlink(path); unlink(link); unlink(fifo); unlink(wr); rmdir(dir);
+    printf("PASS: hosts-file override refuses symlink, FIFO and writable files\n");
+}
+
+static struct in6_addr A6(const char *text)
+{
+    struct in6_addr a;
+    assert(inet_pton(AF_INET6, text, &a) == 1);
+    return a;
+}
+
+static int picked(const struct ra_table *t, const struct in6_addr *active, int alen,
+                  time_t now, const char *want, time_t *deadline)
+{
+    struct in6_addr out, expect = A6(want);
+    int plen;
+    if (ra_table_pick(t, active, alen, now, &out, &plen, deadline, NULL))
+        return 0;
+    return plen == 96 && !memcmp(&out, &expect, sizeof(out));
+}
+
+static void test_ra_all(void)
+{
+    uint8_t ra[64], other[64];
+    struct ra_option o[RA_MAX_OPTIONS];
+    build_ra(ra, 1, 0, "64:ff9b::");
+    build_ra(other, 500, 0, "2001:db8:aaaa::");
+    memcpy(ra + 32, other + 16, 16);
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) == 2);
+    assert(o[0].life == 8 && o[0].plen == 96 && o[1].life == 4000);
+    ra[18] = ra[19] = 0;	/* withdrawal stays in the list */
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) == 2 && o[0].life == 0);
+    ra[17] = 0;		/* zero-length option: discard the RA */
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) < 0);
+    build_ra(ra, 1, 6, "64:ff9b::");	/* reserved PLC */
+    assert(parse_ra_pref64_all(ra, 32, o, RA_MAX_OPTIONS) == 0);
+    printf("PASS: all PREF64 options of an RA are parsed\n");
+}
+
+static void test_ra_table(void)
+{
+    struct ra_table t;
+    struct in6_addr r1 = A6("fe80::1"), r2 = A6("fe80::2");
+    struct in6_addr a = A6("2001:db8:1::"), b = A6("2001:db8:2::");
+    struct ra_option oa = { .prefix = a, .plen = 96, .life = 100 };
+    struct ra_option ob = { .prefix = b, .plen = 96, .life = 200 };
+    time_t deadline = 0;
+
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 1000);
+    assert(picked(&t, NULL, 0, 1000, "2001:db8:1::", &deadline) && deadline == 1100);
+
+    /* A second router with another prefix must not take over, however often it speaks. */
+    for (int i = 0; i < 10; i++) {
+        ra_table_apply(&t, &r2, &ob, 1, 1001 + i);
+        ra_table_apply(&t, &r1, &oa, 1, 1001 + i);
+        assert(picked(&t, &a, 96, 1001 + i, "2001:db8:1::", NULL));
+    }
+    /* Both advertise a: it stays valid while either one does. */
+    struct ra_option oa2 = { .prefix = a, .plen = 96, .life = 300 };
+    ra_table_apply(&t, &r2, &oa2, 1, 1020);
+    struct ra_option wa = { .prefix = a, .plen = 96, .life = 0 };
+    ra_table_apply(&t, &r1, &wa, 1, 1021);		/* one withdrawal */
+    assert(picked(&t, &a, 96, 1021, "2001:db8:1::", &deadline) && deadline == 1320);
+    ra_table_expire(&t, 1321);
+    assert(ra_table_pick(&t, &a, 96, 1321, &(struct in6_addr){0}, &(int){0}, NULL, NULL) != 0);
+
+    /* One router renumbering without lifetime 0 for the old prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 2000);
+    ra_table_apply(&t, &r1, &ob, 1, 2010);
+    assert(picked(&t, &a, 96, 2010, "2001:db8:2::", NULL));
+
+    /* A withdrawal from an unrelated router does not remove the active prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 3000);
+    ra_table_apply(&t, &r2, &wa, 1, 3001);
+    assert(picked(&t, &a, 96, 3001, "2001:db8:1::", NULL));
+    ra_table_apply(&t, &r1, &wa, 1, 3002);		/* its own withdrawal does */
+    assert(ra_table_pick(&t, &a, 96, 3002, &(struct in6_addr){0}, &(int){0}, NULL, NULL) != 0);
+
+    /* Alternative takes over on withdrawal of the active prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 4000);
+    ra_table_apply(&t, &r2, &ob, 1, 4000);
+    ra_table_apply(&t, &r1, &wa, 1, 4001);
+    assert(picked(&t, &a, 96, 4001, "2001:db8:2::", NULL));
+
+    /* A provisional prefix is dropped by the first real advertisement. */
+    ra_table_init(&t);
+    ra_table_add_provisional(&t, &a, 96, 50, 5000);
+    assert(picked(&t, NULL, 0, 5001, "2001:db8:1::", NULL));
+    ra_table_apply(&t, &r1, &ob, 1, 5002);
+    assert(picked(&t, &a, 96, 5002, "2001:db8:2::", NULL));
+
+    /* More candidates than slots: the soonest-expiring one is evicted, never a crash. */
+    ra_table_init(&t);
+    for (int i = 0; i < RA_CANDIDATES + 3; i++) {
+        struct in6_addr r = A6("fe80::100");
+        struct ra_option o = { .prefix = A6("2001:db8:3::"), .plen = 96, .life = 100 + (uint32_t)i };
+        r.s6_addr[15] = (uint8_t)i;
+        ra_table_apply(&t, &r, &o, 1, 6000);
+    }
+    assert(picked(&t, NULL, 0, 6000, "2001:db8:3::", &deadline) && deadline == 6000 + 100 + RA_CANDIDATES + 2);
+    printf("PASS: PREF64 candidate table keeps the active prefix until it is gone\n");
+}
+
+
 int main(void)
 {
     printf("Running unit_pref64 tests...\n");
+    test_ra();
+    test_ra_updates();
+    test_ra_all();
+    test_ra_table();
+    test_hosts_file();
 
     /* /96 with 64:ff9b:: and Telekom/ISP-style */
     test_case("64:ff9b::192.0.0.170", "64:ff9b::", 96);

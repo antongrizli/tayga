@@ -78,20 +78,15 @@ union sockaddr_union {
  * https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html
  * This protocol is guaranteed to be stable as per:
  * https://systemd.io/PORTABILITY_AND_STABILITY/ */
-int notify(const char *message) {
+static int notify_fd = -1;
+
+int notify_prepare(void) {
+    if (notify_fd >= 0) return 0;
     union sockaddr_union socket_addr = {
         .sun.sun_family = AF_UNIX,
     };
-    size_t path_length, message_length;
+    size_t path_length;
     const char *socket_path;
-
-    /* Verify the argument first */
-    if (!message)
-        return -EINVAL;
-
-    message_length = strlen(message);
-    if (message_length == 0)
-        return -EINVAL;
 
     /* If the variable is not set, the protocol is a noop */
     socket_path = getenv("NOTIFY_SOCKET");
@@ -118,19 +113,24 @@ int notify(const char *message) {
         return -errno;
 
     if (connect(fd, &socket_addr.sa, offsetof(struct sockaddr_un, sun_path) + path_length) != 0) {
+        int saved = errno;
         close(fd);
-        return -errno;
+        return -saved;
     }
 
-    ssize_t written = write(fd, message, message_length);
-    if (written != (ssize_t) message_length) {
-        int ret = written < 0 ? -errno : -EPROTO;
-        close(fd);
-        return ret;
-    }
+    notify_fd = fd;
+    return 0;
+}
 
-    close(fd);
-    return 1; /* Notified! */
+int notify(const char *message) {
+    if (!message || !*message) return -EINVAL;
+    int result = notify_prepare();
+    if (result < 0) return result;
+    if (notify_fd < 0) return 0;
+    size_t len = strlen(message);
+    ssize_t written = write(notify_fd, message, len);
+    if (written != (ssize_t)len) return written < 0 ? -errno : -EPROTO;
+    return 1;
 }
 
 
@@ -146,6 +146,7 @@ int notify(const char *message) {
 #define MESSAGE_SIZE 2048
 
 static int journal_fd = -1;
+static int journal_connected = 0;	/* connect()ed before chroot() */
 static const char *syslog_identifier = NULL;
 
 /* Open the systemd journal. Not threadsafe. */
@@ -165,6 +166,16 @@ int journal_init(const char *ident) {
     if (r < 0)
         return r;
 
+    /* Connect now: after chroot() the socket path is unreachable, but a
+     * connected datagram socket keeps working. */
+    {
+        struct sockaddr_un ja;
+        memset(&ja, 0, sizeof(ja));
+        ja.sun_family = AF_UNIX;
+        snprintf(ja.sun_path, sizeof(ja.sun_path), "%s", JOURNAL_SOCKET);
+        journal_connected = connect(fd, (struct sockaddr *)&ja, sizeof(ja)) == 0;
+    }
+
     journal_fd = fd;
     syslog_identifier = ident;
     return 0;
@@ -174,6 +185,7 @@ int journal_init(const char *ident) {
 void journal_cleanup(void) {
     close(journal_fd);
     journal_fd = -1;
+    journal_connected = 0;
 }
 
 /* Send a message to the systemd journal.
@@ -248,8 +260,10 @@ int journal_printv_with_location(
     };
 
     struct msghdr mh = {0};
-    mh.msg_name = (void *)&sa.sa;
-    mh.msg_namelen = offsetof(struct sockaddr_un, sun_path) + strlen(JOURNAL_SOCKET) + 1;
+    if (!journal_connected) {
+        mh.msg_name = (void *)&sa.sa;
+        mh.msg_namelen = offsetof(struct sockaddr_un, sun_path) + strlen(JOURNAL_SOCKET) + 1;
+    }
     mh.msg_iov = iov;
     mh.msg_iovlen = iovlen;
 

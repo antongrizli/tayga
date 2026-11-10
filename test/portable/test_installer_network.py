@@ -52,6 +52,24 @@ esac''',
         return subprocess.run(['sh', str(CONTROLLER), action, str(self.config)],
                               env={**self.env, **env}, capture_output=True, text=True)
 
+    def test_runtime_config_survives_supervisor_snapshot_cleanup(self):
+        saved_config = self.config
+        snapshot = self.root / 'clat.conf.ra.snapshot'
+        snapshot.write_text(saved_config.read_text().replace('64:ff9b::/96', '2001:db8:64::/96'))
+        self.config = snapshot
+        result = self.run_controller('up')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copies = list(self.state.glob('clat.runtime.*'))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
+        self.assertIn('prefix 2001:db8:64::/96', copies[0].read_text())
+        snapshot.unlink()
+        self.config = saved_config
+        result = self.run_controller('down')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(list(self.state.glob('clat.runtime.*')))
+        self.assertFalse((self.state / 'clat.undo').exists())
+
     def test_nat66_generation_requires_real_ula_and_explicit_source(self):
         generator = ROOT / 'packaging/installer/configure.sh'
         output = self.root / 'generated.conf'
@@ -121,6 +139,7 @@ esac''',
         self.assertNotIn('route del 128.0.0.0/1', log)
         self.assertTrue(log.rstrip().endswith('ip link delete dev clat'))
         self.assertFalse((self.state / 'clat.undo').exists())
+        self.assertFalse(list(self.state.glob('clat.runtime.*')))
         self.assertFalse((self.state / 'operation.lock').exists())
 
     def test_up_down_and_existing_interface_protection(self):
@@ -166,6 +185,12 @@ esac''',
 
     def test_verification_uses_translation_and_rejects_failed_tcp(self):
         verify = ROOT / 'packaging/installer/tayga-verify.sh'
+        helper = os.environ.get('TAYGA_PREF64_DISCOVER') or str(ROOT / 'build/pref64-discover')
+        if not os.access(helper, os.X_OK):
+            self.skipTest('pref64-discover not built (make pref64-discover)')
+        link = self.bin / 'pref64-discover'
+        if not link.exists():
+            link.symlink_to(helper)
         for mode, expected in [('clat', 'http://1.1.1.1/'), ('nat64', 'http://[64:ff9b::101:101]/')]:
             self.config.write_text('tun-device ' + mode + '\nprefix 64:ff9b::/96\n')
             result = subprocess.run(['sh', str(verify), str(self.config)],

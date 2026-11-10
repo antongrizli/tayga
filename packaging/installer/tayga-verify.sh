@@ -10,6 +10,18 @@ if [ -z "$mode" ]; then
 fi
 case "$mode" in clat|nat64|siit) ;; *) echo 'Unsupported verification profile' >&2; exit 2 ;; esac
 dev=$(awk '$1=="tun-device" {print $2}' "$config")
+# The RA supervisor publishes the prefix the translator runs when it differs
+# from the installed profile (RFC 8781 renumbering); fall back to the profile.
+active_prefix() {
+    for dir in "${TAYGA_VERIFY_RUNTIME:-}" "/run/tayga-managed-$mode" "/var/run/tayga-managed-$mode"; do
+        [ -n "$dir" ] && [ -r "$dir/active-prefix" ] || continue
+        value=$(awk 'NR==1 {print $1}' "$dir/active-prefix")
+        case "$value" in ''|*[!0-9a-fA-F:./]*) continue ;; esac
+        printf '%s\n' "$value"
+        return 0
+    done
+    awk '$1=="prefix" {print $2}' "$config"
+}
 if [ "$(uname -s)" = FreeBSD ]; then
     ifconfig "$dev" >/dev/null
 else
@@ -36,12 +48,10 @@ if [ "$mode" = siit ]; then
     exit 0
 fi
 # Probe NAT64 through its IPv6 translation route, never through native IPv4.
-# A hexadecimal dotted-quad suffix is valid only for a /96 prefix.
+# Use the same RFC 6052 synthesis as the translator for every supported length.
 if [ "$mode" = nat64 ]; then
-    prefix=$(awk '$1=="prefix" {print $2}' "$config")
-    case "$prefix" in */96) ;; *) echo 'Automatic NAT64 verification currently requires /96' >&2; exit 1 ;; esac
-    address=${prefix%/96}
-    case "$address" in *::) target=${address}101:101 ;; *) echo 'Verification requires a canonical /96 prefix ending in ::' >&2; exit 1 ;; esac
+    prefix=$(active_prefix)
+    target=$(pref64-discover --synthesize "$prefix" 1.1.1.1) || exit 1
     family=-6
     url=http://[$target]/
 else

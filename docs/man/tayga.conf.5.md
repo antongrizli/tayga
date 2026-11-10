@@ -108,6 +108,25 @@ tayga.conf.
 
     Enabled by default
 
+**icmp-rate-limit** *packets_per_second|unlimited*
+:   Limit the rate of ICMPv4/ICMPv6 error messages that Tayga itself
+    originates (Time Exceeded, Destination Unreachable, Parameter
+    Problem), as required by RFC 4443 section 2.4(f). Packet Too Big and
+    Fragmentation Needed have a separate budget so they are not starved
+    by other errors. The burst size is the lower of the rate and 200.
+
+    Defaults to 1000. A value of 0 or **unlimited** disables the limit.
+
+**cache-size** *entries*
+:   Number of entries in the address translation cache used with
+    **dynamic-pool** and **map-file**. The cache is disabled
+    automatically when all mappings are static. Defaults to 8192.
+
+**hash-bits** *bits*
+:   The cache hash tables have 2^bits buckets (4 to 24). When not given,
+    the size follows **cache-size**: about two buckets per entry, between
+    2^7 and 2^14 (the default cache of 8192 entries uses 14).
+
 **map** *ipv4_address[/length] ipv6_address[/length]*
 :   Creates a static mapping between RFC 7757 compliant hosts or
     subnets *ipv4_address[/length]* and *ipv6_address[/length]* to be
@@ -198,6 +217,28 @@ tayga.conf.
     either **\[drop\]** the packet, or calculating **\[calc\]** a new
     checksum. Additionally, Tayga also allows the option of forwarding
     **\[fwd\]** the packet anyway
+
+**flow-label** *zero|compute*
+:   IPv6 Flow Label on IPv4-to-IPv6 translated packets. **zero** (default)
+    sets the label to 0 as RFC 7915 specifies. **compute** derives a 20-bit
+    non-zero label (RFC 6437) from a keyed hash of the IPv4 addresses,
+    protocol and, for unfragmented TCP and UDP, the ports, so that IPv6
+    transit networks can balance flows (ECMP). All fragments of a datagram
+    share one label.
+
+**worker-affinity** *on|off|cpu-list*
+:   Linux only. When **on**, worker thread *i* is pinned to the *i*-th CPU in
+    the process's allowed CPU set (wrapping around). A *cpu-list* such as
+    **4-6,8** pins worker *i* to the *i*-th CPU of that list (wrapping around);
+    a CPU outside the allowed set is skipped with a warning. Default **off**,
+    which leaves placement to the scheduler.
+
+    Pinning is not a free speed-up. In an 8-vCPU test guest where clients and
+    servers were already pinned, **on** was slower in every one of 10 paired
+    runs (about 28% less download and 30% less upload throughput, two to three
+    times the retransmissions per gigabyte), because the first allowed CPUs also
+    take softirq and interrupt work. Choose CPUs that do not, and measure before
+    enabling.
 
 **log** *drop|reject|self*
 :   Configure logging of packets. By default, Tayga only logs errors

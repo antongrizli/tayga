@@ -115,10 +115,18 @@ cleanup() {
 }
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
+# Keep a controller-owned configuration until the last undo operation. A
+# supervisor's private snapshot may disappear before ExecStopPost runs.
+runtime_config=$(mktemp "$state/$dev.runtime.XXXXXXXX")
+# Shell quote the generated path before storing the undo action.
+quoted_runtime=$(printf '%s' "$runtime_config" | sed "s/'/'\\''/g")
+printf "rm -f '%s'\n" "$quoted_runtime" >> "$journal"
+cp "$config" "$runtime_config"
+chmod 600 "$runtime_config"
 # Validate/create TUN first; failure never removes a pre-existing interface.
-tayga --config "$config" --mktun
+tayga --config "$runtime_config" --mktun
 if [ "$os" = FreeBSD ]; then
-    printf 'ifconfig %s destroy 2>/dev/null || tayga --config %s --rmtun\n' "$dev" "$config" >> "$journal"
+    printf "ifconfig %s destroy 2>/dev/null || tayga --config '%s' --rmtun\n" "$dev" "$quoted_runtime" >> "$journal"
     ifconfig "$dev" mtu "$mtu" up
 else
     printf 'ip link delete dev %s\n' "$dev" >> "$journal"

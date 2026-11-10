@@ -62,7 +62,7 @@ for value in "$prefix" "$listen" "$allow" "$upstream"; do
     case "$value" in ''|*[!0-9a-fA-F:./@]*) fail 'Invalid DNS64 address token' ;; esac
 done
 case "$listen" in *[/@]*) fail 'Listener must be a single IP address' ;; esac
-case "$prefix" in *::/96) ;; *) fail 'DNS64 readiness currently requires a canonical /96 prefix ending in ::' ;; esac
+case "$prefix" in */32|*/40|*/48|*/56|*/64|*/96) ;; *) fail 'Unsupported DNS64 prefix length' ;; esac
 case "$dnssec" in validate) modules='dns64 validator iterator' ;; off) modules='dns64 iterator' ;; *) fail 'Invalid DNSSEC policy' ;; esac
 anchor=
 if [ "$dnssec" = validate ]; then
@@ -121,7 +121,8 @@ render > "$unbound_config"
 chmod 644 "$unbound_config"
 unbound-checkconf "$unbound_config"
 [ "$action" = up ] || exit 0
-expected=$(pref64-discover --check "${prefix%/96}192.0.0.170")
+probe=$(pref64-discover --synthesize "$prefix" 192.0.0.170)
+expected=$(pref64-discover --check "$probe")
 unbound -d -c "$unbound_config" > "$runtime/unbound.log" 2>&1 &
 pid=$!
 if ! started=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null); then

@@ -92,10 +92,29 @@ FALLBACK_TO_WELL_KNOWN_PREFIX="${FALLBACK_TO_WELL_KNOWN_PREFIX:-true}"
 PREF64_SOURCE="manual"
 
 if [ "$PREF64" = "auto" ]; then
-  echo "==> Discovering NAT64 prefix via RFC 7050 (ipv4only.arpa)..."
+  echo "==> Discovering NAT64 prefix (RFC 8781 RA, then RFC 7050 ipv4only.arpa)..."
   DISCOVERED=""
+  DISCOVERY_SOURCE="rfc7050_discovered"
   if [ -x /usr/local/sbin/pref64-discover ]; then
-    if [ -n "$UPLINK_DNS64" ]; then
+    # RFC 8781: PREF64 option in Router Advertisements. Needs CAP_NET_RAW;
+    # silently skipped otherwise. Set CLAT_DISCOVERY=dns64 to disable.
+    if [ "${CLAT_DISCOVERY:-auto}" != "dns64" ]; then
+      RA_IFACE="${UPLINK_IFACE:-$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')}"
+      case "$RA_IFACE" in
+        ''|*[!a-zA-Z0-9_.:-]*) RA_IFACE="" ;;
+      esac
+      if [ -n "$RA_IFACE" ]; then
+        RA_JSON=$(/usr/local/sbin/pref64-discover -i "$RA_IFACE" -t 3 --ra-only --json 2>/dev/null || true)
+        RA_PREFIX=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p')
+        RA_LEN=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"length": *\([0-9][0-9]*\).*/\1/p')
+        RA_LIFETIME=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"lifetime": *\([0-9][0-9]*\).*/\1/p')
+        if [ -n "$RA_PREFIX" ] && [ -n "$RA_LEN" ]; then
+            DISCOVERED="$RA_PREFIX/$RA_LEN"
+            DISCOVERY_SOURCE="rfc8781_ra"
+        fi
+      fi
+    fi
+    if [ -z "$DISCOVERED" ] && [ -n "$UPLINK_DNS64" ]; then
       echo "--> Querying uplink DNS64 server: $UPLINK_DNS64"
       DISCOVERED=$(/usr/local/sbin/pref64-discover -s "$UPLINK_DNS64" 2>/dev/null || true)
     fi
@@ -106,7 +125,7 @@ if [ "$PREF64" = "auto" ]; then
 
   if [ -n "$DISCOVERED" ]; then
     PREF64="$DISCOVERED"
-    PREF64_SOURCE="rfc7050_discovered"
+    PREF64_SOURCE="$DISCOVERY_SOURCE"
     echo "==> Discovered PREF64: $PREF64"
   else
     if [ "$FALLBACK_TO_WELL_KNOWN_PREFIX" = "true" ]; then
@@ -199,6 +218,10 @@ if [ -n "$TAYGA_STEERING_VAL" ]; then
   echo "tun-steering ${TAYGA_STEERING_VAL}" >> "$TAYGA_RUNTIME_DIR/clat.conf"
 fi
 
+if [ -n "${CLAT_WORKER_AFFINITY:-}" ]; then
+  echo "worker-affinity ${CLAT_WORKER_AFFINITY}" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+fi
+
 if [ "$TAYGA_STEERING_VAL" = "groups" ] || [ "$TAYGA_STEERING_VAL" = "flows" ]; then
   echo "tun-up on" >> "$TAYGA_RUNTIME_DIR/clat.conf"
   echo "tun-ip ${V4_HOST}/32" >> "$TAYGA_RUNTIME_DIR/clat.conf"
@@ -235,6 +258,17 @@ cat > "$TAYGA_RUNTIME_DIR/clat-info.json" <<INFO_EOF
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 INFO_EOF
+
+if [ "$PREF64_SOURCE" = rfc8781_ra ]; then
+  printf '# installer-pref64-interface %s\n' "$RA_IFACE" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+  # Hand over what was just learned (prefix + remaining lifetime) so the supervisor
+  # starts the translator at once instead of waiting for a second Router Advertisement.
+  set -- --runtime-dir "$TAYGA_RUNTIME_DIR"
+  if [ -n "${RA_LIFETIME:-}" ] && [ "$RA_LIFETIME" -gt 0 ]; then
+    set -- "$@" --initial-prefix "$PREF64" --initial-lifetime "$RA_LIFETIME"
+  fi
+  exec /usr/local/sbin/pref64-discover --supervise-ra "$TAYGA_RUNTIME_DIR/clat.conf" "$@" -- /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d
+fi
 
 echo "==> Launching TAYGA daemon in foreground..."
 exec /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d

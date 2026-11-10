@@ -38,6 +38,19 @@ jobs:
         run: make check-man PANDOC=scripts/ci/pandoc-container.sh
       - name: Native packet ownership checks
         run: make unit_packet_io unit_packet_io_lifetime LDFLAGS='' && ./unit_packet_io && ./unit_packet_io_lifetime
+  strict-warnings:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: GCC and Clang with -Wextra -Wshadow -Wformat=2 -Werror
+        run: |
+          for cc in gcc clang; do
+            make clean
+            make CC=$cc CFLAGS='-O2 -Wall -Wextra -Wshadow -Wformat=2 -Werror' tayga pref64-discover
+          done
   sanitizers:
     runs-on: ubuntu-24.04
     steps:
@@ -45,23 +58,21 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - name: Address and undefined behavior
+      - name: Address, undefined behavior and leak detection (all unit tests)
         run: make test CC=clang CFLAGS='-O1 -g -Wall -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
         env:
-          ASAN_OPTIONS: detect_leaks=0 # Legacy config fixtures retain maps.
-      - name: New mapping fixtures must also pass leak detection
-        run: |
-          ASAN_OPTIONS=detect_leaks=1 ./build/test-bin/unit_addrmap
-          ASAN_OPTIONS=detect_leaks=1 ./build/test-bin/unit_mapping
-      - name: Thread sanitizer on mapping and counters
+          ASAN_OPTIONS: detect_leaks=1
+      - name: Thread sanitizer on every unit test
         run: |
           make clean
-          make unit_addrmap unit_mapping unit_stats CC=gcc CFLAGS='-O1 -g -Wall -fsanitize=thread -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=thread -no-pie'
-          ./build/test-bin/unit_addrmap
-          ./build/test-bin/unit_mapping
-          ./build/test-bin/unit_stats
+          make test CC=clang CFLAGS='-O1 -g -Wall -fsanitize=thread -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=thread -no-pie'
         env:
           TSAN_OPTIONS: halt_on_error=1
+      - name: Fuzzers (short corpus-less smoke run)
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang
+          make clean
+          make fuzz-check CC=clang FUZZ_TIME=60
   linux-kernel:
     runs-on: ubuntu-24.04
     steps:
@@ -106,6 +117,20 @@ jobs:
       - name: Multi-protocol end-to-end system test
         run: |
           sudo python3 test/system/test_protocols_e2e.py --binary "$PWD/tayga" --output /tmp/review-results/protocols-e2e
+      - name: ICMP wire behavior and packet accounting
+        run: |
+          sudo python3 test/system/test_icmp_wire.py --binary "$PWD/tayga" --output /tmp/review-results/icmp-wire
+          sudo python3 test/system/test_stats_balance.py --binary "$PWD/tayga" --output /tmp/review-results/stats-balance
+      - name: Embedded DNS64 server (fake upstream, CD and EDNS0 preserved)
+        run: |
+          make pref64-discover
+          python3 test/system/test_dns64_serve.py build/pref64-discover
+      - name: RFC 8781 PREF64 from Router Advertisements (netns)
+        run: |
+          make pref64-discover
+          sudo python3 test/system/test_ra_pref64.py build/pref64-discover
+      - name: RA supervisor lifetime and process lifecycle
+        run: sudo python3 test/system/test_ra_supervisor.py --helper "$PWD/build/pref64-discover" --output /tmp/review-results/ra-supervisor
       - name: Async kernel wire gate when io_uring is available
         run: |
           sudo mkdir -p /tmp/review-results && sudo chown -R "$USER:$USER" /tmp/review-results
@@ -116,6 +141,10 @@ jobs:
             sudo python3 test/system/test_udp_gso_kernel.py --binary "$PWD/tayga" --packet-io uring --output /tmp/review-results/uring-wire --modes auto off --workers 3 --mtus 1280 1500
             sudo python3 test/system/test_tun_steering_lifecycle.py "$PWD/tayga" --dispatch=flows --packet-io=uring
           fi
+      # Runs last: `make integration` rebuilds ./tayga without WITH_URING, which would
+      # make the io_uring gate above fail if it ran afterwards.
+      - name: Scapy translation integration suite
+        run: sudo make integration
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -93,12 +93,22 @@ case "$action" in
         ;;
     status)
         awk '$1=="prefix" || $1=="tun-device" {print}' "/etc/tayga/$profile.conf"
+        for runtime in "/run/tayga-managed-$profile" "/var/run/tayga-managed-$profile"; do
+            if [ -r "$runtime/active-prefix" ]; then
+                printf 'active-prefix %s\n' "$(awk 'NR==1 {print $1, $2}' "$runtime/active-prefix")"
+                break
+            fi
+        done
         dev=$(awk '$1=="tun-device" {print $2}' "/etc/tayga/$profile.conf")
         if [ "$(uname -s)" = FreeBSD ]; then
             netstat -rn -f inet | grep "$dev" || :
             netstat -rn -f inet6 | grep "$dev" || :
+            # The pidfile holds the daemon(8) supervisor, which exits on SIGUSR2;
+            # ask only its child (the translator) to refresh the status file.
             if [ -f "/var/run/tayga-managed-$profile.pid" ]; then
-                kill -USR2 "$(cat "/var/run/tayga-managed-$profile.pid")" 2>/dev/null || :
+                for child in $(pgrep -P "$(cat "/var/run/tayga-managed-$profile.pid")" 2>/dev/null); do
+                    kill -USR2 "$child" 2>/dev/null || :
+                done
             fi
             if [ -r "/var/run/tayga-managed-$profile/tayga-status.json" ]; then cat "/var/run/tayga-managed-$profile/tayga-status.json"; fi
             exec service tayga-managed onestatus
@@ -122,6 +132,7 @@ case "$action" in
         field() { awk -v key="$1" '$1==key {print $2}' "$config"; }
         meta() { awk -v key="$1" '$1=="#" && $2==key {print $3}' "$config"; }
         PREF64=$(field prefix)
+        if [ "$(meta installer-pref64-source)" = rfc8781 ]; then PREF64=auto; fi
         TAYGA_IPV4=$(field ipv4-addr)
         TAYGA_IPV6=$(field ipv6-addr)
         DYNAMIC_POOL=$(field dynamic-pool)

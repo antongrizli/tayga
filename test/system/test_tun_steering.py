@@ -182,11 +182,11 @@ def bucket(data, mode):
     if family==4:
         h=word(ip[12:16])^word(ip[16:20])^4
         offset=(ip[0]&15)*4
-        use_ports=not int.from_bytes(ip[6:8],'big')&0x3fff and ip[9] in (6,17)
+        use_ports=not int.from_bytes(ip[6:8],'big')&0x3fff and ip[9] in (6,17,33,132,136)
     else:
         h=6
         for i in range(4):h=((h^word(ip[8+4*i:12+4*i])^word(ip[24+4*i:28+4*i]))&0xffffffff)*16777619
-        offset=40;use_ports=ip[6] in (6,17)
+        offset=40;use_ports=ip[6] in (6,17,33,132,136)
     if mode=='flows' and use_ports:h=((h^word(ip[offset:offset+4]))&0xffffffff)*16777619
     h=(h^(h>>16))&0xffffffff;h*=0x45d9f3b
     return (h^(h>>16))&65535
@@ -227,6 +227,14 @@ def test_program(library, mode):
                     assert queue(fd,frame(family,proto=6,sport=6000+flow,length=100))==tcp_owner
                     owners.append(first)
                 if mode=='flows' and count<=8: assert len(set(owners))==count,owners
+                # DCCP, SCTP and UDP-Lite carry ports at the same offset as UDP.
+                if mode=='flows' and count in (4,8):
+                    for proto in (33,132,136):
+                        seen={queue(fd,frame(family,proto=proto,sport=7000+n)) for n in range(32)}
+                        assert len(seen)>1,(proto,seen)
+                        for n in range(4):
+                            p=frame(family,proto=proto,sport=7000+n)
+                            assert queue(fd,p)==queue(fd,frame(family,proto=proto,sport=7000+n,length=300))
                 # Fragment fallback ignores ports, including across sizes.
                 fragment_owner=queue(fd,frame(family,proto=44 if family==6 else 17,fragment=0x2000))
                 for port in (6001,65535):

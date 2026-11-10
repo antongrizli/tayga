@@ -2,9 +2,15 @@
 name='TAYGA managed profile'
 description='TAYGA CLAT/NAT64 with owned network setup and readiness verification'
 profile=${profile:-nat64}
-command=/usr/local/sbin/tayga
-command_args="--config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
-command_background=yes
+command=/usr/local/sbin/pref64-discover
+command_args="--supervise-ra /etc/tayga/$profile.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl --runtime-dir /run/tayga-managed-$profile -- /usr/local/sbin/tayga --config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
+# supervise-daemon restarts the translator after a crash (the OpenRC counterpart
+# of systemd Restart=on-failure, 5 restarts per 120 s). When the budget is used up
+# the service stays down and tayga-recovery takes over.
+supervisor=supervise-daemon
+respawn_delay=2
+respawn_max=5
+respawn_period=120
 pidfile=/run/tayga-managed.pid
 
 depend() {
@@ -18,13 +24,16 @@ start_pre() {
     checkpath --directory --mode 0750 "/run/tayga-managed-$profile" || return 1
     /usr/local/libexec/tayga/tayga-dns64 prepare "/etc/tayga/$profile.conf" || return 1
     /usr/local/libexec/tayga/tayga-host-dns prepare "/etc/tayga/$profile.conf" || return 1
+    # supervise-daemon gives up without running stop_post: clear state a previous
+    # run left behind (rollback is driven by the saved undo file, a no-op if none).
+    /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/$profile.conf" || :
     /usr/local/libexec/tayga/tayga-net-ctl up "/etc/tayga/$profile.conf"
 }
 start_post() {
     if ! /usr/local/libexec/tayga/tayga-dns64 up "/etc/tayga/$profile.conf" ||
         ! /usr/local/libexec/tayga/tayga-host-dns up "/etc/tayga/$profile.conf" ||
         ! /usr/local/libexec/tayga/tayga-verify "/etc/tayga/$profile.conf"; then
-        start-stop-daemon --stop --pidfile "$pidfile" || :
+        supervise-daemon "$RC_SVCNAME" --stop --pidfile "$pidfile" || :
         /usr/local/libexec/tayga/tayga-dns64 down "/etc/tayga/$profile.conf" || :
         /usr/local/libexec/tayga/tayga-host-dns down "/etc/tayga/$profile.conf" || :
         /usr/local/libexec/tayga/tayga-net-ctl down "/etc/tayga/$profile.conf"
