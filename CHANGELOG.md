@@ -30,6 +30,7 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Fixed
 
+- Hardware-GSO IPv4 validation did not require the transport header to lie inside the packet: an IPv4 header whose IHL consumed the whole buffer made `gso_translate_tcp_4to6` read one byte past it (found by the `fuzz_gso` CI smoke run; regression input kept in `test/fuzz/regress/fuzz_gso/`).
 - An unusable `NOTIFY_SOCKET` inherited from the environment is a warning, not a start failure.
 - ICMP error rate limiter no longer spins on its flag or reads the clock inside the critical section; a worker that loses the race refuses the error.
 - With `flow-label compute` the quoted datagram inside a translated ICMP error keeps a zero Flow Label.

@@ -199,7 +199,11 @@ static int gso_validate_ipv4_header(const struct pkt *p, uint8_t proto, uint32_t
 	    (ntohs(ip4->flags_offset) & (IP4_F_MASK | IP4_F_MF)))
 		return -1;
 	uint32_t ihl = (ip4->ver_ihl & 0x0f) * 4;
-	if (ihl < sizeof(struct ip4) || ihl > p->data_len || ip_checksum((void *)ip4, ihl) != 0 ||
+	/* The transport header must lie inside the buffer too: callers read its
+	 * first bytes (TCP data offset, UDP length) right after this check. */
+	uint32_t min_l4 = proto == IPPROTO_TCP ? (uint32_t)sizeof(struct tcp_hdr) : (uint32_t)sizeof(struct udp_hdr);
+	if (ihl < sizeof(struct ip4) || ihl > p->data_len || p->data_len - ihl < min_l4 ||
+	    ip_checksum((void *)ip4, ihl) != 0 ||
 	    validate_ip4_addr(&ip4->src) == ERROR_DROP ||
 	    validate_ip4_addr(&ip4->dest) == ERROR_DROP)
 		return -1;
