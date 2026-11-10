@@ -246,6 +246,7 @@ struct pkt {
 	uint32_t data_len;
 	uint32_t header_len; /* inc IP hdr for v4 but excl IP hdr for v6 */
 	uint32_t gso_sent_payload; /* software GSO: payload bytes already emitted before a failure */
+	uint32_t gso_unsent_segments; /* software GSO: segments not emitted because of that failure */
 	uint32_t next_hdr_offset; /* v6: offset of the Next Header field naming data_proto */
 	struct virtio_net_hdr_raw vhdr;
 	int has_vhdr;
@@ -368,6 +369,8 @@ enum {
 	CACHE_F_REP_AGEOUT	= (1<<3),
 };
 
+#define WORKER_CPU_MAX 64
+
 /// UDP Checksum options
 enum flow_label_mode {
 	FLOW_LABEL_ZERO,	/* RFC 7915 default */
@@ -444,7 +447,9 @@ struct config {
 
 	//Multiqueue related
 	int workers;
-	int worker_affinity;	/* pin worker i to the i-th allowed CPU (Linux) */
+	int worker_affinity;	/* 0 off, 1 worker i -> i-th allowed CPU, 2 explicit list (Linux) */
+	int worker_cpu_count;
+	int worker_cpu[WORKER_CPU_MAX];	/* worker i -> worker_cpu[i % count] when worker_affinity == 2 */
 	pthread_mutex_t cache_mutex;
 	pthread_mutex_t map_mutex;
 	pthread_t threads[MAX_WORKERS];

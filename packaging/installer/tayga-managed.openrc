@@ -3,7 +3,7 @@ name='TAYGA managed profile'
 description='TAYGA CLAT/NAT64 with owned network setup and readiness verification'
 profile=${profile:-nat64}
 command=/usr/local/sbin/pref64-discover
-command_args="--supervise-ra /etc/tayga/$profile.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl -- /usr/local/sbin/tayga --config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
+command_args="--supervise-ra /etc/tayga/$profile.conf --network-controller /usr/local/libexec/tayga/tayga-net-ctl --runtime-dir /run/tayga-managed-$profile -- /usr/local/sbin/tayga --config /etc/tayga/$profile.conf --runtime-dir /run/tayga-managed-$profile --nodetach"
 # supervise-daemon restarts the translator after a crash (the OpenRC counterpart
 # of systemd Restart=on-failure, 5 restarts per 120 s). When the budget is used up
 # the service stays down and tayga-recovery takes over.

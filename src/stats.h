@@ -46,6 +46,7 @@ struct worker_pub_stats {
 	_Atomic uint64_t warnings_suppressed;
 	_Atomic uint64_t icmp_sent_pkts;
 	_Atomic uint64_t self_pkts;
+	_Atomic uint64_t gso_dropped_segments;
 
 
 	/* GSO telemetry integrated per worker */
@@ -95,6 +96,7 @@ struct worker_priv_stats {
 	uint64_t warnings_suppressed;
 	uint64_t icmp_sent_pkts;
 	uint64_t self_pkts;
+	uint64_t gso_dropped_segments;
 
 
 	uint64_t gso_rx_pkts;
@@ -143,6 +145,7 @@ struct tayga_stats {
 	uint64_t warnings_suppressed;
 	uint64_t icmp_sent_pkts;
 	uint64_t self_pkts;
+	uint64_t gso_dropped_segments;
 
 
 	uint64_t gso_rx_pkts;
@@ -171,6 +174,7 @@ struct tayga_stats {
 extern struct worker_pub_stats g_worker_pub[STATS_MAX_SLOTS];
 extern __thread struct worker_priv_stats g_tls_priv;
 extern time_t g_stats_start_time;
+extern time_t g_stats_start_mono;
 extern atomic_uint_fast64_t g_stats_sync_req;
 extern atomic_uint_fast64_t g_stats_sync_ack[STATS_MAX_SLOTS];
 extern atomic_uint_fast64_t g_stats_snapshot_seq;
@@ -203,6 +207,7 @@ static inline void stats_drop(uint32_t bytes) { (void)bytes; }
 static inline void stats_error(void) {}
 static inline void stats_icmp_sent(void) {}
 static inline void stats_self(void) {}
+static inline void stats_gso_drop_segments(uint32_t segments) { (void)segments; }
 static inline void stats_gso_rx(uint32_t bytes) { (void)bytes; }
 static inline void stats_gso_tx(uint32_t bytes) { (void)bytes; }
 static inline void stats_gso_split_tail(void) {}
@@ -266,6 +271,11 @@ static inline void stats_icmp_sent(void) {
 /* Packet addressed to the daemon itself and answered locally (echo reply) */
 static inline void stats_self(void) {
 	g_tls_priv.self_pkts++;
+}
+
+/* Segments of a software-GSO aggregate that were never delivered. */
+static inline void stats_gso_drop_segments(uint32_t segments) {
+	g_tls_priv.gso_dropped_segments += segments;
 }
 
 /* GSO fast-path hooks */

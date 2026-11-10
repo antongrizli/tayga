@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -29,6 +30,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include "pref64_ra.h"
 #ifdef __linux__
 #include <linux/if_tun.h>
 #endif
@@ -423,6 +425,176 @@ int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *ou
     return parse_ra_pref64_update(ra, ra_len, out_prefix, out_plen, out_lifetime_sec, NULL, 0);
 }
 
+/* Every valid PREF64 option of one RA, withdrawals (lifetime 0) included.
+ * Returns the option count, or -1 for an RA that must be discarded. */
+int parse_ra_pref64_all(const uint8_t *ra, size_t ra_len, struct ra_option *out, int max)
+{
+    static const int plc_to_plen[8] = { 96, 64, 56, 48, 40, 32, -1, -1 };
+    if (!ra || !out || max <= 0 || ra_len < 16 || ra[0] != 134 || ra[1] != 0)
+        return -1;
+    size_t pos = 16;
+    int count = 0;
+    while (pos + 2 <= ra_len) {
+        size_t bytes = (size_t)ra[pos + 1] * 8;
+        if (bytes == 0 || pos + bytes > ra_len)
+            return -1;
+        if (ra[pos] == ND_OPT_PREF64 && bytes == 16 && count < max) {
+            uint16_t v = (uint16_t)((ra[pos + 2] << 8) | ra[pos + 3]);
+            int plen = plc_to_plen[v & 7];
+            if (plen > 0) {
+                struct ra_option *o = &out[count];
+                memset(o, 0, sizeof(*o));
+                memcpy(o->prefix.s6_addr, ra + pos + 4, 12);
+                if (plen < 96)
+                    memset(o->prefix.s6_addr + plen / 8, 0, (size_t)(16 - plen / 8));
+                o->plen = plen;
+                o->life = (uint32_t)(v >> 3) * 8u;
+                if (is_valid_pref64_prefix(&o->prefix, plen))
+                    count++;
+            }
+        }
+        pos += bytes;
+    }
+    return count;
+}
+
+/*
+ * Candidate table (RFC 8781): every (router, prefix) pair that currently has
+ * a positive lifetime.  The supervisor keeps the translator on the active
+ * prefix for as long as ANY router still advertises it, so two routers with
+ * different prefixes cannot make it flap.  The active prefix changes only
+ * when no live candidate for it remains (withdrawal, expiry, or the
+ * advertising router replacing its own prefix set).
+ */
+static int same_prefix(const struct in6_addr *a, int alen, const struct in6_addr *b, int blen)
+{
+    return alen == blen && !memcmp(a, b, sizeof(*a));
+}
+
+void ra_table_init(struct ra_table *t)
+{
+    memset(t, 0, sizeof(*t));
+}
+
+/* A prefix learned out of band (container start-up): it lives until its
+ * deadline or until the first real RA arrives. */
+void ra_table_add_provisional(struct ra_table *t, const struct in6_addr *prefix, int plen,
+                              uint32_t life, time_t now)
+{
+    for (int i = 0; i < RA_CANDIDATES; i++) {
+        if (t->c[i].used)
+            continue;
+        memset(&t->c[i], 0, sizeof(t->c[i]));
+        t->c[i].used = 1;
+        t->c[i].provisional = 1;
+        t->c[i].prefix = *prefix;
+        t->c[i].plen = plen;
+        t->c[i].life = life;
+        t->c[i].deadline = now + (time_t)life;
+        return;
+    }
+}
+
+/* Apply one RA from `router`.  A router that advertises at least one prefix
+ * replaces its earlier set (a renumbering router does not have to send
+ * lifetime 0 for the old prefix); a pure withdrawal removes only the named
+ * prefix of that router. */
+void ra_table_apply(struct ra_table *t, const struct in6_addr *router,
+                    const struct ra_option *opts, int n, time_t now)
+{
+    int positive = 0;
+    for (int i = 0; i < n; i++)
+        if (opts[i].life)
+            positive++;
+    if (positive) {
+        for (int i = 0; i < RA_CANDIDATES; i++) {
+            struct ra_candidate *c = &t->c[i];
+            if (!c->used)
+                continue;
+            if (c->provisional) {
+                c->used = 0;
+                continue;
+            }
+            if (memcmp(&c->router, router, sizeof(*router)))
+                continue;
+            int keep = 0;
+            for (int k = 0; k < n; k++)
+                if (opts[k].life && same_prefix(&c->prefix, c->plen, &opts[k].prefix, opts[k].plen))
+                    keep = 1;
+            if (!keep)
+                c->used = 0;
+        }
+    }
+    for (int k = 0; k < n; k++) {
+        struct ra_candidate *slot = NULL, *oldest = NULL;
+        for (int i = 0; i < RA_CANDIDATES; i++) {
+            struct ra_candidate *c = &t->c[i];
+            if (!c->used) {
+                if (!slot) slot = c;
+                continue;
+            }
+            if (!oldest || c->deadline < oldest->deadline)
+                oldest = c;
+            if (!memcmp(&c->router, router, sizeof(*router)) &&
+                same_prefix(&c->prefix, c->plen, &opts[k].prefix, opts[k].plen)) {
+                slot = c;
+                break;
+            }
+        }
+        int existing = slot && slot->used;
+        if (!opts[k].life) {
+            if (existing)
+                slot->used = 0;
+            continue;
+        }
+        if (!slot)
+            slot = oldest;
+        if (!slot)
+            continue;
+        memset(slot, 0, sizeof(*slot));
+        slot->used = 1;
+        slot->router = *router;
+        slot->prefix = opts[k].prefix;
+        slot->plen = opts[k].plen;
+        slot->life = opts[k].life;
+        slot->deadline = now + (time_t)opts[k].life;
+    }
+}
+
+void ra_table_expire(struct ra_table *t, time_t now)
+{
+    for (int i = 0; i < RA_CANDIDATES; i++)
+        if (t->c[i].used && t->c[i].deadline <= now)
+            t->c[i].used = 0;
+}
+
+/* Choose the prefix to run.  The active one wins while it has a live
+ * candidate; otherwise the candidate that stays valid longest.  Returns 0
+ * and fills the outputs, or -1 when nothing is live. */
+int ra_table_pick(const struct ra_table *t, const struct in6_addr *active, int active_len,
+                  time_t now, struct in6_addr *out, int *plen, time_t *deadline, uint32_t *life)
+{
+    const struct ra_candidate *best = NULL;
+    for (int pass = 0; pass < 2 && !best; pass++) {
+        for (int i = 0; i < RA_CANDIDATES; i++) {
+            const struct ra_candidate *c = &t->c[i];
+            if (!c->used || c->deadline <= now)
+                continue;
+            if (pass == 0 && !(active && same_prefix(&c->prefix, c->plen, active, active_len)))
+                continue;
+            if (!best || c->deadline > best->deadline)
+                best = c;
+        }
+    }
+    if (!best)
+        return -1;
+    *out = best->prefix;
+    *plen = best->plen;
+    if (deadline) *deadline = best->deadline;
+    if (life) *life = best->life;
+    return 0;
+}
+
 /* Exported only for unit tests. */
 #ifdef PREF64_NO_MAIN
 #define HOSTS_LINKAGE
@@ -477,6 +649,7 @@ HOSTS_LINKAGE size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
  * caller can fall back to RFC 7050 silently.  RAs are only accepted from
  * link-local sources with Hop Limit 255 (RFC 4861 6.1.2) on that interface.
  */
+static int send_rs(int fd, unsigned ifindex);
 static int open_ra_socket(const char *ifname)
 {
     unsigned ifindex = if_nametoindex(ifname);
@@ -499,6 +672,20 @@ static int open_ra_socket(const char *ifname)
         return -1;
     }
 
+    struct ipv6_mreq mr;
+    memset(&mr, 0, sizeof(mr));
+    inet_pton(AF_INET6, "ff02::1", &mr.ipv6mr_multiaddr);
+    mr.ipv6mr_interface = ifindex;
+    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mr, sizeof(mr));
+    if (send_rs(fd, ifindex) < 0)
+        { close(fd); return -1; }
+
+    return fd;
+}
+
+/* Router Solicitation to ff02::2 (RFC 4861 6.3.7). */
+static int send_rs(int fd, unsigned ifindex)
+{
     struct sockaddr_in6 dst;
     memset(&dst, 0, sizeof(dst));
     dst.sin6_family = AF_INET6;
@@ -507,39 +694,36 @@ static int open_ra_socket(const char *ifname)
     struct nd_router_solicit rs;
     memset(&rs, 0, sizeof(rs));
     rs.nd_rs_type = ND_ROUTER_SOLICIT;
-    int mreq_ok = 0;
-    {
-        struct ipv6_mreq mr;
-        memset(&mr, 0, sizeof(mr));
-        inet_pton(AF_INET6, "ff02::1", &mr.ipv6mr_multiaddr);
-        mr.ipv6mr_interface = ifindex;
-        mreq_ok = setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mr, sizeof(mr)) == 0;
-    }
-    (void)mreq_ok;
-    if (sendto(fd, &rs, sizeof(rs), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0)
-        { close(fd); return -1; }
-
-    return fd;
+    return sendto(fd, &rs, sizeof(rs), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0 ? -1 : 0;
 }
 
-static int receive_ra_pref64(int fd, unsigned ifindex, int timeout_sec,
-                              struct in6_addr *out, int *plen, uint32_t *lifetime,
-                              const struct in6_addr *active, int active_len)
+static long mono_ms_since(const struct timespec *t0)
 {
-    struct timespec t0, now;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)((now.tv_sec - t0->tv_sec) * 1000 + (now.tv_nsec - t0->tv_nsec) / 1000000);
+}
+
+/*
+ * Receive one acceptable RA: link-local source, Hop Limit 255, expected
+ * interface (RFC 4861 6.1.2).  Returns its length (the source router in
+ * *router), or -1 when the timeout elapses first.
+ */
+static ssize_t receive_ra(int fd, unsigned ifindex, long timeout_ms,
+                          uint8_t *buf, size_t bufsz, struct in6_addr *router)
+{
+    struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long left = (long)(timeout_sec * 1000) - ((now.tv_sec - t0.tv_sec) * 1000 +
-                                                   (now.tv_nsec - t0.tv_nsec) / 1000000);
+        long left = timeout_ms - mono_ms_since(&t0);
         if (left <= 0)
-            break;
+            return -1;
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         if (poll(&pfd, 1, (int)left) <= 0)
-            break;
-        uint8_t buf[1500], cbuf[256];
+            return -1;
+        uint8_t cbuf[256];
         struct sockaddr_in6 from;
-        struct iovec iov = { buf, sizeof(buf) };
+        struct iovec iov = { buf, bufsz };
         struct msghdr mh = { .msg_name = &from, .msg_namelen = sizeof(from),
                              .msg_iov = &iov, .msg_iovlen = 1,
                              .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
@@ -562,9 +746,28 @@ static int receive_ra_pref64(int fd, unsigned ifindex, int timeout_sec,
         }
         if (hl != 255 || idx != ifindex)
             continue;
-        if (parse_ra_pref64_update(buf, (size_t)n, out, plen, lifetime, active, active_len) == 0) {
+        *router = from.sin6_addr;
+        return n;
+    }
+}
+
+static int receive_ra_pref64(int fd, unsigned ifindex, int timeout_sec,
+                              struct in6_addr *out, int *plen, uint32_t *lifetime,
+                              const struct in6_addr *active, int active_len)
+{
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        long left = (long)timeout_sec * 1000 - mono_ms_since(&t0);
+        if (left <= 0)
+            break;
+        uint8_t buf[1500];
+        struct in6_addr router;
+        ssize_t n = receive_ra(fd, ifindex, left, buf, sizeof(buf), &router);
+        if (n < 0)
+            break;
+        if (parse_ra_pref64_update(buf, (size_t)n, out, plen, lifetime, active, active_len) == 0)
             return 0;
-        }
     }
     return -1;
 }
@@ -993,7 +1196,7 @@ static ssize_t decode_qname(const uint8_t *pkt, size_t plen, size_t offset,
 static size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
                                 const struct in6_addr *prefix, int prefix_len,
                                 uint16_t rtype, const uint8_t v4_list[][4], size_t count,
-                                uint8_t rcode, uint8_t *resp, size_t resp_sz)
+                                uint8_t rcode, uint32_t ttl, uint8_t *resp, size_t resp_sz)
 {
     if (12 + qsec_len > resp_sz)
         return 0;
@@ -1021,10 +1224,10 @@ static size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
         resp[pos++] = (uint8_t)(rtype & 0xff);
         resp[pos++] = 0x00;
         resp[pos++] = 0x01;
-        resp[pos++] = 0x00;
-        resp[pos++] = 0x00;
-        resp[pos++] = 0x00;
-        resp[pos++] = 0x3c;
+        resp[pos++] = (uint8_t)(ttl >> 24);
+        resp[pos++] = (uint8_t)(ttl >> 16);
+        resp[pos++] = (uint8_t)(ttl >> 8);
+        resp[pos++] = (uint8_t)ttl;
         resp[pos++] = 0x00;
         resp[pos++] = (uint8_t)rdlen;
         if (rtype == 28)
@@ -1067,37 +1270,19 @@ static int upstream_resolve(struct dns_upstream *u)
     return 0;
 }
 
-static ssize_t forward_dns_udp(struct dns_upstream *u,
-                               const uint8_t *pkt, size_t plen,
-                               uint8_t *resp, size_t resp_sz)
-{
-    if (plen < 2 || upstream_resolve(u) < 0)
-        return -1;
-    int fd = socket(u->addr.ss_family, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    ssize_t rlen = -1;
-    if (connect(fd, (struct sockaddr *)&u->addr, u->addrlen) == 0 &&
-        send(fd, pkt, plen, 0) == (ssize_t)plen) {
-        rlen = recv(fd, resp, resp_sz, 0);
-        /* The reply must echo our transaction ID. */
-        if (rlen < 2 || resp[0] != pkt[0] || resp[1] != pkt[1])
-            rlen = -1;
-    }
-    close(fd);
-    return rlen;
-}
-
+/* Counts records of want_type in the answer section.  When ttl_out is given
+ * it receives RFC 6147 5.1.7's TTL for a synthesized AAAA: the smallest TTL of
+ * the matching records, further bounded by the SOA MINIMUM in the authority
+ * section when the response carries one. */
 static size_t extract_dns_records(const uint8_t *resp, size_t rlen,
-                                  uint16_t want_type, uint8_t v4_list[][4], size_t max_v4)
+                                  uint16_t want_type, uint8_t v4_list[][4], size_t max_v4,
+                                  uint32_t *ttl_out)
 {
     if (rlen < 12 || !(resp[2] & 0x80) || (resp[3] & 0x0f) != 0)
         return 0;
     uint16_t qdcount = ((uint16_t)resp[4] << 8) | resp[5];
     uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
+    uint16_t nscount = ((uint16_t)resp[8] << 8) | resp[9];
     size_t pos = 12;
     for (uint16_t q = 0; q < qdcount; q++) {
         ssize_t next = skip_dns_name(resp, rlen, pos);
@@ -1105,23 +1290,50 @@ static size_t extract_dns_records(const uint8_t *resp, size_t rlen,
         pos = (size_t)next + 4;
     }
     size_t found = 0;
-    for (uint16_t a = 0; a < ancount && pos < rlen; a++) {
-        ssize_t next = skip_dns_name(resp, rlen, pos);
-        if (next < 0 || (size_t)next + 10 > rlen) break;
+    uint32_t min_ttl = UINT32_MAX;
+    int complete = 1;
+    for (uint16_t a = 0; a < ancount; a++) {
+        ssize_t next = pos < rlen ? skip_dns_name(resp, rlen, pos) : -1;
+        if (next < 0 || (size_t)next + 10 > rlen) { complete = 0; break; }
         pos = (size_t)next;
         uint16_t atype = ((uint16_t)resp[pos] << 8) | resp[pos + 1];
         uint16_t aclass = ((uint16_t)resp[pos + 2] << 8) | resp[pos + 3];
+        uint32_t rttl = ((uint32_t)resp[pos + 4] << 24) | ((uint32_t)resp[pos + 5] << 16) |
+                        ((uint32_t)resp[pos + 6] << 8) | resp[pos + 7];
         uint16_t rdlen = ((uint16_t)resp[pos + 8] << 8) | resp[pos + 9];
         pos += 10;
-        if (pos + rdlen > rlen) break;
+        if (pos + rdlen > rlen) { complete = 0; break; }
         if (atype == want_type && aclass == 1) {
             if (want_type == 1 && rdlen == 4 && v4_list && found < max_v4) {
                 memcpy(v4_list[found++], resp + pos, 4);
+                if (rttl < min_ttl) min_ttl = rttl;
             } else if (want_type == 28 && rdlen == 16) {
                 found++;
             }
         }
         pos += rdlen;
+    }
+    if (ttl_out) {
+        for (uint16_t n = 0; complete && n < nscount; n++) {
+            ssize_t next = pos < rlen ? skip_dns_name(resp, rlen, pos) : -1;
+            if (next < 0 || (size_t)next + 10 > rlen) break;
+            pos = (size_t)next;
+            uint16_t ntype = ((uint16_t)resp[pos] << 8) | resp[pos + 1];
+            uint16_t rdlen = ((uint16_t)resp[pos + 8] << 8) | resp[pos + 9];
+            pos += 10;
+            if (pos + rdlen > rlen) break;
+            if (ntype == 6) {	/* SOA: MNAME RNAME serial refresh retry expire minimum */
+                ssize_t m = skip_dns_name(resp, pos + rdlen, pos);
+                ssize_t r = m < 0 ? -1 : skip_dns_name(resp, pos + rdlen, (size_t)m);
+                if (r >= 0 && (size_t)r + 20 <= pos + rdlen) {
+                    uint32_t minimum = ((uint32_t)resp[r + 16] << 24) | ((uint32_t)resp[r + 17] << 16) |
+                                       ((uint32_t)resp[r + 18] << 8) | resp[r + 19];
+                    if (minimum < min_ttl) min_ttl = minimum;
+                }
+            }
+            pos += rdlen;
+        }
+        *ttl_out = min_ttl == UINT32_MAX ? 60 : min_ttl;
     }
     return found;
 }
@@ -1131,6 +1343,256 @@ static void handle_dns64_sig(int sig)
 {
     (void)sig;
     dns64_stop = 1;
+}
+
+/*
+ * Concurrent DNS64 service.  Every client query that needs the upstream gets a
+ * slot with its own connected socket (kernel-chosen source port) and a two
+ * second deadline; one poll() loop drives all slots, so a slow authoritative
+ * server delays only the names that depend on it.
+ */
+#define DNS_MAX_PENDING 64
+#define DNS_UPSTREAM_TIMEOUT_MS 2000
+
+enum dns_stage { DNS_FWD, DNS_AAAA, DNS_A };
+
+struct dns_pending {
+    int used, up_fd;
+    enum dns_stage stage;
+    struct sockaddr_storage client;
+    socklen_t client_len;
+    uint8_t req[1500];
+    size_t req_len, qsec_len;
+    uint16_t qtype;
+    uint8_t aaaa_resp[1500];	/* upstream AAAA answer kept as the fallback reply */
+    ssize_t aaaa_len;
+    int64_t deadline_ms;
+};
+
+struct dns_ctx {
+    int fd;
+    struct dns_upstream *up;
+    struct in6_addr prefix;
+    int plen;
+};
+
+static int64_t dns_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void dns_pending_free(struct dns_pending *p)
+{
+    if (p->up_fd >= 0)
+        close(p->up_fd);
+    p->up_fd = -1;
+    p->used = 0;
+}
+
+static void dns_reply(const struct dns_ctx *c, const struct dns_pending *p, const uint8_t *buf, size_t len)
+{
+    (void)sendto(c->fd, buf, len, 0, (const struct sockaddr *)&p->client, p->client_len);
+}
+
+static void dns_servfail(const struct dns_ctx *c, const struct dns_pending *p)
+{
+    uint8_t out[1500];
+    size_t n = build_dns64_reply(p->req, p->qsec_len, &c->prefix, c->plen, p->qtype, NULL, 0, 2, 60, out, sizeof(out));
+    if (n > 0)
+        dns_reply(c, p, out, n);
+}
+
+/* (Re)start the upstream exchange of a slot with a fresh socket. */
+static int dns_upstream_send(struct dns_upstream *u, struct dns_pending *p, const uint8_t *pkt, size_t len)
+{
+    if (p->up_fd >= 0) {
+        close(p->up_fd);
+        p->up_fd = -1;
+    }
+    if (len < 2 || upstream_resolve(u) < 0)
+        return -1;
+    int s = socket(u->addr.ss_family, SOCK_DGRAM, 0);
+    if (s < 0)
+        return -1;
+    (void)fcntl(s, F_SETFD, FD_CLOEXEC);
+    if (connect(s, (struct sockaddr *)&u->addr, u->addrlen) != 0 || send(s, pkt, len, 0) != (ssize_t)len) {
+        close(s);
+        return -1;
+    }
+    p->up_fd = s;
+    p->deadline_ms = dns_now_ms() + DNS_UPSTREAM_TIMEOUT_MS;
+    return 0;
+}
+
+/* Rebuild the client's AAAA query as an A query, keeping CD and EDNS0 (DO). */
+static size_t build_a_query(const uint8_t *req, size_t qlen, size_t qsec_len, uint8_t *a_req, size_t cap)
+{
+    if (12 + qsec_len > cap)
+        return 0;
+    memset(a_req, 0, 12);
+    a_req[0] = req[0];
+    a_req[1] = req[1];
+    a_req[2] = 0x01;
+    a_req[3] = req[3] & 0x10; /* preserve CD (RFC 6147 5.1) */
+    a_req[5] = 1;
+    memcpy(a_req + 12, req + 12, qsec_len);
+    a_req[12 + qsec_len - 4] = 0x00;
+    a_req[12 + qsec_len - 3] = 0x01;
+    size_t a_len_req = 12 + qsec_len;
+    /* Locate OPT by walking all records; never copy compressed
+     * names whose offsets would change in the rebuilt query. */
+    size_t pos = 12 + qsec_len;
+    unsigned records = ((unsigned)req[6] << 8 | req[7]) +
+        ((unsigned)req[8] << 8 | req[9]) +
+        ((unsigned)req[10] << 8 | req[11]);
+    for (unsigned r = 0; r < records; r++) {
+        size_t start = pos;
+        ssize_t end = skip_dns_name(req, qlen, pos);
+        if (end < 0 || (size_t)end + 10 > qlen) break;
+        pos = (size_t)end;
+        unsigned type = (unsigned)req[pos] << 8 | req[pos + 1];
+        size_t rdlen = (size_t)req[pos + 8] << 8 | req[pos + 9];
+        if (rdlen > qlen - pos - 10) break;
+        if (type == 41 && req[start] == 0 && pos == start + 1) {
+            size_t bytes = 11 + rdlen;
+            if (bytes <= cap - a_len_req) {
+                memcpy(a_req + a_len_req, req + start, bytes);
+                a_len_req += bytes;
+                a_req[11] = 1;
+            }
+            break;
+        }
+        pos += 10 + rdlen;
+    }
+    return a_len_req;
+}
+
+/* One step of a slot: resp/rlen is the upstream answer, or rlen < 0 for none. */
+static void dns_advance(struct dns_ctx *c, struct dns_pending *p, const uint8_t *resp, ssize_t rlen)
+{
+    uint8_t out[1500];
+    if (p->stage == DNS_FWD) {
+        if (rlen >= 12)
+            dns_reply(c, p, resp, (size_t)rlen);
+        else
+            dns_servfail(c, p);
+        dns_pending_free(p);
+        return;
+    }
+    if (p->stage == DNS_AAAA) {
+        if (rlen >= 12 && extract_dns_records(resp, (size_t)rlen, 28, NULL, 0, NULL) > 0) {
+            dns_reply(c, p, resp, (size_t)rlen);
+            dns_pending_free(p);
+            return;
+        }
+        if (rlen >= 12) {
+            memcpy(p->aaaa_resp, resp, (size_t)rlen);
+            p->aaaa_len = rlen;
+        } else {
+            p->aaaa_len = -1;
+        }
+        uint8_t a_req[1500];
+        size_t a_len = build_a_query(p->req, p->req_len, p->qsec_len, a_req, sizeof(a_req));
+        if (a_len && dns_upstream_send(c->up, p, a_req, a_len) == 0) {
+            p->stage = DNS_A;
+            return;
+        }
+    } else {
+        uint8_t v4[16][4];
+        uint32_t ttl = 60;
+        size_t cnt = rlen >= 12 ? extract_dns_records(resp, (size_t)rlen, 1, v4, 16, &ttl) : 0;
+        if (cnt > 0) {
+            size_t n = build_dns64_reply(p->req, p->qsec_len, &c->prefix, c->plen, 28, v4, cnt, 0, ttl, out, sizeof(out));
+            if (n > 0) {
+                dns_reply(c, p, out, n);
+                dns_pending_free(p);
+                return;
+            }
+        }
+    }
+    /* No synthesis possible: relay the upstream's own AAAA answer (NODATA,
+     * NXDOMAIN, ...) when there was one, SERVFAIL otherwise. */
+    if (p->aaaa_len >= 12)
+        dns_reply(c, p, p->aaaa_resp, (size_t)p->aaaa_len);
+    else
+        dns_servfail(c, p);
+    dns_pending_free(p);
+}
+
+/* One client datagram: answer locally when possible, else open a slot. */
+static void dns_intake(struct dns_ctx *c, struct dns_pending *pend, const uint8_t *req, size_t qlen,
+                       const struct sockaddr_storage *cli, socklen_t cli_len)
+{
+    if (qlen < 12 || (req[2] & 0x80))
+        return;
+    uint16_t qdcount = ((uint16_t)req[4] << 8) | req[5];
+    if (qdcount < 1)
+        return;
+    char qname[256];
+    ssize_t qend = decode_qname(req, qlen, 12, qname, sizeof(qname));
+    if (qend < 0 || (size_t)qend + 4 > qlen)
+        return;
+    uint16_t qtype = ((uint16_t)req[qend] << 8) | req[qend + 1];
+    uint16_t qclass = ((uint16_t)req[qend + 2] << 8) | req[qend + 3];
+    size_t qsec_len = (size_t)qend + 4 - 12;
+    uint8_t resp[1500];
+    size_t rlen = 0;
+
+    if (qclass == 1 && strcasecmp(qname, "ipv4only.arpa") == 0) {
+        static const uint8_t wka_pair[2][4] = { {192, 0, 0, 170}, {192, 0, 0, 171} };
+        if (qtype == 28 || qtype == 1)
+            rlen = build_dns64_reply(req, qsec_len, &c->prefix, c->plen, qtype, wka_pair, 2, 0, 60, resp, sizeof(resp));
+        else
+            rlen = build_dns64_reply(req, qsec_len, &c->prefix, c->plen, qtype, NULL, 0, 0, 60, resp, sizeof(resp));
+        if (rlen > 0)
+            (void)sendto(c->fd, resp, rlen, 0, (const struct sockaddr *)cli, cli_len);
+        return;
+    }
+
+    uint8_t hosts_v4[8][4];
+    size_t hosts_cnt = (qclass == 1) ? lookup_hosts_v4(g_hosts_file, qname, hosts_v4, 8) : 0;
+    if (hosts_cnt > 0) {
+        if (qtype == 28)
+            rlen = build_dns64_reply(req, qsec_len, &c->prefix, c->plen, 28, hosts_v4, hosts_cnt, 0, 60, resp, sizeof(resp));
+        else
+            rlen = build_dns64_reply(req, qsec_len, &c->prefix, c->plen, qtype, NULL, 0, 0, 60, resp, sizeof(resp));
+        if (rlen > 0)
+            (void)sendto(c->fd, resp, rlen, 0, (const struct sockaddr *)cli, cli_len);
+        return;
+    }
+
+    struct dns_pending *p = NULL;
+    for (int i = 0; i < DNS_MAX_PENDING; i++)
+        if (!pend[i].used) {
+            p = &pend[i];
+            break;
+        }
+    if (!p) {	/* table full: shed load instead of queueing */
+        rlen = build_dns64_reply(req, qsec_len, &c->prefix, c->plen, qtype, NULL, 0, 2, 60, resp, sizeof(resp));
+        if (rlen > 0)
+            (void)sendto(c->fd, resp, rlen, 0, (const struct sockaddr *)cli, cli_len);
+        return;
+    }
+    p->used = 1;
+    p->up_fd = -1;
+    p->client = *cli;
+    p->client_len = cli_len;
+    memcpy(p->req, req, qlen);
+    p->req_len = qlen;
+    p->qsec_len = qsec_len;
+    p->qtype = qtype;
+    p->aaaa_len = -1;
+    p->stage = (qtype == 28 && qclass == 1) ? DNS_AAAA : DNS_FWD;
+    if (dns_upstream_send(c->up, p, p->req, p->req_len) != 0) {
+        if (p->stage == DNS_AAAA)
+            dns_advance(c, p, NULL, -1);	/* still try the A query */
+        else {
+            dns_servfail(c, p);
+            dns_pending_free(p);
+        }
+    }
 }
 
 static int serve_dns64(const char *listen_spec, const char *prefix_spec, const char *upstream_spec)
@@ -1182,133 +1644,80 @@ static int serve_dns64(const char *listen_spec, const char *prefix_spec, const c
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
+    struct dns_ctx ctx = { .fd = fd, .up = &upstream, .prefix = prefix, .plen = prefix_len };
+    struct dns_pending *pend = calloc(DNS_MAX_PENDING, sizeof(*pend));
+    if (!pend) {
+        close(fd);
+        return 1;
+    }
+    for (int i = 0; i < DNS_MAX_PENDING; i++)
+        pend[i].up_fd = -1;
+
     while (!dns64_stop) {
-        struct sockaddr_storage cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        uint8_t req[1500];
-        ssize_t qlen = recvfrom(fd, req, sizeof(req), 0, (struct sockaddr *)&cli_addr, &cli_len);
-        if (qlen < 0) {
+        struct pollfd pfds[1 + DNS_MAX_PENDING];
+        int slot_of[1 + DNS_MAX_PENDING];
+        int n = 0, timeout = 1000;
+        int64_t now = dns_now_ms();
+        pfds[n].fd = fd;
+        pfds[n].events = POLLIN;
+        slot_of[n++] = -1;
+        for (int i = 0; i < DNS_MAX_PENDING; i++) {
+            if (!pend[i].used)
+                continue;
+            pfds[n].fd = pend[i].up_fd;
+            pfds[n].events = POLLIN;
+            slot_of[n++] = i;
+            int64_t left = pend[i].deadline_ms - now;
+            if (left < 0) left = 0;
+            if (left < timeout) timeout = (int)left;
+        }
+        if (poll(pfds, (nfds_t)n, timeout) < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        if (qlen < 12 || (req[2] & 0x80))
-            continue;
-        uint16_t qdcount = ((uint16_t)req[4] << 8) | req[5];
-        if (qdcount < 1)
-            continue;
 
-        char qname[256];
-        ssize_t qend = decode_qname(req, (size_t)qlen, 12, qname, sizeof(qname));
-        if (qend < 0 || (size_t)qend + 4 > (size_t)qlen)
-            continue;
-        uint16_t qtype = ((uint16_t)req[qend] << 8) | req[qend + 1];
-        uint16_t qclass = ((uint16_t)req[qend + 2] << 8) | req[qend + 3];
-        size_t qsec_len = (size_t)qend + 4 - 12;
-
-        uint8_t resp[1500];
-        size_t rlen = 0;
-
-        if (qclass == 1 && strcasecmp(qname, "ipv4only.arpa") == 0) {
-            static const uint8_t wka_pair[2][4] = {
-                {192, 0, 0, 170},
-                {192, 0, 0, 171}
-            };
-            if (qtype == 28 || qtype == 1) {
-                rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, qtype, wka_pair, 2, 0, resp, sizeof(resp));
-            } else {
-                rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, qtype, NULL, 0, 0, resp, sizeof(resp));
-            }
-            if (rlen > 0)
-                sendto(fd, resp, rlen, 0, (struct sockaddr *)&cli_addr, cli_len);
-            continue;
+        /* Upstream answers (several queries may be in flight at once). */
+        for (int k = 1; k < n; k++) {
+            if (!(pfds[k].revents & (POLLIN | POLLERR | POLLHUP)))
+                continue;
+            struct dns_pending *p = &pend[slot_of[k]];
+            if (!p->used || p->up_fd != pfds[k].fd)
+                continue;
+            uint8_t resp[1500];
+            ssize_t rlen = recv(p->up_fd, resp, sizeof(resp), MSG_DONTWAIT);
+            if (rlen < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                continue;
+            /* The reply must echo our transaction ID; anything else is ignored. */
+            if (rlen >= 2 && (resp[0] != p->req[0] || resp[1] != p->req[1]))
+                continue;
+            dns_advance(&ctx, p, resp, rlen);
         }
 
-        uint8_t hosts_v4[8][4];
-        size_t hosts_cnt = (qclass == 1) ? lookup_hosts_v4(g_hosts_file, qname, hosts_v4, 8) : 0;
-        if (hosts_cnt > 0) {
-            if (qtype == 28)
-                rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, 28, hosts_v4, hosts_cnt, 0, resp, sizeof(resp));
-            else
-                rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, qtype, NULL, 0, 0, resp, sizeof(resp));
-            if (rlen > 0)
-                sendto(fd, resp, rlen, 0, (struct sockaddr *)&cli_addr, cli_len);
-            continue;
-        }
+        /* Upstream silence: advance with "no answer". */
+        now = dns_now_ms();
+        for (int i = 0; i < DNS_MAX_PENDING; i++)
+            if (pend[i].used && now >= pend[i].deadline_ms)
+                dns_advance(&ctx, &pend[i], NULL, -1);
 
-        if (qtype == 28 && qclass == 1) {
-            uint8_t up_resp[1500];
-            ssize_t up_len = forward_dns_udp(&upstream, req, (size_t)qlen, up_resp, sizeof(up_resp));
-            if (up_len >= 12 && extract_dns_records(up_resp, (size_t)up_len, 28, NULL, 0) > 0) {
-                sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
-                continue;
-            }
-            uint8_t a_req[sizeof(req)];
-            if (12 + qsec_len <= sizeof(a_req)) {
-                memset(a_req, 0, 12);
-                a_req[0] = req[0];
-                a_req[1] = req[1];
-                a_req[2] = 0x01;
-                a_req[3] = req[3] & 0x10; /* preserve CD (RFC 6147 5.1) */
-                a_req[5] = 1;
-                memcpy(a_req + 12, req + 12, qsec_len);
-                a_req[12 + qsec_len - 4] = 0x00;
-                a_req[12 + qsec_len - 3] = 0x01;
-                size_t a_len_req = 12 + qsec_len;
-                /* Locate OPT by walking all records; never copy compressed
-                 * names whose offsets would change in the rebuilt query. */
-                size_t pos = 12 + qsec_len;
-                unsigned records = ((unsigned)req[6] << 8 | req[7]) +
-                    ((unsigned)req[8] << 8 | req[9]) +
-                    ((unsigned)req[10] << 8 | req[11]);
-                for (unsigned r = 0; r < records; r++) {
-                    size_t start = pos;
-                    ssize_t end = skip_dns_name(req, (size_t)qlen, pos);
-                    if (end < 0 || (size_t)end + 10 > (size_t)qlen) break;
-                    pos = (size_t)end;
-                    unsigned type = (unsigned)req[pos] << 8 | req[pos + 1];
-                    size_t rdlen = (size_t)req[pos + 8] << 8 | req[pos + 9];
-                    if (rdlen > (size_t)qlen - pos - 10) break;
-                    if (type == 41 && req[start] == 0 && pos == start + 1) {
-                        size_t bytes = 11 + rdlen;
-                        if (bytes <= sizeof(a_req) - a_len_req) {
-                            memcpy(a_req + a_len_req, req + start, bytes);
-                            a_len_req += bytes;
-                            a_req[11] = 1;
-                        }
-                        break;
-                    }
-                    pos += 10 + rdlen;
-                }
-                uint8_t a_resp[1500];
-                ssize_t a_len = forward_dns_udp(&upstream, a_req, a_len_req, a_resp, sizeof(a_resp));
-                uint8_t up_v4[16][4];
-                size_t v4_cnt = (a_len >= 12) ? extract_dns_records(a_resp, (size_t)a_len, 1, up_v4, 16) : 0;
-                if (v4_cnt > 0) {
-                    rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, 28, up_v4, v4_cnt, 0, resp, sizeof(resp));
-                    if (rlen > 0) {
-                        sendto(fd, resp, rlen, 0, (struct sockaddr *)&cli_addr, cli_len);
-                        continue;
-                    }
-                }
-            }
-            if (up_len >= 12) {
-                sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
-                continue;
-            }
-        } else {
-            uint8_t up_resp[1500];
-            ssize_t up_len = forward_dns_udp(&upstream, req, (size_t)qlen, up_resp, sizeof(up_resp));
-            if (up_len >= 12) {
-                sendto(fd, up_resp, (size_t)up_len, 0, (struct sockaddr *)&cli_addr, cli_len);
-                continue;
+        /* New client queries. */
+        if (pfds[0].revents & POLLIN) {
+            for (int burst = 0; burst < 32; burst++) {
+                struct sockaddr_storage cli_addr;
+                socklen_t cli_len = sizeof(cli_addr);
+                uint8_t req[1500];
+                ssize_t qlen = recvfrom(fd, req, sizeof(req), MSG_DONTWAIT,
+                                        (struct sockaddr *)&cli_addr, &cli_len);
+                if (qlen < 0)
+                    break;
+                dns_intake(&ctx, pend, req, (size_t)qlen, &cli_addr, cli_len);
             }
         }
-
-        rlen = build_dns64_reply(req, qsec_len, &prefix, prefix_len, qtype, NULL, 0, 2, resp, sizeof(resp));
-        if (rlen > 0)
-            sendto(fd, resp, rlen, 0, (struct sockaddr *)&cli_addr, cli_len);
     }
 
+    for (int i = 0; i < DNS_MAX_PENDING; i++)
+        if (pend[i].used)
+            dns_pending_free(&pend[i]);
+    free(pend);
     close(fd);
     return 0;
 }
@@ -1559,19 +1968,108 @@ static void stop_ra_child(pid_t child)
 }
 #endif
 
+__attribute__((unused)) static void active_prefix_path(const char *dir, char *out, size_t size)
+{
+    snprintf(out, size, "%s/active-prefix", dir);
+}
+
+/* Publish the prefix the translator really runs, so status and verification
+ * scripts do not read the (unchanged) installed profile. */
+__attribute__((unused)) static void publish_active_prefix(const char *dir, const struct in6_addr *prefix, int plen)
+{
+    if (!dir)
+        return;
+    char path[1024], tmp[1040], text[INET6_ADDRSTRLEN];
+    active_prefix_path(dir, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (!inet_ntop(AF_INET6, prefix, text, sizeof(text)))
+        return;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    int failed = dprintf(fd, "%s/%d rfc8781\n", text, plen) < 0;
+    if (close(fd))
+        failed = 1;
+    if (failed || rename(tmp, path))
+        unlink(tmp);
+}
+
+__attribute__((unused)) static void retract_active_prefix(const char *dir)
+{
+    if (!dir)
+        return;
+    char path[1024];
+    active_prefix_path(dir, path, sizeof(path));
+    unlink(path);
+}
+
+__attribute__((unused)) static time_t mono_seconds_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+/* Snapshots "<config>.ra.XXXXXX" survive a SIGKILL or power cut of an earlier
+ * supervisor; one supervisor runs per profile, so every match is stale. */
+__attribute__((unused)) static void remove_stale_snapshots(const char *config)
+{
+    char dir[1024], prefix[300];
+    const char *slash = strrchr(config, '/');
+    size_t dl = slash == config ? 1 : (size_t)(slash - config);
+    if (dl >= sizeof(dir) || snprintf(prefix, sizeof(prefix), "%s.ra.", slash + 1) >= (int)sizeof(prefix))
+        return;
+    memcpy(dir, config, dl);
+    dir[dl] = '\0';
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    size_t plen = strlen(prefix);
+    while ((e = readdir(d)))
+        if (!strncmp(e->d_name, prefix, plen) && strlen(e->d_name) == plen + 6)
+            (void)unlinkat(dirfd(d), e->d_name, 0);
+    closedir(d);
+}
+
+/* RFC 4861 6.3.7: three solicitations, four seconds apart, before giving up
+ * on the first start.  After that the supervisor stays resident and asks
+ * again with exponential back-off (RFC 7559), capped at one hour. */
+#define RA_INITIAL_ATTEMPTS 3
+#define RA_SOLICIT_INTERVAL 4
+#define RA_SOLICIT_CAP 3600
+
 /* Control-plane supervisor. The configured file stays unchanged; each child
- * reads a private snapshot with the currently advertised translation prefix. */
+ * reads a private snapshot with the currently advertised translation prefix.
+ *   --supervise-ra CONFIG [--network-controller PATH] [--runtime-dir DIR]
+ *                  [--initial-prefix PFX/LEN --initial-lifetime SEC] -- COMMAND... */
 static int supervise_ra(int argc, char **argv)
 {
-    int command = 4;
-    const char *controller = NULL;
-    if (argc >= 7 && !strcmp(argv[3], "--network-controller")) {
-        controller = argv[4];
-        if (controller[0] != '/' || strcmp(argv[5], "--")) return 2;
-        command = 6;
-    } else if (argc < 5 || strcmp(argv[3], "--")) return 2;
+    const char *controller = NULL, *runtime_dir = NULL, *initial_prefix = NULL;
+    long initial_lifetime = 0;
+    int command = 0;
+    if (argc < 5)
+        return 2;
     const char *config = argv[2];
-    if (config[0] != '/') return 2;
+    if (config[0] != '/')
+        return 2;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--")) {
+            command = i + 1;
+            break;
+        }
+        if (i + 1 >= argc)
+            return 2;
+        if (!strcmp(argv[i], "--network-controller")) controller = argv[++i];
+        else if (!strcmp(argv[i], "--runtime-dir")) runtime_dir = argv[++i];
+        else if (!strcmp(argv[i], "--initial-prefix")) initial_prefix = argv[++i];
+        else if (!strcmp(argv[i], "--initial-lifetime")) initial_lifetime = atol(argv[++i]);
+        else return 2;
+    }
+    if (!command || command >= argc)
+        return 2;
+    if ((controller && controller[0] != '/') || (runtime_dir && runtime_dir[0] != '/'))
+        return 2;
     FILE *in = fopen(config, "r");
     if (!in) return 1;
     char line[1024], iface[IF_NAMESIZE] = "", configured[INET6_ADDRSTRLEN + 8] = "";
@@ -1589,9 +2087,16 @@ static int supervise_ra(int argc, char **argv)
     if (!iface[0]) { execvp(argv[command], argv + command); return 1; }
 #if defined(__linux__) || defined(__FreeBSD__)
     int ra_fd = open_ra_socket(iface);
-    if (ra_fd < 0) return 1;
+    if (ra_fd < 0) {
+        fprintf(stderr, "Cannot use %s for Router Advertisements%s\n", iface,
+                ra_fd == -2 ? " (raw ICMPv6 socket: CAP_NET_RAW required)"
+                            : " (unknown interface, or no usable link-local address)");
+        return 1;
+    }
+    unsigned ifindex = if_nametoindex(iface);
     char snapshot[1024];
     if (snprintf(snapshot, sizeof(snapshot), "%s.ra.XXXXXX", config) >= (int)sizeof(snapshot)) { close(ra_fd); return 1; }
+    remove_stale_snapshots(config);
     int fd = mkstemp(snapshot);
     if (fd < 0) { close(ra_fd); return 1; }
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) { close(fd); close(ra_fd); unlink(snapshot); return 1; }
@@ -1605,111 +2110,180 @@ static int supervise_ra(int argc, char **argv)
     sigfillset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL); sigaction(SIGUSR1, &sa, NULL); sigaction(SIGUSR2, &sa, NULL);
+
+    struct ra_table table;
+    ra_table_init(&table);
+    time_t started = mono_seconds_now();
+    if (initial_prefix && initial_lifetime > 0) {
+        struct in6_addr p;
+        int pl;
+        if (parse_prefix_spec(initial_prefix, &p, &pl) == 0 && is_valid_pref64_prefix(&p, pl))
+            ra_table_add_provisional(&table, &p, pl, (uint32_t)initial_lifetime, started);
+    }
+    /* The prefix the host network (NAT66 firewall) was built for. */
+    struct in6_addr net_prefix;
+    int net_len = 0;
+    memset(&net_prefix, 0, sizeof(net_prefix));
+    if (parse_prefix_spec(configured, &net_prefix, &net_len))
+        net_len = 0;
+
     pid_t child = -1;
     struct in6_addr active;
     memset(&active, 0, sizeof(active));
-    int active_len = 0, result = 1;
-    time_t deadline = 0;
+    int active_len = 0, result = 1, ever_started = 0, rs_sent = 1;
+    time_t next_rs = started + RA_SOLICIT_INTERVAL;
+    long rs_interval = RA_SOLICIT_INTERVAL;
     while (!dns64_stop) {
         if (child > 0) {
             int status;
             pid_t done = waitpid(child, &status, WNOHANG);
-            if (done == child || (done < 0 && errno == ECHILD)) { child = -1; break; }
+            /* The translator died on its own: let the service manager apply
+             * its restart policy. */
+            if (done == child || (done < 0 && errno == ECHILD)) {
+                if (done == child && WIFEXITED(status))
+                    fprintf(stderr, "Translator exited with status %d\n", WEXITSTATUS(status));
+                else if (done == child && WIFSIGNALED(status))
+                    fprintf(stderr, "Translator killed by signal %d\n", WTERMSIG(status));
+                child = -1;
+                break;
+            }
             if (supervisor_hup) { supervisor_hup = 0; kill(child, SIGHUP); }
             if (supervisor_usr1) { supervisor_usr1 = 0; kill(child, SIGUSR1); }
             if (supervisor_usr2) { supervisor_usr2 = 0; kill(child, SIGUSR2); }
         }
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        if (child > 0 && ts.tv_sec >= deadline) break;
-        struct in6_addr prefix;
-        int plen;
-        uint32_t life;
-        int timeout = child > 0 && deadline - ts.tv_sec < 3 ? (int)(deadline - ts.tv_sec) : 3;
-        if (receive_ra_pref64(ra_fd, if_nametoindex(iface), timeout, &prefix, &plen, &life, child > 0 ? &active : NULL, active_len)) {
-            if (child < 0) break;
-            continue;
-        }
-        if (!life) {
-            if (child > 0 && plen == active_len && !memcmp(&prefix, &active, sizeof(prefix))) break;
-            continue;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        /* A prefix-dependent firewall must change while no translator runs. */
-        int change_network = 0;
-        if (nat66) {
-            struct in6_addr installed_prefix;
-            int installed_len;
-            const struct in6_addr *expected = &active;
-            int expected_len = active_len;
-            if (!active_len) {
-                if (parse_prefix_spec(configured, &installed_prefix, &installed_len)) break;
-                expected = &installed_prefix;
-                expected_len = installed_len;
-            }
-            change_network = expected_len != plen || memcmp(expected, &prefix, sizeof(prefix));
-            if (change_network && !controller) {
-                fprintf(stderr, "RA prefix changed: a network controller is required for NAT66\n");
-                break;
+
+        uint8_t ra[1500];
+        struct in6_addr router;
+        ssize_t ra_len = receive_ra(ra_fd, ifindex, 500, ra, sizeof(ra), &router);
+        time_t now = mono_seconds_now();
+        if (ra_len > 0) {
+            struct ra_option opts[RA_MAX_OPTIONS];
+            int count = parse_ra_pref64_all(ra, (size_t)ra_len, opts, RA_MAX_OPTIONS);
+            if (count > 0) {
+                ra_table_apply(&table, &router, opts, count, now);
+                rs_interval = RA_SOLICIT_INTERVAL;
+                next_rs = now + (long)RA_SOLICIT_INTERVAL;
             }
         }
-        deadline = ts.tv_sec + (time_t)life;
-        if (child > 0 && plen == active_len && !memcmp(&prefix, &active, sizeof(prefix))) continue;
-        if (child > 0) {
+        ra_table_expire(&table, now);
+
+        struct in6_addr pick;
+        int pick_len = 0;
+        time_t pick_deadline = 0;
+        uint32_t pick_life = 0;
+        int have = ra_table_pick(&table, child > 0 ? &active : NULL, active_len, now,
+                                 &pick, &pick_len, &pick_deadline, &pick_life) == 0;
+
+        if (child > 0 && (!have || pick_len != active_len || memcmp(&pick, &active, sizeof(pick)))) {
+            /* Active prefix withdrawn or expired everywhere. */
             stop_ra_child(child);
             child = -1;
+            active_len = 0;
+            retract_active_prefix(runtime_dir);
+            if (!have) {
+                fprintf(stderr, "PREF64 withdrawn or expired; translator stopped, soliciting a new RA\n");
+                rs_interval = RA_SOLICIT_INTERVAL;
+                next_rs = now;
+            }
         }
         if (dns64_stop) break;
-        in = fopen(config, "r");
-        if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) { if (in) fclose(in); break; }
-        int copy_fd = dup(fd);
-        FILE *out = copy_fd >= 0 ? fdopen(copy_fd, "w") : NULL;
-        if (!out && copy_fd >= 0) close(copy_fd);
-        if (!in || !out) { if (in) fclose(in); if (out) fclose(out); break; }
-        char text[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, &prefix, text, sizeof(text));
-        int replaced = 0;
-        while (fgets(line, sizeof(line), in)) {
-            char key[64];
-            if (sscanf(line, "%63s", key) == 1 && !strcmp(key, "prefix")) {
-                fprintf(out, "prefix %s/%d\n", text, plen); replaced++;
-            } else fputs(line, out);
-        }
-        int failed = ferror(in) || ferror(out);
-        if (fclose(in)) failed = 1;
-        if (fclose(out)) failed = 1;
-        if (failed || replaced != 1) break;
-        if (change_network) {
-            /* down uses the existing undo journal, including the actual live
-             * prefix. up validates the snapshot and rolls back partial setup.
-             * If replacement fails, restore the saved profile without starting
-             * a translator on an unconfirmed/expired old prefix. */
-            if (ra_network_action(controller, "down", config)) {
-                fprintf(stderr, "RA network teardown failed; retaining controller journal for recovery\n");
-                break;
+
+        if (child < 0 && have) {
+            /* A prefix-dependent firewall must change while no translator runs. */
+            int change_network = 0;
+            if (nat66) {
+                change_network = net_len != pick_len || memcmp(&net_prefix, &pick, sizeof(pick));
+                if (change_network && !controller) {
+                    fprintf(stderr, "RA prefix changed: a network controller is required for NAT66\n");
+                    break;
+                }
             }
-            if (ra_network_action(controller, "up", snapshot)) {
-                fprintf(stderr, "RA network replacement failed; restoring saved profile\n");
-                if (!dns64_stop && ra_network_action(controller, "up", config))
-                    fprintf(stderr, "RA network restore failed; service cleanup/recovery is required\n");
-                break;
+            in = fopen(config, "r");
+            if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) { if (in) fclose(in); break; }
+            int copy_fd = dup(fd);
+            FILE *out = copy_fd >= 0 ? fdopen(copy_fd, "w") : NULL;
+            if (!out && copy_fd >= 0) close(copy_fd);
+            if (!in || !out) { if (in) fclose(in); if (out) fclose(out); break; }
+            char text[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &pick, text, sizeof(text));
+            int replaced = 0;
+            while (fgets(line, sizeof(line), in)) {
+                char key[64];
+                if (sscanf(line, "%63s", key) == 1 && !strcmp(key, "prefix")) {
+                    fprintf(out, "prefix %s/%d\n", text, pick_len); replaced++;
+                } else fputs(line, out);
             }
+            int failed = ferror(in) || ferror(out);
+            if (fclose(in)) failed = 1;
+            if (fclose(out)) failed = 1;
+            if (failed || replaced != 1) break;
+            if (change_network) {
+                /* down uses the existing undo journal, including the actual live
+                 * prefix. up validates the snapshot and rolls back partial setup.
+                 * If replacement fails, restore the saved profile without starting
+                 * a translator on an unconfirmed/expired old prefix. */
+                if (ra_network_action(controller, "down", config)) {
+                    fprintf(stderr, "RA network teardown failed; retaining controller journal for recovery\n");
+                    break;
+                }
+                if (ra_network_action(controller, "up", snapshot)) {
+                    fprintf(stderr, "RA network replacement failed; restoring saved profile\n");
+                    if (!dns64_stop && ra_network_action(controller, "up", config))
+                        fprintf(stderr, "RA network restore failed; service cleanup/recovery is required\n");
+                    break;
+                }
+                net_prefix = pick;
+                net_len = pick_len;
+            }
+            if (dns64_stop || mono_seconds_now() >= pick_deadline) continue;
+            child = fork();
+            if (child < 0) break;
+            if (!child) {
+                execvp(argv[command], argv + command);
+                fprintf(stderr, "Cannot execute %s: %s\n", argv[command], strerror(errno));
+                _exit(127);
+            }
+            active = pick; active_len = pick_len;
+            ever_started = 1;
+            publish_active_prefix(runtime_dir, &active, active_len);
+            rs_interval = RA_SOLICIT_INTERVAL;
+            next_rs = now + (long)RA_SOLICIT_INTERVAL;
+            continue;
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        if (dns64_stop || ts.tv_sec >= deadline) break;
-        child = fork();
-        if (child < 0) break;
-        if (!child) { execvp(argv[command], argv + command); _exit(127); }
-        active = prefix; active_len = plen;
+
+        /* Solicitations: start-up retries, last-quarter refresh and outage back-off. */
+        int need_rs = 0;
+        if (child < 0 && !have) {
+            if (!ever_started) {
+                if (rs_sent >= RA_INITIAL_ATTEMPTS && now >= next_rs) {
+                    fprintf(stderr, "No PREF64 router advertisement received on %s\n", iface);
+                    break;
+                }
+                need_rs = now >= next_rs && rs_sent < RA_INITIAL_ATTEMPTS;
+            } else {
+                need_rs = now >= next_rs;
+            }
+        } else if (child > 0 && pick_deadline - now < (time_t)(pick_life / 4)) {
+            need_rs = now >= next_rs;
+        }
+        if (need_rs) {
+            (void)send_rs(ra_fd, ifindex);
+            rs_sent++;
+            next_rs = now + rs_interval;
+            if (ever_started)
+                rs_interval = rs_interval < RA_SOLICIT_CAP / 2 ? rs_interval * 2 : RA_SOLICIT_CAP;
+        }
     }
     if (child > 0) stop_ra_child(child);
     if (dns64_stop) result = 0;
+    retract_active_prefix(runtime_dir);
     close(fd);
     close(ra_fd);
     unlink(snapshot);
     return result;
 #else
     (void)configured; (void)nat66; (void)supervisor_signal; (void)controller;
+    (void)runtime_dir; (void)initial_prefix; (void)initial_lifetime;
     return 1;
 #endif
 }

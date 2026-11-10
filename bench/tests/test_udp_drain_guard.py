@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Linux integration regression for the benchmark-only iperf3 write guard.
-Run after make udp-drain-tools. Requires dynamically linked iperf3 (3.18 tested).
+Requires dynamically linked iperf3 (3.18 tested).
 """
 import json
 import os
+import shutil
 from pathlib import Path
 import socket
 import sys
@@ -13,18 +14,28 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-CONTROLLER = ROOT / 'bench/shims/udp-drain-control'
-GUARD = ROOT / 'bench/shims/udp-drain-guard.so'
 
-@unittest.skipUnless(sys.platform == "linux" and GUARD.exists() and CONTROLLER.exists(),
-                     "requires Linux and make udp-drain-tools")
+@unittest.skipUnless(sys.platform == "linux" and shutil.which('iperf3'),
+                     "requires Linux and iperf3")
 class DrainTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.controller = Path(cls.temp.name) / 'controller'
+        cls.guard = Path(cls.temp.name) / 'guard.so'
+        source = str(ROOT / 'bench/shims/udp-drain-guard.c')
+        subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
+                        source, '-ldl', '-o', str(cls.guard)], check=True)
+        subprocess.run(['cc', '-DUDP_DRAIN_CONTROLLER', '-Wall', '-Wextra', '-Werror',
+                        source, '-o', str(cls.controller)], check=True)
+
     def test_both_directions(self):
         for reverse in (False, True):
             with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as tmp:
                 control = str(Path(tmp) / 'control')
-                subprocess.run([str(CONTROLLER), 'init', control], check=True)
-                env = dict(os.environ, LD_PRELOAD=str(GUARD), TAYGA_UDP_DRAIN_CONTROL=control)
+                subprocess.run([str(self.controller), 'init', control], check=True)
+                env = dict(os.environ, LD_PRELOAD=str(self.guard), TAYGA_UDP_DRAIN_CONTROL=control)
                 with socket.socket() as sock:
                     sock.bind(('127.0.0.1', 0)); port = str(sock.getsockname()[1])
                 server = subprocess.Popen(['iperf3', '-s', '-1', '-p', port], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -35,7 +46,7 @@ class DrainTest(unittest.TestCase):
                     if reverse: command += ['-R']
                     client = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     time.sleep(1)
-                    subprocess.run([str(CONTROLLER), 'stop', control], check=True, stdout=subprocess.DEVNULL)
+                    subprocess.run([str(self.controller), 'stop', control], check=True, stdout=subprocess.DEVNULL)
                     output, error = client.communicate(timeout=10)
                     self.assertEqual(client.returncode, 0, error + output)
                     report = json.loads(output)
@@ -46,7 +57,7 @@ class DrainTest(unittest.TestCase):
                     # Only the first second produces traffic: no resumed tail.
                     self.assertLess(sent['bytes'], 2_000_000)
                     self.assertGreater(sent['bytes'], 500_000)
-                    state = json.loads(subprocess.check_output([str(CONTROLLER), 'status', control]))
+                    state = json.loads(subprocess.check_output([str(self.controller), 'status', control]))
                     self.assertEqual(state['stopped'], 1)
                     self.assertGreater(state['blocked_writes'], 0)
                     self.assertEqual(state['attached'], 2)

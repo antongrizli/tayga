@@ -235,6 +235,8 @@ static int parse_bounded_long(const char *text, long lo, long hi, long *out)
 	return 0;
 }
 
+static int hash_bits_explicit;
+
 static int config_hash_bits(int ln, int arg_count, char **args)
 {
 	(void)arg_count;
@@ -244,6 +246,7 @@ static int config_hash_bits(int ln, int arg_count, char **args)
 		return ERROR_REJECT;
 	}
 	gcfg.hash_bits = (int)v;
+	hash_bits_explicit = 1;
 	return ERROR_NONE;
 }
 
@@ -314,17 +317,64 @@ static int config_flow_label(int ln, int arg_count, char **args)
 	return ERROR_NONE;
 }
 
+#ifdef __linux__
+/* "4-6,8" -> worker_cpu[] = {4,5,6,8}.  Strict: digits, commas and ranges only. */
+static int parse_cpu_list(const char *text)
+{
+	int count = 0;
+	const char *p = text;
+	while (*p) {
+		char *end = NULL;
+		errno = 0;
+		if (*p < '0' || *p > '9')
+			return -1;
+		long lo = strtol(p, &end, 10);
+		long hi = lo;
+		if (errno || lo > 1023)
+			return -1;
+		if (*end == '-') {
+			p = end + 1;
+			if (*p < '0' || *p > '9')
+				return -1;
+			hi = strtol(p, &end, 10);
+			if (errno || hi < lo || hi > 1023)
+				return -1;
+		}
+		for (long c = lo; c <= hi; c++) {
+			if (count >= WORKER_CPU_MAX)
+				return -1;
+			gcfg.worker_cpu[count++] = (int)c;
+		}
+		if (*end == ',')
+			end++;
+		else if (*end)
+			return -1;
+		p = end;
+	}
+	return count;
+}
+
+#endif
+
 static int config_worker_affinity(int ln, int arg_count, char **args)
 {
 	(void)arg_count;
 #ifdef __linux__
-	if (!strcasecmp(args[0], "on") || !strcasecmp(args[0], "yes"))
+	if (!strcasecmp(args[0], "on") || !strcasecmp(args[0], "yes")) {
 		gcfg.worker_affinity = 1;
-	else if (!strcasecmp(args[0], "off") || !strcasecmp(args[0], "no"))
+		gcfg.worker_cpu_count = 0;
+	} else if (!strcasecmp(args[0], "off") || !strcasecmp(args[0], "no")) {
 		gcfg.worker_affinity = 0;
-	else {
-		slog(LOG_CRIT, "Error: invalid value for worker-affinity on line %d\n", ln);
-		return ERROR_REJECT;
+		gcfg.worker_cpu_count = 0;
+	} else {
+		int n = parse_cpu_list(args[0]);
+		if (n <= 0) {
+			slog(LOG_CRIT, "Error: invalid value for worker-affinity on line %d "
+					"(expected on, off or a CPU list such as 4-6,8)\n", ln);
+			return ERROR_REJECT;
+		}
+		gcfg.worker_affinity = 2;
+		gcfg.worker_cpu_count = n;
 	}
 	return ERROR_NONE;
 #else
@@ -936,6 +986,7 @@ int config_init(void)
 	gcfg.dyn_max_lease = 14 * 86400;
 	gcfg.max_commit_delay = gcfg.dyn_max_lease / 4;
 	gcfg.hash_bits = 14;
+	hash_bits_explicit = 0;
 	gcfg.cache_size = 8192;
 	INIT_LIST_HEAD(&gcfg.cache_pool);
 	INIT_LIST_HEAD(&gcfg.cache_active);
@@ -1084,6 +1135,14 @@ int config_validate(void)
 	if (gcfg.maps_immutable) {
 		slog(LOG_DEBUG,"Disabling cache for immutable static maps\n");
 		gcfg.cache_size = 0;
+	}
+	/* Size the bucket arrays for the cache actually configured: about two
+	 * buckets per entry, between 128 and 16384 buckets, unless hash-bits is set. */
+	if (!hash_bits_explicit && gcfg.cache_size > 0) {
+		int bits = 7;
+		while (bits < 14 && (1 << (bits - 1)) < gcfg.cache_size)
+			bits++;
+		gcfg.hash_bits = bits;
 	}
 
 	if (!gcfg.local_addr4.s_addr) {

@@ -123,7 +123,9 @@ tayga.conf.
     automatically when all mappings are static. Defaults to 8192.
 
 **hash-bits** *bits*
-:   The cache hash tables have 2^bits buckets (4 to 24). Defaults to 14.
+:   The cache hash tables have 2^bits buckets (4 to 24). When not given,
+    the size follows **cache-size**: about two buckets per entry, between
+    2^7 and 2^14 (the default cache of 8192 entries uses 14).
 
 **map** *ipv4_address[/length] ipv6_address[/length]*
 :   Creates a static mapping between RFC 7757 compliant hosts or
@@ -224,11 +226,19 @@ tayga.conf.
     transit networks can balance flows (ECMP). All fragments of a datagram
     share one label.
 
-**worker-affinity** *on|off*
+**worker-affinity** *on|off|cpu-list*
 :   Linux only. When **on**, worker thread *i* is pinned to the *i*-th CPU in
-    the process's allowed CPU set (wrapping around). Default **off**, which
-    leaves placement to the scheduler. Useful together with NIC/queue IRQ
-    pinning; measure before enabling.
+    the process's allowed CPU set (wrapping around). A *cpu-list* such as
+    **4-6,8** pins worker *i* to the *i*-th CPU of that list (wrapping around);
+    a CPU outside the allowed set is skipped with a warning. Default **off**,
+    which leaves placement to the scheduler.
+
+    Pinning is not a free speed-up. In an 8-vCPU test guest where clients and
+    servers were already pinned, **on** was slower in every one of 10 paired
+    runs (about 28% less download and 30% less upload throughput, two to three
+    times the retransmissions per gigabyte), because the first allowed CPUs also
+    take softirq and interrupt work. Choose CPUs that do not, and measure before
+    enabling.
 
 **log** *drop|reject|self*
 :   Configure logging of packets. By default, Tayga only logs errors

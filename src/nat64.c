@@ -21,6 +21,18 @@
 #include "icmp_rate_limit.h"
 #include "tayga.h"
 
+/* Segments an aborted software-GSO aggregate did not deliver: exact after a
+ * mid-stream write failure, an MSS-based estimate for an aggregate rejected
+ * before any segment was built. */
+static uint32_t gso_unsent_estimate(const struct pkt *p)
+{
+	if (p->gso_unsent_segments)
+		return p->gso_unsent_segments;
+	if (p->vhdr.gso_size)
+		return (p->data_len + p->vhdr.gso_size - 1) / p->vhdr.gso_size;
+	return 1;
+}
+
 static inline uint16_t get_u16(const void *ptr)
 {
 	uint16_t val;
@@ -324,11 +336,15 @@ static bool icmp_allow_send(int which)
     uint32_t rate = gcfg.icmp_rate_limit;
     if (rate == UINT32_MAX) return true;
     if (!rate) rate = ICMP_RL_DEFAULT_RATE;
-    struct icmp_rate_limiter *rl = &g_icmp_rl[which];
-    while (atomic_flag_test_and_set_explicit(&rl->lock, memory_order_acquire)) {}
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t tick = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    struct icmp_rate_limiter *rl = &g_icmp_rl[which];
+    /* Another worker is spending this budget right now: refusing is exactly
+     * what a rate limiter does under load, and nobody spins on the flag.
+     * icmp_bucket_take() tolerates a tick that is slightly behind last_ms. */
+    if (atomic_flag_test_and_set_explicit(&rl->lock, memory_order_acquire))
+        return false;
     bool allow = icmp_bucket_take(&rl->bucket, rate, tick);
     atomic_flag_clear_explicit(&rl->lock, memory_order_release);
     return allow;
@@ -877,6 +893,9 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	if (em_payload_len > UINT16_MAX)
 		em_payload_len = UINT16_MAX;
 	xlate_header_4to6(&p_em, &header.ip6_em, (int)em_payload_len);
+	/* The quoted datagram is only evidence for the sender: never derive a
+	 * Flow Label for it (RFC 6437), it did not carry one. */
+	header.ip6_em.ver_tc_fl &= htonl(~0x000fffffu);
 	if (em_frag_len) {
 		header.ip6_em_frag.next_header = header.ip6_em.next_header;
 		header.ip6_em_frag.reserved = 0;
@@ -1066,6 +1085,7 @@ void handle_ip4(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
 		p->gso_sent_payload = 0;
+		p->gso_unsent_segments = 0;
 		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV4) {
@@ -1079,6 +1099,7 @@ void handle_ip4(struct pkt *p)
 		/* A rejected or partially emitted GSO aggregate is never a plain packet;
 		 * count only the payload that was not already sent. */
 		stats_drop(p->data_len - (p->gso_sent_payload < p->data_len ? p->gso_sent_payload : p->data_len));
+		stats_gso_drop_segments(gso_unsent_estimate(p));
 		return;
 	}
 
@@ -1867,6 +1888,7 @@ void handle_ip6(struct pkt *p)
 {
 	if (p->has_vhdr && (p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) != VIRTIO_NET_HDR_GSO_NONE) {
 		p->gso_sent_payload = 0;
+		p->gso_unsent_segments = 0;
 		if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
 			uint8_t gtype = p->vhdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
 			if (gtype == VIRTIO_NET_HDR_GSO_TCPV6) {
@@ -1880,6 +1902,7 @@ void handle_ip6(struct pkt *p)
 		/* A rejected or partially emitted GSO aggregate is never a plain packet;
 		 * count only the payload that was not already sent. */
 		stats_drop(p->data_len - (p->gso_sent_payload < p->data_len ? p->gso_sent_payload : p->data_len));
+		stats_gso_drop_segments(gso_unsent_estimate(p));
 		return;
 	}
 

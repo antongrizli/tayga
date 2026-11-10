@@ -63,12 +63,40 @@ If the host participates in dynamic routing, we can instead assign a routed addr
 
 When automatic discovery selects RFC 8781, managed profiles record
 `# installer-pref64-interface IFACE`. Their service starts
-`pref64-discover --supervise-ra CONFIG -- tayga --config CONFIG --nodetach`.
+`pref64-discover --supervise-ra CONFIG [--network-controller PATH]
+[--runtime-dir DIR] [--initial-prefix PFX/LEN --initial-lifetime SEC] -- tayga --config CONFIG --nodetach`.
 The supervisor keeps an ICMPv6 receive socket open, renews the prefix lifetime
-using a monotonic clock and restarts the foreground translator with a private
-configuration snapshot when the advertised prefix changes. The saved profile
-is preserved. Withdrawal or expiry stops translation and exits with failure;
-restart behavior follows the service or container policy.
+using a monotonic clock and runs the foreground translator on a private
+configuration snapshot. The saved profile is preserved.
+
+The supervisor tracks every (router, prefix) pair with a positive lifetime.
+The translator stays on its active prefix as long as any router still
+advertises it, so two routers announcing different prefixes cannot make it
+restart on every Router Advertisement. The active prefix changes only when no
+live advertisement for it is left: it was withdrawn (lifetime 0), it expired,
+or its router replaced it with another prefix. A router's Router
+Advertisement is taken as that router's complete PREF64 set, so all of its
+PREF64 options must be in the same advertisement.
+
+At start-up the supervisor sends up to three Router Solicitations, four
+seconds apart, and fails the start (exit status 1) when no usable
+advertisement arrives. Once translation has started it never gives up on its
+own: when the last advertisement of the active prefix is withdrawn or expires,
+the translator is stopped, the supervisor stays resident and solicits again
+with exponential back-off (4 s up to one hour, RFC 7559), and a returning
+prefix starts a new translator. It also solicits during the last quarter of a
+lifetime. A power-cycled router therefore never exhausts the service's restart
+budget. If the translator itself dies, the supervisor exits with failure and
+the service policy decides about the restart.
+
+`--runtime-dir DIR` makes the supervisor publish the prefix the translator is
+really running in `DIR/active-prefix` (`PREFIX/LEN rfc8781`); `tayga-ctl status`
+and the NAT64 readiness probe read it, because the installed profile keeps the
+prefix chosen at installation. The container passes the prefix and remaining
+lifetime it just discovered with `--initial-prefix` and `--initial-lifetime`,
+so translation starts at once; the first real advertisement supersedes it.
+A NAT64 or SIIT profile installs its routes for the configured prefix: after an
+RA-driven prefix change run `tayga-ctl reconfigure` so routes and DNS64 follow.
 
 The supervisor forwards HUP and USR signals to the translator. Systemd managed
 units use `NotifyAccess=all` so readiness can come from that child. Raw ICMPv6
@@ -83,6 +111,9 @@ removes the previous owned network state and sets up the new snapshot. The new
 translator starts only after setup succeeds and the advertised lifetime remains
 valid. The operation causes a translation outage; it is not an atomic live
 migration and existing connections to the previous prefix are interrupted.
+
+While no prefix is valid the NAT66 rules are left as they are; they are rebuilt
+only when a prefix different from the one they were built for returns.
 
 If setup fails, the controller rolls back partial mutations; the supervisor
 attempts to restore the saved profile's network state and exits with failure.

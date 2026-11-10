@@ -886,6 +886,7 @@ int gso_software_segment_and_send_6to4(struct pkt *p)
 		} else {
 			stats_gso_tun_write_error();
 			p->gso_sent_payload = (uint32_t)offset;
+			p->gso_unsent_segments = (payload_len - offset + gso_size - 1) / gso_size;
 			return -1;
 		}
 
@@ -1021,6 +1022,7 @@ int gso_software_segment_and_send_4to6(struct pkt *p)
 		} else {
 			stats_gso_tun_write_error();
 			p->gso_sent_payload = (uint32_t)offset;
+			p->gso_unsent_segments = (payload_len - offset + gso_size - 1) / gso_size;
 			return -1;
 		}
 
@@ -1161,6 +1163,7 @@ int gso_software_segment_and_send_udp_6to4(struct pkt *p)
 		} else {
 			stats_gso_tun_write_error();
 			p->gso_sent_payload = (uint32_t)offset;
+			p->gso_unsent_segments = (payload_len - offset + gso_size - 1) / gso_size;
 			return -1;
 		}
 
@@ -1283,6 +1286,7 @@ int gso_software_segment_and_send_udp_4to6(struct pkt *p)
 		} else {
 			stats_gso_tun_write_error();
 			p->gso_sent_payload = (uint32_t)offset;
+			p->gso_unsent_segments = (payload_len - offset + gso_size - 1) / gso_size;
 			return -1;
 		}
 

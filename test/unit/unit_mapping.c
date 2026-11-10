@@ -106,9 +106,14 @@ static void test_dynamic_persistence(void)
     long long wall = (long long)time(NULL);
     assert(stamp <= wall - 99 && stamp >= wall - 105);
 
+    /* Temporaries left by a killed daemon are removed on the next load. */
+    FILE *stale = fopen("dynamic.map.AbC123", "w"); assert(stale); fclose(stale);
+    stale = fopen("dynamic.map.keep", "w"); assert(stale); fclose(stale);	/* not a mkstemp name */
     reclaim();
     configure("prefix fd64::/96\ndynamic-pool 198.18.0.0/29\n");
     load_dynamic(gcfg.dynamic_pool);
+    assert(access("dynamic.map.AbC123", F_OK) != 0 && access("dynamic.map.keep", F_OK) == 0);
+    assert(unlink("dynamic.map.keep") == 0);
     struct in_addr again;
     assert(map_ip6_to_ip4(&again, &client, 0) == 0 && again.s_addr == leased.s_addr);
     assert(unlink("dynamic.map") == 0);

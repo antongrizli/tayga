@@ -23,6 +23,9 @@ $(TESTOBJDIR)/addrmap-hook.o: src/addrmap.c $(GENDIR)/version.h $(BUILDDIR)/buil
 $(TESTOBJDIR)/dispatch-clock.o: src/experimental_io.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DDISPATCH_TEST_CLOCK -MMD -MP -c -o $@ $<
 
+$(TESTOBJDIR)/stats-export-hook.o: src/stats_exporter.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DSTATS_EXPORT_TEST_HOOK -MMD -MP -c -o $@ $<
+
 $(TESTOBJDIR)/pref64.o: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
 
@@ -31,6 +34,8 @@ $(TESTBINDIR)/unit_addrmap: $(TESTOBJDIR)/unit_addrmap.o $(TESTOBJDIR)/addrmap-h
 $(TESTBINDIR)/unit_dispatch: $(TESTOBJDIR)/unit_dispatch.o $(TESTOBJDIR)/dispatch-clock.o $(TEST_LIB) | $(TESTBINDIR)
 	$(CC) -o $@ $^ $(TEST_LDFLAGS) $(LDLIBS)
 $(TESTBINDIR)/unit_conffile: $(TESTOBJDIR)/unit_conffile.o $(TESTOBJDIR)/unit.o $(TEST_LIB) | $(TESTBINDIR)
+	$(CC) -o $@ $^ $(TEST_LDFLAGS) $(LDLIBS)
+$(TESTBINDIR)/unit_stats: $(TESTOBJDIR)/unit_stats.o $(TESTOBJDIR)/stats-export-hook.o $(TEST_LIB) | $(TESTBINDIR)
 	$(CC) -o $@ $^ $(TEST_LDFLAGS) $(LDLIBS)
 $(TESTBINDIR)/unit_tun: $(TESTOBJDIR)/unit_tun.o $(TEST_LIB) | $(TESTBINDIR)
 	$(CC) -o $@ $^ -Wl,--wrap=write -Wl,--wrap=writev $(TEST_LDFLAGS) $(LDLIBS)

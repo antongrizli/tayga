@@ -93,6 +93,12 @@ case "$action" in
         ;;
     status)
         awk '$1=="prefix" || $1=="tun-device" {print}' "/etc/tayga/$profile.conf"
+        for runtime in "/run/tayga-managed-$profile" "/var/run/tayga-managed-$profile"; do
+            if [ -r "$runtime/active-prefix" ]; then
+                printf 'active-prefix %s\n' "$(awk 'NR==1 {print $1, $2}' "$runtime/active-prefix")"
+                break
+            fi
+        done
         dev=$(awk '$1=="tun-device" {print $2}' "/etc/tayga/$profile.conf")
         if [ "$(uname -s)" = FreeBSD ]; then
             netstat -rn -f inet | grep "$dev" || :

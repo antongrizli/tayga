@@ -18,6 +18,7 @@ __thread bool g_tx_drop_deferred;
 struct worker_pub_stats g_worker_pub[STATS_MAX_SLOTS] __attribute__((aligned(128)));
 __thread struct worker_priv_stats g_tls_priv;
 time_t g_stats_start_time = 0;
+time_t g_stats_start_mono = 0;
 atomic_uint_fast64_t g_stats_sync_req = 0;
 atomic_uint_fast64_t g_stats_sync_ack[STATS_MAX_SLOTS] = {0};
 atomic_uint_fast64_t g_stats_snapshot_seq = 0;
@@ -73,6 +74,7 @@ void stats_init(void)
 	memset(&g_tls_priv, 0, sizeof(g_tls_priv));
 	g_tls_priv.slot_idx = 0;
 	g_stats_start_time = time(NULL);
+	g_stats_start_mono = tayga_mono_sec();
 	atomic_store_explicit(&g_stats_sync_req, 0, memory_order_relaxed);
 	for (int i = 0; i < STATS_MAX_SLOTS; i++) {
 		atomic_store_explicit(&g_stats_sync_ack[i], 0, memory_order_relaxed);
@@ -255,6 +257,7 @@ void stats_flush_worker(void)
 	atomic_store_explicit(&p->warnings_suppressed, g_tls_priv.warnings_suppressed, memory_order_relaxed);
 	atomic_store_explicit(&p->icmp_sent_pkts, g_tls_priv.icmp_sent_pkts, memory_order_relaxed);
 	atomic_store_explicit(&p->self_pkts, g_tls_priv.self_pkts, memory_order_relaxed);
+	atomic_store_explicit(&p->gso_dropped_segments, g_tls_priv.gso_dropped_segments, memory_order_relaxed);
 
 
 	atomic_store_explicit(&p->gso_rx_pkts, g_tls_priv.gso_rx_pkts, memory_order_relaxed);
@@ -309,6 +312,7 @@ void stats_get_snapshot(struct tayga_stats *out)
 		out->warnings_suppressed += atomic_load_explicit(&p->warnings_suppressed, memory_order_relaxed);
 		out->icmp_sent_pkts += atomic_load_explicit(&p->icmp_sent_pkts, memory_order_relaxed);
 		out->self_pkts += atomic_load_explicit(&p->self_pkts, memory_order_relaxed);
+		out->gso_dropped_segments += atomic_load_explicit(&p->gso_dropped_segments, memory_order_relaxed);
 
 
 		out->gso_rx_pkts += atomic_load_explicit(&p->gso_rx_pkts, memory_order_relaxed);

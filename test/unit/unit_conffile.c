@@ -281,7 +281,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),4360,"sizeof");
+    expectl(sizeof(struct config),4624,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */
@@ -1479,6 +1479,76 @@ static void test_tun_prefix_parse(void) {
     }
 }
 
+#ifdef __linux__
+/* worker-affinity accepts on, off or a CPU list; anything else is rejected. */
+static void test_worker_affinity_list(void) {
+    static const struct { const char *line; int ok; int mode; int count; int first; int last; } cases[] = {
+        {"worker-affinity on\n", 1, 1, 0, 0, 0},
+        {"worker-affinity off\n", 1, 0, 0, 0, 0},
+        {"worker-affinity 4\n", 1, 2, 1, 4, 4},
+        {"worker-affinity 4-6\n", 1, 2, 3, 4, 6},
+        {"worker-affinity 4-6,8\n", 1, 2, 4, 4, 8},
+        {"worker-affinity 0,2,4\n", 1, 2, 3, 0, 4},
+        {"worker-affinity 6-4\n", 0, 0, 0, 0, 0},	/* reversed range */
+        {"worker-affinity 4-\n", 0, 0, 0, 0, 0},
+        {"worker-affinity ,4\n", 0, 0, 0, 0, 0},
+        {"worker-affinity 4,,5\n", 0, 0, 0, 0, 0},
+        {"worker-affinity 4x\n", 0, 0, 0, 0, 0},
+        {"worker-affinity 99999\n", 0, 0, 0, 0, 0},
+        {"worker-affinity 0-100\n", 0, 0, 0, 0, 0},	/* more than WORKER_CPU_MAX CPUs */
+    };
+    char *conffile = "unit_conffile.conf";
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *fd = fopen(conffile, "w");
+        expect(fd != NULL, "fopen");
+        if (!fd) return;
+        fputs(cases[i].line, fd);
+        fclose(fd);
+        config_init();
+        int rc = config_read(conffile);
+        if (!print_fail_only) printf("TEST CASE: %s", cases[i].line);
+        expect(cases[i].ok ? !rc : rc, cases[i].ok ? "accepted" : "rejected");
+        if (cases[i].ok && !rc) {
+            expectl(gcfg.worker_affinity, cases[i].mode, "mode");
+            expectl(gcfg.worker_cpu_count, cases[i].count, "cpu count");
+            if (cases[i].count) {
+                expectl(gcfg.worker_cpu[0], cases[i].first, "first cpu");
+                expectl(gcfg.worker_cpu[gcfg.worker_cpu_count - 1], cases[i].last, "last cpu");
+            }
+        }
+    }
+}
+#endif
+
+/* hash-bits follows cache-size unless it is set explicitly. */
+static void test_hash_bits_derivation(void) {
+    static const struct { const char *text; int expect_bits; } cases[] = {
+        {"cache-size 100\n", 8},
+        {"cache-size 8192\n", 14},
+        {"cache-size 4194304\n", 14},
+        {"cache-size 100\nhash-bits 10\n", 10},
+    };
+    char *conffile = "unit_conffile.conf";
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *fd = fopen(conffile, "w");
+        expect(fd != NULL, "fopen");
+        if (!fd) return;
+        fputs("tun-device nat64\nipv4-addr 192.168.255.1\nipv6-addr 2001:db8:1::2\nprefix 64:ff9b::/96\n"
+              "dynamic-pool 192.168.255.0/24\ndata-dir /var/lib/tayga\n", fd);
+        fputs(cases[i].text, fd);
+        fclose(fd);
+        config_init();
+        int rc = config_read(conffile);
+        expect(!rc, "read");
+        getenv_case = 1;
+        rc = config_validate();
+        getenv_case = 0;
+        if (!print_fail_only) printf("TEST CASE: hash bits for \"%s\"\n", cases[i].text);
+        expect(!rc, "validate");
+        expectl(gcfg.hash_bits, cases[i].expect_bits, "hash_bits");
+    }
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* Test function or config_init */
@@ -1487,6 +1557,10 @@ int main(void) {
     /* Test function for config_read */
     test_config_read();
     test_tun_prefix_parse();
+#ifdef __linux__
+    test_worker_affinity_list();
+#endif
+    test_hash_bits_derivation();
 
     /* Test function for config_validate */
     test_config_validate();

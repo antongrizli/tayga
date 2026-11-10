@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "../../src/helpers/pref64_ra.h"
 
 extern int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
                                   int *out_plen, uint32_t *out_lifetime_sec);
@@ -179,11 +180,117 @@ static void test_hosts_file(void)
     printf("PASS: hosts-file override refuses symlink, FIFO and writable files\n");
 }
 
+static struct in6_addr A6(const char *text)
+{
+    struct in6_addr a;
+    assert(inet_pton(AF_INET6, text, &a) == 1);
+    return a;
+}
+
+static int picked(const struct ra_table *t, const struct in6_addr *active, int alen,
+                  time_t now, const char *want, time_t *deadline)
+{
+    struct in6_addr out, expect = A6(want);
+    int plen;
+    if (ra_table_pick(t, active, alen, now, &out, &plen, deadline, NULL))
+        return 0;
+    return plen == 96 && !memcmp(&out, &expect, sizeof(out));
+}
+
+static void test_ra_all(void)
+{
+    uint8_t ra[64], other[64];
+    struct ra_option o[RA_MAX_OPTIONS];
+    build_ra(ra, 1, 0, "64:ff9b::");
+    build_ra(other, 500, 0, "2001:db8:aaaa::");
+    memcpy(ra + 32, other + 16, 16);
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) == 2);
+    assert(o[0].life == 8 && o[0].plen == 96 && o[1].life == 4000);
+    ra[18] = ra[19] = 0;	/* withdrawal stays in the list */
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) == 2 && o[0].life == 0);
+    ra[17] = 0;		/* zero-length option: discard the RA */
+    assert(parse_ra_pref64_all(ra, 48, o, RA_MAX_OPTIONS) < 0);
+    build_ra(ra, 1, 6, "64:ff9b::");	/* reserved PLC */
+    assert(parse_ra_pref64_all(ra, 32, o, RA_MAX_OPTIONS) == 0);
+    printf("PASS: all PREF64 options of an RA are parsed\n");
+}
+
+static void test_ra_table(void)
+{
+    struct ra_table t;
+    struct in6_addr r1 = A6("fe80::1"), r2 = A6("fe80::2");
+    struct in6_addr a = A6("2001:db8:1::"), b = A6("2001:db8:2::");
+    struct ra_option oa = { .prefix = a, .plen = 96, .life = 100 };
+    struct ra_option ob = { .prefix = b, .plen = 96, .life = 200 };
+    time_t deadline = 0;
+
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 1000);
+    assert(picked(&t, NULL, 0, 1000, "2001:db8:1::", &deadline) && deadline == 1100);
+
+    /* A second router with another prefix must not take over, however often it speaks. */
+    for (int i = 0; i < 10; i++) {
+        ra_table_apply(&t, &r2, &ob, 1, 1001 + i);
+        ra_table_apply(&t, &r1, &oa, 1, 1001 + i);
+        assert(picked(&t, &a, 96, 1001 + i, "2001:db8:1::", NULL));
+    }
+    /* Both advertise a: it stays valid while either one does. */
+    struct ra_option oa2 = { .prefix = a, .plen = 96, .life = 300 };
+    ra_table_apply(&t, &r2, &oa2, 1, 1020);
+    struct ra_option wa = { .prefix = a, .plen = 96, .life = 0 };
+    ra_table_apply(&t, &r1, &wa, 1, 1021);		/* one withdrawal */
+    assert(picked(&t, &a, 96, 1021, "2001:db8:1::", &deadline) && deadline == 1320);
+    ra_table_expire(&t, 1321);
+    assert(ra_table_pick(&t, &a, 96, 1321, &(struct in6_addr){0}, &(int){0}, NULL, NULL) != 0);
+
+    /* One router renumbering without lifetime 0 for the old prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 2000);
+    ra_table_apply(&t, &r1, &ob, 1, 2010);
+    assert(picked(&t, &a, 96, 2010, "2001:db8:2::", NULL));
+
+    /* A withdrawal from an unrelated router does not remove the active prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 3000);
+    ra_table_apply(&t, &r2, &wa, 1, 3001);
+    assert(picked(&t, &a, 96, 3001, "2001:db8:1::", NULL));
+    ra_table_apply(&t, &r1, &wa, 1, 3002);		/* its own withdrawal does */
+    assert(ra_table_pick(&t, &a, 96, 3002, &(struct in6_addr){0}, &(int){0}, NULL, NULL) != 0);
+
+    /* Alternative takes over on withdrawal of the active prefix. */
+    ra_table_init(&t);
+    ra_table_apply(&t, &r1, &oa, 1, 4000);
+    ra_table_apply(&t, &r2, &ob, 1, 4000);
+    ra_table_apply(&t, &r1, &wa, 1, 4001);
+    assert(picked(&t, &a, 96, 4001, "2001:db8:2::", NULL));
+
+    /* A provisional prefix is dropped by the first real advertisement. */
+    ra_table_init(&t);
+    ra_table_add_provisional(&t, &a, 96, 50, 5000);
+    assert(picked(&t, NULL, 0, 5001, "2001:db8:1::", NULL));
+    ra_table_apply(&t, &r1, &ob, 1, 5002);
+    assert(picked(&t, &a, 96, 5002, "2001:db8:2::", NULL));
+
+    /* More candidates than slots: the soonest-expiring one is evicted, never a crash. */
+    ra_table_init(&t);
+    for (int i = 0; i < RA_CANDIDATES + 3; i++) {
+        struct in6_addr r = A6("fe80::100");
+        struct ra_option o = { .prefix = A6("2001:db8:3::"), .plen = 96, .life = 100 + (uint32_t)i };
+        r.s6_addr[15] = (uint8_t)i;
+        ra_table_apply(&t, &r, &o, 1, 6000);
+    }
+    assert(picked(&t, NULL, 0, 6000, "2001:db8:3::", &deadline) && deadline == 6000 + 100 + RA_CANDIDATES + 2);
+    printf("PASS: PREF64 candidate table keeps the active prefix until it is gone\n");
+}
+
+
 int main(void)
 {
     printf("Running unit_pref64 tests...\n");
     test_ra();
     test_ra_updates();
+    test_ra_all();
+    test_ra_table();
     test_hosts_file();
 
     /* /96 with 64:ff9b:: and Telekom/ISP-style */

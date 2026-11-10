@@ -1928,6 +1928,7 @@ static void test_software_partial_send_accounting(void)
 	assert(gso_software_segment_and_send_6to4(&packet) == -1);
 	assert(packet.gso_sent_payload > 0 && packet.gso_sent_payload < bytes);
 	assert(packet.gso_sent_payload % mss == 0);
+	assert(packet.gso_unsent_segments == (bytes - packet.gso_sent_payload + mss - 1) / mss);
 	free(storage); close(sv[0]); close(sv[1]);
 	puts("PASS: partial software GSO send reports sent payload");
 }

@@ -150,7 +150,9 @@ Defaults to 8192.
 .TP
 \f[B]hash\-bits\f[R] \f[I]bits\f[R]
 The cache hash tables have 2\[ha]bits buckets (4 to 24).
-Defaults to 14.
+When not given, the size follows \f[B]cache\-size\f[R]: about two
+buckets per entry, between 2\[ha]7 and 2\[ha]14 (the default cache of
+8192 entries uses 14).
 .TP
 \f[B]map\f[R] \f[I]ipv4_address[/length] ipv6_address[/length]\f[R]
 Creates a static mapping between RFC 7757 compliant hosts or subnets
@@ -275,13 +277,25 @@ keyed hash of the IPv4 addresses, protocol and, for unfragmented TCP and
 UDP, the ports, so that IPv6 transit networks can balance flows (ECMP).
 All fragments of a datagram share one label.
 .TP
-\f[B]worker\-affinity\f[R] \f[I]on|off\f[R]
+\f[B]worker\-affinity\f[R] \f[I]on|off|cpu\-list\f[R]
 Linux only.
 When \f[B]on\f[R], worker thread \f[I]i\f[R] is pinned to the
 \f[I]i\f[R]\-th CPU in the process\[cq]s allowed CPU set (wrapping
 around).
+A \f[I]cpu\-list\f[R] such as \f[B]4\-6,8\f[R] pins worker \f[I]i\f[R]
+to the \f[I]i\f[R]\-th CPU of that list (wrapping around); a CPU outside
+the allowed set is skipped with a warning.
 Default \f[B]off\f[R], which leaves placement to the scheduler.
-Useful together with NIC/queue IRQ pinning; measure before enabling.
+.RS
+.PP
+Pinning is not a free speed\-up.
+In an 8\-vCPU test guest where clients and servers were already pinned,
+\f[B]on\f[R] was slower in every one of 10 paired runs (about 28% less
+download and 30% less upload throughput, two to three times the
+retransmissions per gigabyte), because the first allowed CPUs also take
+softirq and interrupt work.
+Choose CPUs that do not, and measure before enabling.
+.RE
 .TP
 \f[B]log\f[R] \f[I]drop|reject|self\f[R]
 Configure logging of packets.

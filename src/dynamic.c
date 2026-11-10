@@ -16,6 +16,7 @@
  *  GNU General Public License for more details.
  */
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -248,6 +249,20 @@ static void load_map(struct dynamic_pool *pool, const struct in6_addr *addr6,
 	move_to_dormant(d, pool);
 }
 
+/* "dynamic.map.XXXXXX" files are left behind when the daemon is killed or
+ * loses power between mkstemp() and rename(); nothing else removes them. */
+static void remove_stale_map_tmp(void)
+{
+	DIR *d = opendir(".");
+	if (!d)
+		return;
+	struct dirent *e;
+	while ((e = readdir(d)))
+		if (!strncmp(e->d_name, "dynamic.map.", 12) && strlen(e->d_name) == 18)
+			(void)unlink(e->d_name);
+	closedir(d);
+}
+
 void load_dynamic(struct dynamic_pool *pool)
 {
 	FILE *in;
@@ -262,6 +277,8 @@ void load_dynamic(struct dynamic_pool *pool)
 
 	if (!pool)
 		return;
+
+	remove_stale_map_tmp();
 
 	/* The file stores wall-clock epoch seconds; the runtime uses a
 	 * monotonic tick.  Convert via the age of each entry. */

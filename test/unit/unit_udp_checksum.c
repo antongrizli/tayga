@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "tayga.h"
 #include "gso.h"
 
@@ -676,6 +677,57 @@ static void test_icmp_error_suppression_and_rate_limit(void)
 	puts("PASS: ICMP error suppression and rate limiting");
 }
 
+/* Workers share one budget per error class: however many threads race for it,
+ * the daemon never originates more than burst + rate * elapsed errors, and a
+ * loser returns at once instead of spinning on the limiter. */
+struct rl_job { int fd; struct pkt *packet; int calls; };
+
+static void *rl_worker(void *arg)
+{
+	struct rl_job *job = arg;
+	for (int i = 0; i < job->calls; i++)
+		host_send_icmp4_error(11, 0, 0, job->packet);
+	return NULL;
+}
+
+static void test_icmp_rate_limit_threads(void)
+{
+	setup_quote_maps();
+	gcfg.mtu = 1500;
+	icmp_rate_limit_reset();
+	gcfg.icmp_rate_limit = 20;
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+	int sz = 1 << 22;
+	setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+	setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+	alignas(8) uint8_t b4[HEADROOM + 64] = {0};
+	struct ip4 *ip4 = (struct ip4 *)(b4 + HEADROOM);
+	ip4->ver_ihl = 0x45; ip4->ttl = 1; ip4->proto = IPPROTO_UDP;
+	ip4->length = htons(28);
+	inet_pton(AF_INET, "192.0.0.1", &ip4->src);
+	inet_pton(AF_INET, "8.8.8.8", &ip4->dest);
+	struct pkt p4 = {.tun_fd = sv[0], .ip4 = ip4, .data = (uint8_t *)ip4 + 20,
+	                 .data_len = 8, .header_len = 20, .data_proto = IPPROTO_UDP};
+	struct rl_job job = {.fd = sv[0], .packet = &p4, .calls = 20000};
+	pthread_t threads[4];
+	struct timespec begin, end;
+	clock_gettime(CLOCK_MONOTONIC, &begin);
+	for (int i = 0; i < 4; i++)
+		assert(pthread_create(&threads[i], NULL, rl_worker, &job) == 0);
+	for (int i = 0; i < 4; i++)
+		pthread_join(threads[i], NULL);
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double elapsed = (double)(end.tv_sec - begin.tv_sec) + (double)(end.tv_nsec - begin.tv_nsec) / 1e9;
+	int sent = drain_count(sv[1]);
+	/* burst 20 + 20/s; one extra for the clock granularity of the first refill */
+	assert(sent >= 1 && (double)sent <= 21 + elapsed * 20);
+	gcfg.icmp_rate_limit = 0;
+	icmp_rate_limit_reset();
+	close(sv[0]); close(sv[1]);
+	puts("PASS: concurrent ICMP originators share one rate budget");
+}
+
 /* xlate_6to4_icmp_error clamps the quoted datagram's IPv4 total length: a lying
  * inner payload_length must neither overflow 16 bits nor underflow when the
  * inner header carries extension headers. Observable as the inner Total Length. */
@@ -1179,6 +1231,7 @@ int main(void)
 	test_rfc4884_ext_4to6();
 	test_rfc4884_ext_6to4();
 	test_icmp_error_suppression_and_rate_limit();
+	test_icmp_rate_limit_threads();
 	test_icmp6_unknown_next_header_pointer();
 	test_icmp6to4_quoted_length_clamp();
 	test_icmp_echo_checksum_translation();

@@ -104,8 +104,14 @@ if [ "$PREF64" = "auto" ]; then
         ''|*[!a-zA-Z0-9_.:-]*) RA_IFACE="" ;;
       esac
       if [ -n "$RA_IFACE" ]; then
-        DISCOVERED=$(/usr/local/sbin/pref64-discover -i "$RA_IFACE" -t 3 --ra-only 2>/dev/null || true)
-        [ -z "$DISCOVERED" ] || DISCOVERY_SOURCE="rfc8781_ra"
+        RA_JSON=$(/usr/local/sbin/pref64-discover -i "$RA_IFACE" -t 3 --ra-only --json 2>/dev/null || true)
+        RA_PREFIX=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p')
+        RA_LEN=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"length": *\([0-9][0-9]*\).*/\1/p')
+        RA_LIFETIME=$(printf '%s\n' "$RA_JSON" | sed -n 's/.*"lifetime": *\([0-9][0-9]*\).*/\1/p')
+        if [ -n "$RA_PREFIX" ] && [ -n "$RA_LEN" ]; then
+            DISCOVERED="$RA_PREFIX/$RA_LEN"
+            DISCOVERY_SOURCE="rfc8781_ra"
+        fi
       fi
     fi
     if [ -z "$DISCOVERED" ] && [ -n "$UPLINK_DNS64" ]; then
@@ -212,6 +218,10 @@ if [ -n "$TAYGA_STEERING_VAL" ]; then
   echo "tun-steering ${TAYGA_STEERING_VAL}" >> "$TAYGA_RUNTIME_DIR/clat.conf"
 fi
 
+if [ -n "${CLAT_WORKER_AFFINITY:-}" ]; then
+  echo "worker-affinity ${CLAT_WORKER_AFFINITY}" >> "$TAYGA_RUNTIME_DIR/clat.conf"
+fi
+
 if [ "$TAYGA_STEERING_VAL" = "groups" ] || [ "$TAYGA_STEERING_VAL" = "flows" ]; then
   echo "tun-up on" >> "$TAYGA_RUNTIME_DIR/clat.conf"
   echo "tun-ip ${V4_HOST}/32" >> "$TAYGA_RUNTIME_DIR/clat.conf"
@@ -251,7 +261,13 @@ INFO_EOF
 
 if [ "$PREF64_SOURCE" = rfc8781_ra ]; then
   printf '# installer-pref64-interface %s\n' "$RA_IFACE" >> "$TAYGA_RUNTIME_DIR/clat.conf"
-  exec /usr/local/sbin/pref64-discover --supervise-ra "$TAYGA_RUNTIME_DIR/clat.conf" -- /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d
+  # Hand over what was just learned (prefix + remaining lifetime) so the supervisor
+  # starts the translator at once instead of waiting for a second Router Advertisement.
+  set -- --runtime-dir "$TAYGA_RUNTIME_DIR"
+  if [ -n "${RA_LIFETIME:-}" ] && [ "$RA_LIFETIME" -gt 0 ]; then
+    set -- "$@" --initial-prefix "$PREF64" --initial-lifetime "$RA_LIFETIME"
+  fi
+  exec /usr/local/sbin/pref64-discover --supervise-ra "$TAYGA_RUNTIME_DIR/clat.conf" "$@" -- /usr/sbin/tayga -c "$TAYGA_RUNTIME_DIR/clat.conf" -d
 fi
 
 echo "==> Launching TAYGA daemon in foreground..."

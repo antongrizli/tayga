@@ -286,13 +286,26 @@ static void * worker(void * arg)
 	if (gcfg.worker_affinity) {
 		cpu_set_t allowed, one;
 		if (!sched_getaffinity(0, sizeof(allowed), &allowed)) {
-			int want = idx % CPU_COUNT(&allowed);
-			for (int c = 0; c < CPU_SETSIZE; c++) {
-				if (!CPU_ISSET(c, &allowed) || want--) continue;
-				CPU_ZERO(&one); CPU_SET(c, &one);
+			int target = -1;
+			if (gcfg.worker_affinity == 2 && gcfg.worker_cpu_count > 0) {
+				/* explicit list: worker i -> list[i % count] */
+				int c = gcfg.worker_cpu[idx % gcfg.worker_cpu_count];
+				if (c < CPU_SETSIZE && CPU_ISSET(c, &allowed))
+					target = c;
+				else
+					slog(LOG_WARNING, "worker %d: CPU %d is not in the allowed set; not pinned\n", idx, c);
+			} else {
+				int want = idx % CPU_COUNT(&allowed);
+				for (int c = 0; c < CPU_SETSIZE; c++) {
+					if (!CPU_ISSET(c, &allowed) || want--) continue;
+					target = c;
+					break;
+				}
+			}
+			if (target >= 0) {
+				CPU_ZERO(&one); CPU_SET(target, &one);
 				if (pthread_setaffinity_np(pthread_self(), sizeof(one), &one))
-					slog(LOG_WARNING, "worker %d: cannot pin to CPU %d\n", idx, c);
-				break;
+					slog(LOG_WARNING, "worker %d: cannot pin to CPU %d\n", idx, target);
 			}
 		}
 	}
@@ -813,8 +826,12 @@ int main(int argc, char **argv)
 	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
 	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 
+	/* Readiness notification is optional (sd_notify): an unusable
+	 * NOTIFY_SOCKET inherited from the environment must not stop the translator. */
 	ret = notify_prepare();
-	if (ret < 0) { errno = -ret; goto startup_failed; }
+	if (ret < 0)
+		slog(LOG_WARNING, "Readiness socket unavailable (%s); continuing without notification\n",
+				strerror(-ret));
 
 	/* Confine and drop privileges BEFORE any thread exists: an error here
 	 * can then abort cleanly, and no thread can retain extra credentials. */

@@ -24,7 +24,8 @@ static inline bool icmp_bucket_take(struct icmp_bucket *b, uint32_t rate, uint64
             b->credit = refill >= capacity - b->credit ? capacity : b->credit + refill;
         }
     }
-    b->last_ms = tick;
+    if (tick > b->last_ms)
+        b->last_ms = tick;	/* never move back: workers read the clock before taking the lock */
     bool allow = b->credit >= 1000;
     if (allow) b->credit -= 1000;
     return allow;

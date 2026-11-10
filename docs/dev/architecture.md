@@ -27,3 +27,16 @@ files use identical suffix-capacity validation.
 Dynamic allocation scans free runs in hash order, then wraps before declaring
 exhaustion. Static overrides are skipped by subnet. Existing minimum lease aging
 protects active assignments; optional allocation-rate limiting is not implemented.
+
+
+## Telemetry snapshot publication
+
+JSON export serializes counter collection and rendering to an in-memory stream.
+Metadata file reads and temporary-file writes happen outside that shared lock.
+A separate lock per destination covers the final rename and sequence check;
+an older slow writer discards its temporary file if a newer snapshot has already
+been published. Publication records live only while writers for that path are
+in flight and are then freed. Different output paths do not share a filesystem
+publication lock. The cached PREF64 source refreshes on monotonic time and
+accepts regular files only. Telemetry export does not change mapping/cache
+ownership or add synchronization to the packet translation path.

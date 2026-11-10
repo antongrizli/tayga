@@ -94,7 +94,7 @@ tayga_runner() {
     { [ -z "$recent" ] || printf '%s\n' "$recent"; echo "$now"; } > "$starts"
     "$net" down "$config" || :
     "$net" up "$config" || exit 1
-    exec /usr/local/sbin/pref64-discover --supervise-ra "$config" --network-controller "$net" -- /usr/local/sbin/tayga --config "$config" --runtime-dir "/var/run/tayga-managed-${profile}" --nodetach
+    exec /usr/local/sbin/pref64-discover --supervise-ra "$config" --network-controller "$net" --runtime-dir "/var/run/tayga-managed-${profile}" -- /usr/local/sbin/tayga --config "$config" --runtime-dir "/var/run/tayga-managed-${profile}" --nodetach
 }
 
 run_rc_command "$@"

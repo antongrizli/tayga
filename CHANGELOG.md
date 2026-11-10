@@ -7,19 +7,36 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 ### Added
 
 - RA prefix supervision for managed CLAT profiles: lifetime renewal, withdrawal/expiry shutdown, foreground translator restart on prefix change, and forwarding of service signals. Managed NAT66 prefix changes stop the translator while the network controller rebuilds owned rules; failed replacement attempts restore the saved network profile and exit without starting a stale translator.
-- Deterministic ICMP token accounting regressions and a Linux RA-supervisor lifecycle scenario; extended DNS64 regressions cover all RFC 6052 prefix lengths and large/non-first EDNS OPT records. These additions have not been executed in this change session.
+- Deterministic ICMP token accounting regressions and Linux/FreeBSD RA-supervisor lifecycle scenarios; extended DNS64 regressions cover all RFC 6052 prefix lengths and large/non-first EDNS OPT records.
 
 - RFC 8781 PREF64 discovery from Router Advertisements now also works on FreeBSD (`pref64-discover -i <if>`); the installer picks the IPv6 default-route interface via `route(8)`.
 - `flow-label zero|compute` (RFC 6437): optional keyed-hash IPv6 Flow Label for IPv4-to-IPv6 translation, including the GSO paths; default stays `zero` per RFC 7915.
 - Flat per-prefix-length index for immutable configurations with at least 9 static maps; `find_map4`/`find_map6` become O(lengths x log N) instead of a linear list scan (about 30x faster at 3000 entries).
 - Status JSON counters `icmp_sent_packets` (ICMP originated by the daemon) and `self_packets` (packets answered locally). For scalar one-input/one-output traffic these counters support `rx == (tx - icmp_sent) + dropped + self`; covered by `test/system/test_stats_balance.py`.
 
+- `worker-affinity` also accepts a CPU list (`worker-affinity 4-6,8`: worker i on the i-th listed CPU); CPUs outside the allowed set are skipped with a warning.
+- `pref64-discover --supervise-ra` options `--runtime-dir DIR` (publishes `active-prefix`), `--initial-prefix` and `--initial-lifetime`; `tayga-ctl status` and the NAT64 readiness probe report the prefix the translator really runs.
+- Status JSON `gso.dropped_segments`: segments of a software-GSO aggregate that were not delivered (exact after a mid-stream write failure).
+- `scripts/ci/openwrt_feed.py` fetches OpenWrt feed packages through the usign-signed `Packages` index; CI no longer pins per-package hashes that break when a feed is rebuilt.
+
 ### Changed
 
-- New `worker-affinity on|off` directive (Linux, default off): pins worker thread i to the i-th allowed CPU. Verified on a live daemon (4 workers on CPUs 0-3); no throughput A/B was run.
+- The RA supervisor keeps the active PREF64 while any router still advertises it instead of restarting the translator on every advertisement with another prefix, solicits three times at start-up and keeps running (soliciting with back-off) after the prefix is withdrawn or expires instead of exiting and consuming the service restart budget.
+- `hash-bits` defaults to a size derived from `cache-size` (128 to 16384 buckets) unless set explicitly.
+- `uptime_sec` in the status JSON uses the monotonic clock; JSON strings keep valid UTF-8 and escape invalid bytes.
+- `pref64-discover --serve-dns64` handles queries concurrently (a slow upstream name no longer delays other names; table of 64 in-flight queries, then SERVFAIL) and sets the synthesized AAAA TTL from the A record, bounded by an SOA MINIMUM in the response (RFC 6147 5.1.7) instead of a fixed 60 s.
+- New `worker-affinity on|off` directive (Linux, default off): pins worker thread i to the i-th allowed CPU. Verified on a live daemon (4 workers on CPUs 0-3). A/B on an 8-vCPU Lima guest (flows, 3 workers, clients pinned per CPU, 10 pairs) was slower with it on in every pair (about -28% download, -30% upload, 2-3x retransmits/GB), so it stays off by default; enable only after measuring your own topology.
 - eBPF `tun-steering=flows` now hashes the ports of DCCP (33), SCTP (132) and UDP-Lite (136) in addition to TCP/UDP, so those flows spread across queues instead of sticking to one address-pair bucket.
 
 ### Fixed
+
+- An unusable `NOTIFY_SOCKET` inherited from the environment is a warning, not a start failure.
+- ICMP error rate limiter no longer spins on its flag or reads the clock inside the critical section; a worker that loses the race refuses the error.
+- With `flow-label compute` the quoted datagram inside a translated ICMP error keeps a zero Flow Label.
+- Leftover temporary files of a killed process (`dynamic.map.XXXXXX`, `.tayga-status.<pid>.<n>`, `<profile>.conf.ra.XXXXXX`) are removed at start-up; status files of other live daemons are left alone.
+- `clat-info.json` (`pref64_source`) is read through a directory descriptor opened before `chroot()`; its parser accepts any JSON whitespace.
+- Render telemetry JSON in memory and write it outside the shared collection lock; retain per-destination publication order so a slow old export cannot replace a newer snapshot. Metadata cache reads use monotonic refresh scheduling and reject non-regular input files.
+- Make the package-upgrade operation-lock fixture portable to FreeBSD and retain coverage for refusing to delete a foreign stale lock. Find Bash through PATH in benchmark regressions and build the UDP drain guard test helpers in an isolated temporary directory instead of silently skipping a stale binary path.
 
 - FreeBSD managed profile now restarts a crashed translator (`daemon -r`, 3 s delay, at most 5 starts per 120 s) and rebuilds the tun(4) addresses, routes and PF anchor before every start, because FreeBSD drops them when the translator dies; `service tayga-managed status` now reports the supervisor correctly.
 - OpenRC managed profile now restarts a crashed translator through `supervise-daemon` (2 s delay, at most 5 restarts per 120 s, like the systemd unit) and clears stale network state before a manual restart.
