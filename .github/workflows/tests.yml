@@ -42,6 +42,9 @@ jobs:
         run: sudo apt-get install -y python3-pyroute2 python3-scapy
       - name: run test
         run: sudo make integration
+      - name: Make integration test outputs readable for artifact upload
+        if: always()
+        run: sudo chmod -R a+rX build/test-output/integration
       - uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.arch }}

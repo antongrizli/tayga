@@ -135,6 +135,9 @@ jobs:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      - name: Make integration test outputs readable for artifact upload
+        if: always()
+        run: sudo chmod -R a+rX build/test-output/integration
       - uses: actions/upload-artifact@v7
         if: always()
         with:

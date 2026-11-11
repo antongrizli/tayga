@@ -26,6 +26,15 @@ def main():
                             str(root / 'test/integration' / f'{name}.py')], check=True)
     finally:
         subprocess.run([ip, 'netns', 'del', namespace], check=True)
+        out_dir = os.environ.get('TAYGA_TEST_OUT')
+        if out_dir and os.path.exists(out_dir):
+            for root_path, _dirs, files in os.walk(out_dir):
+                try:
+                    os.chmod(root_path, 0o755)
+                    for f in files:
+                        os.chmod(os.path.join(root_path, f), 0o644)
+                except OSError:
+                    pass
 
 
 if __name__ == '__main__':
