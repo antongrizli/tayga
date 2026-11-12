@@ -25,9 +25,9 @@ RFC7757 describes 'Explicit Address Mapping' for stateless IP/ICMP Translation. 
 
 RFC7757 specifies cases where a packet may 'hairpin' (IPv6->IPv4->IPv6), and an algorithm to correct this. TAYGA does not implement this. See [Issue #9](https://github.com/apalrd/tayga/issues/9). TAYGA does detect packets which will hairpin and *WILL DROP THESE PACKETS*.
 
-### Unequal Suffix Lenghts
+### Unequal Suffix Lengths
 
-Per RFC7757, the translator should support cases where the number of suffix bits in the MAP6 entry is equal to or greater than the MAP4 entry. TAYGA requires that these be exactly equal (i.e. IPv4/24 corresponds to IPv6/120, not IPv6/64). TAYGA will fail to start if such maps are configured. See [Issue #37](https://github.com/apalrd/tayga/issues/37)
+Per RFC7757, the translator supports cases where the number of suffix bits in the MAP6 entry is equal to or greater than the MAP4 entry. TAYGA accepts a `map` entry when the IPv6 prefix leaves at least as many suffix bits as the IPv4 prefix (`32 - len4 <= 128 - len6`). The IPv4 suffix is copied directly after the IPv6 prefix and any trailing IPv6 bits are zero (e.g. IPv4/24 may correspond to IPv6/120 or to IPv6/64). A map with fewer IPv6 suffix bits than IPv4 suffix bits is rejected at start-up. Earlier versions required exactly equal suffix lengths; see [Issue #37](https://github.com/apalrd/tayga/issues/37) for the historical discussion.
 
 ### Overlapping EAM Regions
 
