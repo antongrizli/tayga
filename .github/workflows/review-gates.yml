@@ -51,6 +51,23 @@ jobs:
             make clean
             make CC=$cc CFLAGS='-O2 -Wall -Wextra -Wshadow -Wformat=2 -Werror' tayga pref64-discover
           done
+  static-analysis:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Install clang static analyzer
+        run: sudo apt-get update && sudo apt-get install -y clang clang-tools
+      - name: Clang static analyzer (fails on any report)
+        run: make analyze
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: analyze-report
+          path: build/analyze-report
+          if-no-files-found: warn
   sanitizers:
     runs-on: ubuntu-24.04
     steps:

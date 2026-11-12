@@ -116,3 +116,11 @@ fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 	  [ -d test/fuzz/regress/$$t ] && seeds="$$seeds $(abspath test/fuzz/regress)/$$t"; \
 	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null); \
 	done; echo 'fuzz-check passed'
+
+# Clang static analyzer gate: `make analyze` needs scan-build on PATH and fails
+# on any report. Output lands in $(BUILDDIR)/analyze-report.
+.PHONY: analyze
+analyze:
+	@command -v scan-build >/dev/null || { echo 'analyze requires scan-build (clang-tools)'; exit 1; }
+	scan-build --status-bugs -o $(BUILDDIR)/analyze-report \
+	  $(MAKE) BUILDDIR=$(BUILDDIR)/analyze $(BUILDDIR)/analyze/tayga $(BUILDDIR)/analyze/pref64-discover
