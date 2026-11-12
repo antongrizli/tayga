@@ -56,13 +56,19 @@ drops below `COVERAGE_MIN` (default 66 in `mk/config.mk`; override on the comman
 for example `make coverage COVERAGE_MIN=100` to see the gate fail). The `portable` job
 in `review-gates.yml` runs it on Linux and uploads the HTML report as `coverage-html`.
 
-Baseline: 68.4% of lines (4384 of 6406), measured on 2026-11-12 at commit `7e61584`
-(Debian GCC 14.2, gcovr 8.8). The floor is two points below the integer part of that value.
+Baseline: 67.8% of lines (4399 of 6486), measured on 2026-11-12 at commit `1eb04a6`
+(GCC, gcovr 8.8). The floor of 66 sits about two points below that value.
 The least-covered files are `src/tun_steering.h` (0%), `src/log.c` (6%) and
 `src/tun.c` (13%). Unit coverage excludes paths only reached by the root system tests
 (TUN, netlink, steering and the daemon main loop), so low figures there do not mean
 those paths are untested. Raise `COVERAGE_MIN` when coverage improves; never lower it
 to make a change pass without a stated reason.
+
+## Static analysis
+
+`make analyze` runs the clang static analyzer (`scan-build`, from clang-tools) over
+`tayga` and `pref64-discover` and fails on any finding. CI runs it as a gate in
+`review-gates.yml`, and a separate CodeQL workflow scans the sources.
 
 ## Nightly fuzzing
 

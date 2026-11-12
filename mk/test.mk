@@ -136,7 +136,7 @@ analyze:
 # line coverage of src/ drops below COVERAGE_MIN. Output: $(BUILDDIR)/coverage.
 .PHONY: coverage
 coverage:
-	@command -v gcovr >/dev/null || { echo 'coverage requires gcovr (pip install gcovr)'; exit 1; }
+	@command -v gcovr >/dev/null || { echo 'coverage requires gcovr (pip install gcovr==8.8)'; exit 1; }
 	@rm -rf $(BUILDDIR)/coverage
 	$(MAKE) BUILDDIR=$(BUILDDIR)/coverage COVERAGE=1 CFLAGS='-O0 -g -Wall' LDFLAGS= test
 	@mkdir -p $(BUILDDIR)/coverage/html

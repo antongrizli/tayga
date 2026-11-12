@@ -21,6 +21,7 @@ help:
 	@echo 'system-test     - Run Linux kernel acceptance tests (root)'
 	@echo 'analyze         - Run the clang static analyzer (requires scan-build)'
 	@echo 'coverage        - Unit-test line coverage report with COVERAGE_MIN floor (requires gcovr)'
+	@echo 'microbench      - Build and run the translator microbenchmark'
 	@echo 'bench-tools     - Build benchmark helpers and fault shims'
 	@echo 'integration     - Run integration tests (requires root/netns)'
 	@echo 'release         - Prepare VERSION and dated changelog for review'
