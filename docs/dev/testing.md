@@ -47,5 +47,18 @@ links. Payload integrity/PMTUD can additionally exercise unmodified production
 startup with `run-steering-integrity.py --production-startup --steering flows` in
 the prepared benchmark VM; that runner restores the installed files afterwards.
 
+## Nightly fuzzing
+
+The `Nightly fuzzing` workflow (`.github/workflows/fuzz-nightly.yml`, 02:17 UTC and
+on manual dispatch) runs `make fuzz-check CC=clang FUZZ_TIME=600`. Each harness keeps
+its working corpus in `build/fuzz/fuzz-run/<target>/`; the workflow restores that
+directory from the Actions cache before the run and saves it afterwards, so coverage
+accumulates from night to night. Do not run `make clean` before `make fuzz-check` if you
+want to keep a local corpus. If a harness fails, the run uploads the `crash-*`,
+`leak-*` and `timeout-*` inputs as the `fuzz-findings` artifact (kept 30 days);
+download it from the workflow run page or with `gh run download <run-id> -n fuzz-findings`.
+Fix a finding together with a regression input in `test/fuzz/regress/<target>/`, which
+every later run replays.
+
 See [the audit acceptance scenarios](audit-acceptance.md) for the pending Linux/FreeBSD
 RA-supervisor, service lifecycle, DNS64, TX accounting and persistence matrix.
