@@ -12,6 +12,14 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 - `make microbench`: translator microbenchmark.
 - Nightly fuzzing workflow with a persistent corpus.
 
+### Changed
+
+- `src/helpers/pref64-discover.c` is split into `pref64-discover.c`, `pref64_ra.c`, `dns64_serve.c`, `ra_supervisor.c` and `tun_probe.c`; builds that compiled the single file directly must now use `make pref64-discover` or compile all five.
+
+### Fixed
+
+- `docs/rfc.md` now describes the implemented RFC 7757 unequal-suffix handling.
+
 ## [0.9.16] - 2026-11-10
 
 ### Added
@@ -31,7 +39,6 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Changed
 
-- `src/helpers/pref64-discover.c` is split into `pref64-discover.c`, `pref64_ra.c`, `dns64_serve.c`, `ra_supervisor.c` and `tun_probe.c`; builds that compiled the single file directly must now use `make pref64-discover` or compile all five.
 - The RA supervisor keeps the active PREF64 while any router still advertises it instead of restarting the translator on every advertisement with another prefix, solicits three times at start-up and keeps running (soliciting with back-off) after the prefix is withdrawn or expires instead of exiting and consuming the service restart budget.
 - `hash-bits` defaults to a size derived from `cache-size` (128 to 16384 buckets) unless set explicitly.
 - `uptime_sec` in the status JSON uses the monotonic clock; JSON strings keep valid UTF-8 and escape invalid bytes.
@@ -41,7 +48,6 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Fixed
 
-- `docs/rfc.md` now describes the implemented RFC 7757 unequal-suffix handling.
 - Hardware-GSO IPv4 validation did not require the transport header to lie inside the packet: an IPv4 header whose IHL consumed the whole buffer made `gso_translate_tcp_4to6` read one byte past it (found by the `fuzz_gso` CI smoke run; regression input kept in `test/fuzz/regress/fuzz_gso/`).
 - An unusable `NOTIFY_SOCKET` inherited from the environment is a warning, not a start failure.
 - ICMP error rate limiter no longer spins on its flag or reads the clock inside the critical section; a worker that loses the race refuses the error.
