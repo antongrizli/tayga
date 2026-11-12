@@ -41,7 +41,7 @@ jobs:
       - name: Unit coverage report with regression floor
         if: runner.os == 'Linux'
         run: |
-          python3 -m pip install gcovr
+          python3 -m pip install gcovr==8.8
           make coverage
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux' && always()

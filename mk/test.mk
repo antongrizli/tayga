@@ -134,6 +134,9 @@ coverage:
 	@rm -rf $(BUILDDIR)/coverage
 	$(MAKE) BUILDDIR=$(BUILDDIR)/coverage COVERAGE=1 CFLAGS='-O0 -g -Wall' LDFLAGS= test
 	@mkdir -p $(BUILDDIR)/coverage/html
+	@# Extra gcovr flags: negative_hits.warn_once_per_file tolerates GCC bug 68080
+	@# (negative counters with threaded tests); merge-use-line-min merges the same
+	@# source compiled with different -D test hooks (e.g. experimental_io.c).
 	gcovr --root . --filter 'src/' --gcov-ignore-parse-errors negative_hits.warn_once_per_file --merge-mode-functions merge-use-line-min --object-directory $(BUILDDIR)/coverage \
 	  --txt $(BUILDDIR)/coverage/summary.txt --html-details $(BUILDDIR)/coverage/html/index.html \
 	  --fail-under-line $(COVERAGE_MIN)

@@ -51,13 +51,13 @@ the prepared benchmark VM; that runner restores the installed files afterwards.
 
 `make coverage` builds the unit tests with `COVERAGE=1` in `build/coverage`, runs them
 and writes `build/coverage/summary.txt` and `build/coverage/html/index.html` with
-`gcovr` (install it with `pip install gcovr`). It fails when line coverage of `src/`
+`gcovr` (install it with `pip install gcovr==8.8`, the version CI pins). It fails when line coverage of `src/`
 drops below `COVERAGE_MIN` (default 66 in `mk/config.mk`; override on the command line,
 for example `make coverage COVERAGE_MIN=100` to see the gate fail). The `portable` job
 in `review-gates.yml` runs it on Linux and uploads the HTML report as `coverage-html`.
 
 Baseline: 68.4% of lines (4384 of 6406), measured on 2026-11-12 at commit `7e61584`
-(Debian GCC 14.2, gcovr 8.8). The floor is two points below the floor of that value.
+(Debian GCC 14.2, gcovr 8.8). The floor is two points below the integer part of that value.
 The least-covered files are `src/tun_steering.h` (0%), `src/log.c` (6%) and
 `src/tun.c` (13%). Unit coverage excludes paths only reached by the root system tests
 (TUN, netlink, steering and the daemon main loop), so low figures there do not mean
