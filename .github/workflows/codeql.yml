@@ -19,13 +19,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.language == 'c-cpp' && 'manual' || 'none' }}
       - name: Build C sources
         if: matrix.language == 'c-cpp'
         run: make tayga pref64-discover
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.language }}

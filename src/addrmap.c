@@ -261,15 +261,13 @@ int create_cache(void)
 	struct list_head *entry;
 	struct cache_entry *c;
 
-	/* conffile.c enforces 4..24; state the invariant so the table size is
-	 * known to be positive (hash_bits 0 is the unhashed single bucket). */
+	/* conffile.c enforces 4..24; hash_bits 0 (a single bucket) is also
+	 * tolerated by the hash functions, so accept 0..24 here. */
 	if (gcfg.hash_bits < 0 || gcfg.hash_bits > 24) {
 		slog(LOG_CRIT, "Invalid hash table size\n");
 		return ERROR_REJECT;
 	}
 	hash_size = 1 << gcfg.hash_bits;
-	if (hash_size < 1)
-		return ERROR_REJECT;
 
 	/* Zeroed so every bucket is defined even before the init loop below;
 	 * hash4/hash6 indices are only known to be < hash_size at run time. */

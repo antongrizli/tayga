@@ -441,7 +441,8 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown)
 		f->count += d->free.count + 1;
 		list_del(&d->free.list);
 		list_del(&d->list);
-		/* d came from the dormant list, never from the mapped list. */
+		/* d came from the dormant list, never from the mapped list;
+		 * this tells the analyzer the two circular lists are disjoint. */
 		assert(pool->mapped_list.next != &d->list);
 		free(d);
 	}

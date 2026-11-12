@@ -122,5 +122,6 @@ fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 .PHONY: analyze
 analyze:
 	@command -v scan-build >/dev/null || { echo 'analyze requires scan-build (clang-tools)'; exit 1; }
+	@rm -rf $(BUILDDIR)/analyze $(BUILDDIR)/analyze-report
 	scan-build --status-bugs -o $(BUILDDIR)/analyze-report \
 	  $(MAKE) BUILDDIR=$(BUILDDIR)/analyze $(BUILDDIR)/analyze/tayga $(BUILDDIR)/analyze/pref64-discover
