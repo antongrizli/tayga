@@ -74,8 +74,10 @@ class Dns64RegressionTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 binary = str(Path(directory) / "pref64-discover")
-                subprocess.run(["cc", f'-DPREF64_DNS_PORT="{port}"',
-                                str(root / "src/helpers/pref64-discover.c"), "-o", binary], check=True)
+                helpers = root / "src/helpers"
+                sources = [str(helpers / name) for name in ("pref64-discover.c", "pref64_ra.c", "dns64_serve.c",
+                                                            "ra_supervisor.c", "tun_probe.c")]
+                subprocess.run(["cc", f'-DPREF64_DNS_PORT="{port}"', *sources, "-o", binary], check=True)
                 worker = threading.Thread(target=server, daemon=True)
                 worker.start()
                 result = subprocess.run([binary, "-s", "127.0.0.1"], capture_output=True, text=True, timeout=8)

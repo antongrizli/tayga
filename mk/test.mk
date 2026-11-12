@@ -26,7 +26,13 @@ $(TESTOBJDIR)/dispatch-clock.o: src/experimental_io.c $(GENDIR)/version.h $(BUIL
 $(TESTOBJDIR)/stats-export-hook.o: src/stats_exporter.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DSTATS_EXPORT_TEST_HOOK -MMD -MP -c -o $@ $<
 
+# pref64-discover modules the unit and fuzz tests link. -DPREF64_NO_MAIN drops
+# main() and the DNS64 server loop, as in the single-file helper before the split.
+PREF64_TEST_OBJS := $(TESTOBJDIR)/pref64.o $(TESTOBJDIR)/lib/helpers/pref64_ra.o \
+                    $(TESTOBJDIR)/dns64_serve.o
 $(TESTOBJDIR)/pref64.o: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
+$(TESTOBJDIR)/dns64_serve.o: src/helpers/dns64_serve.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
 
 $(TESTBINDIR)/unit_addrmap: $(TESTOBJDIR)/unit_addrmap.o $(TESTOBJDIR)/addrmap-hook.o $(TEST_LIB) | $(TESTBINDIR)
@@ -43,7 +49,7 @@ $(TESTBINDIR)/unit_tun: $(TESTOBJDIR)/unit_tun.o $(TEST_LIB) | $(TESTBINDIR)
 STANDALONE_TESTS := unit_icmp_rate_limit unit_packet_io unit_packet_io_lifetime unit_netlink unit_checksum
 $(addprefix $(TESTBINDIR)/,$(STANDALONE_TESTS)): $(TESTBINDIR)/%: $(TESTOBJDIR)/%.o | $(TESTBINDIR)
 	$(CC) -o $@ $< $(TEST_LDFLAGS)
-$(TESTBINDIR)/unit_pref64: $(TESTOBJDIR)/unit_pref64.o $(TESTOBJDIR)/pref64.o | $(TESTBINDIR)
+$(TESTBINDIR)/unit_pref64: $(TESTOBJDIR)/unit_pref64.o $(PREF64_TEST_OBJS) | $(TESTBINDIR)
 	$(CC) -o $@ $^ $(TEST_LDFLAGS)
 
 $(TESTBINDIR)/%: $(TESTOBJDIR)/%.o $(TEST_LIB) | $(TESTBINDIR)
@@ -82,7 +88,7 @@ integration: tayga
 system-test: tayga pref64-discover fault-shims
 	python3 test/run-system.py --binary "$(abspath $(BUILDDIR)/tayga)" --output "$(abspath $(TESTOUTDIR)/system)"
 
--include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d)
+-include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d) $(PREF64_TEST_OBJS:.o=.d)
 
 .SECONDARY: $(TEST_OBJS) $(addprefix $(TESTOBJDIR)/,$(addsuffix .o,$(UNIT_TESTS)))
 
@@ -103,12 +109,12 @@ fuzz-check:
 	$(MAKE) CC=clang BUILDDIR=$(BUILDDIR)/fuzz CFLAGS='$(FUZZ_FLAGS) -fsanitize=fuzzer-no-link' LDFLAGS='' fuzz-run
 
 .PHONY: fuzz-run
-fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
+fuzz-run: $(TEST_LIB) $(PREF64_TEST_OBJS)
 	@mkdir -p $(BUILDDIR)/fuzz-bin $(BUILDDIR)/fuzz-run
 	@set -eu; for t in fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_conffile fuzz_flow fuzz_maps; do \
 	  $(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -Isrc -I$(GENDIR) -Itest/fuzz -o $(BUILDDIR)/fuzz-bin/$$t test/fuzz/$$t.c $(TEST_LIB) $(LDLIBS); \
 	done
-	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(TESTOBJDIR)/pref64.o
+	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(PREF64_TEST_OBJS)
 	@python3 test/fuzz/make_seeds.py $(BUILDDIR)/fuzz-seeds >/dev/null
 	@set -eu; for t in $(FUZZ_TARGETS); do \
 	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; seeds=; \
