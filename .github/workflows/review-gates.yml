@@ -38,6 +38,17 @@ jobs:
         run: make check-man PANDOC=scripts/ci/pandoc-container.sh
       - name: Native packet ownership checks
         run: make unit_packet_io unit_packet_io_lifetime LDFLAGS='' && ./unit_packet_io && ./unit_packet_io_lifetime
+      - name: Unit coverage report with regression floor
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install gcovr
+          make coverage
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux' && always()
+        with:
+          name: coverage-html
+          path: build/coverage/html
+          if-no-files-found: warn
   strict-warnings:
     runs-on: ubuntu-24.04
     steps:

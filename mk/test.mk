@@ -125,3 +125,15 @@ analyze:
 	@rm -rf $(BUILDDIR)/analyze $(BUILDDIR)/analyze-report
 	scan-build --status-bugs -o $(BUILDDIR)/analyze-report \
 	  $(MAKE) BUILDDIR=$(BUILDDIR)/analyze $(BUILDDIR)/analyze/tayga $(BUILDDIR)/analyze/pref64-discover
+
+# Unit-test line coverage: `make coverage` needs gcovr on PATH and fails when
+# line coverage of src/ drops below COVERAGE_MIN. Output: $(BUILDDIR)/coverage.
+.PHONY: coverage
+coverage:
+	@command -v gcovr >/dev/null || { echo 'coverage requires gcovr (pip install gcovr)'; exit 1; }
+	@rm -rf $(BUILDDIR)/coverage
+	$(MAKE) BUILDDIR=$(BUILDDIR)/coverage COVERAGE=1 CFLAGS='-O0 -g -Wall' LDFLAGS= test
+	@mkdir -p $(BUILDDIR)/coverage/html
+	gcovr --root . --filter 'src/' --gcov-ignore-parse-errors negative_hits.warn_once_per_file --merge-mode-functions merge-use-line-min --object-directory $(BUILDDIR)/coverage \
+	  --txt $(BUILDDIR)/coverage/summary.txt --html-details $(BUILDDIR)/coverage/html/index.html \
+	  --fail-under-line $(COVERAGE_MIN)

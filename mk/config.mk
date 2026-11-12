@@ -59,6 +59,8 @@ ifeq ($(COVERAGE),1)
 override TEST_CFLAGS += --coverage
 override TEST_LDFLAGS += --coverage
 endif
+# Minimum unit-test line coverage (percent) enforced by `make coverage`.
+COVERAGE_MIN ?= 66
 TESTOBJDIR := $(BUILDDIR)/test-obj
 TESTBINDIR := $(BUILDDIR)/test-bin
 TESTOUTDIR := $(BUILDDIR)/test-output
