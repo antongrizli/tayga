@@ -2024,11 +2024,16 @@ __attribute__((unused)) static void remove_stale_snapshots(const char *config)
     DIR *d = opendir(dir);
     if (!d)
         return;
+    int dfd = dirfd(d);
+    if (dfd < 0) {
+        closedir(d);
+        return;
+    }
     struct dirent *e;
     size_t plen = strlen(prefix);
     while ((e = readdir(d)))
         if (!strncmp(e->d_name, prefix, plen) && strlen(e->d_name) == plen + 6)
-            (void)unlinkat(dirfd(d), e->d_name, 0);
+            (void)unlinkat(dfd, e->d_name, 0);
     closedir(d);
 }
 

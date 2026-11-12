@@ -231,12 +231,15 @@ static void load_map(struct dynamic_pool *pool, const struct in6_addr *addr6,
 		return;
 	}
 	addr = ntohl(addr4->s_addr);
+	f = NULL;
 	list_for_each(entry, &pool->free_list) {
-		f = list_entry(entry, struct free_addr, list);
-		if (f->addr + f->count >= addr)
+		struct free_addr *cand = list_entry(entry, struct free_addr, list);
+		if (cand->addr + cand->count >= addr) {
+			f = cand;
 			break;
+		}
 	}
-	if (entry == &pool->free_list || f->addr >= addr) {
+	if (!f || f->addr >= addr) {
 		inet_ntop(AF_INET, addr4, addrbuf4, sizeof(addrbuf4));
 		slog(LOG_NOTICE, "Ignoring duplicate map for %s from %s/%s\n",
 				addrbuf4, gcfg.data_dir, MAP_FILE);
@@ -426,15 +429,20 @@ void dynamic_maint(struct dynamic_pool *pool, int shutdown)
 			move_to_dormant(d, pool);
 		}
 	}
-	while (!list_empty(&pool->dormant_list)) {
-		d = list_entry(pool->dormant_list.prev,
-				struct map_dynamic, list);
+	/* Walk the dormant list from its oldest end.  The next candidate is
+	 * read before the current entry is freed. */
+	for (entry = pool->dormant_list.prev, next = entry->prev;
+			entry != &pool->dormant_list;
+			entry = next, next = entry->prev) {
+		d = list_entry(entry, struct map_dynamic, list);
 		if (d->last_use + gcfg.dyn_max_lease >= now)
 			break;
 		f = list_entry(d->free.list.prev, struct free_addr, list);
 		f->count += d->free.count + 1;
 		list_del(&d->free.list);
 		list_del(&d->list);
+		/* d came from the dormant list, never from the mapped list. */
+		assert(pool->mapped_list.next != &d->list);
 		free(d);
 	}
 
