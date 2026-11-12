@@ -60,8 +60,12 @@ test: $(TEST_BINS)
 	@mkdir -p $(TESTOUTDIR)/unit
 	@set -eu; for binary in $(abspath $(TEST_BINS)); do (cd $(TESTOUTDIR)/unit && "$$binary"); done
 
-test-portable: $(BUILDDIR)/pref64-discover
-	TAYGA_PREF64_DISCOVER="$(abspath $(BUILDDIR)/pref64-discover)" python3 test/portable/run_portable.py
+# The daemon builds on Linux only; elsewhere the option tests skip explicitly.
+ifeq ($(shell uname -s),Linux)
+PORTABLE_TAYGA = $(BUILDDIR)/tayga
+endif
+test-portable: $(BUILDDIR)/pref64-discover $(PORTABLE_TAYGA)
+	$(if $(PORTABLE_TAYGA),TAYGA_BIN="$(abspath $(PORTABLE_TAYGA))") TAYGA_PREF64_DISCOVER="$(abspath $(BUILDDIR)/pref64-discover)" python3 test/portable/run_portable.py
 
 test-linux-tools: bench-tools
 	python3 -m unittest discover -s bench/tests -p 'test_*.py'

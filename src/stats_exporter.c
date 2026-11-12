@@ -69,6 +69,9 @@ static void json_string(FILE *out, const char *value)
  * be published with openat()/renameat() once the absolute path is unreachable. */
 static int g_status_dirfd = -1;
 static char g_status_base[256];
+/* The optional Prometheus file keeps its own directory descriptor. */
+static int g_metrics_dirfd = -1;
+static char g_metrics_base[256];
 /* Same for the clat-info.json metadata read for pref64_source. */
 static int g_info_dirfd = -1;
 static char g_info_base[256];
@@ -93,8 +96,9 @@ static void open_info_dir(const char *path)
 
 /* NEW-4: a crash between mkstemp-style creation and rename leaves
  * ".tayga-status.<pid>.<seq>" behind; remove those from earlier runs. */
-static void remove_stale_status_tmp(int dirfd)
+static void remove_stale_tmp(int dirfd, const char *prefix)
 {
+	size_t plen = strlen(prefix);
 	int dup_fd = dup(dirfd);
 	if (dup_fd < 0)
 		return;
@@ -102,11 +106,11 @@ static void remove_stale_status_tmp(int dirfd)
 	if (!d) { close(dup_fd); return; }
 	struct dirent *e;
 	while ((e = readdir(d))) {
-		if (strncmp(e->d_name, ".tayga-status.", 14))
+		if (strncmp(e->d_name, prefix, plen))
 			continue;
 		/* Only files whose writer is gone: another daemon may share the directory. */
 		char *end = NULL;
-		long pid = strtol(e->d_name + 14, &end, 10);
+		long pid = strtol(e->d_name + plen, &end, 10);
 		if (pid > 0 && end && *end == '.' && pid != (long)getpid() &&
 				kill((pid_t)pid, 0) < 0 && errno == ESRCH)
 			(void)unlinkat(dirfd, e->d_name, 0);
@@ -114,9 +118,38 @@ static void remove_stale_status_tmp(int dirfd)
 	closedir(d);
 }
 
+static void remove_stale_status_tmp(int dirfd)
+{
+	remove_stale_tmp(dirfd, ".tayga-status.");
+}
+
+/* Open the directory of an absolute destination path; the base name is
+ * copied to base (size base_size).  Returns -1 when unusable. */
+static int open_destination_dir(const char *path, char *base, size_t base_size, const char *what)
+{
+	if (!path || path[0] != '/')
+		return -1;
+	const char *slash = strrchr(path, '/');
+	char dir[768];
+	size_t dl = slash == path ? 1 : (size_t)(slash - path);
+	if (dl >= sizeof(dir) || strlen(slash + 1) >= base_size)
+		return -1;
+	memcpy(dir, path, dl); dir[dl] = '\0';
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0) {
+		slog(LOG_WARNING, "Unable to open %s directory %s: %s\n", what, dir, strerror(errno));
+		return -1;
+	}
+	strcpy(base, slash + 1);
+	return fd;
+}
+
+static void prepare_metrics_dir(void);
+
 void telemetry_prepare_dir(const char *path)
 {
 	open_info_dir(gcfg.clat_info_path[0] ? gcfg.clat_info_path : "/run/clat-info.json");
+	prepare_metrics_dir();
 	if (!path || path[0] != '/')
 		return;
 	const char *slash = strrchr(path, '/');
@@ -134,6 +167,21 @@ void telemetry_prepare_dir(const char *path)
 	g_status_dirfd = fd;
 	strcpy(g_status_base, slash + 1);
 	remove_stale_status_tmp(fd);
+}
+
+/* Same preparation for the metrics destination (gcfg.metrics_path). */
+static void prepare_metrics_dir(void)
+{
+	if (!gcfg.metrics_path[0])
+		return;
+	char base[sizeof(g_metrics_base)];
+	int fd = open_destination_dir(gcfg.metrics_path, base, sizeof(base), "metrics");
+	if (fd < 0)
+		return;
+	if (g_metrics_dirfd >= 0) close(g_metrics_dirfd);
+	g_metrics_dirfd = fd;
+	strcpy(g_metrics_base, base);
+	remove_stale_tmp(fd, ".tayga-metrics.");
 }
 
 /* Keep publication ordering per destination only while writers are in flight.
@@ -242,6 +290,60 @@ static void pref64_source_snapshot(char source[64])
     }
 }
 
+/* Serialize snapshot collection.  Main must acknowledge sync requests while
+ * waiting for another collector. */
+static void export_lock(void)
+{
+    if (g_tls_priv.slot_idx == 0) {
+        while (pthread_mutex_trylock(&s_stats_export_mutex) == EBUSY) {
+            stats_check_sync_request();
+            usleep(250);
+        }
+    } else pthread_mutex_lock(&s_stats_export_mutex);
+}
+
+/* Write data to a temporary file next to path and rename it into place, unless
+ * a newer snapshot of the same destination has already been published.  With
+ * dirfd >= 0 the paths are relative to it (the chroot case). */
+static void export_publish(struct export_destination *destination, const char *path,
+                           int dirfd, const char *base, const char *tmp_prefix,
+                           const char *data, size_t length, uint64_t seq, const char *what)
+{
+    char tmp_path[864], tmp_base[96];
+    snprintf(tmp_base, sizeof(tmp_base), "%s%ld.%llu", tmp_prefix, (long)getpid(),
+             (unsigned long long)seq);
+    const char *slash = strrchr(path, '/');
+    size_t directory_length = slash ? (size_t)(slash - path) + 1 : 0;
+    snprintf(tmp_path, sizeof(tmp_path), "%.*s%s", (int)directory_length, path, tmp_base);
+    bool use_dirfd = dirfd >= 0;
+    int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
+    int fd = use_dirfd ? openat(dirfd, tmp_base, flags, 0644) : open(tmp_path, flags, 0644);
+    if (fd < 0) {
+        slog(LOG_WARNING, "Unable to open %s temporary file: %s\n", what, strerror(errno));
+        return;
+    }
+    bool failed = false;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); failed = true; }
+    else {
+        failed = fwrite(data, 1, length, f) != length;
+        if (fclose(f)) failed = true;
+    }
+
+    bool published = false;
+    pthread_mutex_lock(&destination->publish_lock);
+    if (!failed && seq > destination->published) {
+        failed = use_dirfd ? renameat(dirfd, tmp_base, dirfd, base) : rename(tmp_path, path);
+        if (!failed) { destination->published = seq; published = true; }
+    }
+    pthread_mutex_unlock(&destination->publish_lock);
+    if (!published) {
+        if (failed) slog(LOG_WARNING, "Unable to publish %s: %s\n", what, strerror(errno));
+        if (use_dirfd) unlinkat(dirfd, tmp_base, 0);
+        else unlink(tmp_path);
+    }
+}
+
 void stats_write_json(const char *path, const char *state)
 {
     if (!path || !*path || strlen(path) >= sizeof(g_telemetry_path)) return;
@@ -256,12 +358,7 @@ void stats_write_json(const char *path, const char *state)
 
     /* Only snapshot synchronization and in-memory rendering are serialized.
      * Main must acknowledge sync requests while waiting for another collector. */
-    if (g_tls_priv.slot_idx == 0) {
-        while (pthread_mutex_trylock(&s_stats_export_mutex) == EBUSY) {
-            stats_check_sync_request();
-            usleep(250);
-        }
-    } else pthread_mutex_lock(&s_stats_export_mutex);
+    export_lock();
 	char ip4_buf[INET_ADDRSTRLEN] = "none";
 	char ip6_buf[INET6_ADDRSTRLEN] = "none";
 	char prefix_buf[INET6_ADDRSTRLEN + 8] = "none";
@@ -437,41 +534,125 @@ void stats_write_json(const char *path, const char *state)
     stats_export_test_before_io(state);
 #endif
 
-    char tmp_path[864], tmp_base[96];
-    snprintf(tmp_base, sizeof(tmp_base), ".tayga-status.%ld.%llu", (long)getpid(),
-             (unsigned long long)snap_seq);
-    const char *slash = strrchr(path, '/');
-    size_t directory_length = slash ? (size_t)(slash - path) + 1 : 0;
-    snprintf(tmp_path, sizeof(tmp_path), "%.*s%s", (int)directory_length, path, tmp_base);
     bool use_dirfd = g_status_dirfd >= 0 && !strcmp(path, g_telemetry_path);
-    int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
-    int fd = use_dirfd ? openat(g_status_dirfd, tmp_base, flags, 0644) : open(tmp_path, flags, 0644);
-    if (fd < 0) {
-        slog(LOG_WARNING, "Unable to open stats JSON temporary file: %s\n", strerror(errno));
-        free(json); export_end(destination); return;
-    }
-    f = fdopen(fd, "w");
-    if (!f) { close(fd); failed = 1; }
-    else {
-        failed = fwrite(json, 1, json_length, f) != json_length;
-        if (fclose(f)) failed = 1;
-    }
+    export_publish(destination, path, use_dirfd ? g_status_dirfd : -1, g_status_base,
+                   ".tayga-status.", json, json_length, snap_seq, "stats JSON");
     free(json);
-
-    bool published = false;
-    pthread_mutex_lock(&destination->publish_lock);
-    if (!failed && snap_seq > destination->published) {
-        failed = use_dirfd ? renameat(g_status_dirfd, tmp_base, g_status_dirfd, g_status_base)
-                           : rename(tmp_path, path);
-        if (!failed) { destination->published = snap_seq; published = true; }
-    }
-    pthread_mutex_unlock(&destination->publish_lock);
-    if (!published) {
-        if (failed) slog(LOG_WARNING, "Unable to publish stats JSON: %s\n", strerror(errno));
-        if (use_dirfd) unlinkat(g_status_dirfd, tmp_base, 0);
-        else unlink(tmp_path);
-    }
     export_end(destination);
+}
+
+/* Label values: backslash, double quote and newline are escaped per the
+ * Prometheus text exposition format. */
+static void prom_label(FILE *out, const char *value)
+{
+	for (const char *c = value; *c; c++) {
+		if (*c == '\\') fputs("\\\\", out);
+		else if (*c == '"') fputs("\\\"", out);
+		else if (*c == '\n') fputs("\\n", out);
+		else fputc(*c, out);
+	}
+}
+
+static void prom_head(FILE *f, const char *name, const char *type, const char *help)
+{
+	fprintf(f, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+}
+
+#define PROM_U64(v) ((unsigned long long)(v))
+
+/* Counter with a family label: one series per address family. */
+static void prom_family(FILE *f, const char *name, const char *help, uint64_t v4, uint64_t v6)
+{
+	prom_head(f, name, "counter", help);
+	fprintf(f, "%s{family=\"ipv4\"} %llu\n", name, PROM_U64(v4));
+	fprintf(f, "%s{family=\"ipv6\"} %llu\n", name, PROM_U64(v6));
+}
+
+static void prom_plain(FILE *f, const char *name, const char *type, const char *help, uint64_t v)
+{
+	prom_head(f, name, type, help);
+	fprintf(f, "%s %llu\n", name, PROM_U64(v));
+}
+
+/* Prometheus text exposition of the same snapshot the JSON carries, for the
+ * node_exporter textfile collector.  Published exactly like the JSON file. */
+void stats_write_prometheus(const char *path)
+{
+	if (!path || !*path || strlen(path) >= sizeof(gcfg.metrics_path)) return;
+	struct export_destination *destination = export_begin(path);
+	if (!destination) { slog(LOG_WARNING, "Unable to allocate metrics publication state\n"); return; }
+	char *text = NULL;
+	size_t text_length = 0;
+	FILE *f = open_memstream(&text, &text_length);
+	if (!f) { export_end(destination); return; }
+
+	export_lock();
+	struct tayga_stats s;
+	stats_get_snapshot(&s);
+	uint32_t active_map = 0, dormant_map = 0, free_addr = 0;
+	if (gcfg.dynamic_pool)
+		dynamic_get_stats(gcfg.dynamic_pool, &active_map, &dormant_map, &free_addr);
+	long uptime = (long)(tayga_mono_sec() - g_stats_start_mono);
+	if (uptime < 0) uptime = 0;
+	uint64_t snap_seq = atomic_fetch_add_explicit(&g_stats_snapshot_seq, 1, memory_order_relaxed) + 1;
+
+	prom_head(f, "tayga_info", "gauge", "Build and datapath configuration; the value is always 1.");
+	fputs("tayga_info{version=\"", f); prom_label(f, TAYGA_VERSION);
+	fputs("\",offload=\"", f); prom_label(f, tun_offload_name(gcfg.tun_offload_effective));
+	fputs("\",steering=\"", f);
+	prom_label(f, gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
+	fputs("\"} 1\n", f);
+	prom_plain(f, "tayga_uptime_seconds", "gauge", "Seconds since the daemon started.", (uint64_t)uptime);
+	prom_family(f, "tayga_rx_packets_total", "Packets received from the TUN device, by address family.", s.rx_pkts_v4, s.rx_pkts_v6);
+	prom_family(f, "tayga_rx_bytes_total", "Bytes received from the TUN device, by address family.", s.rx_bytes_v4, s.rx_bytes_v6);
+	prom_family(f, "tayga_tx_packets_total", "Packets written to the TUN device, by address family.", s.tx_pkts_v4, s.tx_pkts_v6);
+	prom_family(f, "tayga_tx_bytes_total", "Bytes written to the TUN device, by address family.", s.tx_bytes_v4, s.tx_bytes_v6);
+	prom_plain(f, "tayga_dropped_packets_total", "counter", "Packets dropped.", s.dropped_pkts);
+	prom_plain(f, "tayga_dropped_bytes_total", "counter", "Bytes dropped.", s.dropped_bytes);
+	prom_plain(f, "tayga_self_packets_total", "counter", "Packets addressed to the translator itself.", s.self_pkts);
+	prom_plain(f, "tayga_icmp_sent_packets_total", "counter", "ICMP error and reply packets generated.", s.icmp_sent_pkts);
+	prom_plain(f, "tayga_error_packets_total", "counter", "Packets that failed translation.", s.error_pkts);
+	prom_head(f, "tayga_tx_failures_total", "counter", "TUN write failures, by reason.");
+	static const char *const reasons[] = { "eagain", "enobufs", "eintr", "short", "fatal", "other" };
+	const uint64_t reason_values[] = { s.tx_eagain, s.tx_enobufs, s.tx_eintr, s.tx_short, s.tx_fatal, s.tx_other };
+	for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); i++)
+		fprintf(f, "tayga_tx_failures_total{reason=\"%s\"} %llu\n", reasons[i], PROM_U64(reason_values[i]));
+	prom_head(f, "tayga_gso_packets_total", "counter", "Segmentation-offload aggregates handled, by direction.");
+	fprintf(f, "tayga_gso_packets_total{direction=\"rx\"} %llu\n", PROM_U64(s.gso_rx_pkts));
+	fprintf(f, "tayga_gso_packets_total{direction=\"tx\"} %llu\n", PROM_U64(s.gso_tx_pkts));
+	prom_plain(f, "tayga_gso_software_segmented_packets_total", "counter", "Aggregates segmented in software.", s.gso_sw_seg_pkts);
+	prom_plain(f, "tayga_gso_dropped_segments_total", "counter", "Segments dropped during offload processing.", s.gso_dropped_segments);
+	prom_head(f, "tayga_dynamic_pool_mappings", "gauge", "Dynamic pool mappings, by state.");
+	fprintf(f, "tayga_dynamic_pool_mappings{state=\"active\"} %u\n", active_map);
+	fprintf(f, "tayga_dynamic_pool_mappings{state=\"dormant\"} %u\n", dormant_map);
+	prom_plain(f, "tayga_dynamic_pool_free_addresses", "gauge", "Free addresses in the dynamic pool.", free_addr);
+	prom_head(f, "tayga_worker_rx_packets_total", "counter", "Packets received per worker slot, by address family.");
+	for (int i = 0; i <= gcfg.workers && i < STATS_MAX_SLOTS; i++) {
+		struct worker_pub_stats *p = &g_worker_pub[i];
+		fprintf(f, "tayga_worker_rx_packets_total{worker=\"%d\",family=\"ipv4\"} %llu\n", i,
+			PROM_U64(atomic_load_explicit(&p->rx_pkts_v4, memory_order_relaxed)));
+		fprintf(f, "tayga_worker_rx_packets_total{worker=\"%d\",family=\"ipv6\"} %llu\n", i,
+			PROM_U64(atomic_load_explicit(&p->rx_pkts_v6, memory_order_relaxed)));
+	}
+
+	int failed = ferror(f);
+	if (fclose(f)) failed = 1;
+	pthread_mutex_unlock(&s_stats_export_mutex);
+	if (failed) { free(text); export_end(destination); return; }
+
+	bool use_dirfd = g_metrics_dirfd >= 0 && !strcmp(path, gcfg.metrics_path);
+	export_publish(destination, path, use_dirfd ? g_metrics_dirfd : -1, g_metrics_base,
+	               ".tayga-metrics.", text, text_length, snap_seq, "metrics file");
+	free(text);
+	export_end(destination);
+}
+
+/* Everything written whenever the status JSON is. */
+static void telemetry_write_all(const char *state)
+{
+	stats_write_json(g_telemetry_path, state);
+	if (gcfg.metrics_path[0])
+		stats_write_prometheus(gcfg.metrics_path);
 }
 
 static void *telemetry_worker_loop(void *arg)
@@ -495,7 +676,7 @@ static void *telemetry_worker_loop(void *arg)
 
 		g_telemetry_triggered = false;
 		pthread_mutex_unlock(&g_telemetry_mutex);
-		stats_write_json(g_telemetry_path, "running");
+		telemetry_write_all("running");
 		pthread_mutex_lock(&g_telemetry_mutex);
 	}
 	pthread_mutex_unlock(&g_telemetry_mutex);
@@ -541,9 +722,14 @@ void telemetry_start(const char *status_path, int interval_sec)
 			if (dfd >= 0) { remove_stale_status_tmp(dfd); close(dfd); }
 		}
 	}
+	if (g_metrics_dirfd < 0 && gcfg.metrics_path[0] == '/') {
+		char mbase[sizeof(g_metrics_base)];
+		int mfd = open_destination_dir(gcfg.metrics_path, mbase, sizeof(mbase), "metrics");
+		if (mfd >= 0) { remove_stale_tmp(mfd, ".tayga-metrics."); close(mfd); }
+	}
 	atomic_store_explicit(&g_telemetry_running, true, memory_order_relaxed);
 	/* Write initial snapshot immediately */
-	stats_write_json(g_telemetry_path, "running");
+	telemetry_write_all("running");
 
 	int ret = pthread_create(&g_telemetry_thread, NULL, telemetry_worker_loop, NULL);
 	if (ret != 0) {
@@ -565,14 +751,14 @@ void telemetry_stop(void)
 
 	pthread_join(g_telemetry_thread, NULL);
 	/* Final snapshot with stopped status */
-	stats_write_json(g_telemetry_path, "stopped");
+	telemetry_write_all("stopped");
 #endif
 }
 
 void telemetry_write_status(const char *state)
 {
 #ifndef STATS_DISABLED
-	stats_write_json(g_telemetry_path, state ? state : "running");
+	telemetry_write_all(state ? state : "running");
 #else
 	(void)state;
 #endif

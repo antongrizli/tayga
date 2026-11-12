@@ -4,6 +4,10 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Added
+
+- `--metrics-file FILE` (`TAYGA_METRICS_FILE`): optional Prometheus text-format counters for the node_exporter textfile collector, rewritten atomically with every status JSON write (every 5 s, on SIGUSR2 and at shutdown); no listening socket.
+
 ## [0.9.16] - 2026-11-10
 
 ### Added
