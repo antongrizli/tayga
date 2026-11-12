@@ -41,6 +41,21 @@ owning project's tools when comparing that different implementation.
 
 See [benchmarking guidance](../docs/dev/benchmarking.md) for measurement boundaries.
 
+## Translator microbenchmark
+
+`make microbench` builds `build/bench_xlate` and prints one JSON object per
+case: `{"case", "ns_per_pkt", "iters", "runs"}`. It calls `handle_ip4()` and
+`handle_ip6()` directly on prebuilt packets, so the kernel TUN path is out of
+the measurement. Options: `--iters N` (default 2000000) and `--runs R`
+(default 5); `ns_per_pkt` is the minimum over the runs.
+
+Each number includes translation, checksum work and one `write()` to
+`/dev/null`. Subtract `baseline_write_1400` (template copy plus the same
+`write()`, no translation) to estimate translation alone.
+
+To compare two commits, run `make microbench` on each on the same idle machine,
+three times, and compare the minimum per case. A difference under 3% is noise.
+
 ## TCP recovery acceptance
 
 Run `bench/lima/run-recovery.sh` on the prepared Lima host for five alternating

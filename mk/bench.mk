@@ -31,3 +31,10 @@ $(BUILDDIR)/benchmark-clat.sh: bench/clat/benchmark-clat.sh $(wildcard bench/cla
 	python3 scripts/assemble-benchmark.py > $@.tmp
 	chmod +x $@.tmp
 	mv $@.tmp $@
+
+# Translator microbenchmark: handler cost per packet without the TUN path.
+.PHONY: microbench
+$(BUILDDIR)/bench_xlate: bench/micro/bench_xlate.c test/fuzz/fuzz_common.h $(TEST_LIB) $(BUILDDIR)/build.flags
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itest/fuzz -o $@ $< $(TEST_LIB) $(LDLIBS)
+microbench: $(BUILDDIR)/bench_xlate
+	$(BUILDDIR)/bench_xlate
