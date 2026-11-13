@@ -9,6 +9,9 @@
 #include <sys/socket.h>
 
 #include "tayga.h"
+#ifdef __linux__
+#include "tun_steering.h"
+#endif
 #include "stats.h"
 
 struct config gcfg;
@@ -245,6 +248,20 @@ int main(void)
 	for (unsigned i = 0; i < WORKER_DIRECT_BURSTS; i++)
 		assert(tun_next_direct_burst(i, 0) == 0);
 	printf("PASS: full bursts skip redundant polls with bounded recheck; drained input resets readiness\n");
+
+#ifdef __linux__
+	{
+		struct steering_builder b;
+		assert(steering_build_program(0, 0, 10, 11, &b) == -1 && errno == EINVAL);
+		assert(steering_build_program(129, 1, 10, 11, &b) == -1 && errno == EINVAL);
+		assert(steering_build_program(4, 0, 10, 11, &b) == 0);
+		assert(!b.overflow && b.n > 0 && b.n < 512);
+		unsigned groups_n = b.n;
+		assert(steering_build_program(4, 1, 10, 11, &b) == 0);
+		assert(!b.overflow && b.n > groups_n && b.n < 512);
+		printf("PASS: eBPF steering_build_program (groups & flows)\n");
+	}
+#endif
 
 	printf("PASS: All unit_tun tests passed.\n");
 	return 0;

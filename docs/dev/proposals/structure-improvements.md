@@ -122,7 +122,12 @@ tayga/
 │   ├── stats.c  stats.h  stats_exporter.c
 │   ├── version.h.in             template; real version.h generated into build/
 │   └── helpers/
-│       └── pref64-discover.c    (was src-helper/)
+│       ├── pref64-discover.c    (was src-helper/; CLI, RFC 7050 discovery)
+│       ├── pref64_ra.c/.h       (RA option parsing, candidate table)
+│       ├── dns64_serve.c/.h     (embedded DNS64 server)
+│       ├── ra_supervisor.c/.h   (RA supervisor loop)
+│       ├── tun_probe.c/.h       (ICMPv6 echo probe)
+│       └── pref64_util.h        (shared helper inline utilities)
 │
 ├── tools/                       user-facing diagnostics shipped/documented
 │   ├── probe-tun-offload.c

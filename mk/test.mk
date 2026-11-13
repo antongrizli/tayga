@@ -1,6 +1,6 @@
 # Unit objects, libraries, binaries and fixtures are isolated per BUILDDIR.
 UNIT_TESTS := unit_addrmap unit_mapping unit_netlink unit_dispatch unit_conffile unit_checksum \
-              unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_pref64 unit_stats \
+              unit_udp_checksum unit_ip4_id unit_tun unit_gso unit_nat64 unit_pref64 unit_stats \
               unit_packet_io unit_packet_io_lifetime unit_icmp_rate_limit
 TEST_BINS := $(addprefix $(TESTBINDIR)/,$(UNIT_TESTS))
 TEST_LIB := $(BUILDDIR)/libtayga_test.a
@@ -116,12 +116,12 @@ fuzz-run: $(TEST_LIB) $(PREF64_TEST_OBJS)
 	done
 	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(PREF64_TEST_OBJS)
 	@python3 test/fuzz/make_seeds.py $(BUILDDIR)/fuzz-seeds >/dev/null
-	@set -eu; for t in $(FUZZ_TARGETS); do \
+	@rc=0; for t in $(FUZZ_TARGETS); do \
 	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; seeds=; \
 	  [ -d $(BUILDDIR)/fuzz-seeds/$$t ] && seeds=$(abspath $(BUILDDIR))/fuzz-seeds/$$t; \
 	  [ -d test/fuzz/regress/$$t ] && seeds="$$seeds $(abspath test/fuzz/regress)/$$t"; \
-	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null); \
-	done; echo 'fuzz-check passed'
+	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null) || rc=1; \
+	done; [ $$rc -eq 0 ] && echo 'fuzz-check passed' || exit $$rc
 
 # Clang static analyzer gate: `make analyze` needs scan-build on PATH and fails
 # on any report. Output lands in $(BUILDDIR)/analyze-report.
@@ -145,4 +145,4 @@ coverage:
 	@# source compiled with different -D test hooks (e.g. experimental_io.c).
 	gcovr --root . --filter 'src/' --gcov-ignore-parse-errors negative_hits.warn_once_per_file --merge-mode-functions merge-use-line-min --object-directory $(BUILDDIR)/coverage \
 	  --txt $(BUILDDIR)/coverage/summary.txt --html-details $(BUILDDIR)/coverage/html/index.html \
-	  --fail-under-line $(COVERAGE_MIN)
+	  --fail-under-line $(COVERAGE_MIN) --fail-under-branch $(COVERAGE_BRANCH_MIN)
