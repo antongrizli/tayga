@@ -68,7 +68,7 @@ to make a change pass without a stated reason.
 
 `make analyze` runs the clang static analyzer (`scan-build`, from clang-tools) over
 `tayga` and `pref64-discover` and fails on any finding. CI runs it as a gate in
-`review-gates.yml`, and a separate CodeQL workflow scans the sources.
+`review-gates.yml`. CodeQL runs through the repository's GitHub default setup, not a workflow file.
 
 ## Nightly fuzzing
 
