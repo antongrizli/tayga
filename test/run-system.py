@@ -40,10 +40,9 @@ def main():
     subprocess.run([sys.executable, str(root / 'test_nat66_prefix_change.py'), '--binary', binary,
                     '--helper', str(Path(binary).with_name('pref64-discover')),
                     '--output', str(args.output.resolve() / 'nat66_prefix_change')], check=True)
-    for mode in ('groups', 'flows'):
-        subprocess.run([sys.executable, str(root / 'test_tun_steering.py'), '--steering', mode], check=True)
-        subprocess.run([sys.executable, str(root / 'test_tun_steering_lifecycle.py'),
-                        binary, '--tun-steering=' + mode], check=True)
+    subprocess.run([sys.executable, str(root / 'test_tun_steering.py'), '--steering', 'flows'], check=True)
+    subprocess.run([sys.executable, str(root / 'test_tun_steering_lifecycle.py'),
+                    binary, '--tun-steering=flows'], check=True)
     subprocess.run([sys.executable, str(root / 'test_tun_steering_lifecycle.py'),
                     binary, '--dispatch=kernel', '--packet-io=sync'], check=True)
 

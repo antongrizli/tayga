@@ -18,12 +18,17 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "../../src/helpers/pref64_ra.h"
+#include "../../src/helpers/dns64_serve.h"
 
 extern int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
                                   int *out_plen, uint32_t *out_lifetime_sec);
 extern size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
                               uint8_t v4_list[][4], size_t max_v4);
 extern int extract_pref64(const struct in6_addr *in, struct in6_addr *out, int *prefix_len);
+extern size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
+                                const struct in6_addr *prefix, int prefix_len,
+                                uint16_t rtype, const uint8_t v4_list[][4], size_t count,
+                                uint8_t rcode, uint32_t ttl, uint8_t *resp, size_t resp_sz);
 
 static void test_case(const char *in_str, const char *expected_pref, int expected_len)
 {
@@ -450,6 +455,58 @@ int main(void)
     assert(parse_dns_response(pkt, valid_len + 76, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == 0);
     pkt[34] = 5; /* CNAME */
     assert(parse_dns_response(pkt, valid_len + 76, 0x1234, "ipv4only.arpa", &out_p, &plen_p) == 0);
+
+    /* synthesize_pref64 across all RFC 6052 prefix lengths */
+    {
+        const struct { int plen; const char *pref; const char *exp; } syn[] = {
+            { 96, "64:ff9b::", "64:ff9b::c000:201" },
+            { 64, "2001:db8:1:2::", "2001:db8:1:2:c0:2:100:0" },
+            { 56, "2001:db8:1:200::", "2001:db8:1:2c0:0:201::" },
+            { 48, "2001:db8:1::", "2001:db8:1:c000:2:100::" },
+            { 40, "2001:db8:100::", "2001:db8:1c0:2:1::" },
+            { 32, "2001:db8::", "2001:db8:c000:201::" },
+        };
+        const uint8_t ip4[4] = { 192, 0, 2, 1 };
+        for (size_t i = 0; i < sizeof(syn) / sizeof(syn[0]); i++) {
+            struct in6_addr p6, out6, exp6;
+            assert(inet_pton(AF_INET6, syn[i].pref, &p6) == 1);
+            assert(inet_pton(AF_INET6, syn[i].exp, &exp6) == 1);
+            assert(synthesize_pref64(&p6, syn[i].plen, ip4, &out6) == 0);
+            assert(memcmp(&out6, &exp6, 16) == 0);
+        }
+        struct in6_addr p6, out6;
+        assert(inet_pton(AF_INET6, "64:ff9b::", &p6) == 1);
+        assert(synthesize_pref64(&p6, 44, ip4, &out6) == -1);
+        printf("PASS: synthesize_pref64 across RFC 6052 lengths\n");
+    }
+
+    /* RFC 6147 §5.1: build_dns64_reply sets TC=1 when answers truncate resp_sz */
+    {
+        uint8_t req[32];
+        memset(req, 0, sizeof(req));
+        req[0] = 0xab; req[1] = 0xcd; req[2] = 0x01; /* RD=1 */
+        req[5] = 1; /* QDCOUNT=1 */
+        /* QNAME: \x01a\x00 + QTYPE=28 + QCLASS=1 => 7 bytes */
+        req[12] = 1; req[13] = 'a'; req[14] = 0;
+        req[15] = 0; req[16] = 28; req[17] = 0; req[18] = 1;
+        struct in6_addr p6;
+        assert(inet_pton(AF_INET6, "64:ff9b::", &p6) == 1);
+        const uint8_t v4s[2][4] = { {192, 0, 2, 1}, {192, 0, 2, 2} };
+        /* 12 + 7 = 19 header+question; one AAAA answer = 28 bytes (total 47); two = 75 */
+        uint8_t small_resp[50];
+        size_t rlen = build_dns64_reply(req, 7, &p6, 96, 28, v4s, 2, 0, 60,
+                                        small_resp, sizeof(small_resp));
+        assert(rlen == 47);
+        assert((small_resp[2] & 0x02) != 0); /* TC=1 */
+        assert(small_resp[7] == 1);          /* ANCOUNT=1 */
+        uint8_t full_resp[128];
+        rlen = build_dns64_reply(req, 7, &p6, 96, 28, v4s, 2, 0, 60,
+                                 full_resp, sizeof(full_resp));
+        assert(rlen == 75);
+        assert((full_resp[2] & 0x02) == 0);  /* TC=0 */
+        assert(full_resp[7] == 2);           /* ANCOUNT=2 */
+        printf("PASS: build_dns64_reply sets TC=1 on truncation (RFC 6147 §5.1)\n");
+    }
 
     printf("All unit_pref64 tests passed successfully!\n");
     return 0;

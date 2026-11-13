@@ -33,9 +33,12 @@
 #include <pwd.h>
 #include <grp.h>
 #include <stdatomic.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 
 _Atomic time_t now;
+struct tayga_runtime grt = { .pidfd = -1 };
 static const char *progname;
 static int signalfds[2];
 static _Atomic bool g_shutdown = false;
@@ -79,11 +82,11 @@ void usage(int code) {
 			"--tun-offload MODE : Offload mode: off, tcp, udp, or auto (default: auto; UDP then TCP fallback)\n"
 			"--check-offload    : Check kernel TUN offload support and exit\n"
 			"--check-config     : Validate configuration without changing system state\n"
-			"--tun-steering MODE: kernel (default), groups or flows (eBPF requires a fresh disposable Linux TUN)\n"
-			"--dispatch MODE   : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
-			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
-			"--runtime-dir DIR : Runtime files directory (default /run; TAYGA_RUNTIME_DIR)\n"
-			"--status-file FILE: Instance status path (TAYGA_STATUS_FILE)\n"
+			"--tun-steering MODE: kernel (default) or flows (eBPF requires a fresh disposable Linux TUN)\n"
+			"--dispatch MODE    : kernel (default) or experimental flows (1..8 workers, static mappings)\n"
+			"--packet-io MODE   : sync (default) or experimental uring TX (WITH_URING=1)\n"
+			"--runtime-dir DIR  : Runtime files directory (default /run; TAYGA_RUNTIME_DIR)\n"
+			"--status-file FILE : Instance status path (TAYGA_STATUS_FILE)\n"
 			"--metrics-file FILE: Also write Prometheus text metrics to FILE (TAYGA_METRICS_FILE)\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
@@ -99,6 +102,64 @@ void die(const char *format, ...) {
 	va_end(ap);
 	putc('\n', stderr);
 	exit(1);
+}
+
+static void normalize_abs_path(const char *in, char *out, size_t out_sz)
+{
+	size_t o = 0;
+	out[o++] = '/';
+	const char *p = in;
+	while (*p && o + 1 < out_sz) {
+		while (*p == '/') p++;
+		if (!*p) break;
+		const char *seg = p;
+		while (*p && *p != '/') p++;
+		size_t len = (size_t)(p - seg);
+		if (len == 1 && seg[0] == '.') continue;
+		if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+			while (o > 1 && out[o - 1] != '/') o--;
+			if (o > 1) o--;
+			continue;
+		}
+		if (o > 1 && o + 1 < out_sz) out[o++] = '/';
+		size_t copy = len < (out_sz - 1 - o) ? len : (out_sz - 1 - o);
+		memcpy(out + o, seg, copy);
+		o += copy;
+	}
+	out[o] = '\0';
+}
+
+static bool resolve_parent_join(const char *path, char *out, size_t out_sz)
+{
+	const char *slash = strrchr(path, '/');
+	if (!slash) return false;
+	char dir[768];
+	size_t dl = slash == path ? 1 : (size_t)(slash - path);
+	if (dl >= sizeof(dir)) return false;
+	memcpy(dir, path, dl);
+	dir[dl] = '\0';
+	char real_dir[PATH_MAX];
+	if (!realpath(dir, real_dir)) return false;
+	int n = strcmp(real_dir, "/") == 0
+		? snprintf(out, out_sz, "/%s", slash + 1)
+		: snprintf(out, out_sz, "%s/%s", real_dir, slash + 1);
+	return n > 0 && (size_t)n < out_sz;
+}
+
+static bool same_destination_path(const char *a, const char *b)
+{
+	char na[768], nb[768];
+	normalize_abs_path(a, na, sizeof(na));
+	normalize_abs_path(b, nb, sizeof(nb));
+	if (!strcmp(na, nb))
+		return true;
+	char ra[PATH_MAX], rb[PATH_MAX];
+	if (resolve_parent_join(na, ra, sizeof(ra)) &&
+	    resolve_parent_join(nb, rb, sizeof(rb)) && !strcmp(ra, rb))
+		return true;
+	struct stat sa, sb;
+	return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+	       sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
 static void signal_handler(int signal)
@@ -154,13 +215,18 @@ static void signal_read(void)
 			exit(1);
 		}
 		/* If we got SIGHUP, then reload configuration */
-		if(sig == SIGHUP) {
-			slog(LOG_DEBUG,"Received SIGHUP, reloading\n");
-			/* Reload map-file */
-			addrmap_reload();
-			/* Dynamic map flush to file */
-			if (gcfg.dynamic_pool)
-				dynamic_maint(gcfg.dynamic_pool, 1);
+		if (sig == SIGHUP) {
+			slog(LOG_INFO, "Received SIGHUP, reloading configuration\n");
+			if (grt.conffile && config_reload(grt.conffile) == ERROR_NONE) {
+				slog(LOG_INFO, "Configuration reloaded successfully\n");
+				if (gcfg.dynamic_pool)
+					dynamic_maint(gcfg.dynamic_pool, 1);
+			} else {
+				slog(LOG_WARNING, "Full config reload failed; falling back to map-file reload\n");
+				addrmap_reload();
+				if (gcfg.dynamic_pool)
+					dynamic_maint(gcfg.dynamic_pool, 1);
+			}
 			continue;
 		}
 		/* If we got SIGUSR2, dump statistics without exiting */
@@ -400,38 +466,27 @@ static void * worker(void * arg)
 }
 #endif //__linux__
 
-int main(int argc, char **argv)
+struct startup_opts {
+	char *conffile;
+	char *user;
+	char *group;
+	char *pidfile;
+	const char *runtime_dir;
+	const char *status_path;
+	const char *metrics_path;
+	int do_chroot;
+	int detach;
+	int do_mktun;
+	int do_rmtun;
+	int check_config;
+	int check_offload;
+	struct passwd *pw;
+	struct group *gr;
+};
+
+static void parse_cli_args(int argc, char **argv, struct startup_opts *opts)
 {
-	int c, ret, longind;
-	int pidfd;
-	struct pollfd pollfds[2];
-	char addrbuf[INET6_ADDRSTRLEN];
-
-	char *conffile = TAYGA_CONF_PATH;
-	char *user = NULL;
-	char *group = NULL;
-	char *pidfile = NULL;
-	const char *runtime_dir = getenv("TAYGA_RUNTIME_DIR");
-	const char *status_path = getenv("TAYGA_STATUS_FILE");
-	const char *metrics_path = getenv("TAYGA_METRICS_FILE");
-	int do_chroot = 0;
-	int detach = 1;
-	int do_mktun = 0;
-	int do_rmtun = 0;
-	int check_config = 0;
-	int check_offload = 0;
-	struct passwd *pw = NULL;
-	struct group *gr = NULL;
-	progname = argv[0];
-
-	/* Init config structure */
-	if(config_init() < 0) return 1;
-	stats_init();
-	atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
-	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) ||
-	    pthread_mutex_init(&gcfg.map_mutex, NULL))
-		die("Failed to initialize mapping mutexes");
-
+	int c, longind;
 	static struct option longopts[] = {
 		{ "mktun", 0, 0, 0 },
 		{ "rmtun", 0, 0, 0 },
@@ -458,30 +513,28 @@ int main(int argc, char **argv)
 		{ 0, 0, 0, 0 }
 	};
 
-	/* Arg parsing loop */
 	for (;;) {
 		c = getopt_long(argc, argv, "c:dhnu:g:rp:", longopts, &longind);
-		/* Reached last argument, terminate loop */
 		if (c == -1)
 			break;
 		switch (c) {
-		case 1006: runtime_dir = optarg; break;
-		case 1007: status_path = optarg; break;
-		case 1009: metrics_path = optarg; break;
+		case 1006: opts->runtime_dir = optarg; break;
+		case 1007: opts->status_path = optarg; break;
+		case 1009: opts->metrics_path = optarg; break;
 		case 1004:
-			if(!strcmp(optarg,"kernel"))gcfg.dispatch_mode=0;
-			else if(!strcmp(optarg,"flows"))gcfg.dispatch_mode=1;
+			if (!strcmp(optarg, "kernel")) gcfg.dispatch_mode = 0;
+			else if (!strcmp(optarg, "flows")) gcfg.dispatch_mode = 1;
 			else die("Invalid --dispatch: use kernel or flows");
 #ifndef __linux__
-			if(gcfg.dispatch_mode)die("Experimental dispatch requires Linux");
+			if (gcfg.dispatch_mode) die("Experimental dispatch requires Linux");
 #endif
 			break;
 		case 1005:
-			if(!strcmp(optarg,"sync"))gcfg.async_tun=0;
-			else if(!strcmp(optarg,"uring"))gcfg.async_tun=1;
+			if (!strcmp(optarg, "sync")) gcfg.async_tun = 0;
+			else if (!strcmp(optarg, "uring")) gcfg.async_tun = 1;
 			else die("Invalid --packet-io: use sync or uring");
 #ifndef TAYGA_WITH_URING
-			if(gcfg.async_tun)die("io_uring requires build WITH_URING=1");
+			if (gcfg.async_tun) die("io_uring requires build WITH_URING=1");
 #endif
 			break;
 		case 1003:
@@ -489,23 +542,18 @@ int main(int argc, char **argv)
 			if (strcmp(optarg, "kernel")) die("Experimental steering requires Linux");
 #endif
 			if (!strcmp(optarg, "kernel")) {
-				gcfg.tun_steering_groups = 0;
-				gcfg.tun_steering_flows = 0;
-			} else if (!strcmp(optarg, "groups")) {
-				gcfg.tun_steering_groups = 1;
 				gcfg.tun_steering_flows = 0;
 			} else if (!strcmp(optarg, "flows")) {
-				gcfg.tun_steering_groups = 0;
 				gcfg.tun_steering_flows = 1;
 			} else {
-				die("Invalid --tun-steering: use kernel, groups, or flows");
+				die("Invalid --tun-steering: use kernel or flows");
 			}
 			break;
 		case 1002:
-			check_offload = 1;
+			opts->check_offload = 1;
 			break;
 		case 1008:
-			check_config = 1;
+			opts->check_config = 1;
 			break;
 		case 1001:
 			if (strcasecmp(optarg, "off") == 0) {
@@ -522,229 +570,198 @@ int main(int argc, char **argv)
 			break;
 		case 0:
 			switch (longind) {
-				case 0: /* --mktun */
-					if (do_rmtun) {
-						die("Error: both --mktun and --rmtun specified");
-					}
-					do_mktun = 1;
-					break;
-				case 1: /* --rmtun */
-					if (do_mktun) {
-						die("Error: both --mktun and --rmtun specified");
-						exit(1);
-					}
-					do_rmtun = 1;
-					break;
-				case 2: /* --syslog */
-					gcfg.log_out = LOG_TO_SYSLOG;
-					break;
-				case 3: /* --stdout */
-					gcfg.log_out = LOG_TO_STDOUT;
-					break;
-				case 4: /* --journal */
-					gcfg.log_out = LOG_TO_JOURNAL;
-					break;
-				default:
-					usage(1);
+			case 0: /* --mktun */
+				if (opts->do_rmtun)
+					die("Error: both --mktun and --rmtun specified");
+				opts->do_mktun = 1;
+				break;
+			case 1: /* --rmtun */
+				if (opts->do_mktun)
+					die("Error: both --mktun and --rmtun specified");
+				opts->do_rmtun = 1;
+				break;
+			case 2: /* --syslog */
+				gcfg.log_out = LOG_TO_SYSLOG;
+				break;
+			case 3: /* --stdout */
+				gcfg.log_out = LOG_TO_STDOUT;
+				break;
+			case 4: /* --journal */
+				gcfg.log_out = LOG_TO_JOURNAL;
+				break;
+			default:
+				usage(1);
 			}
 			break;
 		case 'c':
-			conffile = optarg;
+			opts->conffile = optarg;
 			break;
 		case 'd':
 			gcfg.log_out = LOG_TO_STDOUT;
-			detach = 0;
+			opts->detach = 0;
 			break;
 		case 'n':
-			detach = 0;
+			opts->detach = 0;
 			break;
 		case 'u':
-			user = optarg;
+			opts->user = optarg;
 			break;
 		case 'g':
-			group = optarg;
+			opts->group = optarg;
 			break;
 		case 'r':
-			do_chroot = 1;
+			opts->do_chroot = 1;
 			break;
 		case 'p':
-			pidfile = optarg;
+			opts->pidfile = optarg;
 			break;
 		case 'h':
 			usage(0);
 			break;
 		default:
-			die("Try `%s --help' for more information (got %c)", argv[0],c);
-			exit(1);
+			die("Try `%s --help' for more information (got %c)", argv[0], c);
 		}
 	}
+}
 
-	if (check_config && (do_mktun || do_rmtun || check_offload))
-		die("Error: --check-config cannot be combined with tunnel operations");
-	if (check_offload) return tun_check_offload_support();
-
-	/* Setup logging
-	 * But not if we are only doing mktun / rmtun
-	 * This must be done before config parsing, since those rely
-	 * on logging based on log_out
-	 */
-	if(do_mktun || do_rmtun || check_config) {
-		//Force stdout for these options
+static int setup_logging(const struct startup_opts *opts)
+{
+	/* Setup logging (force stdout for mktun/rmtun/check-config)
+	 * before config parsing, which relies on slog(). */
+	if (opts->do_mktun || opts->do_rmtun || opts->check_config) {
 		gcfg.log_out = LOG_TO_STDOUT;
 	} else if (gcfg.log_out == LOG_TO_SYSLOG) {
 		openlog("tayga", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 	} else if (gcfg.log_out == LOG_TO_JOURNAL) {
 		int r = journal_init("tayga");
 		if (r < 0) {
-			fprintf(stderr,"Error: Unable to initialize journal: %s\n", strerror(-r));
-			return 1;
+			fprintf(stderr, "Error: Unable to initialize journal: %s\n", strerror(-r));
+			return -1;
 		}
 	}
+	return 0;
+}
 
-	/* Parse config file options */
-	if(config_read(conffile) < 0) return 1;
-	if (runtime_dir) {
-		if (runtime_dir[0] != '/' || strlen(runtime_dir) >= sizeof(gcfg.runtime_dir))
+static void setup_runtime_paths(const struct startup_opts *opts)
+{
+	if (opts->runtime_dir) {
+		if (opts->runtime_dir[0] != '/' || strlen(opts->runtime_dir) >= sizeof(gcfg.runtime_dir))
 			die("runtime-dir must be an absolute path of at most 511 bytes");
-		strcpy(gcfg.runtime_dir, runtime_dir);
+		strcpy(gcfg.runtime_dir, opts->runtime_dir);
 	}
 #ifdef __linux__
 	struct stat namespace_stat;
-	if (!stat("/proc/self/ns/net", &namespace_stat)) gcfg.runtime_netns = namespace_stat.st_ino;
+	if (!stat("/proc/self/ns/net", &namespace_stat))
+		gcfg.runtime_netns = namespace_stat.st_ino;
 #endif
 	snprintf(gcfg.status_path, sizeof(gcfg.status_path), "%s/tayga-status.json", gcfg.runtime_dir);
 	snprintf(gcfg.clat_info_path, sizeof(gcfg.clat_info_path), "%s/clat-info.json", gcfg.runtime_dir);
-	if (status_path) {
-		if (status_path[0] != '/' || strlen(status_path) >= sizeof(gcfg.status_path))
+	if (opts->status_path) {
+		if (opts->status_path[0] != '/' || strlen(opts->status_path) >= sizeof(gcfg.status_path))
 			die("status-file must be an absolute path of at most 767 bytes");
-		strcpy(gcfg.status_path, status_path);
+		strcpy(gcfg.status_path, opts->status_path);
 	}
-	if (metrics_path && *metrics_path) {
-		if (metrics_path[0] != '/' || strlen(metrics_path) >= sizeof(gcfg.metrics_path))
+	if (opts->metrics_path && *opts->metrics_path) {
+		if (opts->metrics_path[0] != '/' || strlen(opts->metrics_path) >= sizeof(gcfg.metrics_path))
 			die("metrics-file must be an absolute path of at most 767 bytes");
-		if (!strcmp(metrics_path, gcfg.status_path))
+		if (same_destination_path(opts->metrics_path, gcfg.status_path))
 			die("metrics-file must differ from status-file");
-		strcpy(gcfg.metrics_path, metrics_path);
+		strcpy(gcfg.metrics_path, opts->metrics_path);
 	}
+}
 
-	/* Validate config (and load map file) */
-	if(config_validate() < 0) return 1;
-	/* Validation must not create TUNs, runtime files, data directories or workers. */
-	if (check_config) {
-		return 0;
-	}
-
-	/* Check if we are doing tunnel operations only
-	 * Must be done after config reading so we know tun name
-	 */
-	if (do_mktun || do_rmtun) {
-		if (user) {
-			die("Error: cannot specify -u or --user "
-					"with mktun/rmtun operation");
-		}
-		if (group) {
-			die("Error: cannot specify -g or --group "
-					"with mktun/rmtun operation\n");
-		}
-		if (do_chroot) {
-			die("Error: cannot specify -r or --chroot "
-					"with mktun/rmtun operation\n");
-		}
-		if(tun_setup(do_mktun, do_rmtun)) return 1;
-		return 0;
-	}
-
-	/* Change user */
-	if (user) {
-		pw = getpwnam(user);
-		if (!pw) {
-			slog(LOG_CRIT, "Error: user %s does not exist\n", user);
-			return 1;
+static int resolve_credentials(struct startup_opts *opts)
+{
+	if (opts->user) {
+		opts->pw = getpwnam(opts->user);
+		if (!opts->pw) {
+			slog(LOG_CRIT, "Error: user %s does not exist\n", opts->user);
+			return -1;
 		}
 	}
-
-	/* Change group */
-	if (group) {
-		gr = getgrnam(group);
-		if (!gr) {
-			slog(LOG_CRIT, "Error: group %s does not exist\n",
-					group);
-			return 1;
+	if (opts->group) {
+		opts->gr = getgrnam(opts->group);
+		if (!opts->gr) {
+			slog(LOG_CRIT, "Error: group %s does not exist\n", opts->group);
+			return -1;
 		}
 	}
+	return 0;
+}
 
-	/* Chroot */
+static int setup_data_dir(const struct startup_opts *opts)
+{
 	if (!gcfg.data_dir[0]) {
-		if (do_chroot) {
+		if (opts->do_chroot) {
 			slog(LOG_CRIT, "Error: cannot chroot when no data-dir "
-					"is specified in %s\n", conffile);
-			return 1;
+					"is specified in %s\n", opts->conffile);
+			return -1;
 		}
 		if (chdir("/")) {
 			slog(LOG_CRIT, "Error: unable to chdir to /, aborting: %s\n",
 					strerror(errno));
-			return 1;
+			return -1;
 		}
 	} else if (chdir(gcfg.data_dir) < 0) {
-		if (user || errno != ENOENT) {
+		if (opts->user || errno != ENOENT) {
 			slog(LOG_CRIT, "Error: unable to chdir to %s, "
 					"aborting: %s\n", gcfg.data_dir,
 					strerror(errno));
-			return 1;
+			return -1;
 		}
 		if (mkdir(gcfg.data_dir, 0777) < 0) {
 			slog(LOG_CRIT, "Error: unable to create %s, aborting: "
 					"%s\n", gcfg.data_dir,
 					strerror(errno));
-			return 1;
+			return -1;
 		}
 		if (chdir(gcfg.data_dir) < 0) {
 			slog(LOG_CRIT, "Error: created %s but unable to chdir "
 					"to it!?? (%s)\n", gcfg.data_dir,
 					strerror(errno));
-			return 1;
+			return -1;
 		}
 	}
-
-	if (do_chroot && (!pw || pw->pw_uid == 0)) {
+	if (opts->do_chroot && (!opts->pw || opts->pw->pw_uid == 0)) {
 		slog(LOG_CRIT, "Error: chroot is ineffective without also "
 				"specifying the -u option to switch to an "
 				"unprivileged user\n");
-		return 1;
+		return -1;
 	}
+	return 0;
+}
 
-	/* If using a map-file, read it after doing chroot/chdir */
-	if(gcfg.map_file[0] && addrmap_reload() != ERROR_NONE) {
-		slog(LOG_CRIT, "Error: map-file %s is configured but not readable\n",
-			gcfg.map_file);
-		return 1;
-	}
+static void daemonize_and_write_pid(const struct startup_opts *opts)
+{
+	char pidbuf[32];
 
-	if (pidfile) {
-		pidfd = open(pidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-		if (pidfd < 0) {
+	if (opts->pidfile) {
+		grt.pidfd = open(opts->pidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (grt.pidfd < 0) {
 			slog(LOG_CRIT, "Error, unable to open %s for "
-					"writing: %s\n", pidfile,
+					"writing: %s\n", opts->pidfile,
 					strerror(errno));
 			exit(1);
 		}
 	}
-
-	if (detach && daemon(1, 0) < 0) {
+	if (opts->detach && daemon(1, 0) < 0) {
 		slog(LOG_CRIT, "Error, unable to fork and detach: %s\n",
 				strerror(errno));
 		exit(1);
 	}
-
-	if (pidfile) {
-		snprintf(addrbuf, sizeof(addrbuf), "%ld\n", (long)getpid());
-		if (write(pidfd, addrbuf, strlen(addrbuf)) != (ssize_t)strlen(addrbuf)) {
+	if (opts->pidfile) {
+		snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)getpid());
+		if (write(grt.pidfd, pidbuf, strlen(pidbuf)) != (ssize_t)strlen(pidbuf)) {
 			slog(LOG_CRIT, "Error, unable to write PID file.\n");
 			exit(1);
 		}
-		close(pidfd);
+		close(grt.pidfd);
+		grt.pidfd = -1;
 	}
+}
 
+static void record_process_identity(void)
+{
 #ifdef __linux__
 	FILE *identity = fopen("/proc/self/stat", "r");
 	if (identity) {
@@ -752,184 +769,130 @@ int main(int argc, char **argv)
 		if (fgets(line, sizeof(line), identity)) {
 			char *tail = strrchr(line, ')'), *save = NULL;
 			if (tail) {
-				char *token = strtok_r(tail+1, " ", &save);
-				for (int field = 3; token && field < 22; field++) token = strtok_r(NULL, " ", &save);
-				if (token) snprintf(gcfg.process_start_ticks, sizeof(gcfg.process_start_ticks), "%s", token);
+				char *token = strtok_r(tail + 1, " ", &save);
+				for (int field = 3; token && field < 22; field++)
+					token = strtok_r(NULL, " ", &save);
+				if (token)
+					snprintf(gcfg.process_start_ticks, sizeof(gcfg.process_start_ticks), "%s", token);
 			}
 		}
 		fclose(identity);
 	}
 #endif
-	slog(LOG_INFO, "Starting tayga " TAYGA_VERSION "\n");
-	slog(LOG_DEBUG, "Compiled from " TAYGA_BRANCH "\n");
-	slog(LOG_DEBUG, "Commit " TAYGA_COMMIT "\n");
+}
 
-	if (gcfg.cache_size || gcfg.flow_label_mode == FLOW_LABEL_COMPUTE) {
-		int urandom_fd = open("/dev/urandom", O_RDONLY);
-		if (urandom_fd < 0) {
-			slog(LOG_CRIT, "Unable to open /dev/urandom, "
-					"aborting: %s\n", strerror(errno));
-			exit(1);
-		}		
-		int len = 8 * sizeof(uint32_t);
-		int nread = read(urandom_fd, gcfg.rand, len);
-		if (nread < 0) {
-			slog(LOG_CRIT, "read /dev/urandom returned %s\n",
-					strerror(errno));
-			exit(1);
-		}
-		if (nread < len) {
-			slog(LOG_CRIT, "read /dev/urandom returned EOF\n");
-			exit(1);
-		}
-
-		close(urandom_fd);
-		gcfg.rand[0] |= 1; /* need an odd number for IPv4 hash */
+static void init_random_seed(void)
+{
+	if (!gcfg.cache_size && gcfg.flow_label_mode != FLOW_LABEL_COMPUTE)
+		return;
+	int urandom_fd = open("/dev/urandom", O_RDONLY);
+	if (urandom_fd < 0) {
+		slog(LOG_CRIT, "Unable to open /dev/urandom, aborting: %s\n", strerror(errno));
+		exit(1);
 	}
-	
-	/* If workers is -1 (default), set to cpu cores */
-	if(gcfg.workers < 0) {
+	int len = 8 * sizeof(uint32_t);
+	int nread = read(urandom_fd, gcfg.rand, len);
+	if (nread < 0) {
+		slog(LOG_CRIT, "read /dev/urandom returned %s\n", strerror(errno));
+		exit(1);
+	}
+	if (nread < len) {
+		slog(LOG_CRIT, "read /dev/urandom returned EOF\n");
+		exit(1);
+	}
+	close(urandom_fd);
+	gcfg.rand[0] |= 1; /* need an odd number for IPv4 hash */
+}
+
+static void resolve_worker_count(void)
+{
+	if (gcfg.workers < 0) {
 		int cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
-		if(cpu_cores > MAX_WORKERS) cpu_cores = MAX_WORKERS;
-		if(cpu_cores < 0) {
-			slog(LOG_WARNING,"Unable to detect CPU cores, defaulting to 4\n");
+		if (cpu_cores > MAX_WORKERS)
+			cpu_cores = MAX_WORKERS;
+		if (cpu_cores < 0) {
+			slog(LOG_WARNING, "Unable to detect CPU cores, defaulting to 4\n");
 			cpu_cores = 4;
-		}
-		else {
-			slog(LOG_DEBUG,"Using %d workers based on CPU core count\n",cpu_cores);
+		} else {
+			slog(LOG_DEBUG, "Using %d workers based on CPU core count\n", cpu_cores);
 		}
 		gcfg.workers = cpu_cores;
 	}
-
-	if(gcfg.dispatch_mode && (gcfg.workers<1 || gcfg.workers>8 || gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dynamic_pool || gcfg.map_file[0]))
+	if (gcfg.dispatch_mode && (gcfg.workers < 1 || gcfg.workers > 8 || gcfg.tun_steering_flows || gcfg.dynamic_pool || gcfg.map_file[0]))
 		die("Experimental dispatch requires 1..8 workers, static inline mappings and kernel steering");
-	if(gcfg.async_tun && gcfg.workers>8)die("Experimental io_uring supports at most 8 workers");
-	/* Load dynamic maps if configured */
-	if (gcfg.data_dir[0] && gcfg.dynamic_pool)
-		load_dynamic(gcfg.dynamic_pool);
+	if (gcfg.async_tun && gcfg.workers > 8)
+		die("Experimental io_uring supports at most 8 workers");
+}
 
-	if (gcfg.cache_size)
-		if (create_cache()) return 1;
-
-	uint8_t * recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
-	if (!recv_buf) {
-		slog(LOG_CRIT, "Error: unable to allocate %d bytes for "
-				"receive buffer\n", RECV_BUF_SIZE);
-		return 1;
-	}
-
-#ifdef __linux__
-	int created_workers = 0;
-	static int thread_ids[MAX_WORKERS];
-	for (int i = 0; i < gcfg.workers; i++) {
-		worker_buffers[i] = malloc(RECV_BUF_SIZE);
-		if (!worker_buffers[i]) {
-			for (int j = 0; j < i; j++) free(worker_buffers[j]);
-			free(recv_buf);
-			return 1;
-		}
-	}
-#endif
-	signal_setup();
-	if(tun_setup(0, 0)) goto startup_failed;
-	if(gcfg.dispatch_mode && dispatch_init(gcfg.workers)) goto startup_failed;
-	if(gcfg.async_tun && async_tun_init()) goto startup_failed;
-	if(gcfg.async_tun && !gcfg.workers)async_tun_select(0);
-	slog(LOG_INFO,"Packet I/O: dispatch=%s transmit=%s\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
-
-	/* Readiness notification is optional (sd_notify): an unusable
-	 * NOTIFY_SOCKET inherited from the environment must not stop the translator. */
-	ret = notify_prepare();
-	if (ret < 0)
-		slog(LOG_WARNING, "Readiness socket unavailable (%s); continuing without notification\n",
-				strerror(-ret));
-
+static int drop_privileges(const struct startup_opts *opts)
+{
 	/* Confine and drop privileges BEFORE any thread exists: an error here
 	 * can then abort cleanly, and no thread can retain extra credentials. */
-	if (do_chroot)
+	if (opts->do_chroot)
 		telemetry_prepare_dir(gcfg.status_path);
-	if (do_chroot) {
+	if (opts->do_chroot) {
 		if (chroot(gcfg.data_dir) < 0) {
 			slog(LOG_CRIT, "Unable to chroot to %s: %s\n",
 					gcfg.data_dir, strerror(errno));
-			goto startup_failed;
+			return -1;
 		}
 		if (chdir("/")) {
 			slog(LOG_CRIT, "Error: unable to chdir to /, aborting: %s\n",
 					strerror(errno));
-			goto startup_failed;
+			return -1;
 		}
 	}
-
-	if (gr || pw) {
-		gid_t target_gid = gr ? gr->gr_gid : pw->pw_gid;
+	if (opts->gr || opts->pw) {
+		gid_t target_gid = opts->gr ? opts->gr->gr_gid : opts->pw->pw_gid;
 		if (setgroups(1, &target_gid) < 0 ||
 		    setregid(target_gid, target_gid) < 0) {
 			slog(LOG_CRIT, "Error: cannot set gid to %d: %s\n",
 					target_gid, strerror(errno));
-			goto startup_failed;
+			return -1;
 		}
 	}
-
-	if (pw) {
-		if (setreuid(pw->pw_uid, pw->pw_uid) < 0) {
+	if (opts->pw) {
+		if (setreuid(opts->pw->pw_uid, opts->pw->pw_uid) < 0) {
 			slog(LOG_CRIT, "Error: cannot set uid to %d: %s\n",
-					pw->pw_uid, strerror(errno));
-			goto startup_failed;
+					opts->pw->pw_uid, strerror(errno));
+			return -1;
 		}
 	}
+	return 0;
+}
 
-#ifdef __linux__
-	for (int i = 0; i < gcfg.workers; i++) {
-		thread_ids[i] = i;
-		ret = pthread_create(&gcfg.threads[i], NULL, worker, &thread_ids[i]);
-		if (ret) { errno = ret; goto startup_failed; }
-		created_workers++;
-	}
-	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != created_workers)
-		usleep(1000);
-#endif
+static int run_event_loop(uint8_t *recv_buf)
+{
+	struct pollfd pollfds[2];
+	struct timespec last_main_flush, main_mono_now;
+	int exit_code = 0;
 
-	/* Print running information */
-	print_op_info();
-
-
-	memset(pollfds, 0, 2 * sizeof(struct pollfd));
+	memset(pollfds, 0, sizeof(pollfds));
 	pollfds[0].fd = signalfds[0];
 	pollfds[0].events = POLLIN;
 	pollfds[1].fd = gcfg.tun_fd;
 	pollfds[1].events = POLLIN;
 
-
-	tun_setup_commit();
-	stats_main_start();
-#ifdef __linux__
-	atomic_store_explicit(&worker_start_gate, 1, memory_order_release);
-#endif
-	telemetry_start(gcfg.status_path, 5);
-	{
-		int r = notify("READY=1");
-		if (r < 0) slog(LOG_WARNING, "Readiness notification failed: %s\n", strerror(-r));
-	}
-
-	struct timespec last_main_flush, main_mono_now;
 	clock_gettime(CLOCK_MONOTONIC, &last_main_flush);
-	int exit_code = 0;
 
-	/* Main loop */
 	while (!atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+		int ret;
 		if (atomic_load_explicit(&g_tun_tx_fatal, memory_order_relaxed)) {
-			tun_io_fail("fatal TUN transmit failure", EIO); break;
+			tun_io_fail("fatal TUN transmit failure", EIO);
+			break;
 		}
-		if(gcfg.dispatch_mode)dispatch_expire();
-		if(gcfg.async_tun && !gcfg.workers && async_tun_service()<0){tun_io_fail("main async completion failed",EIO);break;}
+		if (gcfg.dispatch_mode)
+			dispatch_expire();
+		if (gcfg.async_tun && !gcfg.workers && async_tun_service() < 0) {
+			tun_io_fail("main async completion failed", EIO);
+			break;
+		}
 		ret = poll(pollfds, 2, gcfg.async_tun && !gcfg.workers ? 1 : 500);
 		stats_check_sync_request();
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			slog(LOG_ERR, "poll returned error %s\n",
-				strerror(errno));
+			slog(LOG_ERR, "poll returned error %s\n", strerror(errno));
 			atomic_store_explicit(&g_shutdown, true, memory_order_relaxed);
 			exit_code = 1;
 			break;
@@ -945,15 +908,10 @@ int main(int argc, char **argv)
 			if (pollfds[1].revents & POLLIN) {
 				for (int reads = 0; reads < WORKER_BURST_BUDGET; reads++) {
 					int res = tun_read_packet(recv_buf, gcfg.tun_fd);
-					if (res == TUN_READ_CONSUMED) {
+					if (res == TUN_READ_CONSUMED || res == TUN_READ_INTR)
 						continue;
-					}
-					if (res == TUN_READ_WOULDBLOCK) {
+					if (res == TUN_READ_WOULDBLOCK)
 						break;
-					}
-					if (res == TUN_READ_INTR) {
-						continue;
-					}
 					if (res == TUN_READ_FATAL) {
 						tun_io_fail("main TUN read failed", errno);
 						exit_code = 1;
@@ -985,28 +943,154 @@ int main(int argc, char **argv)
 			gcfg.last_dynamic_maint = now;
 		}
 	}
+	return exit_code;
+}
+
+int main(int argc, char **argv)
+{
+	int ret;
+	struct startup_opts opts = {
+		.conffile = TAYGA_CONF_PATH,
+		.runtime_dir = getenv("TAYGA_RUNTIME_DIR"),
+		.status_path = getenv("TAYGA_STATUS_FILE"),
+		.metrics_path = getenv("TAYGA_METRICS_FILE"),
+		.detach = 1,
+	};
+	progname = argv[0];
+
+	if (config_init() < 0) return 1;
+	stats_init();
+	atomic_store_explicit(&now, tayga_mono_sec(), memory_order_relaxed);
+	if (pthread_mutex_init(&gcfg.cache_mutex, NULL) ||
+	    pthread_mutex_init(&gcfg.map_mutex, NULL))
+		die("Failed to initialize mapping mutexes");
+
+	parse_cli_args(argc, argv, &opts);
+	grt.conffile = opts.conffile;
+
+	if (opts.check_config && (opts.do_mktun || opts.do_rmtun || opts.check_offload))
+		die("Error: --check-config cannot be combined with tunnel operations");
+	if (opts.check_offload)
+		return tun_check_offload_support();
+
+	if (setup_logging(&opts) < 0)
+		return 1;
+	if (config_read(opts.conffile) < 0)
+		return 1;
+	setup_runtime_paths(&opts);
+	if (config_validate() < 0)
+		return 1;
+	if (opts.check_config)
+		return 0;
+
+	if (opts.do_mktun || opts.do_rmtun) {
+		if (opts.user)
+			die("Error: cannot specify -u or --user with mktun/rmtun operation");
+		if (opts.group)
+			die("Error: cannot specify -g or --group with mktun/rmtun operation\n");
+		if (opts.do_chroot)
+			die("Error: cannot specify -r or --chroot with mktun/rmtun operation\n");
+		return tun_setup(opts.do_mktun, opts.do_rmtun) ? 1 : 0;
+	}
+
+	if (resolve_credentials(&opts) < 0 || setup_data_dir(&opts) < 0)
+		return 1;
+
+	/* If using a map-file, read it after doing chroot/chdir */
+	if (gcfg.map_file[0] && addrmap_reload() != ERROR_NONE) {
+		slog(LOG_CRIT, "Error: map-file %s is configured but not readable\n",
+			gcfg.map_file);
+		return 1;
+	}
+
+	daemonize_and_write_pid(&opts);
+	record_process_identity();
+	slog(LOG_INFO, "Starting tayga " TAYGA_VERSION "\n");
+	slog(LOG_DEBUG, "Compiled from " TAYGA_BRANCH "\n");
+	slog(LOG_DEBUG, "Commit " TAYGA_COMMIT "\n");
+
+	init_random_seed();
+	resolve_worker_count();
+
+	if (gcfg.data_dir[0] && gcfg.dynamic_pool)
+		load_dynamic(gcfg.dynamic_pool);
+	if (gcfg.cache_size && create_cache())
+		return 1;
+
+	uint8_t *recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
+	if (!recv_buf) {
+		slog(LOG_CRIT, "Error: unable to allocate %d bytes for receive buffer\n", RECV_BUF_SIZE);
+		return 1;
+	}
+
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		worker_buffers[i] = malloc(RECV_BUF_SIZE);
+		if (!worker_buffers[i]) {
+			for (int j = 0; j < i; j++) free(worker_buffers[j]);
+			free(recv_buf);
+			return 1;
+		}
+	}
+#endif
+	signal_setup();
+	if (tun_setup(0, 0)) goto startup_failed;
+	if (gcfg.dispatch_mode && dispatch_init(gcfg.workers)) goto startup_failed;
+	if (gcfg.async_tun && async_tun_init()) goto startup_failed;
+	if (gcfg.async_tun && !gcfg.workers) async_tun_select(0);
+	slog(LOG_INFO, "Packet I/O: dispatch=%s transmit=%s\n",
+	     gcfg.dispatch_mode ? "flows" : "kernel", gcfg.async_tun ? "uring" : "sync");
+
+	ret = notify_prepare();
+	if (ret < 0)
+		slog(LOG_WARNING, "Readiness socket unavailable (%s); continuing without notification\n",
+				strerror(-ret));
+
+	if (drop_privileges(&opts) < 0)
+		goto startup_failed;
+
+#ifdef __linux__
+	for (int i = 0; i < gcfg.workers; i++) {
+		grt.thread_ids[i] = i;
+		ret = pthread_create(&gcfg.threads[i], NULL, worker, &grt.thread_ids[i]);
+		if (ret) { errno = ret; goto startup_failed; }
+		grt.created_workers++;
+	}
+	while (atomic_load_explicit(&workers_ready, memory_order_acquire) != grt.created_workers)
+		usleep(1000);
+#endif
+
+	print_op_info();
+	tun_setup_commit();
+	stats_main_start();
+#ifdef __linux__
+	atomic_store_explicit(&worker_start_gate, 1, memory_order_release);
+#endif
+	telemetry_start(gcfg.status_path, 5);
+	ret = notify("READY=1");
+	if (ret < 0)
+		slog(LOG_WARNING, "Readiness notification failed: %s\n", strerror(-ret));
+
+	int exit_code = run_event_loop(recv_buf);
 
 	/* Graceful shutdown */
 	stats_main_stop();
-	if(gcfg.dispatch_mode)dispatch_stop();
+	if (gcfg.dispatch_mode) dispatch_stop();
 #ifdef __linux__
-	for (int i = 0; i < gcfg.workers; i++) {
+	for (int i = 0; i < gcfg.workers; i++)
 		pthread_join(gcfg.threads[i], NULL);
-	}
 #endif
 	if (atomic_load_explicit(&g_tun_io_failure, memory_order_relaxed) || atomic_load(&g_tun_tx_fatal))
 		exit_code = 1;
-	if(gcfg.async_tun && !gcfg.workers && async_tun_finish()<0)exit_code=1;
-	if(gcfg.dispatch_mode)dispatch_destroy();
-	if(gcfg.async_tun)async_tun_destroy();
+	if (gcfg.async_tun && !gcfg.workers && async_tun_finish() < 0) exit_code = 1;
+	if (gcfg.dispatch_mode) dispatch_destroy();
+	if (gcfg.async_tun) async_tun_destroy();
 	stats_flush_worker();
 	stats_dump();
-	if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF) {
+	if (gcfg.tun_offload_effective != TUN_OFFLOAD_OFF)
 		gso_dump_stats();
-	}
 	telemetry_stop();
 	free(recv_buf);
-
 #ifdef __linux__
 	for (int i = 0; i < gcfg.workers; i++) free(worker_buffers[i]);
 #endif
@@ -1016,7 +1100,7 @@ startup_failed:
 	slog(LOG_CRIT, "Startup failed: %s\n", strerror(errno));
 #ifdef __linux__
 	atomic_store_explicit(&worker_start_gate, -1, memory_order_release);
-	for (int i = 0; i < created_workers; i++) pthread_join(gcfg.threads[i], NULL);
+	for (int i = 0; i < grt.created_workers; i++) pthread_join(gcfg.threads[i], NULL);
 	for (int i = 0; i < gcfg.workers; i++) free(worker_buffers[i]);
 #endif
 	if (gcfg.async_tun) async_tun_destroy();
