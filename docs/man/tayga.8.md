@@ -102,6 +102,25 @@ network interface.
     before sending SIGUSR2. Paths used after chroot refer to the new root and
     must be writable by the final service user.
 
+**\-\-metrics-file** *absolute-path*
+:   Also write counters in Prometheus text exposition format to this file,
+    also settable with `TAYGA_METRICS_FILE` (the option wins). Off unless a
+    path is given. The path must be absolute, at most 767 bytes and differ from
+    the status file. It is rewritten whenever the status file is (every five
+    seconds, on SIGUSR2 and at shutdown) through a temporary file and rename, so
+    a reader never sees a partial file; no socket is opened. Paths used after
+    chroot refer to the new root and must be writable by the final service
+    user. For the node_exporter textfile collector:
+
+        tayga --metrics-file /var/lib/node_exporter/textfile_collector/tayga.prom
+
+    Series include `tayga_info`, `tayga_uptime_seconds`, per-family
+    `tayga_rx_packets_total`, `tayga_rx_bytes_total`, `tayga_tx_packets_total`
+    and `tayga_tx_bytes_total`, `tayga_dropped_packets_total`,
+    `tayga_tx_failures_total{reason}`, `tayga_gso_packets_total{direction}`,
+    `tayga_dynamic_pool_mappings{state}` and
+    `tayga_worker_rx_packets_total{worker,family}`.
+
 TX failure counters count failed TUN frames, including GSO aggregates, rather
 than reconstructed wire datagrams. `tx_eagain`, `tx_enobufs`, `tx_eintr`,
 `tx_short`, `tx_fatal` and `tx_other` partition `tx_failed_frames`. Each failed

@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -52,6 +53,10 @@ CASES = {
     'v4_unmapped': lambda: [IP(src='198.51.100.9', dst='192.0.2.77') / UDP() / Raw(b'x')] * 4,
     'v4_ttl1': lambda: [IP(src='198.51.100.9', dst='192.0.2.130', ttl=1) / UDP() / Raw(b'x')] * 4,
 }
+
+
+# Used only by the metrics-file case below.
+CASES_EXTRA = {'echo10': lambda: [v6(D) / ICMPv6EchoRequest()] * 10}
 
 
 def sh(cmd):
@@ -102,17 +107,61 @@ def run_case(name, packets, tmp):
     return rx, tx, g('icmp_sent_packets'), g('dropped_packets'), g('self_packets')
 
 
-def send_mode(name):
+def run_metrics_case(tmp):
+    """--chroot with --metrics-file: SIGUSR2 publishes the Prometheus file outside the chroot."""
+    ns = f'statprom{os.getpid()}'
+    rt = tmp / 'prom-rt'
+    data = tmp / 'prom-data'
+    rt.mkdir()
+    data.mkdir()
+    rt.chmod(0o777)  # the unprivileged daemon user publishes through a descriptor opened before chroot()
+    metrics = rt / 'tayga.prom'
+    cfg = tmp / 'prom.conf'
+    cfg.write_text('tun-device statprom0\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\n'
+                   f'prefix 64:ff9b::/96\ndynamic-pool 192.0.2.128/25\ndata-dir {data}\nworkers 1\ntun-offload off\n')
+    subprocess.run(['ip', 'netns', 'add', ns], check=True)
+    try:
+        d = subprocess.Popen(['ip', 'netns', 'exec', ns, a.binary, '-d', '--chroot', '-u', 'nobody', '-c', str(cfg),
+                              '--runtime-dir', str(rt), '--metrics-file', str(metrics)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        try:
+            e = f'ip netns exec {ns} ip'
+            sh(f'{e} link set statprom0 up; {e} addr add 192.0.2.254/24 dev statprom0; '
+               f'{e} -6 addr add {SRC6}/64 dev statprom0 nodad; {e} -6 route add 64:ff9b::/96 dev statprom0')
+            time.sleep(1)
+            subprocess.run(['ip', 'netns', 'exec', ns, sys.executable, __file__, '--send', 'echo10',
+                            'statprom0'], check=True)
+            time.sleep(.5)
+            d.send_signal(signal.SIGUSR2)
+            time.sleep(1.5)
+            text = metrics.read_text()
+            leftovers = [x.name for x in rt.iterdir() if x.name.startswith('.tayga-metrics.')]
+        finally:
+            d.terminate()
+            d.wait(timeout=5)
+    finally:
+        subprocess.run(['ip', 'netns', 'del', ns], check=False)
+    prefix = 'tayga_rx_packets_total{family="ipv6"} '
+    line = next(x for x in text.splitlines() if x.startswith(prefix))
+    value = int(line[len(prefix):])
+    assert value >= 10, f'ipv6 rx {value} < 10 in metrics file'
+    assert '# TYPE tayga_rx_packets_total counter' in text and text.endswith('\n')
+    assert not leftovers, f'temporary metrics files left behind: {leftovers}'
+    print(f'metrics_file   chroot rx_ipv6={value}')
+
+
+def send_mode(name, dev='statbal0'):
     def mk(proto):
         k = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(proto))
-        k.bind(('statbal0', proto))
+        k.bind((dev, proto))
         return k
-    for pkt in CASES[name]():
+    for pkt in {**CASES, **CASES_EXTRA}[name]():
         mk(0x86dd if pkt.version == 6 else 0x0800).send(raw(pkt))
 
 
 if SEND_MODE:
-    send_mode(sys.argv[2])
+    send_mode(*sys.argv[2:4])
     sys.exit(0)
 
 if sys.platform != 'linux' or os.geteuid() != 0:
@@ -133,6 +182,7 @@ with tempfile.TemporaryDirectory() as t:
         print(lines[-1])
         if balance != 0 or rx < n:
             failed.append(name)
+    run_metrics_case(tmp)
     if a.output:
         out = Path(a.output)
         out.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <poll.h>
+#include <dirent.h>
 #include "tayga.h"
 #include "stats.h"
 #include "gso.h"
@@ -209,6 +210,60 @@ static void test_main_sync(void)
     assert(main_snapshot.rx_pkts_v4 == 1 && main_snapshot.rx_bytes_v4 == 77);
     stats_main_stop();
     puts("PASS: background snapshot publishes partial main batch with zero workers");
+}
+
+/* Prometheus text exposition: same snapshot, published atomically. */
+static void test_prometheus_export(void)
+{
+	char dir[] = "/tmp/tayga-prom-XXXXXX";
+	assert(mkdtemp(dir));
+	char path[256];
+	snprintf(path, sizeof(path), "%s/tayga.prom", dir);
+
+	stats_init();
+	gcfg.workers = 0;
+	gcfg.dynamic_pool = NULL;
+	stats_rx4(100);
+	stats_rx4(100);
+	stats_rx4(100);
+	stats_flush_worker();
+
+	stats_write_prometheus(path);
+
+	FILE *f = fopen(path, "r");
+	assert(f != NULL);
+	static char buf[65536];
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+	assert(n > 0);
+	assert(strstr(buf, "# TYPE tayga_rx_packets_total counter\n") != NULL);
+	assert(strstr(buf, "# HELP tayga_rx_packets_total ") != NULL);
+	assert(strstr(buf, "tayga_rx_packets_total{family=\"ipv4\"} 3\n") != NULL);
+	assert(strstr(buf, "tayga_rx_bytes_total{family=\"ipv4\"} 300\n") != NULL);
+	assert(strstr(buf, "tayga_rx_packets_total{family=\"ipv6\"} 0\n") != NULL);
+	assert(strstr(buf, "tayga_info{version=\"") != NULL);
+	assert(strstr(buf, "# TYPE tayga_uptime_seconds gauge\n") != NULL);
+	assert(strstr(buf, "tayga_tx_failures_total{reason=\"eagain\"} 0\n") != NULL);
+	assert(strstr(buf, "tayga_gso_packets_total{direction=\"tx\"} 0\n") != NULL);
+	assert(strstr(buf, "tayga_dynamic_pool_mappings{state=\"dormant\"} 0\n") != NULL);
+	assert(strstr(buf, "tayga_worker_rx_packets_total{worker=\"0\",family=\"ipv4\"} 3\n") != NULL);
+	assert(buf[strlen(buf) - 1] == '\n');
+
+	/* No temporary file is left behind. */
+	DIR *d = opendir(dir);
+	assert(d != NULL);
+	struct dirent *e;
+	int entries = 0;
+	while ((e = readdir(d))) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+		assert(!strcmp(e->d_name, "tayga.prom"));
+		entries++;
+	}
+	closedir(d);
+	assert(entries == 1);
+	assert(!unlink(path) && !rmdir(dir));
+	puts("PASS: Prometheus text export is complete and leaves no temporary file");
 }
 
 int main(void)
@@ -535,6 +590,7 @@ int main(void)
 #endif
 	test_main_sync();
 	test_export_publication_order();
+	test_prometheus_export();
 	printf("All stats unit tests PASSED.\n");
 	return 0;
 }

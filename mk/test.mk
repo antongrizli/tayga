@@ -26,7 +26,13 @@ $(TESTOBJDIR)/dispatch-clock.o: src/experimental_io.c $(GENDIR)/version.h $(BUIL
 $(TESTOBJDIR)/stats-export-hook.o: src/stats_exporter.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DSTATS_EXPORT_TEST_HOOK -MMD -MP -c -o $@ $<
 
+# pref64-discover modules the unit and fuzz tests link. -DPREF64_NO_MAIN drops
+# main() and the DNS64 server loop, as in the single-file helper before the split.
+PREF64_TEST_OBJS := $(TESTOBJDIR)/pref64.o $(TESTOBJDIR)/lib/helpers/pref64_ra.o \
+                    $(TESTOBJDIR)/dns64_serve.o
 $(TESTOBJDIR)/pref64.o: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
+$(TESTOBJDIR)/dns64_serve.o: src/helpers/dns64_serve.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
 
 $(TESTBINDIR)/unit_addrmap: $(TESTOBJDIR)/unit_addrmap.o $(TESTOBJDIR)/addrmap-hook.o $(TEST_LIB) | $(TESTBINDIR)
@@ -43,7 +49,7 @@ $(TESTBINDIR)/unit_tun: $(TESTOBJDIR)/unit_tun.o $(TEST_LIB) | $(TESTBINDIR)
 STANDALONE_TESTS := unit_icmp_rate_limit unit_packet_io unit_packet_io_lifetime unit_netlink unit_checksum
 $(addprefix $(TESTBINDIR)/,$(STANDALONE_TESTS)): $(TESTBINDIR)/%: $(TESTOBJDIR)/%.o | $(TESTBINDIR)
 	$(CC) -o $@ $< $(TEST_LDFLAGS)
-$(TESTBINDIR)/unit_pref64: $(TESTOBJDIR)/unit_pref64.o $(TESTOBJDIR)/pref64.o | $(TESTBINDIR)
+$(TESTBINDIR)/unit_pref64: $(TESTOBJDIR)/unit_pref64.o $(PREF64_TEST_OBJS) | $(TESTBINDIR)
 	$(CC) -o $@ $^ $(TEST_LDFLAGS)
 
 $(TESTBINDIR)/%: $(TESTOBJDIR)/%.o $(TEST_LIB) | $(TESTBINDIR)
@@ -60,8 +66,12 @@ test: $(TEST_BINS)
 	@mkdir -p $(TESTOUTDIR)/unit
 	@set -eu; for binary in $(abspath $(TEST_BINS)); do (cd $(TESTOUTDIR)/unit && "$$binary"); done
 
-test-portable: $(BUILDDIR)/pref64-discover
-	TAYGA_PREF64_DISCOVER="$(abspath $(BUILDDIR)/pref64-discover)" python3 test/portable/run_portable.py
+# The daemon builds on Linux only; elsewhere the option tests skip explicitly.
+ifeq ($(shell uname -s),Linux)
+PORTABLE_TAYGA = $(BUILDDIR)/tayga
+endif
+test-portable: $(BUILDDIR)/pref64-discover $(PORTABLE_TAYGA)
+	$(if $(PORTABLE_TAYGA),TAYGA_BIN="$(abspath $(PORTABLE_TAYGA))") TAYGA_PREF64_DISCOVER="$(abspath $(BUILDDIR)/pref64-discover)" python3 test/portable/run_portable.py
 
 test-linux-tools: bench-tools
 	python3 -m unittest discover -s bench/tests -p 'test_*.py'
@@ -78,7 +88,7 @@ integration: tayga
 system-test: tayga pref64-discover fault-shims
 	python3 test/run-system.py --binary "$(abspath $(BUILDDIR)/tayga)" --output "$(abspath $(TESTOUTDIR)/system)"
 
--include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d)
+-include $(wildcard $(TESTOBJDIR)/*.d) $(TEST_OBJS:.o=.d) $(PREF64_TEST_OBJS:.o=.d)
 
 .SECONDARY: $(TEST_OBJS) $(addprefix $(TESTOBJDIR)/,$(addsuffix .o,$(UNIT_TESTS)))
 
@@ -99,12 +109,12 @@ fuzz-check:
 	$(MAKE) CC=clang BUILDDIR=$(BUILDDIR)/fuzz CFLAGS='$(FUZZ_FLAGS) -fsanitize=fuzzer-no-link' LDFLAGS='' fuzz-run
 
 .PHONY: fuzz-run
-fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
+fuzz-run: $(TEST_LIB) $(PREF64_TEST_OBJS)
 	@mkdir -p $(BUILDDIR)/fuzz-bin $(BUILDDIR)/fuzz-run
 	@set -eu; for t in fuzz_pkt4 fuzz_pkt6 fuzz_gso fuzz_conffile fuzz_flow fuzz_maps; do \
 	  $(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -Isrc -I$(GENDIR) -Itest/fuzz -o $(BUILDDIR)/fuzz-bin/$$t test/fuzz/$$t.c $(TEST_LIB) $(LDLIBS); \
 	done
-	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(TESTOBJDIR)/pref64.o
+	@$(CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $(BUILDDIR)/fuzz-bin/fuzz_pref64 test/fuzz/fuzz_pref64.c $(PREF64_TEST_OBJS)
 	@python3 test/fuzz/make_seeds.py $(BUILDDIR)/fuzz-seeds >/dev/null
 	@set -eu; for t in $(FUZZ_TARGETS); do \
 	  echo "== $$t ($(FUZZ_TIME)s)"; mkdir -p $(BUILDDIR)/fuzz-run/$$t; seeds=; \
@@ -112,3 +122,27 @@ fuzz-run: $(TEST_LIB) $(TESTOBJDIR)/pref64.o
 	  [ -d test/fuzz/regress/$$t ] && seeds="$$seeds $(abspath test/fuzz/regress)/$$t"; \
 	  (cd $(BUILDDIR)/fuzz-run/$$t && ASAN_OPTIONS=detect_leaks=1 $(abspath $(BUILDDIR))/fuzz-bin/$$t -max_total_time=$(FUZZ_TIME) -max_len=4096 -print_final_stats=0 -close_fd_mask=3 . $$seeds >/dev/null); \
 	done; echo 'fuzz-check passed'
+
+# Clang static analyzer gate: `make analyze` needs scan-build on PATH and fails
+# on any report. Output lands in $(BUILDDIR)/analyze-report.
+.PHONY: analyze
+analyze:
+	@command -v scan-build >/dev/null || { echo 'analyze requires scan-build (clang-tools)'; exit 1; }
+	@rm -rf $(BUILDDIR)/analyze $(BUILDDIR)/analyze-report
+	scan-build --status-bugs -o $(BUILDDIR)/analyze-report \
+	  $(MAKE) BUILDDIR=$(BUILDDIR)/analyze $(BUILDDIR)/analyze/tayga $(BUILDDIR)/analyze/pref64-discover
+
+# Unit-test line coverage: `make coverage` needs gcovr on PATH and fails when
+# line coverage of src/ drops below COVERAGE_MIN. Output: $(BUILDDIR)/coverage.
+.PHONY: coverage
+coverage:
+	@command -v gcovr >/dev/null || { echo 'coverage requires gcovr (pip install gcovr==8.8)'; exit 1; }
+	@rm -rf $(BUILDDIR)/coverage
+	$(MAKE) BUILDDIR=$(BUILDDIR)/coverage COVERAGE=1 CFLAGS='-O0 -g -Wall' LDFLAGS= test
+	@mkdir -p $(BUILDDIR)/coverage/html
+	@# Extra gcovr flags: negative_hits.warn_once_per_file tolerates GCC bug 68080
+	@# (negative counters with threaded tests); merge-use-line-min merges the same
+	@# source compiled with different -D test hooks (e.g. experimental_io.c).
+	gcovr --root . --filter 'src/' --gcov-ignore-parse-errors negative_hits.warn_once_per_file --merge-mode-functions merge-use-line-min --object-directory $(BUILDDIR)/coverage \
+	  --txt $(BUILDDIR)/coverage/summary.txt --html-details $(BUILDDIR)/coverage/html/index.html \
+	  --fail-under-line $(COVERAGE_MIN)

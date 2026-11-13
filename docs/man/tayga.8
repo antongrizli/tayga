@@ -101,6 +101,34 @@ The Linux status helper validates the recorded identity before sending
 SIGUSR2.
 Paths used after chroot refer to the new root and must be writable by
 the final service user.
+.TP
+\f[B]\-\-metrics\-file\f[R] \f[I]absolute\-path\f[R]
+Also write counters in Prometheus text exposition format to this file,
+also settable with \f[CR]TAYGA_METRICS_FILE\f[R] (the option wins).
+Off unless a path is given.
+The path must be absolute, at most 767 bytes and differ from the status
+file.
+It is rewritten whenever the status file is (every five seconds, on
+SIGUSR2 and at shutdown) through a temporary file and rename, so a
+reader never sees a partial file; no socket is opened.
+Paths used after chroot refer to the new root and must be writable by
+the final service user.
+For the node_exporter textfile collector:
+.RS
+.IP
+.EX
+tayga \-\-metrics\-file /var/lib/node_exporter/textfile_collector/tayga.prom
+.EE
+.PP
+Series include \f[CR]tayga_info\f[R], \f[CR]tayga_uptime_seconds\f[R],
+per\-family \f[CR]tayga_rx_packets_total\f[R],
+\f[CR]tayga_rx_bytes_total\f[R], \f[CR]tayga_tx_packets_total\f[R] and
+\f[CR]tayga_tx_bytes_total\f[R], \f[CR]tayga_dropped_packets_total\f[R],
+\f[CR]tayga_tx_failures_total{reason}\f[R],
+\f[CR]tayga_gso_packets_total{direction}\f[R],
+\f[CR]tayga_dynamic_pool_mappings{state}\f[R] and
+\f[CR]tayga_worker_rx_packets_total{worker,family}\f[R].
+.RE
 .PP
 TX failure counters count failed TUN frames, including GSO aggregates,
 rather than reconstructed wire datagrams.

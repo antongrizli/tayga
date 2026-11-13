@@ -32,6 +32,12 @@ struct ra_table {
     struct ra_candidate c[RA_CANDIDATES];
 };
 
+int is_valid_pref64_prefix(const struct in6_addr *p, int plen);
+int parse_ra_pref64_update(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                           int *out_plen, uint32_t *out_lifetime_sec,
+                           const struct in6_addr *active, int active_len);
+int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
+                           int *out_plen, uint32_t *out_lifetime_sec);
 int parse_ra_pref64_all(const uint8_t *ra, size_t ra_len, struct ra_option *out, int max);
 void ra_table_init(struct ra_table *t);
 void ra_table_add_provisional(struct ra_table *t, const struct in6_addr *prefix, int plen,

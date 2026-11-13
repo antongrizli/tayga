@@ -47,5 +47,41 @@ links. Payload integrity/PMTUD can additionally exercise unmodified production
 startup with `run-steering-integrity.py --production-startup --steering flows` in
 the prepared benchmark VM; that runner restores the installed files afterwards.
 
+## Unit coverage
+
+`make coverage` builds the unit tests with `COVERAGE=1` in `build/coverage`, runs them
+and writes `build/coverage/summary.txt` and `build/coverage/html/index.html` with
+`gcovr` (install it with `pip install gcovr==8.8`, the version CI pins). It fails when line coverage of `src/`
+drops below `COVERAGE_MIN` (default 66 in `mk/config.mk`; override on the command line,
+for example `make coverage COVERAGE_MIN=100` to see the gate fail). The `portable` job
+in `review-gates.yml` runs it on Linux and uploads the HTML report as `coverage-html`.
+
+Baseline: 67.8% of lines (4399 of 6486), measured on 2026-11-12 at commit `1eb04a6`
+(GCC, gcovr 8.8). The floor of 66 sits about two points below that value.
+The least-covered files are `src/tun_steering.h` (0%), `src/log.c` (6%) and
+`src/tun.c` (13%). Unit coverage excludes paths only reached by the root system tests
+(TUN, netlink, steering and the daemon main loop), so low figures there do not mean
+those paths are untested. Raise `COVERAGE_MIN` when coverage improves; never lower it
+to make a change pass without a stated reason.
+
+## Static analysis
+
+`make analyze` runs the clang static analyzer (`scan-build`, from clang-tools) over
+`tayga` and `pref64-discover` and fails on any finding. CI runs it as a gate in
+`review-gates.yml`. CodeQL runs through the repository's GitHub default setup, not a workflow file.
+
+## Nightly fuzzing
+
+The `Nightly fuzzing` workflow (`.github/workflows/fuzz-nightly.yml`, 02:17 UTC and
+on manual dispatch) runs `make fuzz-check CC=clang FUZZ_TIME=600`. Each harness keeps
+its working corpus in `build/fuzz/fuzz-run/<target>/`; the workflow restores that
+directory from the Actions cache before the run and saves it afterwards, so coverage
+accumulates from night to night. Do not run `make clean` before `make fuzz-check` if you
+want to keep a local corpus. If a harness fails, the run uploads the `crash-*`,
+`leak-*` and `timeout-*` inputs as the `fuzz-findings` artifact (kept 30 days);
+download it from the workflow run page or with `gh run download <run-id> -n fuzz-findings`.
+Fix a finding together with a regression input in `test/fuzz/regress/<target>/`, which
+every later run replays.
+
 See [the audit acceptance scenarios](audit-acceptance.md) for the pending Linux/FreeBSD
 RA-supervisor, service lifecycle, DNS64, TX accounting and persistence matrix.

@@ -195,6 +195,7 @@ void stats_check_sync_request(void);
 void stats_get_snapshot(struct tayga_stats *out);
 void stats_dump(void);
 void stats_write_json(const char *path, const char *state);
+void stats_write_prometheus(const char *path);
 
 #ifdef STATS_DISABLED
 static inline void stats_packet_done(void) {}

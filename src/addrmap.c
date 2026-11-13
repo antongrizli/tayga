@@ -228,6 +228,9 @@ HASH_LINKAGE uint32_t hash_ip6(const struct in6_addr *addr6)
 static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
 		uint32_t hash6)
 {
+	assert(hash4 < (1u << gcfg.hash_bits) && hash6 < (1u << gcfg.hash_bits));
+	/* create_cache() initialises every bucket before filling any. */
+	assert(gcfg.hash_table4[hash4].next && gcfg.hash_table6[hash6].next);
 	list_add(&c->hash4, &gcfg.hash_table4[hash4]);
 	list_add(&c->hash6, &gcfg.hash_table6[hash6]);
 }
@@ -254,12 +257,22 @@ static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
 int create_cache(void)
 {
 	addrmap_invalidate_front();
-	int i, hash_size = 1 << gcfg.hash_bits;
+	int i, hash_size;
 	struct list_head *entry;
 	struct cache_entry *c;
 
-	struct list_head *new4 = malloc(hash_size * sizeof(*new4));
-	struct list_head *new6 = malloc(hash_size * sizeof(*new6));
+	/* conffile.c enforces 4..24; hash_bits 0 (a single bucket) is also
+	 * tolerated by the hash functions, so accept 0..24 here. */
+	if (gcfg.hash_bits < 0 || gcfg.hash_bits > 24) {
+		slog(LOG_CRIT, "Invalid hash table size\n");
+		return ERROR_REJECT;
+	}
+	hash_size = 1 << gcfg.hash_bits;
+
+	/* Zeroed so every bucket is defined even before the init loop below;
+	 * hash4/hash6 indices are only known to be < hash_size at run time. */
+	struct list_head *new4 = calloc(hash_size, sizeof(*new4));
+	struct list_head *new6 = calloc(hash_size, sizeof(*new6));
 	int new_pool = list_empty(&gcfg.cache_pool) && list_empty(&gcfg.cache_active);
 	struct cache_entry *storage = new_pool ? calloc(gcfg.cache_size, sizeof(*storage)) : NULL;
 	if (!new4 || !new6 || (new_pool && !storage)) {

@@ -4,6 +4,22 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ## [Unreleased]
 
+### Added
+
+- `--metrics-file FILE` (`TAYGA_METRICS_FILE`): optional Prometheus text-format counters for the node_exporter textfile collector, rewritten atomically with every status JSON write (every 5 s, on SIGUSR2 and at shutdown); no listening socket.
+- `make analyze` (clang static analyzer via `scan-build`) with a CI gate.
+- `make coverage`: unit-test line coverage report (gcovr) that fails below the `COVERAGE_MIN` floor.
+- `make microbench`: translator microbenchmark.
+- Nightly fuzzing workflow with a persistent corpus.
+
+### Changed
+
+- `src/helpers/pref64-discover.c` is split into `pref64-discover.c`, `pref64_ra.c`, `dns64_serve.c`, `ra_supervisor.c` and `tun_probe.c`; builds that compiled the single file directly must now use `make pref64-discover` or compile all five.
+
+### Fixed
+
+- `docs/rfc.md` now describes the implemented RFC 7757 unequal-suffix handling.
+
 ## [0.9.16] - 2026-11-10
 
 ### Added

@@ -407,6 +407,7 @@ struct config {
 	unsigned long long runtime_netns;
 	char process_start_ticks[32];
 	char status_path[768];
+	char metrics_path[768]; /* empty: Prometheus file disabled */
 	char clat_info_path[768];
 
 	//Dynamic map parameters

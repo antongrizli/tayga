@@ -1,0 +1,48 @@
+name: Nightly fuzzing
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # No `make clean` anywhere in this job: it would delete the restored corpus.
+      - name: Restore the fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build/fuzz/fuzz-run
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz every harness
+        run: make fuzz-check CC=clang FUZZ_TIME=600
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings
+          path: |
+            build/fuzz/fuzz-run/**/crash-*
+            build/fuzz/fuzz-run/**/leak-*
+            build/fuzz/fuzz-run/**/timeout-*
+          retention-days: 30
+          if-no-files-found: warn
+      # Findings are written into the corpus directory; drop them (after the upload
+      # above) so they are never cached and replayed as corpus inputs on later nights.
+      - name: Prune findings from the corpus
+        if: always()
+        run: test ! -d build/fuzz/fuzz-run || find build/fuzz/fuzz-run \( -name 'crash-*' -o -name 'leak-*' -o -name 'timeout-*' \) -delete
+      - name: Save the fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build/fuzz/fuzz-run
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}

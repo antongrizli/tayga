@@ -42,8 +42,17 @@ taygabe: $(SOURCES) $(GENDIR)/version.h
 	s390x-linux-gnu-gcc $(CPPFLAGS) $(CFLAGS) -o $@ $(SOURCES) $(LDFLAGS) $(LDLIBS)
 
 # Helper tools
-$(BUILDDIR)/pref64-discover: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $(BUILDDIR)/pref64-discover.d -Isrc -o $@ $< $(LDFLAGS)
+PREF64_SOURCES := src/helpers/pref64-discover.c src/helpers/pref64_ra.c \
+                  src/helpers/dns64_serve.c src/helpers/ra_supervisor.c src/helpers/tun_probe.c
+PREF64_OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(PREF64_SOURCES))
+
+# Static pattern rule: wins over $(OBJDIR)/%.o under GNU make 3.81 (macOS) too.
+$(PREF64_OBJS): $(OBJDIR)/helpers/%.o: src/helpers/%.c $(GENDIR)/version.h $(BUILDDIR)/build.flags
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILDDIR)/pref64-discover: $(PREF64_OBJS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $(PREF64_OBJS) $(LDFLAGS)
 
 pref64-discover: $(BUILDDIR)/pref64-discover
 	@cp $(BUILDDIR)/pref64-discover pref64-discover
@@ -61,4 +70,4 @@ $(BUILDDIR)/build.flags: FORCE | $(BUILDDIR)
 	@printf '%s\n' 'CC=$(CC)' 'CPPFLAGS=$(CPPFLAGS)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' 'LDLIBS=$(LDLIBS)' 'AR=$(AR)' 'TEST_CFLAGS=$(TEST_CFLAGS)' 'TEST_LDFLAGS=$(TEST_LDFLAGS)' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
--include $(OBJS:.o=.d) $(BUILDDIR)/pref64-discover.d
+-include $(OBJS:.o=.d) $(PREF64_OBJS:.o=.d)

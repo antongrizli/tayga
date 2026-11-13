@@ -84,6 +84,7 @@ void usage(int code) {
 			"--packet-io MODE  : sync (default) or experimental uring TX (WITH_URING=1)\n"
 			"--runtime-dir DIR : Runtime files directory (default /run; TAYGA_RUNTIME_DIR)\n"
 			"--status-file FILE: Instance status path (TAYGA_STATUS_FILE)\n"
+			"--metrics-file FILE: Also write Prometheus text metrics to FILE (TAYGA_METRICS_FILE)\n"
 			"--help, -h         : Show this help message\n",
 		TAYGA_VERSION, progname, progname, progname);
 	exit(code);
@@ -412,6 +413,7 @@ int main(int argc, char **argv)
 	char *pidfile = NULL;
 	const char *runtime_dir = getenv("TAYGA_RUNTIME_DIR");
 	const char *status_path = getenv("TAYGA_STATUS_FILE");
+	const char *metrics_path = getenv("TAYGA_METRICS_FILE");
 	int do_chroot = 0;
 	int detach = 1;
 	int do_mktun = 0;
@@ -452,6 +454,7 @@ int main(int argc, char **argv)
 		{ "runtime-dir", 1, 0, 1006 },
 		{ "status-file", 1, 0, 1007 },
 		{ "check-config", 0, 0, 1008 },
+		{ "metrics-file", 1, 0, 1009 },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -464,6 +467,7 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 1006: runtime_dir = optarg; break;
 		case 1007: status_path = optarg; break;
+		case 1009: metrics_path = optarg; break;
 		case 1004:
 			if(!strcmp(optarg,"kernel"))gcfg.dispatch_mode=0;
 			else if(!strcmp(optarg,"flows"))gcfg.dispatch_mode=1;
@@ -614,6 +618,13 @@ int main(int argc, char **argv)
 		if (status_path[0] != '/' || strlen(status_path) >= sizeof(gcfg.status_path))
 			die("status-file must be an absolute path of at most 767 bytes");
 		strcpy(gcfg.status_path, status_path);
+	}
+	if (metrics_path && *metrics_path) {
+		if (metrics_path[0] != '/' || strlen(metrics_path) >= sizeof(gcfg.metrics_path))
+			die("metrics-file must be an absolute path of at most 767 bytes");
+		if (!strcmp(metrics_path, gcfg.status_path))
+			die("metrics-file must differ from status-file");
+		strcpy(gcfg.metrics_path, metrics_path);
 	}
 
 	/* Validate config (and load map file) */
