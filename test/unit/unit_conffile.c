@@ -280,7 +280,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),5392,"sizeof");
+    expectl(sizeof(struct config),5400,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */

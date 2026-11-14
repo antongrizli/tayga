@@ -101,7 +101,17 @@ static void drain_out(void)
 
 static ssize_t recv_out(void)
 {
+#ifdef __linux__
 	return recv(g_fds[1], g_out, sizeof(g_out), MSG_DONTWAIT);
+#else
+	uint8_t raw[sizeof(g_out) + sizeof(struct tun_pi)];
+	ssize_t n = recv(g_fds[1], raw, sizeof(raw), MSG_DONTWAIT);
+	if (n < (ssize_t)sizeof(struct tun_pi))
+		return -1;
+	n -= (ssize_t)sizeof(struct tun_pi);
+	memcpy(g_out, raw + sizeof(struct tun_pi), (size_t)n);
+	return n;
+#endif
 }
 
 static void feed_ip4(const uint8_t *pkt, uint32_t len)
