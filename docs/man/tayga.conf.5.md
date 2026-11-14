@@ -46,10 +46,9 @@ tayga.conf.
     ownership lock prevents concurrent TAYGA processes; other software must not
     share the device. On FreeBSD, **auto** uses the ordinary TUN path.
 
-**tun-steering** *kernel|groups|flows*
+**tun-steering** *kernel|flows*
 :   Defaults to **kernel**. On Linux with multiqueue TUN devices, configures
     packet queue steering. **kernel** relies on default Linux kernel steering;
-    **groups** enables opt-in eBPF 2-tuple L3 address-group steering;
     **flows** enables opt-in eBPF 4-tuple flow steering for unfragmented
     TCP and UDP traffic, retaining 2-tuple steering for fragments and IPv6
     extension headers. Each of 65,536 hash buckets retains its first assigned

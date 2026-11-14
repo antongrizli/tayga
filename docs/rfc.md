@@ -23,7 +23,11 @@ RFC7757 describes 'Explicit Address Mapping' for stateless IP/ICMP Translation. 
 
 ### Hairpin
 
-RFC7757 specifies cases where a packet may 'hairpin' (IPv6->IPv4->IPv6), and an algorithm to correct this. TAYGA does not implement this. See [Issue #9](https://github.com/apalrd/tayga/issues/9). TAYGA does detect packets which will hairpin and *WILL DROP THESE PACKETS*.
+RFC7757 §4.2 specifies cases where a packet may 'hairpin' (IPv6->IPv4->IPv6), and an algorithm to handle this. When an IPv6 packet's destination is in the translation prefix and its extracted IPv4 address maps back to another IPv6 destination (EAM or dynamic pool), TAYGA translates the packet IPv6 → IPv4 → IPv6 with Hop Limit decremented by 1. See [Issue #9](https://github.com/apalrd/tayga/issues/9).
+
+### ICMPv6 Source Address Pool (RFC 6791)
+
+RFC6791 recommends using a pool of IPv4 addresses when translating ICMPv6 error messages from untranslatable IPv6 router sources (e.g., for `traceroute`). TAYGA supports the optional `icmp-v4-pool <prefix/len>` directive, hashing the IPv6 source into the configured pool and falling back to `ipv4-addr` when unset.
 
 ### Unequal Suffix Lengths
 
@@ -31,7 +35,7 @@ Per RFC7757, the translator supports cases where the number of suffix bits in th
 
 ### Overlapping EAM Regions
 
-RFC7757 specifies that a packet should follow the EAM region according to a longest prefix match, but notest that overlapping regions are likely to cause asymmetric or broken return path routing. TAYGA will correctly handle overlapping IPV4 regions but not IPv6 regions. See [Issue #38](https://github.com/apalrd/tayga/issues/38)
+RFC7757 specifies that a packet should follow the EAM region according to a longest prefix match, while noting that overlapping regions may cause asymmetric return path routing if misconfigured. TAYGA supports overlapping IPv4 and IPv6 static EAM regions using longest-prefix match (exact duplicate prefixes and overlaps involving dynamic pool mappings are still rejected). See [Issue #38](https://github.com/apalrd/tayga/issues/38)
 
 ## RFC6791
 
@@ -49,7 +53,7 @@ RFC6052 describes methods of encoding IPv4 addresses into IPv6 prefixes.
 
 ### Support for non/96 prefixes
 
-RFC6052 specifies several prefix lengths and mapping formats. While TAYGA supports all of these, for prefixes other than /96, there are unused suffix bits in the translated addresses. RFC6052 specifies that we `SHOULD` ignore these bits, as future extensions may utilize them. TAYGA will drop packets if these bits are not zero. See [Issue #10](https://github.com/apalrd/tayga/issues/10).
+RFC6052 specifies several prefix lengths and mapping formats. For prefixes shorter than /96 (/32, /40, /48, /56, /64), TAYGA ignores the unused `u` octet (bits 64..71) and trailing suffix bits (bits 104..127) when extracting the IPv4 address per RFC 6052 §2.2. See [Issue #10](https://github.com/apalrd/tayga/issues/10).
 
 ### Strict RFC6052 Well-Known Prefix Compliance
 

@@ -119,6 +119,18 @@ def send_v6_rejected(v6_dst, label):
     pkt = IPv6(dst=str(v6_dst), src=str(test.public_ipv6), nh=16) / Raw(randbytes(128))
     test.send_and_check(pkt, ip6_val, label)
 
+def send_v4_dropped(v4_dst, label):
+    rt = router(v4_dst)
+    rt.apply()
+    pkt = IP(dst=str(v4_dst), src=str(test.public_ipv4), proto=16) / Raw(randbytes(128))
+    test.send_and_none(pkt, label)
+
+def send_v6_dropped(v6_dst, label):
+    rt = router(v6_dst)
+    rt.apply()
+    pkt = IPv6(dst=str(v6_dst), src=str(test.public_ipv6), nh=16) / Raw(randbytes(128))
+    test.send_and_none(pkt, label)
+
 
 
 
@@ -254,9 +266,8 @@ def test_reloading():
     send_v6_rejected(map_v6+2,         "iter 7: v6 2 absent")
     send_v6_mapped(map_v6+3, map_v4+1, "iter 7: v6 3->1 present")
 
-    # iter 8: replace host entry with shorter-prefix (wider net) covering it
-    # 1->3 mapping entry should be replaced since it overlaps with a later map
-    # Note that overlapping entries is still considered a configuration error
+    # iter 8: host entry and shorter-prefix (wider net) covering it coexist via RFC 7757 LPM
+    # 1->3 host mapping overrides the /30<->/126 subnet; overshadowed 3 (v4) and 1 (v6) are dropped
     map_v4_net = ipaddress.ip_network(f"{map_v4}/30", strict=True)
     map_v6_net = ipaddress.ip_network(f"{map_v6}/126", strict=True)
     test.tayga_conf.map_file_entries = [
@@ -265,27 +276,27 @@ def test_reloading():
     ]
     test.reconf()
     send_v4_mapped(map_v4+0, map_v6+0, "iter 8: v4 0->0 present via net")
-    send_v4_mapped(map_v4+1, map_v6+1, "iter 8: v4 1->1 present via net")
+    send_v4_mapped(map_v4+1, map_v6+3, "iter 8: v4 1->3 present via host")
     send_v4_mapped(map_v4+2, map_v6+2, "iter 8: v4 2->2 present via net")
-    send_v4_mapped(map_v4+3, map_v6+3, "iter 8: v4 3->3 present via net")
-    send_v6_mapped(map_v6+1, map_v4+1, "iter 8: v6 0->0 present via net")
-    send_v6_mapped(map_v6+1, map_v4+1, "iter 8: v6 1->1 present via net")
+    send_v4_dropped(map_v4+3,          "iter 8: v4 3 overshadowed drop")
+    send_v6_mapped(map_v6+0, map_v4+0, "iter 8: v6 0->0 present via net")
+    send_v6_dropped(map_v6+1,          "iter 8: v6 1 overshadowed drop")
     send_v6_mapped(map_v6+2, map_v4+2, "iter 8: v6 2->2 present via net")
-    send_v6_mapped(map_v6+3, map_v4+3, "iter 8: v6 3->3 present via net")
+    send_v6_mapped(map_v6+3, map_v4+1, "iter 8: v6 3->1 present via host")
 
-    # iter 9: replace net with longer-prefix (narrower) host entry overlapping it
+    # iter 9: net and longer-prefix (narrower) host entry overlapping it coexist via RFC 7757 LPM
     test.tayga_conf.map_file_entries = [
         f"{map_v4_net} {map_v6_net}",
         f"{map_v4+3} {map_v6+3}",
     ]
     test.reconf()
-    send_v4_rejected(map_v4+0,         "iter 9: v4 0 absent (net gone)")
-    send_v4_rejected(map_v4+1,         "iter 9: v4 1 absent (net gone)")
-    send_v4_rejected(map_v4+2,         "iter 9: v4 2 absent (net gone)")
+    send_v4_mapped(map_v4+0, map_v6+0, "iter 9: v4 0->0 present via net")
+    send_v4_mapped(map_v4+1, map_v6+1, "iter 9: v4 1->1 present via net")
+    send_v4_mapped(map_v4+2, map_v6+2, "iter 9: v4 2->2 present via net")
     send_v4_mapped(map_v4+3, map_v6+3, "iter 9: v4 3->3 present via host")
-    send_v6_rejected(map_v6+0,         "iter 9: v6 0 absent (net gone)")
-    send_v6_rejected(map_v6+1,         "iter 9: v6 1 absent (net gone)")
-    send_v6_rejected(map_v6+2,         "iter 9: v6 2 absent (net gone)")
+    send_v6_mapped(map_v6+0, map_v4+0, "iter 9: v6 0->0 present via net")
+    send_v6_mapped(map_v6+1, map_v4+1, "iter 9: v6 1->1 present via net")
+    send_v6_mapped(map_v6+2, map_v4+2, "iter 9: v6 2->2 present via net")
     send_v6_mapped(map_v6+3, map_v4+3, "iter 9: v6 3->3 present via host")
 
     # iter 10: empty file removes all map-file entries

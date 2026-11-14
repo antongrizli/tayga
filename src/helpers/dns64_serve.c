@@ -28,6 +28,13 @@
 
 /* Optional hosts-file override for --serve-dns64 (set only via --hosts-file). */
 const char *g_hosts_file __attribute__((unused)) = NULL;
+volatile sig_atomic_t dns64_stop = 0;
+
+void handle_dns64_sig(int sig)
+{
+    (void)sig;
+    dns64_stop = 1;
+}
 
 /*
  * Synthesizes an IPv6 address from a NAT64 prefix and 4-byte IPv4 address per RFC 6052.
@@ -137,6 +144,57 @@ size_t lookup_hosts_v4(const char *hosts_path, const char *qname,
     return count;
 }
 
+size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
+                         const struct in6_addr *prefix, int prefix_len,
+                         uint16_t rtype, const uint8_t v4_list[][4], size_t count,
+                         uint8_t rcode, uint32_t ttl, uint8_t *resp, size_t resp_sz)
+{
+    if (12 + qsec_len > resp_sz)
+        return 0;
+    memset(resp, 0, 12);
+    resp[0] = req[0];
+    resp[1] = req[1];
+    resp[2] = (uint8_t)((req[2] & 0x01) | 0x80);
+    resp[3] = (uint8_t)(0x80 | (rcode & 0x0f));
+    resp[4] = 0;
+    resp[5] = 1;
+    memcpy(resp + 12, req + 12, qsec_len);
+    size_t pos = 12 + qsec_len;
+    uint16_t added = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t rdlen = (rtype == 28) ? 16 : 4;
+        if (pos + 12 + rdlen > resp_sz) {
+            resp[2] |= 0x02; /* RFC 6147 §5.1: set TC=1 on truncation */
+            break;
+        }
+        struct in6_addr syn6;
+        if (rtype == 28 && synthesize_pref64(prefix, prefix_len, v4_list[i], &syn6) < 0)
+            continue;
+        resp[pos++] = 0xc0;
+        resp[pos++] = 0x0c;
+        resp[pos++] = (uint8_t)(rtype >> 8);
+        resp[pos++] = (uint8_t)(rtype & 0xff);
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x01;
+        resp[pos++] = (uint8_t)(ttl >> 24);
+        resp[pos++] = (uint8_t)(ttl >> 16);
+        resp[pos++] = (uint8_t)(ttl >> 8);
+        resp[pos++] = (uint8_t)ttl;
+        resp[pos++] = 0x00;
+        resp[pos++] = (uint8_t)rdlen;
+        if (rtype == 28)
+            memcpy(resp + pos, syn6.s6_addr, 16);
+        else
+            memcpy(resp + pos, v4_list[i], 4);
+        pos += rdlen;
+        added++;
+    }
+    resp[6] = (uint8_t)(added >> 8);
+    resp[7] = (uint8_t)(added & 0xff);
+    return pos;
+}
+
 #ifndef PREF64_NO_MAIN
 static void split_host_port(const char *spec, const char *default_port,
                             char *host, size_t host_sz, char *port, size_t port_sz)
@@ -205,55 +263,6 @@ static ssize_t decode_qname(const uint8_t *pkt, size_t plen, size_t offset,
         pos += llen;
     }
     return -1;
-}
-
-static size_t build_dns64_reply(const uint8_t *req, size_t qsec_len,
-                                const struct in6_addr *prefix, int prefix_len,
-                                uint16_t rtype, const uint8_t v4_list[][4], size_t count,
-                                uint8_t rcode, uint32_t ttl, uint8_t *resp, size_t resp_sz)
-{
-    if (12 + qsec_len > resp_sz)
-        return 0;
-    memset(resp, 0, 12);
-    resp[0] = req[0];
-    resp[1] = req[1];
-    resp[2] = (uint8_t)((req[2] & 0x01) | 0x80);
-    resp[3] = (uint8_t)(0x80 | (rcode & 0x0f));
-    resp[4] = 0;
-    resp[5] = 1;
-    memcpy(resp + 12, req + 12, qsec_len);
-    size_t pos = 12 + qsec_len;
-    uint16_t added = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        size_t rdlen = (rtype == 28) ? 16 : 4;
-        if (pos + 12 + rdlen > resp_sz)
-            break;
-        struct in6_addr syn6;
-        if (rtype == 28 && synthesize_pref64(prefix, prefix_len, v4_list[i], &syn6) < 0)
-            continue;
-        resp[pos++] = 0xc0;
-        resp[pos++] = 0x0c;
-        resp[pos++] = (uint8_t)(rtype >> 8);
-        resp[pos++] = (uint8_t)(rtype & 0xff);
-        resp[pos++] = 0x00;
-        resp[pos++] = 0x01;
-        resp[pos++] = (uint8_t)(ttl >> 24);
-        resp[pos++] = (uint8_t)(ttl >> 16);
-        resp[pos++] = (uint8_t)(ttl >> 8);
-        resp[pos++] = (uint8_t)ttl;
-        resp[pos++] = 0x00;
-        resp[pos++] = (uint8_t)rdlen;
-        if (rtype == 28)
-            memcpy(resp + pos, syn6.s6_addr, 16);
-        else
-            memcpy(resp + pos, v4_list[i], 4);
-        pos += rdlen;
-        added++;
-    }
-    resp[6] = (uint8_t)(added >> 8);
-    resp[7] = (uint8_t)(added & 0xff);
-    return pos;
 }
 
 /* Upstream resolver address, resolved once and cached (no getaddrinfo()
@@ -350,13 +359,6 @@ static size_t extract_dns_records(const uint8_t *resp, size_t rlen,
         *ttl_out = min_ttl == UINT32_MAX ? 60 : min_ttl;
     }
     return found;
-}
-
-volatile sig_atomic_t dns64_stop = 0;
-void handle_dns64_sig(int sig)
-{
-    (void)sig;
-    dns64_stop = 1;
 }
 
 /*
@@ -496,7 +498,8 @@ static void dns_advance(struct dns_ctx *c, struct dns_pending *p, const uint8_t 
         return;
     }
     if (p->stage == DNS_AAAA) {
-        if (rlen >= 12 && extract_dns_records(resp, (size_t)rlen, 28, NULL, 0, NULL) > 0) {
+        if (rlen >= 12 && ((resp[2] & 0x02) ||
+                           extract_dns_records(resp, (size_t)rlen, 28, NULL, 0, NULL) > 0)) {
             dns_reply(c, p, resp, (size_t)rlen);
             dns_pending_free(p);
             return;

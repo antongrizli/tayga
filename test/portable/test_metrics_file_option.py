@@ -41,9 +41,10 @@ class MetricsFileOptionTests(unittest.TestCase):
         self.assertEqual(self.run_tayga('--metrics-file', '/' + 'a' * 766).returncode, 0)
 
     def test_status_path_is_rejected(self):
-        result = self.run_tayga('--status-file', '/tmp/a', '--metrics-file', '/tmp/a')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('metrics-file must differ from status-file', result.stderr)
+        for candidate in ('/tmp/a', '/tmp//a', '/tmp/./a'):
+            result = self.run_tayga('--status-file', '/tmp/a', '--metrics-file', candidate)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('metrics-file must differ from status-file', result.stderr)
 
     def test_distinct_absolute_path_is_accepted(self):
         result = self.run_tayga('--status-file', '/tmp/a', '--metrics-file', '/tmp/b.prom')

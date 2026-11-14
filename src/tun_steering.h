@@ -44,19 +44,13 @@ static unsigned steering_emit(struct steering_builder *b, unsigned code,
 #define LOADMAP(d,fd) do { SE(BPF_LD|BPF_DW|BPF_IMM,d,BPF_PSEUDO_MAP_FD,0,fd); SE(0,0,0,0,0); } while(0)
 #define CALL(i) SE(BPF_JMP|BPF_CALL,0,0,0,i)
 #define PATCH(n,to) (b.code[n].off=(to)-(n)-1)
-static int steering_program_ext(unsigned queues, int flow_aware, char *log, size_t log_size)
+static inline int steering_build_program(unsigned queues, int flow_aware,
+                                         int buckets, int counter,
+                                         struct steering_builder *out)
 {
-	int buckets=-1, counter=-1, program=-1, saved;
 	struct steering_builder b = {0};
 	unsigned fail[16], nf=0, ipv6, hash_done;
-	union bpf_attr attr = {0};
-	if (!queues || queues > 128) { errno=EINVAL; return -1; }
-	buckets=steering_map(65536);
-	if (buckets<0) goto done;
-	/* Independent admission counters for IPv4 and IPv6. Ownership is permanent
-	 * from the first packet: changing queues cannot drain an old worker. */
-	counter=steering_map(2);
-	if (counter<0) goto done;
+	if (!queues || queues > 128 || !out) { errno=EINVAL; return -1; }
 	MOVR(6,1);
 	/* Load first 20 bytes (covers entire basic IPv4 header + IPv6 version & next_header). */
 	MOVI(2,0); MOVR(3,10); ALUI(BPF_ADD,3,-64); MOVI(4,20);
@@ -160,7 +154,25 @@ static int steering_program_ext(unsigned queues, int flow_aware, char *log, size
 	SE(BPF_JMP|BPF_EXIT,0,0,0,0);
 	for (unsigned i=0;i<nf;i++) PATCH(fail[i],b.n);
 	MOVI(0,0); SE(BPF_JMP|BPF_EXIT,0,0,0,0);
-	if (b.overflow) { errno=E2BIG; goto done; }
+	if (b.overflow) { errno=E2BIG; return -1; }
+	*out = b;
+	return 0;
+}
+
+static int steering_program_ext(unsigned queues, int flow_aware, char *log, size_t log_size)
+{
+	int buckets=-1, counter=-1, program=-1, saved;
+	struct steering_builder b = {0};
+	union bpf_attr attr = {0};
+	if (!queues || queues > 128) { errno=EINVAL; return -1; }
+	buckets=steering_map(65536);
+	if (buckets<0) goto done;
+	/* Independent admission counters for IPv4 and IPv6. Ownership is permanent
+	 * from the first packet: changing queues cannot drain an old worker. */
+	counter=steering_map(2);
+	if (counter<0) goto done;
+	if (steering_build_program(queues, flow_aware, buckets, counter, &b) < 0)
+		goto done;
 	attr.prog_type=BPF_PROG_TYPE_SOCKET_FILTER;
 	attr.insn_cnt=b.n; attr.insns=(uintptr_t)b.code;
 	attr.license=(uintptr_t)"GPL";

@@ -1460,6 +1460,77 @@ int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4, int em)
 	return ERROR_NONE;
 }
 
+static void hairpin_6to4to6(struct pkt *p, const struct in_addr *ip4_dest)
+{
+	struct ip4_data header;
+	uint8_t stack_buf[2200];
+	uint8_t *buf = stack_buf;
+	const size_t headroom = 64;
+	size_t total_len;
+	struct pkt hpkt;
+
+	if (sizeof(struct ip6) + p->data_len > gcfg.mtu) {
+		stats_drop(p->data_len);
+		log_pkt6(LOG_OPT_ICMP, p, "Packet Too Big");
+		host_send_icmp6_error(2, 0, gcfg.mtu, p);
+		return;
+	}
+
+	int ret = map_ip6_to_ip4(&header.ip4.src, &p->ip6->src, 1);
+	if (ret == ERROR_REJECT) {
+		stats_drop(p->data_len);
+		log_pkt6(LOG_OPT_REJECT, p, "Failed to map src addr");
+		host_send_icmp6_error(1, 5, 0, p);
+		return;
+	} else if (ret == ERROR_DROP) {
+		stats_drop(p->data_len);
+		log_pkt6(LOG_OPT_DROP, p, "Failed to map src addr");
+		return;
+	}
+	header.ip4.dest = *ip4_dest;
+
+	xlate_header_6to4(p, &header.ip4, p->data_len);
+	/* Keep ttl == p->ip6->hop_limit here so xlate_4to6_data() decrements
+	 * the final Hop Limit by 1 total per RFC 7757 §4.2. */
+	if (xlate_payload_6to4(p, &header.ip4, 0) < 0) {
+		stats_drop(p->data_len);
+		return;
+	}
+	header.ip4.cksum = ip4_header_checksum(&header.ip4);
+
+	total_len = headroom + sizeof(struct ip4) + p->data_len;
+	if (total_len > sizeof(stack_buf)) {
+		buf = malloc(total_len);
+		if (!buf) {
+			stats_drop(p->data_len);
+			return;
+		}
+	}
+	memcpy(buf + headroom, &header.ip4, sizeof(struct ip4));
+	memcpy(buf + headroom + sizeof(struct ip4), p->data, p->data_len);
+
+	memset(&hpkt, 0, sizeof(hpkt));
+	hpkt.data = buf + headroom;
+	hpkt.data_len = sizeof(struct ip4) + p->data_len;
+	hpkt.tun_fd = p->tun_fd;
+	if (p->has_vhdr && (p->vhdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) &&
+	    (p->data_proto == IPPROTO_TCP || p->data_proto == IPPROTO_UDP)) {
+		hpkt.has_vhdr = 1;
+		hpkt.vhdr = p->vhdr;
+		hpkt.vhdr.gso_type = VIRTIO_NET_HDR_GSO_NONE;
+		hpkt.vhdr.csum_start = sizeof(struct ip4);
+		hpkt.vhdr.csum_offset = p->data_proto == IPPROTO_UDP ? 6 : 16;
+	}
+
+	if (parse_ip4(&hpkt, 0) == 0)
+		xlate_4to6_data(&hpkt);
+	else
+		stats_drop(p->data_len);
+
+	if (buf != stack_buf)
+		free(buf);
+}
+
 static void xlate_6to4_data(struct pkt *p)
 {
 	struct ip4_data header;
@@ -1469,6 +1540,15 @@ static void xlate_6to4_data(struct pkt *p)
 #endif
 
 	ret = map_ip6_to_ip4(&header.ip4.dest, &p->ip6->dest, 0);
+	if (ret == ERROR_DROP) {
+		int hret = map_ip6_to_ip4_hairpin(&header.ip4.dest, &p->ip6->dest);
+		if (hret == ERROR_NONE) {
+			hairpin_6to4to6(p, &header.ip4.dest);
+			return;
+		}
+		if (hret == ERROR_REJECT)
+			ret = ERROR_REJECT;
+	}
 	if (ret == ERROR_REJECT) {
 		stats_drop(p->data_len);
 		log_pkt6(LOG_OPT_REJECT,p,"Failed to map dest addr");
@@ -1650,6 +1730,27 @@ static int parse_ip6(struct pkt *p,int em)
 	return ERROR_NONE;
 }
 
+/* RFC 6791: map untranslatable IPv6 ICMP error source to icmp-v4-pool if
+ * configured, otherwise fall back to local_addr4. */
+static struct in_addr rfc6791_icmp_src(const struct in6_addr *src6)
+{
+	if (gcfg.icmp_v4_pool_len <= 0)
+		return gcfg.local_addr4;
+	if (gcfg.icmp_v4_pool_len >= 32)
+		return gcfg.icmp_v4_pool_addr;
+
+	uint32_t h = 2166136261u;
+	for (int i = 0; i < 16; i++) {
+		h ^= src6->s6_addr[i];
+		h *= 16777619u;
+	}
+	uint32_t host_mask = ~ntohl(gcfg.icmp_v4_pool_mask.s_addr);
+	uint32_t host = (host_mask >= 3) ? (1u + (h % (host_mask - 1u))) : (h & host_mask);
+	struct in_addr out;
+	out.s_addr = htonl(ntohl(gcfg.icmp_v4_pool_addr.s_addr) | host);
+	return out;
+}
+
 static void xlate_6to4_icmp_error(struct pkt *p)
 {
 	struct ip4_error header;
@@ -1814,8 +1915,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 	//send errors, so treat return of REJECT = DROP
 	if (map_ip6_to_ip4(&header.ip4.src, &p->ip6->src, 0)) {
 		log_pkt6(LOG_OPT_ICMP,p,"Need to rely on fake source");
-		//fake source IP is our own IP
-		header.ip4.src = gcfg.local_addr4;
+		header.ip4.src = rfc6791_icmp_src(&p->ip6->src);
 	}
 
 	if (map_ip6_to_ip4(&header.ip4.dest, &p->ip6->dest, 0)) {

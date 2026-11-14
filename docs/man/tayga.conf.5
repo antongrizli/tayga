@@ -53,13 +53,12 @@ A namespace/device ownership lock prevents concurrent TAYGA processes;
 other software must not share the device.
 On FreeBSD, \f[B]auto\f[R] uses the ordinary TUN path.
 .TP
-\f[B]tun\-steering\f[R] \f[I]kernel|groups|flows\f[R]
+\f[B]tun\-steering\f[R] \f[I]kernel|flows\f[R]
 Defaults to \f[B]kernel\f[R].
 On Linux with multiqueue TUN devices, configures packet queue steering.
 \f[B]kernel\f[R] relies on default Linux kernel steering;
-\f[B]groups\f[R] enables opt\-in eBPF 2\-tuple L3 address\-group
-steering; \f[B]flows\f[R] enables opt\-in eBPF 4\-tuple flow steering
-for unfragmented TCP and UDP traffic, retaining 2\-tuple steering for
+\f[B]flows\f[R] enables opt\-in eBPF 4\-tuple flow steering for
+unfragmented TCP and UDP traffic, retaining 2\-tuple steering for
 fragments and IPv6 extension headers.
 Each of 65,536 hash buckets retains its first assigned queue for the
 disposable device lifetime, including across SIGHUP.

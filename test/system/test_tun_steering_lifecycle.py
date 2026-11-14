@@ -13,10 +13,10 @@ import json
 
 def main():
     binary=Path(sys.argv[1]).resolve()
-    flags=sys.argv[2:] or ["--tun-steering=groups"]
+    flags=sys.argv[2:] or ["--tun-steering=flows"]
     selected=dict(flag[2:].split("=",1) for flag in flags)
     steering=selected.get("tun-steering","kernel")
-    experimental=steering in ("groups","flows")
+    experimental=(steering == "flows")
     readiness=f"requested={steering} effective={steering}" if experimental else "Packet I/O: dispatch="+selected.get("dispatch","kernel")+" transmit="+selected.get("packet-io","sync")
     lock=open('/tmp/tayga-perf-workflow.lock','a')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

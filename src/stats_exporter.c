@@ -123,6 +123,20 @@ static void remove_stale_status_tmp(int dirfd)
 	remove_stale_tmp(dirfd, ".tayga-status.");
 }
 
+/* Scope metrics temp files to the destination basename so multiple instances
+ * sharing a textfile_collector directory do not clean up each other's files. */
+static void format_metrics_tmp_prefix(const char *path, char *out, size_t out_sz)
+{
+	const char *slash = path ? strrchr(path, '/') : NULL;
+	const char *base = slash ? slash + 1 : (path ? path : "");
+	uint32_t h = 2166136261u;
+	for (const unsigned char *p = (const unsigned char *)base; *p; p++) {
+		h ^= *p;
+		h *= 16777619u;
+	}
+	snprintf(out, out_sz, ".tayga-metrics.%08x.", h);
+}
+
 /* Open the directory of an absolute destination path; the base name is
  * copied to base (size base_size).  Returns -1 when unusable. */
 static int open_destination_dir(const char *path, char *base, size_t base_size, const char *what)
@@ -181,7 +195,9 @@ static void prepare_metrics_dir(void)
 	if (g_metrics_dirfd >= 0) close(g_metrics_dirfd);
 	g_metrics_dirfd = fd;
 	strcpy(g_metrics_base, base);
-	remove_stale_tmp(fd, ".tayga-metrics.");
+	char mprefix[32];
+	format_metrics_tmp_prefix(gcfg.metrics_path, mprefix, sizeof(mprefix));
+	remove_stale_tmp(fd, mprefix);
 }
 
 /* Keep publication ordering per destination only while writers are in flight.
@@ -442,8 +458,8 @@ void stats_write_json(const char *path, const char *state)
 	fprintf(f,"  \"dispatch_mode\": \"%s\", \"packet_io\": \"%s\",\n",gcfg.dispatch_mode?"flows":"kernel",gcfg.async_tun?"uring":"sync");
 	fprintf(f,"  \"dispatch_drops\": %llu, \"dispatch_held\": %llu, \"dispatch_expired\": %llu,\n",(unsigned long long)atomic_load(&dispatch_drops),(unsigned long long)atomic_load(&dispatch_held),(unsigned long long)atomic_load(&dispatch_expired));
 	fprintf(f,"  \"async_accepted\": %llu, \"async_completed\": %llu, \"async_errors\": %llu, \"async_pressure\": %llu,\n",(unsigned long long)atomic_load(&async_accepted),(unsigned long long)atomic_load(&async_completed),(unsigned long long)atomic_load(&async_errors),(unsigned long long)atomic_load(&async_pressure));
-	fprintf(f, "  \"steering_requested\": \"%s\",\n", gcfg.tun_steering_flows ? "flows" : (gcfg.tun_steering_groups ? "groups" : "kernel"));
-	fprintf(f, "  \"steering_effective\": \"%s\",\n", gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
+	fprintf(f, "  \"steering_requested\": \"%s\",\n", gcfg.tun_steering_flows ? "flows" : "kernel");
+	fprintf(f, "  \"steering_effective\": \"%s\",\n", gcfg.tun_steering_effective ? "flows" : "kernel");
 	fprintf(f, "  \"steering_fallback_errno\": %d,\n", gcfg.tun_steering_errno);
 	fprintf(f, "  \"steering_buckets\": %u,\n", gcfg.tun_steering_effective ? 65536 : 0);
 	fprintf(f, "  \"offload_effective\": \"%s\",\n", tun_offload_name(gcfg.tun_offload_effective));
@@ -600,7 +616,7 @@ void stats_write_prometheus(const char *path)
 	fputs("tayga_info{version=\"", f); prom_label(f, TAYGA_VERSION);
 	fputs("\",offload=\"", f); prom_label(f, tun_offload_name(gcfg.tun_offload_effective));
 	fputs("\",steering=\"", f);
-	prom_label(f, gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
+	prom_label(f, gcfg.tun_steering_effective ? "flows" : "kernel");
 	fputs("\"} 1\n", f);
 	prom_plain(f, "tayga_uptime_seconds", "gauge", "Seconds since the daemon started.", (uint64_t)uptime);
 	prom_family(f, "tayga_rx_packets_total", "Packets received from the TUN device, by address family.", s.rx_pkts_v4, s.rx_pkts_v6);
@@ -641,8 +657,10 @@ void stats_write_prometheus(const char *path)
 	if (failed) { free(text); export_end(destination); return; }
 
 	bool use_dirfd = g_metrics_dirfd >= 0 && !strcmp(path, gcfg.metrics_path);
+	char mprefix[32];
+	format_metrics_tmp_prefix(path, mprefix, sizeof(mprefix));
 	export_publish(destination, path, use_dirfd ? g_metrics_dirfd : -1, g_metrics_base,
-	               ".tayga-metrics.", text, text_length, snap_seq, "metrics file");
+	               mprefix, text, text_length, snap_seq, "metrics file");
 	free(text);
 	export_end(destination);
 }
@@ -723,9 +741,13 @@ void telemetry_start(const char *status_path, int interval_sec)
 		}
 	}
 	if (g_metrics_dirfd < 0 && gcfg.metrics_path[0] == '/') {
-		char mbase[sizeof(g_metrics_base)];
+		char mbase[sizeof(g_metrics_base)], mprefix[32];
 		int mfd = open_destination_dir(gcfg.metrics_path, mbase, sizeof(mbase), "metrics");
-		if (mfd >= 0) { remove_stale_tmp(mfd, ".tayga-metrics."); close(mfd); }
+		if (mfd >= 0) {
+			format_metrics_tmp_prefix(gcfg.metrics_path, mprefix, sizeof(mprefix));
+			remove_stale_tmp(mfd, mprefix);
+			close(mfd);
+		}
 	}
 	atomic_store_explicit(&g_telemetry_running, true, memory_order_relaxed);
 	/* Write initial snapshot immediately */

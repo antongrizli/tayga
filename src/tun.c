@@ -584,7 +584,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	int created_persistent = 0;
 	/* No existing interface/BPF attachment is replaced. On last close this
 	 * disposable device and its maps disappear, including after SIGKILL. */
-	if ((gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
+	if ((gcfg.tun_steering_flows || gcfg.dispatch_mode) && (do_mktun || do_rmtun || if_nametoindex(gcfg.tundev))) {
 		slog(LOG_CRIT, "Experimental steering/dispatch requires a fresh disposable TUN device\n");
 		return ERROR_REJECT;
 	}
@@ -616,7 +616,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 	ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
 	/* Atomic creation guard: the name check above alone cannot exclude a
 	 * device created by another owner between the check and TUNSETIFF. */
-	if (gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
+	if (gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 	if (want_vnet) {
 		ifr.ifr_flags |= IFF_VNET_HDR;
 	}
@@ -629,7 +629,7 @@ int tun_setup(int do_mktun, int do_rmtun)
 				strerror(errno));
 			gcfg.vnet_hdr_sz = 0;
 			ifr.ifr_flags = TAYGA_TUN_BASE_FLAGS;
-			if (gcfg.tun_steering_groups || gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
+			if (gcfg.tun_steering_flows || gcfg.dispatch_mode) ifr.ifr_flags |= IFF_TUN_EXCL;
 			if (ioctl(gcfg.tun_fd, TUNSETIFF, &ifr) < 0) {
 				slog(LOG_CRIT, "Unable to attach tun device %s, aborting: %s\n",
 					gcfg.tundev, strerror(errno));
@@ -833,10 +833,9 @@ int tun_setup(int do_mktun, int do_rmtun)
 		ifr.ifr_flags = IFF_DETACH_QUEUE;
 		if (ioctl(gcfg.tun_fd, TUNSETQUEUE, &ifr) < 0) goto setup_fail;
 	}
-	if (gcfg.tun_steering_groups || gcfg.tun_steering_flows) {
+	if (gcfg.tun_steering_flows) {
 		char verifier[16384] = {0};
-		int flow_aware = gcfg.tun_steering_flows;
-		int program = steering_program_ext(gcfg.workers > 0 ? gcfg.workers : 1, flow_aware, verifier, sizeof(verifier));
+		int program = steering_program_ext(gcfg.workers > 0 ? gcfg.workers : 1, 1, verifier, sizeof(verifier));
 		int active_fd = gcfg.workers > 0 ? gcfg.tun_fd_addl[0] : gcfg.tun_fd;
 		if (program >= 0) {
 			if (!ioctl(active_fd, TUNSETSTEERINGEBPF, &program)) gcfg.tun_steering_effective = 1;
@@ -844,12 +843,12 @@ int tun_setup(int do_mktun, int do_rmtun)
 			close(program);
 		} else gcfg.tun_steering_errno = errno;
 		if (!gcfg.tun_steering_effective)
-			slog(LOG_WARNING, "%s steering unavailable; retaining kernel steering: %s; verifier: %.400s\n",
-				flow_aware ? "Flow" : "Group", strerror(gcfg.tun_steering_errno), verifier);
+			slog(LOG_WARNING, "Flow steering unavailable; retaining kernel steering: %s; verifier: %.400s\n",
+				strerror(gcfg.tun_steering_errno), verifier);
 	}
 	slog(LOG_INFO, "TUN steering requested=%s effective=%s\n",
-		gcfg.tun_steering_flows ? "flows" : (gcfg.tun_steering_groups ? "groups" : "kernel"),
-		gcfg.tun_steering_effective ? (gcfg.tun_steering_flows ? "flows" : "groups") : "kernel");
+		gcfg.tun_steering_flows ? "flows" : "kernel",
+		gcfg.tun_steering_effective ? "flows" : "kernel");
 	/* Bring tun device up */
 	if(gcfg.tun_up || restore_up) {
 		if(netlink_set_if_flags(ifidx,IFF_UP,IFF_UP)) goto setup_fail;

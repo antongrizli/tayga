@@ -27,7 +27,13 @@
 #endif
 
 #ifdef __linux__
-static uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
+#ifdef PREF64_NO_MAIN
+#define PROBE_TESTABLE
+#else
+#define PROBE_TESTABLE static
+#endif
+
+PROBE_TESTABLE uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t sum = init_sum;
@@ -43,8 +49,8 @@ static uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
     return (uint16_t)(~sum & 0xffff);
 }
 
-static uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
-                            const uint8_t *icmp, size_t icmp_len)
+PROBE_TESTABLE uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
+                                    const uint8_t *icmp, size_t icmp_len)
 {
     uint8_t pseudo[40];
     memset(pseudo, 0, sizeof(pseudo));
@@ -59,6 +65,7 @@ static uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
     return inet_cksum(icmp, icmp_len, sum);
 }
 
+#ifndef PREF64_NO_MAIN
 static int open_tun_dev(const char *dev)
 {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -118,12 +125,14 @@ int tun_echo6(const char *dev)
     close(fd);
     return 0;
 }
+#endif
 
 int tun_client4(const char *dev, const char *src_str, const char *dst_str)
 {
     struct in_addr src4, dst4;
     if (inet_pton(AF_INET, src_str, &src4) != 1 || inet_pton(AF_INET, dst_str, &dst4) != 1)
         return 1;
+#ifndef PREF64_NO_MAIN
     int fd = open_tun_dev(dev);
     if (fd < 0) return 1;
     uint8_t pkt[28];
@@ -163,6 +172,10 @@ int tun_client4(const char *dev, const char *src_str, const char *dst_str)
     }
     close(fd);
     return 1;
+#else
+    (void)dev;
+    return 1;
+#endif
 }
 
 int tun_client6(const char *dev, const char *src_str, const char *dst_str)
@@ -170,6 +183,7 @@ int tun_client6(const char *dev, const char *src_str, const char *dst_str)
     struct in6_addr src6, dst6;
     if (inet_pton(AF_INET6, src_str, &src6) != 1 || inet_pton(AF_INET6, dst_str, &dst6) != 1)
         return 1;
+#ifndef PREF64_NO_MAIN
     int fd = open_tun_dev(dev);
     if (fd < 0) return 1;
     uint8_t pkt[48];
@@ -205,5 +219,9 @@ int tun_client6(const char *dev, const char *src_str, const char *dst_str)
     }
     close(fd);
     return 1;
+#else
+    (void)dev;
+    return 1;
+#endif
 }
 #endif
