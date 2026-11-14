@@ -29,10 +29,15 @@ $(TESTOBJDIR)/stats-export-hook.o: src/stats_exporter.c $(GENDIR)/version.h $(BU
 # pref64-discover modules the unit and fuzz tests link. -DPREF64_NO_MAIN drops
 # main() and the DNS64 server loop, as in the single-file helper before the split.
 PREF64_TEST_OBJS := $(TESTOBJDIR)/pref64.o $(TESTOBJDIR)/lib/helpers/pref64_ra.o \
-                    $(TESTOBJDIR)/dns64_serve.o
+                    $(TESTOBJDIR)/dns64_serve.o $(TESTOBJDIR)/ra_supervisor.o \
+                    $(TESTOBJDIR)/tun_probe.o
 $(TESTOBJDIR)/pref64.o: src/helpers/pref64-discover.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
 $(TESTOBJDIR)/dns64_serve.o: src/helpers/dns64_serve.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
+$(TESTOBJDIR)/ra_supervisor.o: src/helpers/ra_supervisor.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
+$(TESTOBJDIR)/tun_probe.o: src/helpers/tun_probe.c $(GENDIR)/version.h $(BUILDDIR)/build.flags | $(TESTOBJDIR)
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -DPREF64_NO_MAIN -MMD -MP -c -o $@ $<
 
 $(TESTBINDIR)/unit_addrmap: $(TESTOBJDIR)/unit_addrmap.o $(TESTOBJDIR)/addrmap-hook.o $(TEST_LIB) | $(TESTBINDIR)

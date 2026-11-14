@@ -28,6 +28,13 @@
 
 /* Optional hosts-file override for --serve-dns64 (set only via --hosts-file). */
 const char *g_hosts_file __attribute__((unused)) = NULL;
+volatile sig_atomic_t dns64_stop = 0;
+
+void handle_dns64_sig(int sig)
+{
+    (void)sig;
+    dns64_stop = 1;
+}
 
 /*
  * Synthesizes an IPv6 address from a NAT64 prefix and 4-byte IPv4 address per RFC 6052.
@@ -352,13 +359,6 @@ static size_t extract_dns_records(const uint8_t *resp, size_t rlen,
         *ttl_out = min_ttl == UINT32_MAX ? 60 : min_ttl;
     }
     return found;
-}
-
-volatile sig_atomic_t dns64_stop = 0;
-void handle_dns64_sig(int sig)
-{
-    (void)sig;
-    dns64_stop = 1;
 }
 
 /*

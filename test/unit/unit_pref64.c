@@ -19,6 +19,19 @@
 #include <sys/stat.h>
 #include "../../src/helpers/pref64_ra.h"
 #include "../../src/helpers/dns64_serve.h"
+#include "../../src/helpers/ra_supervisor.h"
+#include "../../src/helpers/tun_probe.h"
+
+#if defined(__linux__) || defined(__FreeBSD__)
+extern void publish_active_prefix(const char *dir, const struct in6_addr *prefix, int plen);
+extern void retract_active_prefix(const char *dir);
+extern void remove_stale_snapshots(const char *config);
+#endif
+#ifdef __linux__
+extern uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum);
+extern uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
+                            const uint8_t *icmp, size_t icmp_len);
+#endif
 
 extern int parse_ra_pref64_option(const uint8_t *ra, size_t ra_len, struct in6_addr *out_prefix,
                                   int *out_plen, uint32_t *out_lifetime_sec);
@@ -507,6 +520,81 @@ int main(void)
         assert(full_resp[7] == 2);           /* ANCOUNT=2 */
         printf("PASS: build_dns64_reply sets TC=1 on truncation (RFC 6147 §5.1)\n");
     }
+
+#if defined(__linux__) || defined(__FreeBSD__)
+    /* ra_supervisor helper unit tests */
+    {
+        char tmpl[] = "/tmp/tayga_unit_ra_XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        assert(dir != NULL);
+
+        struct in6_addr p6;
+        assert(inet_pton(AF_INET6, "64:ff9b::", &p6) == 1);
+        publish_active_prefix(dir, &p6, 96);
+
+        char apath[1024];
+        snprintf(apath, sizeof(apath), "%s/active-prefix", dir);
+        FILE *af = fopen(apath, "r");
+        assert(af != NULL);
+        char line[128] = "";
+        assert(fgets(line, sizeof(line), af) != NULL);
+        fclose(af);
+        assert(strcmp(line, "64:ff9b::/96 rfc8781\n") == 0);
+
+        retract_active_prefix(dir);
+        assert(access(apath, F_OK) != 0);
+
+        char cfgpath[1024], stale[1040];
+        snprintf(cfgpath, sizeof(cfgpath), "%s/tayga.conf", dir);
+        snprintf(stale, sizeof(stale), "%s/tayga.conf.ra.123456", dir);
+        int fd = open(cfgpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        assert(fd >= 0); close(fd);
+        fd = open(stale, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        assert(fd >= 0); close(fd);
+
+        remove_stale_snapshots(cfgpath);
+        assert(access(cfgpath, F_OK) == 0);
+        assert(access(stale, F_OK) != 0);
+        unlink(cfgpath);
+        rmdir(dir);
+
+        char *short_argv[] = { "pref64-discover", "--supervise-ra", "/etc/tayga.conf", "--" };
+        assert(supervise_ra(4, short_argv) == 2);
+        char *rel_cfg_argv[] = { "pref64-discover", "--supervise-ra", "tayga.conf", "--", "true" };
+        assert(supervise_ra(5, rel_cfg_argv) == 2);
+        char *bad_flag_argv[] = { "pref64-discover", "--supervise-ra", "/etc/tayga.conf", "--bad-flag", "x", "--", "true" };
+        assert(supervise_ra(7, bad_flag_argv) == 2);
+        char *rel_rt_argv[] = { "pref64-discover", "--supervise-ra", "/etc/tayga.conf", "--runtime-dir", "rel", "--", "true" };
+        assert(supervise_ra(7, rel_rt_argv) == 2);
+        char *missing_cfg_argv[] = { "pref64-discover", "--supervise-ra", "/tmp/nonexistent_tayga_ra.conf", "--", "true" };
+        assert(supervise_ra(5, missing_cfg_argv) == 1);
+        printf("PASS: ra_supervisor helpers and CLI argument validation\n");
+    }
+#endif
+
+#ifdef __linux__
+    /* tun_probe checksum and validation unit tests */
+    {
+        uint8_t ip4_hdr[20] = {
+            0x45, 0x00, 0x00, 0x1c, 0x12, 0x34, 0x00, 0x00,
+            0x40, 0x01, 0x00, 0x00, 192, 0, 2, 1, 192, 0, 2, 2
+        };
+        uint16_t ck = inet_cksum(ip4_hdr, sizeof(ip4_hdr), 0);
+        ip4_hdr[10] = (uint8_t)(ck >> 8);
+        ip4_hdr[11] = (uint8_t)(ck & 0xff);
+        assert(inet_cksum(ip4_hdr, sizeof(ip4_hdr), 0) == 0);
+
+        struct in6_addr s6, d6;
+        assert(inet_pton(AF_INET6, "2001:db8::1", &s6) == 1);
+        assert(inet_pton(AF_INET6, "2001:db8::2", &d6) == 1);
+        uint8_t icmp6[8] = { 128, 0, 0, 0, 0x54, 0x47, 0x00, 0x01 };
+        uint16_t c6 = icmp6_cksum(s6.s6_addr, d6.s6_addr, icmp6, sizeof(icmp6));
+        assert(c6 != 0);
+        assert(tun_client4("tun0", "bad_ip", "192.0.2.1") == 1);
+        assert(tun_client6("tun0", "bad_ip6", "2001:db8::1") == 1);
+        printf("PASS: tun_probe checksums and address validation\n");
+    }
+#endif
 
     printf("All unit_pref64 tests passed successfully!\n");
     return 0;

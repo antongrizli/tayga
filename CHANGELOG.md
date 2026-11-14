@@ -6,19 +6,30 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- `icmp-v4-pool PREFIX/LEN` (RFC 6791): deterministic pool-based IPv4 source address selection for ICMPv4 errors originated from untranslatable IPv6 sources, falling back to `ipv4-addr`.
+- Full `SIGHUP` configuration hot-reload (`config_reload()`): parses and validates the updated configuration in isolation and atomically applies reloadable settings and mappings without recreating the TUN interface, retaining active state on validation errors or immutable mode changes.
+- RFC 7757 §4.2 hairpinning (`map_ip6_to_ip4_hairpin()` / `hairpin_6to4to6()`) and overlapping static IPv6 EAM prefixes resolved by longest-prefix match.
+- Experimental `tc-bpf` stateless fast-path specification ([docs/performance/tc-bpf-fastpath.md](docs/performance/tc-bpf-fastpath.md)) and standalone prototype + control helper (`contrib/tc-bpf/`).
+- Unit test suite `unit_nat64` for scalar packet/ICMP/offload translation paths, plus expanded coverage for `dns64_serve`, `ra_supervisor`, `tun_probe`, `conffile` (`config_reload`), and `tun_steering`.
 - `--metrics-file FILE` (`TAYGA_METRICS_FILE`): optional Prometheus text-format counters for the node_exporter textfile collector, rewritten atomically with every status JSON write (every 5 s, on SIGUSR2 and at shutdown); no listening socket.
 - `make analyze` (clang static analyzer via `scan-build`) with a CI gate.
-- `make coverage`: unit-test line coverage report (gcovr) that fails below the `COVERAGE_MIN` floor.
+- `make coverage`: unit-test line and branch coverage report (`gcovr`) failing below `COVERAGE_MIN=70` / `COVERAGE_BRANCH_MIN=56`.
 - `make microbench`: translator microbenchmark.
 - Nightly fuzzing workflow with a persistent corpus.
 
 ### Changed
 
+- Retired `tun-steering groups` in favor of `kernel` (default) and `flows`.
+- Decomposed daemon startup and lifecycle state in `src/tayga.c` (`struct tayga_runtime` and single-purpose initialization/loop helpers).
 - `src/helpers/pref64-discover.c` is split into `pref64-discover.c`, `pref64_ra.c`, `dns64_serve.c`, `ra_supervisor.c` and `tun_probe.c`; builds that compiled the single file directly must now use `make pref64-discover` or compile all five.
 
 ### Fixed
 
-- `docs/rfc.md` now describes the implemented RFC 7757 unequal-suffix handling.
+- RFC 6052 §2.2 compliance: `extract_from_prefix()` now ignores unused suffix and u-octet bits for non-`/96` prefixes instead of rejecting valid packets.
+- RFC 6890 compliance: `192.88.99.0/24` (RFC 7526 deprecated 6to4 Relay Anycast) is treated as non-global under `wkpf-strict`.
+- RFC 6147 §5.1 DNS64 truncation handling: `build_dns64_reply()` sets `TC=1` when answers overflow the buffer and `dns_advance()` relays upstream `TC=1` responses directly.
+- Normalized `--metrics-file` and `--status-file` destination comparison (preventing symlink/duplicate-slash collisions) and scoped telemetry `.tmp` cleanup to each target basename.
+- `docs/rfc.md` now describes the implemented RFC 7757 unequal-suffix handling, overlapping EAM prefixes, hairpinning, RFC 6052 suffixes, and RFC 6791 `icmp-v4-pool`.
 
 ## [0.9.16] - 2026-11-10
 

@@ -42,8 +42,14 @@ Userspace TAYGA owns configuration parsing (`conffile.c`), validation, `SIGHUP` 
 
 ## 5. Prototype
 
-A minimal, verifier-oriented `tc-bpf` prototype is provided in [tayga_tc_fastpath.c](../../contrib/tc-bpf/tayga_tc_fastpath.c) with a standalone build target in [Makefile](../../contrib/tc-bpf/Makefile):
+A minimal, verifier-oriented `tc-bpf` prototype and shared map control helper are provided under `contrib/tc-bpf/`:
+
+- [tayga_tc_fastpath.c](../../contrib/tc-bpf/tayga_tc_fastpath.c): `cls_bpf` dataplane using `bpf_skb_change_proto()`
+- [tayga_tc_maps.h](../../contrib/tc-bpf/tayga_tc_maps.h): shared BPF map ABI (`tayga_bpf_cfg`, `tayga_lpm4_key`, `tayga_lpm6_key`, `tayga_eam_val`, `tayga_bpf_stats`)
+- [tayga_tc_ctl.c](../../contrib/tc-bpf/tayga_tc_ctl.c): control-plane helper parsing `tayga.conf` into BPF map records and formatting Prometheus/JSON counters
+
+Build and run the self-test via [Makefile](../../contrib/tc-bpf/Makefile):
 
 ```sh
-make -C contrib/tc-bpf
+make -C contrib/tc-bpf test
 ```
