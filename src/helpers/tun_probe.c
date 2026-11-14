@@ -27,7 +27,13 @@
 #endif
 
 #ifdef __linux__
-static uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
+#ifdef PREF64_NO_MAIN
+#define PROBE_TESTABLE
+#else
+#define PROBE_TESTABLE static
+#endif
+
+PROBE_TESTABLE uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t sum = init_sum;
@@ -43,8 +49,8 @@ static uint16_t inet_cksum(const void *buf, size_t len, uint32_t init_sum)
     return (uint16_t)(~sum & 0xffff);
 }
 
-static uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
-                            const uint8_t *icmp, size_t icmp_len)
+PROBE_TESTABLE uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[16],
+                                    const uint8_t *icmp, size_t icmp_len)
 {
     uint8_t pseudo[40];
     memset(pseudo, 0, sizeof(pseudo));

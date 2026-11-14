@@ -134,6 +134,10 @@ int is_private_ip4_addr(const struct in_addr *a)
 	    (a->s_addr & htonl(0xfffffff8)) != htonl(0xc0000000))
 		return ERROR_REJECT;
 
+	/* 192.88.99.0/24 RFC7526 Deprecated 6to4 Relay Anycast */
+	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0586300))
+		return ERROR_REJECT;
+
 	/* 240.0.0.0/4 RFC1112 Reserved (Class E) */
 	if ((a->s_addr & htonl(0xf0000000)) == htonl(0xf0000000))
 		return ERROR_REJECT;
@@ -553,13 +557,13 @@ struct map6 *find_map6(const struct in6_addr *addr6)
  * @returns -1 on conflict
  * Caller must possess map mutex
  */
-int insert_map4(struct map4 *m, struct map4 **conflict)
+int insert_map4_to(struct list_head *head, struct map4 *m, struct map4 **conflict)
 {
 	struct list_head *entry;
 	struct list_head *insert_pos = NULL;
 	struct map4 *s;
 
-	list_for_each(entry, &gcfg.map4_list) {
+	list_for_each(entry, head) {
 		s = list_entry(entry, struct map4, list);
 		if (s->prefix_len == m->prefix_len &&
 				s->addr.s_addr == m->addr.s_addr)
@@ -567,13 +571,18 @@ int insert_map4(struct map4 *m, struct map4 **conflict)
 		if (s->prefix_len < m->prefix_len && !insert_pos)
 			insert_pos = entry;
 	}
-	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map4_list);
+	list_add_tail(&m->list, insert_pos ? insert_pos : head);
 	return 0;
 
 conflict:
 	if (conflict)
 		*conflict = s;
 	return -1;
+}
+
+int insert_map4(struct map4 *m, struct map4 **conflict)
+{
+	return insert_map4_to(&gcfg.map4_list, m, conflict);
 }
 /**
  * @brief Insert an IPv6 entry into the map
@@ -583,30 +592,41 @@ conflict:
  * @returns -1 on conflict
  * Caller must possess map mutex
  */
-int insert_map6(struct map6 *m, struct map6 **conflict)
+int insert_map6_to(struct list_head *head, struct map6 *m, struct map6 **conflict)
 {
 	struct list_head *entry, *insert_pos = NULL;
 	struct map6 *s;
 
-	list_for_each(entry, &gcfg.map6_list) {
+	list_for_each(entry, head) {
 		s = list_entry(entry, struct map6, list);
+		if (s->prefix_len == m->prefix_len &&
+				IN6_ARE_ADDR_EQUAL(&s->addr, &m->addr))
+			goto conflict;
+		/* RFC 7757: overlapping static EAM entries of different prefix
+		 * lengths are allowed and resolved by longest-prefix match. */
 		if (s->prefix_len < m->prefix_len) {
-			if (IN6_IS_IN_NET(&m->addr, &s->addr, &s->mask))
+			if ((s->type != MAP_TYPE_STATIC || m->type != MAP_TYPE_STATIC) &&
+					IN6_IS_IN_NET(&m->addr, &s->addr, &s->mask))
 				goto conflict;
 			if (!insert_pos)
 				insert_pos = entry;
-		} else {
-			if (IN6_IS_IN_NET(&s->addr, &m->addr, &m->mask))
-				goto conflict;
+		} else if ((s->type != MAP_TYPE_STATIC || m->type != MAP_TYPE_STATIC) &&
+				IN6_IS_IN_NET(&s->addr, &m->addr, &m->mask)) {
+			goto conflict;
 		}
 	}
-	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg.map6_list);
+	list_add_tail(&m->list, insert_pos ? insert_pos : head);
 	return 0;
 
 conflict:
 	if (conflict)
 		*conflict = s;
 	return -1;
+}
+
+int insert_map6(struct map6 *m, struct map6 **conflict)
+{
+	return insert_map6_to(&gcfg.map6_list, m, conflict);
 }
 /**
  * @brief Append an IPv4 address to an IPv6 translation prefix
@@ -835,42 +855,30 @@ int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 static int extract_from_prefix(struct in_addr *addr4,
 		const struct in6_addr *addr6, int prefix_len)
 {
+	/* RFC 6052 §2.2: bits 64..71 (u-octet) and trailing suffix bits
+	 * beyond the embedded IPv4 address are ignored on extraction. */
+	const uint8_t *a = addr6->s6_addr;
+	uint8_t b[4];
+
 	switch (prefix_len) {
 	case 32:
-		if (addr6->s6_addr32[2] || addr6->s6_addr32[3])
-			return ERROR_DROP;
 		addr4->s_addr = addr6->s6_addr32[1];
 		break;
 	case 40:
-		if (addr6->s6_addr32[2] & htonl(0xff00ffff) ||
-				addr6->s6_addr32[3])
-			return ERROR_DROP;
-		addr4->s_addr = BIG_LITTLE(
-                (addr6->s6_addr32[1] << 8) | addr6->s6_addr[9],
-                (addr6->s6_addr32[1] >> 8) | (addr6->s6_addr32[2] << 16));
+		b[0] = a[5]; b[1] = a[6]; b[2] = a[7]; b[3] = a[9];
+		memcpy(&addr4->s_addr, b, 4);
 		break;
 	case 48:
-		if (addr6->s6_addr32[2] & htonl(0xff0000ff) ||
-				addr6->s6_addr32[3])
-			return ERROR_DROP;
-		addr4->s_addr = BIG_LITTLE(
-            (addr6->s6_addr16[3] << 16) | (addr6->s6_addr32[2] >> 8),
-            (addr6->s6_addr16[3]      ) | (addr6->s6_addr32[2] << 8));
+		b[0] = a[6]; b[1] = a[7]; b[2] = a[9]; b[3] = a[10];
+		memcpy(&addr4->s_addr, b, 4);
 		break;
 	case 56:
-		if (addr6->s6_addr[8] || addr6->s6_addr32[3])
-			return ERROR_DROP;
-		addr4->s_addr = BIG_LITTLE(
-                (addr6->s6_addr[7] << 24) | addr6->s6_addr32[2],
-		        addr6->s6_addr[7] | addr6->s6_addr32[2]);
+		b[0] = a[7]; b[1] = a[9]; b[2] = a[10]; b[3] = a[11];
+		memcpy(&addr4->s_addr, b, 4);
 		break;
 	case 64:
-		if (addr6->s6_addr[8] ||
-				addr6->s6_addr32[3] & htonl(0x00ffffff))
-			return ERROR_DROP;
-		addr4->s_addr = BIG_LITTLE(
-                (addr6->s6_addr32[2] << 8) | addr6->s6_addr[12],
-		        (addr6->s6_addr32[2] >> 8) | (addr6->s6_addr32[3] << 24));
+		b[0] = a[9]; b[1] = a[10]; b[2] = a[11]; b[3] = a[12];
+		memcpy(&addr4->s_addr, b, 4);
 		break;
 	case 96:
 		addr4->s_addr = addr6->s6_addr32[3];
@@ -1034,6 +1042,45 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 	return ERROR_NONE;
 }
 
+int map_ip6_to_ip4_hairpin(struct in_addr *addr4, const struct in6_addr *addr6)
+{
+	struct map6 *map6;
+	struct map_static *s;
+	struct map4 *m4;
+
+	if (!gcfg.maps_immutable)
+		pthread_mutex_lock(&gcfg.map_mutex);
+	map6 = find_map6(addr6);
+	if (!map6 || map6->type != MAP_TYPE_RFC6052) {
+		if (!gcfg.maps_immutable)
+			pthread_mutex_unlock(&gcfg.map_mutex);
+		return ERROR_DROP;
+	}
+	if (extract_from_prefix(addr4, addr6, map6->prefix_len) < 0) {
+		if (!gcfg.maps_immutable)
+			pthread_mutex_unlock(&gcfg.map_mutex);
+		return ERROR_DROP;
+	}
+	if (map6->addr.s6_addr32[0] == WKPF &&
+	    map6->addr.s6_addr32[1] == 0 &&
+	    map6->addr.s6_addr32[2] == 0 &&
+	    gcfg.wkpf_strict && is_private_ip4_addr(addr4)) {
+		if (!gcfg.maps_immutable)
+			pthread_mutex_unlock(&gcfg.map_mutex);
+		return ERROR_REJECT;
+	}
+	s = container_of(map6, struct map_static, map6);
+	m4 = find_map4(addr4);
+	if (!m4 || m4 == &s->map4) {
+		if (!gcfg.maps_immutable)
+			pthread_mutex_unlock(&gcfg.map_mutex);
+		return ERROR_DROP;
+	}
+	if (!gcfg.maps_immutable)
+		pthread_mutex_unlock(&gcfg.map_mutex);
+	return ERROR_NONE;
+}
+
 static void report_ageout(struct cache_entry *c)
 {
 	struct map4 *m4;
@@ -1119,6 +1166,10 @@ static struct map_static *parse_map_entry(int line, char *v4, char *v6)
 
 static int map6_overlaps(const struct map6 *a, const struct map6 *b)
 {
+	if (a->prefix_len == b->prefix_len)
+		return IN6_ARE_ADDR_EQUAL(&a->addr, &b->addr);
+	if (a->type == MAP_TYPE_STATIC && b->type == MAP_TYPE_STATIC)
+		return 0;
 	return IN6_IS_IN_NET(&a->addr, &b->addr, &b->mask) ||
 		IN6_IS_IN_NET(&b->addr, &a->addr, &a->mask);
 }

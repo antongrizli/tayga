@@ -102,7 +102,6 @@ void test_config_compare(void) {
     expectl(gcfg.tun_up, tcfg.tun_up, "tun_up");
     expectl(gcfg.dispatch_mode, tcfg.dispatch_mode, "dispatch_mode");
     expectl(gcfg.async_tun, tcfg.async_tun, "async_tun");
-    expectl(gcfg.tun_steering_groups, tcfg.tun_steering_groups, "tun_steering_groups");
     expectl(gcfg.tun_steering_flows, tcfg.tun_steering_flows, "tun_steering_flows");
     expectl(gcfg.tun_steering_effective, 0, "tun_steering_effective");
     expectl(gcfg.tun_steering_errno, 0, "tun_steering_errno");
@@ -281,7 +280,7 @@ void test_config_init(void) {
      */
 #if defined(__amd64__) && defined(__linux__)
     if(!print_fail_only) printf("TEST CASE: config struct size\n");
-    expectl(sizeof(struct config),5392,"sizeof");
+    expectl(sizeof(struct config),5400,"sizeof");
 #endif
 
     /* Compare to our initialized tcfg */
@@ -1549,6 +1548,140 @@ static void test_hash_bits_derivation(void) {
     }
 }
 
+static void test_extra_directives(void) {
+    char conffile[] = "unit_conffile_extra.conf";
+    FILE *fd = fopen(conffile, "w");
+    expect(fd != NULL, "fopen");
+    if (!fd) return;
+    const char *cfg =
+        "tun-device nat64\n"
+        "ipv4-addr 192.0.2.254\n"
+        "ipv6-addr 2001:db8:ffff::fe\n"
+        "prefix 64:ff9b::/96\n"
+        "icmp-rate-limit 50\n"
+        "flow-label compute\n"
+        "strict-frag-hdr yes\n"
+        "tun-steering flows\n"
+        "icmp-v4-pool 198.51.100.128/28\n";
+    fwrite(cfg, strlen(cfg), 1, fd);
+    fclose(fd);
+
+    config_init();
+    getenv_case = 1;
+    expect(!config_read(conffile), "Read extra directives");
+    expect(!config_validate(), "Validate extra directives");
+    expectl(getenv_case, 0, "Getenv Called");
+    expectl(gcfg.icmp_rate_limit, 50, "icmp_rate_limit");
+    expectl(gcfg.flow_label_mode, FLOW_LABEL_COMPUTE, "flow_label_mode");
+    expectl(gcfg.tun_steering_flows, 1, "tun_steering_flows");
+    expectl(gcfg.icmp_v4_pool_len, 28, "icmp_v4_pool_len");
+    unlink(conffile);
+
+    /* Reject duplicate / invalid icmp-v4-pool */
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open bad icmp-v4-pool conf");
+    fputs("tun-device nat64\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\n"
+          "icmp-v4-pool 198.51.100.128/28\nicmp-v4-pool 198.51.100.144/28\n", fd);
+    fclose(fd);
+    config_init();
+    expect(config_read(conffile) != 0, "Duplicate icmp-v4-pool rejected");
+    unlink(conffile);
+
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open reserved icmp-v4-pool conf");
+    fputs("tun-device nat64\nipv4-addr 192.0.2.1\nipv6-addr 2001:db8::1\n"
+          "icmp-v4-pool 127.0.0.0/8\n", fd);
+    fclose(fd);
+    config_init();
+    expect(config_read(conffile) != 0, "Reserved icmp-v4-pool rejected");
+    unlink(conffile);
+}
+
+static void test_config_reload(void) {
+    char conffile[] = "/tmp/tayga_unit_reload.conf";
+    FILE *fd;
+
+    printf("TEST CASES FOR CONFIG RELOAD\n");
+
+    config_init();
+    pthread_mutex_init(&gcfg.map_mutex, NULL);
+    pthread_mutex_init(&gcfg.cache_mutex, NULL);
+
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open initial reload conf");
+    fputs("tun-device nat64\n"
+          "ipv4-addr 192.0.2.1\n"
+          "ipv6-addr 2001:db8::1\n"
+          "prefix 64:ff9b::/96\n"
+          "wkpf-strict yes\n"
+          "offlink-mtu 1400\n"
+          "icmp-rate-limit 500\n"
+          "map 192.0.2.10 2001:db8::10\n", fd);
+    fclose(fd);
+
+    getenv_case = 1;
+    expect(config_read(conffile) == 0, "Initial reload conf read");
+    expect(config_validate() == 0, "Initial reload conf validate");
+    expectl(getenv_case, 0, "Initial Getenv Called");
+    expectl(gcfg.maps_immutable, 1, "Initial maps_immutable");
+    expectl(gcfg.ipv6_offlink_mtu, 1400, "Initial ipv6_offlink_mtu");
+    expectl(gcfg.icmp_rate_limit, 500, "Initial icmp_rate_limit");
+
+    /* Reload with updated static map and scalar settings */
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open updated reload conf");
+    fputs("tun-device nat64\n"
+          "ipv4-addr 192.0.2.1\n"
+          "ipv6-addr 2001:db8::1\n"
+          "prefix 64:ff9b::/96\n"
+          "wkpf-strict no\n"
+          "offlink-mtu 1480\n"
+          "icmp-rate-limit 1200\n"
+          "map 192.0.2.20 2001:db8::20\n", fd);
+    fclose(fd);
+
+    getenv_case = 1;
+    expect(config_reload(conffile) == 0, "Valid config_reload succeeds");
+    expectl(getenv_case, 0, "Reload Getenv Called");
+    expectl(gcfg.wkpf_strict, 0, "Reloaded wkpf_strict");
+    expectl(gcfg.ipv6_offlink_mtu, 1480, "Reloaded ipv6_offlink_mtu");
+    expectl(gcfg.icmp_rate_limit, 1200, "Reloaded icmp_rate_limit");
+
+    struct in_addr a4;
+    struct in6_addr a6;
+    inet_pton(AF_INET, "192.0.2.20", &a4);
+    expect(map_ip4_to_ip6(&a6, &a4) == 0, "Reloaded map 192.0.2.20 lookup");
+
+    /* Invalid config reload must be rejected and retain active state */
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open invalid reload conf");
+    fputs("tun-device nat64\n"
+          "unknown-directive foo\n", fd);
+    fclose(fd);
+    expect(config_reload(conffile) != 0, "Invalid config_reload rejected");
+    expectl(gcfg.ipv6_offlink_mtu, 1480, "Active ipv6_offlink_mtu retained");
+    expect(map_ip4_to_ip6(&a6, &a4) == 0, "Active map retained after failed reload");
+
+    /* Switching maps_immutable mode at runtime must be rejected */
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open mode-switch reload conf");
+    fputs("tun-device nat64\n"
+          "ipv4-addr 192.0.2.1\n"
+          "ipv6-addr 2001:db8::1\n"
+          "prefix 64:ff9b::/96\n"
+          "dynamic-pool 192.0.2.128/25\n", fd);
+    fclose(fd);
+    getenv_case = 1;
+    expect(config_reload(conffile) != 0, "Switching immutable->dynamic rejected on reload");
+    expectl(getenv_case, 0, "Mode-switch Getenv Called");
+    expectl(gcfg.maps_immutable, 1, "maps_immutable preserved");
+
+    unlink(conffile);
+    config_free();
+    pthread_mutex_destroy(&gcfg.cache_mutex);
+    pthread_mutex_destroy(&gcfg.map_mutex);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* Test function or config_init */
@@ -1561,9 +1694,11 @@ int main(void) {
     test_worker_affinity_list();
 #endif
     test_hash_bits_derivation();
+    test_extra_directives();
 
     /* Test function for config_validate */
     test_config_validate();
+    test_config_reload();
 
     /* Clean up all configuration allocations before exit */
     config_free();

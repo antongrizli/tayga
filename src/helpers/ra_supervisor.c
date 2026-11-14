@@ -30,6 +30,12 @@
 #include "dns64_serve.h"
 #include "ra_supervisor.h"
 
+#ifdef PREF64_NO_MAIN
+#define RA_TESTABLE
+#else
+#define RA_TESTABLE __attribute__((unused)) static
+#endif
+
 #if defined(__linux__) || defined(__FreeBSD__)
 /*
  * Solicit a Router Advertisement on ifname and read PREF64 from it.
@@ -235,14 +241,14 @@ static void stop_ra_child(pid_t child)
 }
 #endif
 
-__attribute__((unused)) static void active_prefix_path(const char *dir, char *out, size_t size)
+RA_TESTABLE void active_prefix_path(const char *dir, char *out, size_t size)
 {
     snprintf(out, size, "%s/active-prefix", dir);
 }
 
 /* Publish the prefix the translator really runs, so status and verification
  * scripts do not read the (unchanged) installed profile. */
-__attribute__((unused)) static void publish_active_prefix(const char *dir, const struct in6_addr *prefix, int plen)
+RA_TESTABLE void publish_active_prefix(const char *dir, const struct in6_addr *prefix, int plen)
 {
     if (!dir)
         return;
@@ -261,7 +267,7 @@ __attribute__((unused)) static void publish_active_prefix(const char *dir, const
         unlink(tmp);
 }
 
-__attribute__((unused)) static void retract_active_prefix(const char *dir)
+RA_TESTABLE void retract_active_prefix(const char *dir)
 {
     if (!dir)
         return;
@@ -279,7 +285,7 @@ __attribute__((unused)) static time_t mono_seconds_now(void)
 
 /* Snapshots "<config>.ra.XXXXXX" survive a SIGKILL or power cut of an earlier
  * supervisor; one supervisor runs per profile, so every match is stale. */
-__attribute__((unused)) static void remove_stale_snapshots(const char *config)
+RA_TESTABLE void remove_stale_snapshots(const char *config)
 {
     char dir[1024], prefix[300];
     const char *slash = strrchr(config, '/');

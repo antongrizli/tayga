@@ -398,6 +398,9 @@ struct config {
 	//Map paramters
 	struct in_addr local_addr4;
 	struct in6_addr local_addr6;
+	struct in_addr icmp_v4_pool_addr;
+	struct in_addr icmp_v4_pool_mask;
+	int icmp_v4_pool_len; /* RFC 6791: 0 = disabled (use local_addr4) */
 	struct list_head map4_list;
 	struct list_head map6_list;
 	/* Set after validation when no code path can modify static maps. */
@@ -457,7 +460,6 @@ struct config {
 	int tun_fd_addl[MAX_WORKERS];
 	int dispatch_mode; /* bounded experimental software ingress dispatch */
 	int async_tun; /* explicit io_uring TX prototype */
-	int tun_steering_groups; /* opt-in, fresh nonpersistent interfaces only */
 	int tun_steering_flows;  /* opt-in 4-tuple flow steering */
 	int tun_steering_effective;
 	int tun_steering_errno;
@@ -472,6 +474,14 @@ struct config {
 	const char *tun_offload_reason;
 	int vnet_hdr_sz;
 	int tun_has_uso;
+};
+
+/// Process/daemon runtime state separated from declarative configuration
+struct tayga_runtime {
+	const char *conffile;
+	int pidfd;
+	int created_workers;
+	int thread_ids[MAX_WORKERS];
 };
 
 /// Logging flags
@@ -522,6 +532,7 @@ enum {
 
 /* TAYGA function prototypes */
 extern struct config gcfg;
+extern struct tayga_runtime grt;
 extern _Atomic time_t now;
 void addrmap_invalidate_front(void);
 int addrmap_build_index(void);
@@ -547,12 +558,15 @@ int calc_ip6_mask(struct in6_addr *mask, const struct in6_addr *addr, int len);
 int create_cache(void);
 int insert_map4(struct map4 *m, struct map4 **conflict);
 int insert_map6(struct map6 *m, struct map6 **conflict);
+int insert_map4_to(struct list_head *head, struct map4 *m, struct map4 **conflict);
+int insert_map6_to(struct list_head *head, struct map6 *m, struct map6 **conflict);
 struct map4 *find_map4(const struct in_addr *addr4);
 struct map6 *find_map6(const struct in6_addr *addr6);
 int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 		const struct in6_addr *prefix, int prefix_len);
 int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4);
 int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_alloc);
+int map_ip6_to_ip4_hairpin(struct in_addr *addr4, const struct in6_addr *addr6);
 void addrmap_maint(void);
 int addrmap_reload(void);
 
@@ -561,6 +575,7 @@ int config_init(void);
 void config_free(void);
 int config_read(char *conffile);
 int config_validate(void);
+int config_reload(const char *conffile);
 
 /* dynamic.c */
 struct map6 *assign_dynamic(const struct in6_addr *addr6);

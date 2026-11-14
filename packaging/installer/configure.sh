@@ -27,7 +27,7 @@ nat66_address=${NAT66_ADDRESS:-}
 out=
 management4=${SSH_CONNECTION:-}
 management4=${management4%% *}
-case "$management4" in *:*) management4= ;; *[!0-9.]*) fail 'Invalid SSH peer address' ;; esac
+case "$management4" in UNKNOWN|*:*) management4= ;; *[!0-9.]*) fail 'Invalid SSH peer address' ;; esac
 
 generate_deterministic_ula() {
     seed=

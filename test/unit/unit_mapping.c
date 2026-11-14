@@ -193,18 +193,23 @@ static void test_eam(void)
     }
     reclaim();
     configure("map 198.51.100.90/32 2001:db8:aaaa::/64\n");
-    /* Overlapping IPv6 entries cannot bypass the host-map fast path's
-     * invariant, even when the IPv4 mapping has no suffix bits. */
+    /* Exact duplicate IPv6 EAM prefixes are still rejected. */
     FILE *overlap = fopen("mapping-invalid.conf", "w"); assert(overlap);
-    fputs("map 198.51.100.91 2001:db8:aaaa::1\n", overlap); fclose(overlap);
+    fputs("map 198.51.100.91/32 2001:db8:aaaa::/64\n", overlap); fclose(overlap);
     assert(config_read("mapping-invalid.conf") == ERROR_REJECT);
     unlink("mapping-invalid.conf");
     check_pair("198.51.100.90", "2001:db8:aaaa::");
+    reclaim();
+    /* Overlapping IPv6 static EAM entries of different prefix lengths resolve via LPM (RFC 7757). */
+    configure("map 198.51.100.90/32 2001:db8:aaaa::/64\nmap 198.51.100.91 2001:db8:aaaa::1\n");
+    check_pair("198.51.100.90", "2001:db8:aaaa::");
+    check_pair("198.51.100.91", "2001:db8:aaaa::1");
     strcpy(gcfg.map_file,"mapping-reload.conf");gcfg.maps_immutable=0;
     overlap=fopen(gcfg.map_file,"w");assert(overlap);
-    fputs("map 198.51.100.91 2001:db8:aaaa::2\nmap 192.0.2.254 2001:db8:bbbb::1\n",overlap);fclose(overlap);
+    fputs("map 198.51.100.92 2001:db8:aaaa::2\nmap 192.0.2.254 2001:db8:bbbb::1\n",overlap);fclose(overlap);
     assert(addrmap_reload()==0); /* Conflicting fixed/self entries are skipped. */
     check_pair("198.51.100.90", "2001:db8:aaaa::");
+    check_pair("198.51.100.92", "2001:db8:aaaa::2");
     struct in_addr local;struct in6_addr unused;
     inet_pton(AF_INET,"192.0.2.254",&local);
     assert(map_ip4_to_ip6(&unused,&local)==0);
@@ -214,7 +219,41 @@ static void test_eam(void)
     assert(addrmap_reload()==ERROR_REJECT);
     check_pair("198.51.100.90", "2001:db8:aaaa::");
     unlink(gcfg.map_file);reclaim();
-    puts("PASS: host/subnet EAM, reload, self/IPv6 overlap invariants and LPM override");
+
+    /* RFC 6052 §2.2: ignore u-octet (s6_addr[8]) and trailing suffix bits for non-/96 prefixes. */
+    {
+        const struct {
+            const char *prefix;
+            const char *v6_with_bits;
+            const char *expected_v4;
+        } rfc6052_cases[] = {
+            {"prefix fd00::/32\n",           "fd00:0:c633:645a:ff:0012:3456:789a",     "198.51.100.90"},
+            {"prefix 2001:db8:100::/40\n",   "2001:db8:1c6:3364:ff5a:0012:3456:789a", "198.51.100.90"},
+            {"prefix 2001:db8:123::/48\n",   "2001:db8:123:c633:ff64:5a12:3456:789a", "198.51.100.90"},
+            {"prefix 2001:db8:1234::/56\n",  "2001:db8:1234:00c6:ff33:645a:1234:5678", "198.51.100.90"},
+            {"prefix 2001:db8:1:2::/64\n",   "2001:db8:1:2:ffc6:3364:5a12:3456",     "198.51.100.90"},
+        };
+        for (size_t i = 0; i < sizeof(rfc6052_cases) / sizeof(rfc6052_cases[0]); i++) {
+            configure(rfc6052_cases[i].prefix);
+            struct in6_addr in6; struct in_addr out4, exp4;
+            assert(inet_pton(AF_INET6, rfc6052_cases[i].v6_with_bits, &in6) == 1);
+            assert(inet_pton(AF_INET, rfc6052_cases[i].expected_v4, &exp4) == 1);
+            assert(map_ip6_to_ip4(&out4, &in6, 0) == 0);
+            assert(out4.s_addr == exp4.s_addr);
+            reclaim();
+        }
+    }
+
+    /* RFC 7526: 192.88.99.0/24 is rejected under wkpf-strict=yes with 64:ff9b::/96. */
+    configure("prefix 64:ff9b::/96\n");
+    gcfg.wkpf_strict = 1;
+    {
+        struct in6_addr v6_6to4; struct in_addr out4;
+        assert(inet_pton(AF_INET6, "64:ff9b::c058:6301", &v6_6to4) == 1); /* 192.88.99.1 */
+        assert(map_ip6_to_ip4(&out4, &v6_6to4, 0) == ERROR_REJECT);
+    }
+    reclaim();
+    puts("PASS: host/subnet EAM, reload, RFC 7757 LPM, RFC 6052 §2.2, RFC 7526");
 }
 
 int main(void)
