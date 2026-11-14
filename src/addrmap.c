@@ -1007,6 +1007,11 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 				pthread_mutex_unlock(&gcfg.map_mutex);
 			return ERROR_DROP;
 		}
+		if (map6->prefix_len != 96) {
+			struct in6_addr canon;
+			cache_pair = append_to_prefix(&canon, addr4, &s->map6.addr, map6->prefix_len) == 0 &&
+				IN6_ARE_ADDR_EQUAL(addr6, &canon);
+		}
 		break;
 	case MAP_TYPE_DYNAMIC_HOST:
 		d = container_of(map6, struct map_dynamic, map6);

@@ -655,4 +655,4 @@ dynamic_pool()
 time.sleep(1)
 test.cleanup()
 #Print test report
-test.report(189,17)
+test.report(204,2)

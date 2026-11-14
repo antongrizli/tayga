@@ -239,7 +239,7 @@ def prefix_generic(pref,strict,expect_drop,expect_icmp):
     test_prefix(pref,"192.0.0.5","DS-Lite Space 5",False,False)
     test_prefix(pref,"192.0.0.6","DS-Lite Space 6",False,False)
     test_prefix(pref,"192.0.0.7","DS-Lite Space 7",False,False)
-    test_prefix(pref,"192.88.99.52","6to4 Relay Space",False,False)
+    test_prefix(pref,"192.88.99.52","6to4 Relay Space",expect_drop,expect_icmp)
 
     #Finished
 
