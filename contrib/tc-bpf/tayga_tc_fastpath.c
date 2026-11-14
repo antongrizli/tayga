@@ -18,8 +18,10 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <stddef.h>
-#include <stdint.h>
 
+#ifndef __always_inline
+#define __always_inline inline __attribute__((always_inline))
+#endif
 #ifndef SEC
 #define SEC(NAME) __attribute__((section(NAME), used))
 #endif
