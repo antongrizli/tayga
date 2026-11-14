@@ -990,10 +990,25 @@ def sec_4_2():
 #############################################
 def sec_4_2_rfc4884():
     global test
+    global expect_class
+    global expect_sa
+    global expect_da
+    global expect_type
+    global expect_code
+    global expect_ptr
     # Setup config for this section
     test.tayga_conf.default()
     test.reload()
-    test.tfail("ICMPv4 Packets with Extensions (RFC4884)","Not Implemented")
+    expect_class = ICMPv6TimeExceeded()
+    expect_sa = test.public_ipv4_xlate
+    expect_da = test.public_ipv6
+    expect_type = 3
+    expect_code = 0
+    expect_ptr = -1
+    ext_obj = b"\x20\x00\xdf\xff\x00\x04\x01\x01"
+    inner_pkt = IP(dst=str(test.public_ipv4),src=str(test.public_ipv6_xlate)) / ICMP(type=8,code=0,id=221,seq=19) / Raw(b"A" * 100)
+    send_pkt = IP(dst=str(test.public_ipv6_xlate),src=str(test.public_ipv4)) / ICMP(type=11,code=0,length=32) / inner_pkt / Raw(ext_obj)
+    test.send_and_check(send_pkt,icmp6_val, "ICMPv4 Packets with Extensions (RFC4884)")
     test.section("ICMPv4 Packets with Extensions (RFC 7915 4.2 + RFC4884)")
 
 #############################################
@@ -1954,5 +1969,5 @@ time.sleep(1)
 
 test.cleanup()
 #Print test report (expected pass/fail count)
-test.report(249,1)
+test.report(250,0)
 

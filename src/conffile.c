@@ -1219,8 +1219,16 @@ static int config_validate_internal(int build_index)
 		}
 	/* ipv6-addr is zero (not set), generate from ipv4-addr and prefix */
 	} else {
-		m6 = list_entry(cfg_target->map6_list.prev, struct map6, list);
-		if (m6->type != MAP_TYPE_RFC6052) {
+		struct list_head *entry;
+		m6 = NULL;
+		list_for_each(entry, &cfg_target->map6_list) {
+			struct map6 *cand = list_entry(entry, struct map6, list);
+			if (cand->type == MAP_TYPE_RFC6052) {
+				m6 = cand;
+				break;
+			}
+		}
+		if (!m6) {
 			slog(LOG_CRIT, "Error: ipv6-addr directive must be "
 					"specified if no NAT64 prefix is "
 					"configured\n");

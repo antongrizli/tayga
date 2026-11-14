@@ -572,9 +572,22 @@ def test_conflicts():
     pkt = IPv6(dst="3fff:6464::69", src=str(test.public_ipv6), nh=16) / Raw(randbytes(128))
     test.send_and_none(pkt, "iter 6a: v6 pref64 absent")
 
-    # Overlapping with dynamic-pool is not guaranteed at this point
-    test.tfail("Map-file overlaps with dynamic-pool","Not Implemented")
-    
+    # iter 7a/b: v4 entry is within dynamic-pool
+    test.tayga_conf.default()
+    test.tayga_conf.map_file_entries = [
+        f"{map_v4+1} {map_v6+1}",
+        f"172.16.0.50 {map_v6+2}",
+    ]
+    test.reload()
+    send_v4_mapped(map_v4+1, map_v6+1, "iter 7a: v4 1->1 present")
+    send_v6_mapped(map_v6+1, map_v4+1, "iter 7a: v6 1->1 present")
+    send_v6_rejected(map_v6+2,         "iter 7a: v6 dynamic-pool overlap absent")
+
+    test.reconf()
+    send_v4_mapped(map_v4+1, map_v6+1, "iter 7b: v4 1->1 present")
+    send_v6_mapped(map_v6+1, map_v4+1, "iter 7b: v6 1->1 present")
+    send_v6_rejected(map_v6+2,         "iter 7b: v6 dynamic-pool overlap absent")
+
     test.section("Map-File: Conflicts")
 
 
@@ -592,4 +605,4 @@ test_conflicts()
 #Cleanup and test report
 time.sleep(1)
 test.cleanup()
-test.report(144,1)
+test.report(150,0)

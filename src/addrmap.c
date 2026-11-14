@@ -1239,8 +1239,12 @@ int addrmap_reload(void)
 			struct list_head *fixed;
 			list_for_each(fixed, &gcfg.map4_list) {
 				struct map4 *f = list_entry(fixed, struct map4, list);
-				if (!is_file_map4(f) && f->prefix_len == m->map4.prefix_len &&
-					f->addr.s_addr == m->map4.addr.s_addr) {
+				if (!is_file_map4(f) &&
+				    ((f->prefix_len == m->map4.prefix_len &&
+				      f->addr.s_addr == m->map4.addr.s_addr) ||
+				     (f->type == MAP_TYPE_DYNAMIC_POOL &&
+				      ((m->map4.addr.s_addr & f->mask.s_addr) == f->addr.s_addr ||
+				       (f->addr.s_addr & m->map4.mask.s_addr) == m->map4.addr.s_addr)))) {
 					conflict = 1;
 					break;
 				}
