@@ -65,6 +65,7 @@ PROBE_TESTABLE uint16_t icmp6_cksum(const uint8_t src6[16], const uint8_t dst6[1
     return inet_cksum(icmp, icmp_len, sum);
 }
 
+#ifndef PREF64_NO_MAIN
 static int open_tun_dev(const char *dev)
 {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -124,12 +125,14 @@ int tun_echo6(const char *dev)
     close(fd);
     return 0;
 }
+#endif
 
 int tun_client4(const char *dev, const char *src_str, const char *dst_str)
 {
     struct in_addr src4, dst4;
     if (inet_pton(AF_INET, src_str, &src4) != 1 || inet_pton(AF_INET, dst_str, &dst4) != 1)
         return 1;
+#ifndef PREF64_NO_MAIN
     int fd = open_tun_dev(dev);
     if (fd < 0) return 1;
     uint8_t pkt[28];
@@ -169,6 +172,10 @@ int tun_client4(const char *dev, const char *src_str, const char *dst_str)
     }
     close(fd);
     return 1;
+#else
+    (void)dev;
+    return 1;
+#endif
 }
 
 int tun_client6(const char *dev, const char *src_str, const char *dst_str)
@@ -176,6 +183,7 @@ int tun_client6(const char *dev, const char *src_str, const char *dst_str)
     struct in6_addr src6, dst6;
     if (inet_pton(AF_INET6, src_str, &src6) != 1 || inet_pton(AF_INET6, dst_str, &dst6) != 1)
         return 1;
+#ifndef PREF64_NO_MAIN
     int fd = open_tun_dev(dev);
     if (fd < 0) return 1;
     uint8_t pkt[48];
@@ -211,5 +219,9 @@ int tun_client6(const char *dev, const char *src_str, const char *dst_str)
     }
     close(fd);
     return 1;
+#else
+    (void)dev;
+    return 1;
+#endif
 }
 #endif

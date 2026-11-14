@@ -36,7 +36,7 @@
 #define RA_TESTABLE __attribute__((unused)) static
 #endif
 
-#if defined(__linux__) || defined(__FreeBSD__)
+#if !defined(PREF64_NO_MAIN) && (defined(__linux__) || defined(__FreeBSD__))
 /*
  * Solicit a Router Advertisement on ifname and read PREF64 from it.
  * Needs CAP_NET_RAW; returns -2 when the socket cannot be opened so the
@@ -177,6 +177,7 @@ int discover_ra_pref64(const char *ifname, int timeout_sec, struct in6_addr *out
 
 #endif
 
+#ifndef PREF64_NO_MAIN
 static volatile sig_atomic_t supervisor_hup, supervisor_usr1, supervisor_usr2;
 static void supervisor_signal(int sig)
 {
@@ -240,6 +241,7 @@ static void stop_ra_child(pid_t child)
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
 }
 #endif
+#endif /* !PREF64_NO_MAIN */
 
 RA_TESTABLE void active_prefix_path(const char *dir, char *out, size_t size)
 {
@@ -362,8 +364,8 @@ int supervise_ra(int argc, char **argv)
     int read_failed = ferror(in);
     fclose(in);
     if (read_failed) return 1;
+#if !defined(PREF64_NO_MAIN) && (defined(__linux__) || defined(__FreeBSD__))
     if (!iface[0]) { execvp(argv[command], argv + command); return 1; }
-#if defined(__linux__) || defined(__FreeBSD__)
     int ra_fd = open_ra_socket(iface);
     if (ra_fd < 0) {
         fprintf(stderr, "Cannot use %s for Router Advertisements%s\n", iface,
@@ -560,8 +562,11 @@ int supervise_ra(int argc, char **argv)
     unlink(snapshot);
     return result;
 #else
-    (void)configured; (void)nat66; (void)supervisor_signal; (void)controller;
+    (void)iface; (void)configured; (void)nat66; (void)controller;
     (void)runtime_dir; (void)initial_prefix; (void)initial_lifetime;
+#ifndef PREF64_NO_MAIN
+    (void)supervisor_signal;
+#endif
     return 1;
 #endif
 }
