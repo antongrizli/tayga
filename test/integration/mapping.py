@@ -434,9 +434,38 @@ def rfc7757_eam():
             # Clear some expecteds
             expect_proto = 16
 
-    # Fail unequal lengths until #37 is resolved
-    # That is commented out as it tayga will exit with error
-    test.tfail("Unequal Suffix Legnths","See Issue #37")
+    # Unequal suffix lengths (RFC 7757 EAM: 32 - len4 <= 128 - len6)
+    test.flush()
+    test.tayga_conf.default()
+    test.tayga_conf.dynamic_pool = None
+    test.tayga_conf.map.append("10.0.0.0/24 2001:db8:beef:0:cafe::/80")
+    test.reload()
+    rt_v4 = router("8.0.0.0/6")
+    rt_v6 = router("2001:db8:beef::/64")
+    rt_v4.apply()
+    expect_sa = test.public_ipv4_xlate
+    expect_da = ipaddress.ip_address("2001:db8:beef:0:cafe::")
+    expect_data = randbytes(128)
+    expect_len = 128
+    send_pkt = IP(dst="10.0.0.0",src=str(test.public_ipv4),proto=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip6_val, "8 bits unequal dest min v4->v6")
+    expect_da = ipaddress.ip_address("2001:db8:beef:0:cafe:ff00::")
+    expect_data = randbytes(128)
+    send_pkt = IP(dst="10.0.0.255",src=str(test.public_ipv4),proto=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip6_val, "8 bits unequal dest max v4->v6")
+    rt_v4.remove()
+    rt_v6.apply()
+    expect_sa = test.public_ipv6_xlate
+    expect_da = ipaddress.ip_address("10.0.0.0")
+    expect_data = randbytes(128)
+    expect_len = 128+20
+    send_pkt = IPv6(dst="2001:db8:beef:0:cafe::",src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "8 bits unequal dest min v6->v4")
+    expect_da = ipaddress.ip_address("10.0.0.255")
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst="2001:db8:beef:0:cafe:ff00::",src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "8 bits unequal dest max v6->v4")
+    rt_v6.remove()
 
     ####
     #  Overlapping EAM Regions
@@ -542,47 +571,88 @@ def rfc7757_eam():
     test.send_and_check(send_pkt,ip6_val, "overlap src over net2 v4->v6")
 
 
-    ## This section will crash tayga
-    ## So it has been commented out
-    test.tfail("IPv6 Overlapping Ranges","See Issue #10")
-    test.section("Explicit Address Mapping (RFC 7757 3.2)")
-    return
-
-
-    # Generate test config for this one
+    # Generate test config for overlapping IPv6 EAM ranges (RFC 7757 LPM)
     test.tayga_conf.default()
     test.tayga_conf.dynamic_pool = None
-    # Regions which overlap in IPv6 this time
     test.tayga_conf.map.append("10.0.0.0/16 2001:db8:beef:0:cafe::/112")
     test.tayga_conf.map.append("11.0.0.0/24 2001:db8:beef:0:cafe::100/120")
     test.tayga_conf.map.append("9.1.2.3/32  2001:db8:beef:0:cafe::106/128")
     test.reload()
 
-    
     net1_v4 = ipaddress.ip_network("10.0.0.0/16")
     net1_v6 = ipaddress.ip_network("2001:db8:beef:0:cafe::/112")
-    net2_v4 = ipaddress.ip_network("10.0.0.0/24")
+    net2_v4 = ipaddress.ip_network("11.0.0.0/24")
     net2_v6 = ipaddress.ip_network("2001:db8:beef:0:cafe::100/120")
     net3_v4 = ipaddress.ip_network("9.1.2.3/32")
     net3_v6 = ipaddress.ip_network("2001:db8:beef:0:cafe::106/128")
 
     # v6->v4 dest
-    test.reload()
     rt_v6.apply()
     expect_sa = test.public_ipv6_xlate
-    expect_da = net1_v4.network_address+255
-    expect_data = randbytes(128)
     expect_len = 128+20
+    expect_da = net1_v4.network_address + 255
+    expect_data = randbytes(128)
     send_pkt = IPv6(dst=str(net2_v6.network_address-1),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
-    test.send_and_check(send_pkt,ip_val, test_nm+" dest min v6->v4")
-    expect_sa = test.public_ipv6_xlate
-    expect_da = this_net4.broadcast_address
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest under net2 v6->v4")
+    expect_da = net2_v4.network_address
     expect_data = randbytes(128)
-    expect_len = 128+20
-    send_pkt = IPv6(dst=str(this_net6.broadcast_address),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
-    test.send_and_check(send_pkt,ip_val, test_nm+" dest max v6->v4")
+    send_pkt = IPv6(dst=str(net2_v6.network_address),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest min net2 v6->v4")
+    expect_da = net2_v4.network_address + 5
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(net3_v6.network_address-1),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest under net3 v6->v4")
+    expect_da = net3_v4.network_address
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(net3_v6.network_address),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest equal net3 v6->v4")
+    expect_da = net2_v4.network_address + 7
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(net3_v6.network_address+1),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest over net3 v6->v4")
+    expect_da = net2_v4.broadcast_address
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(net2_v6.broadcast_address),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest max net2 v6->v4")
+    expect_da = net1_v4.network_address + 512
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(net2_v6.broadcast_address+1),src=str(test.public_ipv6),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 dest over net2 v6->v4")
+    rt_v6.remove()
 
     # v6->v4 src
+    expect_da = test.public_ipv4
+    expect_len = 128+20
+    expect_sa = net1_v4.network_address + 255
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net2_v6.network_address-1),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src under net2 v6->v4")
+    expect_sa = net2_v4.network_address
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net2_v6.network_address),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src min net2 v6->v4")
+    expect_sa = net2_v4.network_address + 5
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net3_v6.network_address-1),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src under net3 v6->v4")
+    expect_sa = net3_v4.network_address
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net3_v6.network_address),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src equal net3 v6->v4")
+    expect_sa = net2_v4.network_address + 7
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net3_v6.network_address+1),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src over net3 v6->v4")
+    expect_sa = net2_v4.broadcast_address
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net2_v6.broadcast_address),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src max net2 v6->v4")
+    expect_sa = net1_v4.network_address + 512
+    expect_data = randbytes(128)
+    send_pkt = IPv6(dst=str(test.public_ipv4_xlate),src=str(net2_v6.broadcast_address+1),nh=16) / Raw(expect_data)
+    test.send_and_check(send_pkt,ip_val, "overlap v6 src over net2 v6->v4")
+
+    test.section("Explicit Address Mapping (RFC 7757 3.2)")
 
 
 
@@ -655,4 +725,4 @@ dynamic_pool()
 time.sleep(1)
 test.cleanup()
 #Print test report
-test.report(204,2)
+test.report(222,0)

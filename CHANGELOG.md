@@ -6,6 +6,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- `tc-bpf` helper (`tayga-tc-ctl`): added `map-file` directive parsing and Linux `bpffs` syscall synchronization (`--sync-maps <tayga.conf> <pin_dir>` and `--read-stats <pin_dir> [--json]`) without `libbpf`.
+- CI checks in `review-gates.yml` for `make -C contrib/tc-bpf clean test` and `make microbench` GitHub Step Summary reporting.
 - `icmp-v4-pool PREFIX/LEN` (RFC 6791): deterministic pool-based IPv4 source address selection for ICMPv4 errors originated from untranslatable IPv6 sources, falling back to `ipv4-addr`.
 - Full `SIGHUP` configuration hot-reload (`config_reload()`): parses and validates the updated configuration in isolation and atomically applies reloadable settings and mappings without recreating the TUN interface, retaining active state on validation errors or immutable mode changes.
 - RFC 7757 §4.2 hairpinning (`map_ip6_to_ip4_hairpin()` / `hairpin_6to4to6()`) and overlapping static IPv6 EAM prefixes resolved by longest-prefix match.
@@ -19,11 +21,14 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Changed
 
+- Activated and expanded Scapy integration tests for RFC 7757 EAM unequal suffixes, overlapping IPv6 EAM LPM ranges, RFC 4884 ICMPv4 extensions, and `map-file` / `dynamic-pool` overlap rejection (`0` expected failures across all 6 suites).
 - Retired `tun-steering groups` in favor of `kernel` (default) and `flows`.
 - Decomposed daemon startup and lifecycle state in `src/tayga.c` (`struct tayga_runtime` and single-purpose initialization/loop helpers).
 - `src/helpers/pref64-discover.c` is split into `pref64-discover.c`, `pref64_ra.c`, `dns64_serve.c`, `ra_supervisor.c` and `tun_probe.c`; builds that compiled the single file directly must now use `make pref64-discover` or compile all five.
 
 ### Fixed
+
+- `addrmap_reload()` now rejects `map-file` entries overlapping `dynamic-pool`.
 
 - RFC 6052 §2.2 compliance: `extract_from_prefix()` now ignores unused suffix and u-octet bits for non-`/96` prefixes instead of rejecting valid packets.
 - RFC 6890 compliance: `192.88.99.0/24` (RFC 7526 deprecated 6to4 Relay Anycast) is treated as non-global under `wkpf-strict`.

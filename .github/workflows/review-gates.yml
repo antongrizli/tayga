@@ -62,6 +62,17 @@ jobs:
             make clean
             make CC=$cc CFLAGS='-O2 -Wall -Wextra -Wshadow -Wformat=2 -Werror' tayga pref64-discover
           done
+      - name: Build and self-test standalone tc-bpf fast-path prototype
+        run: make -C contrib/tc-bpf clean test
+      - name: Run translator microbenchmark and publish summary
+        run: |
+          make microbench | tee build/microbench.txt
+          {
+            echo "### Translator Microbenchmark (\`make microbench\`)"
+            echo '```'
+            cat build/microbench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
   static-analysis:
     runs-on: ubuntu-24.04
     steps:

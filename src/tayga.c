@@ -266,8 +266,15 @@ static void print_op_info(void)
 	slog(LOG_INFO, "TAYGA's IPv4 address: %s\n", addrbuf);
 	inet_ntop(AF_INET6, &gcfg.local_addr6, addrbuf, sizeof(addrbuf));
 	slog(LOG_INFO, "TAYGA's IPv6 address: %s\n", addrbuf);
-	m6 = list_entry(gcfg.map6_list.prev, struct map6, list);
-	if (m6->type == MAP_TYPE_RFC6052) {
+	m6 = NULL;
+	list_for_each(entry, &gcfg.map6_list) {
+		s6 = list_entry(entry, struct map6, list);
+		if (s6->type == MAP_TYPE_RFC6052) {
+			m6 = s6;
+			break;
+		}
+	}
+	if (m6) {
 		inet_ntop(AF_INET6, &m6->addr, addrbuf, sizeof(addrbuf));
 		slog(LOG_INFO, "NAT64 prefix: %s/%d\n",
 				addrbuf, m6->prefix_len);
