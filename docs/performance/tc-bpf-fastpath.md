@@ -44,12 +44,14 @@ Userspace TAYGA owns configuration parsing (`conffile.c`), validation, `SIGHUP` 
 
 A minimal, verifier-oriented `tc-bpf` prototype and shared map control helper are provided under `contrib/tc-bpf/`:
 
-- [tayga_tc_fastpath.c](../../contrib/tc-bpf/tayga_tc_fastpath.c): `cls_bpf` dataplane using `bpf_skb_change_proto()`
-- [tayga_tc_maps.h](../../contrib/tc-bpf/tayga_tc_maps.h): shared BPF map ABI (`tayga_bpf_cfg`, `tayga_lpm4_key`, `tayga_lpm6_key`, `tayga_eam_val`, `tayga_bpf_stats`)
-- [tayga_tc_ctl.c](../../contrib/tc-bpf/tayga_tc_ctl.c): control-plane helper parsing `tayga.conf` into BPF map records and formatting Prometheus/JSON counters
+- [tayga_tc_fastpath.c](../../contrib/tc-bpf/tayga_tc_fastpath.c): `cls_bpf` dataplane using `bpf_skb_change_proto()` and `LIBBPF_PIN_BY_NAME` (`__uint(pinning, 1)`) map auto-pinning
+- [tayga_tc_maps.h](../../contrib/tc-bpf/tayga_tc_maps.h): shared BPF map ABI (`tayga_bpf_cfg`, `tayga_lpm4_key`, `tayga_lpm6_key`, `tayga_eam_val` with `src_prefix_len`, `tayga_bpf_stats`) and inline RFC 7757 subnet EAM suffix synthesis helpers (`tayga_bpf_eam_4to6()`, `tayga_bpf_eam_6to4()`)
+- [tayga_tc_ctl.c](../../contrib/tc-bpf/tayga_tc_ctl.c): control-plane helper parsing `tayga.conf` / `map-file` into BPF map records (enforcing `(32 - l4) <= (128 - l6)`), synchronizing pinned `bpffs` maps (`--sync-maps`), and formatting Prometheus/JSON counters (`--read-stats`)
+- [test_kernel_e2e.sh](../../contrib/tc-bpf/test_kernel_e2e.sh): isolated network/mount namespace test attaching `tayga_tc_fastpath.o` to `veth` `clsact` egress and verifying live host/subnet EAM translation and checksums with Scapy
 
-Build and run the self-test via [Makefile](../../contrib/tc-bpf/Makefile):
+Build and run the userspace self-test and live kernel `cls_bpf` test via [Makefile](../../contrib/tc-bpf/Makefile):
 
 ```sh
 make -C contrib/tc-bpf test
+sudo make -C contrib/tc-bpf test-kernel
 ```

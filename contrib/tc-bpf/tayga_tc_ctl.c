@@ -83,6 +83,8 @@ static int parse_eam_pair(const char *tok1, const char *tok2,
 	if (parse_cidr4(tok1, &a4, &l4) != 0 ||
 	    parse_cidr6(tok2, a6, &l6) != 0)
 		return -1;
+	if ((32 - l4) > (128 - l6))
+		return -1;
 
 	size_t idx = (*eam_count_out)++;
 	memset(&k4[idx], 0, sizeof(k4[idx]));
@@ -91,6 +93,7 @@ static int parse_eam_pair(const char *tok1, const char *tok2,
 	k4[idx].addr = a4;
 	memcpy(v4[idx].prefix, a6, 16);
 	v4[idx].prefix_len = (__u8)l6;
+	v4[idx].src_prefix_len = (__u8)l4;
 
 	memset(&k6[idx], 0, sizeof(k6[idx]));
 	memset(&v6[idx], 0, sizeof(v6[idx]));
@@ -98,6 +101,7 @@ static int parse_eam_pair(const char *tok1, const char *tok2,
 	memcpy(k6[idx].addr, a6, 16);
 	v6[idx].prefix[0] = a4;
 	v6[idx].prefix_len = (__u8)l4;
+	v6[idx].src_prefix_len = (__u8)l6;
 	return 0;
 }
 
@@ -445,10 +449,57 @@ static int run_self_test(void)
 	assert(memcmp(cfg.pref64_words, exp_pref.s6_addr, 12) == 0);
 
 	assert(eam_count == 3);
-	assert(k4[0].prefixlen == 32 && v4[0].prefix_len == 128);
-	assert(k4[1].prefixlen == 24 && v4[1].prefix_len == 56);
-	assert(k6[1].prefixlen == 56 && v6[1].prefix_len == 24);
-	assert(k4[2].prefixlen == 32 && v4[2].prefix_len == 128);
+	assert(k4[0].prefixlen == 32 && v4[0].prefix_len == 128 && v4[0].src_prefix_len == 32);
+	assert(k4[1].prefixlen == 24 && v4[1].prefix_len == 56 && v4[1].src_prefix_len == 24);
+	assert(k6[1].prefixlen == 56 && v6[1].prefix_len == 24 && v6[1].src_prefix_len == 56);
+	assert(k4[2].prefixlen == 32 && v4[2].prefix_len == 128 && v4[2].src_prefix_len == 32);
+
+	/* Reject invalid EAM suffix expansion (32 - l4 > 128 - l6) */
+	assert(parse_eam_pair("198.51.100.0/24", "2001:db8::/124",
+			      k4, v4, k6, v6, 8, &eam_count) != 0);
+	assert(eam_count == 3);
+
+	/* Test /32 <-> /128 host EAM synthesis */
+	{
+		struct in_addr in4, out4;
+		struct in6_addr out6, exp6;
+		assert(inet_pton(AF_INET, "192.0.2.1", &in4) == 1);
+		assert(inet_pton(AF_INET6, "2001:db8::1", &exp6) == 1);
+		tayga_bpf_eam_4to6(in4.s_addr, &v4[0], out6.s6_addr32);
+		assert(memcmp(&out6, &exp6, sizeof(out6)) == 0);
+		out4.s_addr = tayga_bpf_eam_6to4(out6.s6_addr32, &v6[0]);
+		assert(out4.s_addr == in4.s_addr);
+	}
+
+	/* Test /24 <-> /120, /24 <-> /80, and cross-word /16 <-> /88 EAM synthesis */
+	{
+		static const struct {
+			const char *p4;
+			const char *p6;
+			const char *in4_str;
+			const char *exp6_str;
+		} cases[] = {
+			{ "198.51.100.0/24", "2001:db8:200::/120",
+			  "198.51.100.42", "2001:db8:200::2a" },
+			{ "10.0.0.0/24", "2001:db8:beef:0:cafe::/80",
+			  "10.0.0.42", "2001:db8:beef:0:cafe:2a00::" },
+			{ "10.20.0.0/16", "2001:db8:cafe::/88",
+			  "10.20.18.52", "2001:db8:cafe::12:3400:0" },
+		};
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			size_t idx = eam_count;
+			assert(parse_eam_pair(cases[i].p4, cases[i].p6,
+					      k4, v4, k6, v6, 8, &eam_count) == 0);
+			struct in_addr in4, out4;
+			struct in6_addr out6, exp6;
+			assert(inet_pton(AF_INET, cases[i].in4_str, &in4) == 1);
+			assert(inet_pton(AF_INET6, cases[i].exp6_str, &exp6) == 1);
+			tayga_bpf_eam_4to6(in4.s_addr, &v4[idx], out6.s6_addr32);
+			assert(memcmp(&out6, &exp6, sizeof(out6)) == 0);
+			out4.s_addr = tayga_bpf_eam_6to4(exp6.s6_addr32, &v6[idx]);
+			assert(out4.s_addr == in4.s_addr);
+		}
+	}
 
 	struct tayga_bpf_stats st = { .fast_4to6 = 123, .fast_6to4 = 456, .slow_fallback = 7 };
 	FILE *mem = tmpfile();

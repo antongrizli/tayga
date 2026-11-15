@@ -30,26 +30,17 @@
  */
 int validate_ip4_addr(const struct in_addr *a)
 {
-	/* First Octet == 0 */
-	if ((a->s_addr & htonl(0xff000000)) == htonl(0x00000000))
-		return ERROR_DROP;
-	/* First octet == 127 */
-	if ((a->s_addr & htonl(0xff000000)) == htonl(0x7f000000))
+	uint32_t h = ntohl(a->s_addr);
+	uint32_t oct = h >> 24;
+
+	/* First octet == 0, first octet == 127, Class D (224.0.0.0/4),
+	 * or Local Broadcast (255.255.255.255); Class E considered valid now. */
+	if (oct == 0 || oct == 127 || (oct & 0xf0u) == 0xe0u || h == 0xffffffffu)
 		return ERROR_DROP;
 
 	/* Link-local block 169.254.0.0/16 */
-	if ((a->s_addr & htonl(0xffff0000)) == htonl(0xa9fe0000))
+	if ((h >> 16) == 0xa9feu)
 		return ERROR_LOCAL;
-
-	/* Class D */
-	if ((a->s_addr & htonl(0xf0000000)) == htonl(0xe0000000))
-		return ERROR_DROP;
-
-	/* Class E considered valid now */
-
-	/* Local Broadcast not considered valid */
-	if (a->s_addr== 0xffffffff)
-		return ERROR_DROP;
 
 	return ERROR_NONE;
 }
@@ -143,6 +134,16 @@ int is_private_ip4_addr(const struct in_addr *a)
 		return ERROR_REJECT;
 
 	return ERROR_NONE;
+}
+
+static inline int is_wkpf_private_violation(const struct in6_addr *prefix,
+					    const struct in_addr *addr4)
+{
+	return gcfg.wkpf_strict &&
+	       prefix->s6_addr32[0] == WKPF &&
+	       !prefix->s6_addr32[1] &&
+	       !prefix->s6_addr32[2] &&
+	       is_private_ip4_addr(addr4);
 }
 
 /**
@@ -645,11 +646,7 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 
 	/* Do not allow translation of well-known prefix with private IPv4
 	 * But still allow local-use prefix */
-	if (prefix->s6_addr32[0] == WKPF &&
-		!prefix->s6_addr32[1] &&
-		!prefix->s6_addr32[2] &&
-		gcfg.wkpf_strict &&
-		is_private_ip4_addr(addr4))
+	if (is_wkpf_private_violation(prefix, addr4))
 		return ERROR_REJECT;
 
 	switch (prefix_len) {
@@ -991,11 +988,7 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 				pthread_mutex_unlock(&gcfg.map_mutex);
 			return ERROR_DROP;
 		}
-		if (map6->addr.s6_addr32[0] == WKPF &&
-			map6->addr.s6_addr32[1] == 0 &&
-			map6->addr.s6_addr32[2] == 0 &&
-			gcfg.wkpf_strict &&
-				is_private_ip4_addr(addr4)) {
+		if (is_wkpf_private_violation(&map6->addr, addr4)) {
 			if (!gcfg.maps_immutable)
 				pthread_mutex_unlock(&gcfg.map_mutex);
 			return ERROR_REJECT;
@@ -1007,7 +1000,7 @@ int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6, int dyn_
 				pthread_mutex_unlock(&gcfg.map_mutex);
 			return ERROR_DROP;
 		}
-		if (map6->prefix_len != 96) {
+		if (gcfg.cache_size && map6->prefix_len != 96) {
 			struct in6_addr canon;
 			cache_pair = append_to_prefix(&canon, addr4, &s->map6.addr, map6->prefix_len) == 0 &&
 				IN6_ARE_ADDR_EQUAL(addr6, &canon);
@@ -1066,10 +1059,7 @@ int map_ip6_to_ip4_hairpin(struct in_addr *addr4, const struct in6_addr *addr6)
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_DROP;
 	}
-	if (map6->addr.s6_addr32[0] == WKPF &&
-	    map6->addr.s6_addr32[1] == 0 &&
-	    map6->addr.s6_addr32[2] == 0 &&
-	    gcfg.wkpf_strict && is_private_ip4_addr(addr4)) {
+	if (is_wkpf_private_violation(&map6->addr, addr4)) {
 		if (!gcfg.maps_immutable)
 			pthread_mutex_unlock(&gcfg.map_mutex);
 		return ERROR_REJECT;
