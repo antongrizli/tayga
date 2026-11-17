@@ -17,7 +17,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang
       # No `make clean` anywhere in this job: it would delete the restored corpus.
       - name: Restore the fuzz corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: build/fuzz/fuzz-run
           key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
@@ -42,7 +42,7 @@ jobs:
         run: test ! -d build/fuzz/fuzz-run || find build/fuzz/fuzz-run \( -name 'crash-*' -o -name 'leak-*' -o -name 'timeout-*' \) -delete
       - name: Save the fuzz corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: build/fuzz/fuzz-run
           key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
