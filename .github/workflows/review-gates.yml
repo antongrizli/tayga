@@ -120,7 +120,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Dependencies and opt-in io_uring build
-        run: sudo apt-get update && sudo apt-get install -y liburing-dev python3-scapy python3-pyroute2 iproute2 nftables tcpdump socat iputils-ping ethtool
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev clang python3-scapy python3-pyroute2 iproute2 nftables tcpdump socat iputils-ping ethtool
       - name: Shell script errors
         run: |
           sudo apt-get install -y shellcheck
@@ -128,6 +128,11 @@ jobs:
       - name: Default build and incremental build regressions
         run: python3 scripts/ci/check-build.py
       - run: make WITH_URING=1 all test
+      - name: tc-bpf self-test and live kernel cls_bpf E2E
+        run: |
+          make -C contrib/tc-bpf clean test
+          sudo make -C contrib/tc-bpf test-kernel
+          make -C contrib/tc-bpf clean
       - name: Kernel negotiation, rollback, wire and lifecycle
         run: |
           set -o pipefail

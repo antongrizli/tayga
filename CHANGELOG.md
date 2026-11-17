@@ -6,6 +6,8 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 
 ### Added
 
+- `tc-bpf` subnet EAM & live kernel verification: added RFC 7757 subnet EAM suffix synthesis (`tayga_bpf_eam_4to6()` / `tayga_bpf_eam_6to4()`), `src_prefix_len` map value field with `(32 - l4) <= (128 - l6)` validation, `LIBBPF_PIN_BY_NAME` (`__uint(pinning, 1)`) map auto-pinning in `tayga_tc_fastpath.c`, and live `cls_bpf` + `veth` + Scapy E2E test (`contrib/tc-bpf/test_kernel_e2e.sh` / `make -C contrib/tc-bpf test-kernel` in CI `linux-kernel`).
+- Unit tests in `unit_conffile` (auto `ipv6-addr` synthesis alongside shorter EAM prefixes) and `unit_addrmap` (`load_dynamic()` malformed/conflict/duplicate/future-timestamp handling and `dynamic_get_stats()`).
 - `tc-bpf` helper (`tayga-tc-ctl`): added `map-file` directive parsing and Linux `bpffs` syscall synchronization (`--sync-maps <tayga.conf> <pin_dir>` and `--read-stats <pin_dir> [--json]`) without `libbpf`.
 - CI checks in `review-gates.yml` for `make -C contrib/tc-bpf clean test` and `make microbench` GitHub Step Summary reporting.
 - `icmp-v4-pool PREFIX/LEN` (RFC 6791): deterministic pool-based IPv4 source address selection for ICMPv4 errors originated from untranslatable IPv6 sources, falling back to `ipv4-addr`.
@@ -15,12 +17,13 @@ Changes for this fork are recorded here. Releases use semantic version tags.
 - Unit test suite `unit_nat64` for scalar packet/ICMP/offload translation paths, plus expanded coverage for `dns64_serve`, `ra_supervisor`, `tun_probe`, `conffile` (`config_reload`), and `tun_steering`.
 - `--metrics-file FILE` (`TAYGA_METRICS_FILE`): optional Prometheus text-format counters for the node_exporter textfile collector, rewritten atomically with every status JSON write (every 5 s, on SIGUSR2 and at shutdown); no listening socket.
 - `make analyze` (clang static analyzer via `scan-build`) with a CI gate.
-- `make coverage`: unit-test line and branch coverage report (`gcovr`) failing below `COVERAGE_MIN=70` / `COVERAGE_BRANCH_MIN=56`.
+- `make coverage`: unit-test line and branch coverage report (`gcovr`) failing below `COVERAGE_MIN=71` / `COVERAGE_BRANCH_MIN=57`.
 - `make microbench`: translator microbenchmark.
 - Nightly fuzzing workflow with a persistent corpus.
 
 ### Changed
 
+- Hot-path address validation/mapping optimizations in `src/addrmap.c`: compact bitmask/shift checks in `validate_ip4_addr()`, deduplicated `is_wkpf_private_violation()` guard checking `gcfg.wkpf_strict` first, and gating RFC 6052 canonicalization in `map_ip6_to_ip4()` on `gcfg.cache_size`.
 - Activated and expanded Scapy integration tests for RFC 7757 EAM unequal suffixes, overlapping IPv6 EAM LPM ranges, RFC 4884 ICMPv4 extensions, and `map-file` / `dynamic-pool` overlap rejection (`0` expected failures across all 6 suites).
 - Retired `tun-steering groups` in favor of `kernel` (default) and `flows`.
 - Decomposed daemon startup and lifecycle state in `src/tayga.c` (`struct tayga_runtime` and single-purpose initialization/loop helpers).

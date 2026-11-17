@@ -173,6 +173,105 @@ static void test_dynamic_dump(void)
     puts("PASS: concurrent dynamic lookup, maintenance, disk snapshot and atomic clock");
 }
 
+static void test_dynamic_load_and_stats(void)
+{
+    assert(config_init() == 0);
+    assert(pthread_mutex_init(&gcfg.map_mutex, NULL) == 0);
+    assert(pthread_mutex_init(&gcfg.cache_mutex, NULL) == 0);
+    char directory[] = "/tmp/tayga-dynload-XXXXXX";
+    assert(mkdtemp(directory));
+    int cwd = open(".", O_RDONLY); assert(cwd >= 0); assert(chdir(directory) == 0);
+
+    FILE *f = fopen("config", "w"); assert(f);
+    fprintf(f,
+            "tun-device dynload\n"
+            "ipv4-addr 192.0.2.254\n"
+            "ipv6-addr 2001:db8::fe\n"
+            "prefix fd64::/96\n"
+            "map 198.19.0.1 2001:db8:dead::10\n"
+            "map 198.18.0.10 2001:db8:dead::20\n"
+            "dynamic-pool 198.18.0.0/24\n"
+            "data-dir %s\n",
+            directory);
+    assert(fclose(f) == 0);
+    assert(config_read("config") == 0);
+    assert(config_validate() == 0);
+    gcfg.cache_size = 16; gcfg.hash_bits = 2; gcfg.rand[0] = 1;
+    assert(create_cache() == 0);
+    void *storage = list_entry(gcfg.cache_pool.next, struct cache_entry, list);
+
+    /* NULL and missing dynamic.map paths */
+    load_dynamic(NULL);
+    uint32_t mapped = 99, dormant = 99, free_addrs = 99;
+    dynamic_get_stats(NULL, &mapped, &dormant, &free_addrs);
+    assert(mapped == 0 && dormant == 0 && free_addrs == 0);
+    dynamic_get_stats(gcfg.dynamic_pool, NULL, NULL, NULL);
+
+    FILE *stale = fopen("dynamic.map.abc123", "w"); assert(stale); assert(fclose(stale) == 0);
+    load_dynamic(gcfg.dynamic_pool);
+    assert(access("dynamic.map.abc123", F_OK) != 0);
+
+    /* Stale temp cleanup + malformed, conflicting, duplicate, and future-timestamp entries */
+    stale = fopen("dynamic.map.xyz789", "w"); assert(stale); assert(fclose(stale) == 0);
+    f = fopen("dynamic.map", "w"); assert(f);
+    char oversized[520];
+    memset(oversized, 'x', sizeof(oversized) - 1);
+    oversized[sizeof(oversized) - 1] = '\0';
+    time_t wall = time(NULL);
+    fprintf(f, "# comment line\n\n");
+    fprintf(f, "%s\n", oversized);
+    fprintf(f, "198.18.0.30\n");
+    fprintf(f, "198.18.0.30 2001:db8:5::30\n");
+    fprintf(f, "198.18.0.30 2001:db8:5::30 123 extra\n");
+    fprintf(f, "999.0.0.1 2001:db8:5::30 123\n");
+    fprintf(f, "198.18.0.30 not-ipv6 123\n");
+    fprintf(f, "198.18.0.30 2001:db8:5::30 0\n");
+    fprintf(f, "198.18.0.30 2001:db8:5::30 123abc\n");
+    fprintf(f, "198.19.0.1 2001:db8:5::31 %ld\n", (long)(wall - 10));
+    fprintf(f, "198.18.0.10 2001:db8:5::32 %ld\n", (long)(wall - 10));
+    fprintf(f, "198.18.0.11 fe80::1 %ld\n", (long)(wall - 10));
+    fprintf(f, "198.18.0.12 2001:db8:dead::10 %ld\n", (long)(wall - 10));
+    fprintf(f, "198.18.0.20 2001:db8:5::20 %ld\n", (long)(wall - 30));
+    fprintf(f, "198.18.0.21 2001:db8:5::21 %ld\n", (long)(wall + 60));
+    fprintf(f, "198.18.0.20 2001:db8:5::22 %ld\n", (long)(wall - 5));
+    assert(fclose(f) == 0);
+
+    load_dynamic(gcfg.dynamic_pool);
+    assert(access("dynamic.map.xyz789", F_OK) != 0);
+
+    dynamic_get_stats(gcfg.dynamic_pool, &mapped, &dormant, &free_addrs);
+    assert(mapped == 0 && dormant == 2 && free_addrs == 253);
+
+    /* Activate one dormant entry and verify stats reflect mapped vs dormant split */
+    struct in6_addr c20;
+    struct in_addr out4, exp4;
+    assert(inet_pton(AF_INET6, "2001:db8:5::20", &c20) == 1);
+    assert(inet_pton(AF_INET, "198.18.0.20", &exp4) == 1);
+    assert(map_ip6_to_ip4(&out4, &c20, 1) == 0);
+    assert(out4.s_addr == exp4.s_addr);
+    dynamic_get_stats(gcfg.dynamic_pool, &mapped, &dormant, &free_addrs);
+    assert(mapped == 1 && dormant == 1 && free_addrs == 253);
+
+    struct list_head *entry, *next;
+    list_for_each_safe(entry, next, &gcfg.dynamic_pool->mapped_list) {
+        struct map_dynamic *d = list_entry(entry, struct map_dynamic, list);
+        list_del(&d->map4.list); list_del(&d->map6.list); list_del(&d->list); free(d);
+    }
+    list_for_each_safe(entry, next, &gcfg.dynamic_pool->dormant_list) {
+        struct map_dynamic *d = list_entry(entry, struct map_dynamic, list);
+        list_del(&d->map4.list); list_del(&d->map6.list); list_del(&d->list); free(d);
+    }
+    list_del(&gcfg.dynamic_pool->map4.list); free(gcfg.dynamic_pool);
+    list_for_each_safe(entry, next, &gcfg.map4_list) {
+        struct map_static *m = list_entry(entry, struct map_static, map4.list);
+        list_del(&m->map4.list); list_del(&m->map6.list); free(m);
+    }
+    free(storage); free(gcfg.hash_table4); free(gcfg.hash_table6);
+    unlink("config"); unlink("dynamic.map"); assert(fchdir(cwd) == 0); close(cwd); assert(rmdir(directory) == 0);
+    pthread_mutex_destroy(&gcfg.map_mutex); pthread_mutex_destroy(&gcfg.cache_mutex);
+    puts("PASS: load_dynamic edge cases and dynamic_get_stats");
+}
+
 extern uint32_t hash_ip4(const struct in_addr *addr4);
 extern uint32_t hash_ip6(const struct in6_addr *addr6);
 
@@ -375,6 +474,7 @@ int main(void)
     pthread_mutex_destroy(&gcfg.map_mutex); pthread_mutex_destroy(&gcfg.cache_mutex);
     test_immutable_maps();
     test_dynamic_dump();
+    test_dynamic_load_and_stats();
     puts("PASS: all masks, bidirectional reload publication, malformed transaction, concurrent miss deduplication");
     return 0;
 }

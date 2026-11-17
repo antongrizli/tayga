@@ -15,7 +15,10 @@ tayga-tc-ctl: tayga_tc_ctl.c tayga_tc_maps.h
 test: all
 	./tayga-tc-ctl --self-test
 
+test-kernel: all
+	./test_kernel_e2e.sh
+
 clean:
 	rm -f tayga_tc_fastpath.o tayga-tc-ctl
 
-.PHONY: all test clean
+.PHONY: all test test-kernel clean

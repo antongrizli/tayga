@@ -1682,6 +1682,46 @@ static void test_config_reload(void) {
     pthread_mutex_destroy(&gcfg.map_mutex);
 }
 
+static void test_ipv6_addr_with_shorter_eam(void) {
+    char conffile[] = "/tmp/tayga_unit_shorter_eam.conf";
+    FILE *fd;
+
+    printf("TEST CASES FOR AUTO IPV6-ADDR WITH SHORTER EAM\n");
+
+    config_init();
+    pthread_mutex_init(&gcfg.map_mutex, NULL);
+    pthread_mutex_init(&gcfg.cache_mutex, NULL);
+
+    fd = fopen(conffile, "w");
+    expect(fd != NULL, "Open shorter EAM conf");
+    fputs("tun-device nat64\n"
+          "ipv4-addr 192.0.2.1\n"
+          "prefix 3fff:6464::/96\n"
+          "map 10.0.0.0/24 2001:db8:beef:0:cafe::/80\n", fd);
+    fclose(fd);
+
+    getenv_case = 1;
+    expect(config_read(conffile) == 0, "Read shorter EAM without ipv6-addr");
+    expect(config_validate() == 0, "Validate shorter EAM synthesizes ipv6-addr from /96 prefix");
+    expectl(getenv_case, 0, "Shorter EAM Getenv Called");
+
+    struct in6_addr exp_local, got6, exp6;
+    struct in_addr a4;
+    expect(inet_pton(AF_INET6, "3fff:6464::c000:201", &exp_local) == 1, "Parse expected local_addr6");
+    expect(IN6_ARE_ADDR_EQUAL(&gcfg.local_addr6, &exp_local),
+           "Synthesized local_addr6 uses /96 RFC 6052 prefix before shorter /80 EAM");
+
+    expect(inet_pton(AF_INET, "10.0.0.42", &a4) == 1, "Parse EAM IPv4 test address");
+    expect(map_ip4_to_ip6(&got6, &a4) == 0, "Map 10.0.0.42 through /80 EAM");
+    expect(inet_pton(AF_INET6, "2001:db8:beef:0:cafe:2a00::", &exp6) == 1, "Parse expected /80 EAM IPv6");
+    expect(IN6_ARE_ADDR_EQUAL(&got6, &exp6), "Mapped /80 EAM IPv6 matches expected suffix");
+
+    unlink(conffile);
+    config_free();
+    pthread_mutex_destroy(&gcfg.cache_mutex);
+    pthread_mutex_destroy(&gcfg.map_mutex);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* Test function or config_init */
@@ -1699,6 +1739,7 @@ int main(void) {
     /* Test function for config_validate */
     test_config_validate();
     test_config_reload();
+    test_ipv6_addr_with_shorter_eam();
 
     /* Clean up all configuration allocations before exit */
     config_free();

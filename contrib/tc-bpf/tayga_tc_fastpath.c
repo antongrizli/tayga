@@ -60,6 +60,7 @@ static int (*bpf_skb_change_proto)(struct __sk_buff *skb, __be16 proto,
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
+	__uint(pinning, 1);
 	__type(key, __u32);
 	__type(value, struct tayga_bpf_cfg);
 } tayga_cfg_map SEC(".maps");
@@ -68,6 +69,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__uint(max_entries, TAYGA_TC_MAX_EAM);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, 1);
 	__type(key, struct tayga_lpm4_key);
 	__type(value, struct tayga_eam_val);
 } tayga_eam4_map SEC(".maps");
@@ -76,6 +78,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__uint(max_entries, TAYGA_TC_MAX_EAM);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, 1);
 	__type(key, struct tayga_lpm6_key);
 	__type(value, struct tayga_eam_val);
 } tayga_eam6_map SEC(".maps");
@@ -83,6 +86,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
+	__uint(pinning, 1);
 	__type(key, __u32);
 	__type(value, struct tayga_bpf_stats);
 } tayga_stats_map SEC(".maps");
@@ -142,10 +146,7 @@ static __always_inline int translate_4to6(struct __sk_buff *skb,
 		.nexthdr = proto,
 		.hop_limit = ttl,
 	};
-	ip6.saddr.s6_addr32[0] = src_eam->prefix[0];
-	ip6.saddr.s6_addr32[1] = src_eam->prefix[1];
-	ip6.saddr.s6_addr32[2] = src_eam->prefix[2];
-	ip6.saddr.s6_addr32[3] = src_eam->prefix[3];
+	tayga_bpf_eam_4to6(saddr4, src_eam, ip6.saddr.s6_addr32);
 
 	/* Destination uses /96 NAT64 prefix */
 	ip6.daddr.s6_addr32[0] = cfg->pref64_words[0];
@@ -225,6 +226,8 @@ static __always_inline int translate_6to4(struct __sk_buff *skb,
 		ip6->daddr.s6_addr32[2], ip6->daddr.s6_addr32[3],
 	};
 
+	__u32 daddr4 = tayga_bpf_eam_6to4(daddr6, dst_eam);
+
 	struct iphdr ip4 = {
 		.version = 4,
 		.ihl = 5,
@@ -236,7 +239,7 @@ static __always_inline int translate_6to4(struct __sk_buff *skb,
 		.protocol = ip6->nexthdr,
 		.check = 0,
 		.saddr = saddr6[3],
-		.daddr = dst_eam->prefix[0],
+		.daddr = daddr4,
 	};
 
 	if (bpf_skb_change_proto(skb, bpf_htons(ETH_P_IP), 0) < 0) {
